@@ -54,12 +54,15 @@
 //!     `max_write_queue_bytes`). A Hello-complete peer that stops draining
 //!     overflows it; the overflow fails the enqueue and force-disconnects the
 //!     conn (socket shutdown → its reader unblocks → normal teardown).
-//!   * The handshake has a receive deadline (`handshake_timeout_s`, via
-//!     SO_RCVTIMEO, cleared once the Hello completes): a peer that connects
-//!     but never sends its Hello cannot wedge a reader thread forever. While
-//!     the deadline is armed, reads go through `std.posix.read` (not the Io
-//!     vtable) so a timeout surfaces as error.WouldBlock — Io.Threaded treats
-//!     EAGAIN as a programmer bug and would panic in debug builds.
+//!   * The handshake has a receive deadline (`handshake_timeout_s`): a peer
+//!     that connects but never sends its Hello cannot wedge a reader thread
+//!     forever. The deadline belongs to the Io OPERATION, not to the socket:
+//!     `std.Io.operateTimeout(.{ .net_read = ... }, deadline)` is std's own
+//!     mechanism for this — it bounds (and abandons) the read itself and
+//!     yields `error.Timeout`, which drives the ordinary teardown. The
+//!     deadline is made absolute once per handshake, so a peer dribbling
+//!     bytes cannot renew the window on every read. Once the Hello exchange
+//!     completes the conn reads untimed again through `Conn.read`.
 //!
 //! Shutdown (`stop`, idempotent): flip `stopping`, wake the dialers' backoff
 //! condvar, wake the accept thread WITHOUT invalidating the listener fd
@@ -113,10 +116,19 @@ pub const max_inbound_conns: usize = 128;
 /// opening 128 real sockets.
 var inbound_conn_cap: usize = max_inbound_conns;
 
-/// Handshake receive deadline (seconds): a peer that connects but never
-/// sends its Hello is disconnected after this long (SO_RCVTIMEO on the raw
-/// fd, cleared once the Hello exchange completes).
-const handshake_timeout_s: u32 = 10;
+/// Handshake receive deadline (10s), as an `std.Io.Timeout`: a peer that
+/// connects but never sends its Hello is disconnected after this long. The
+/// deadline rides on the Io read operation (`operateTimeout`), never on the
+/// socket — see the implementation notes above.
+const handshake_timeout_s: std.Io.Timeout = .{ .duration = .{
+    .raw = std.Io.Duration.fromSeconds(10),
+    .clock = .awake,
+} };
+
+/// Runtime handshake deadline. Production always runs the
+/// `handshake_timeout_s` default; file-private so a test can drop it to a
+/// few hundred milliseconds instead of stalling the suite for ten seconds.
+var handshake_deadline: std.Io.Timeout = handshake_timeout_s;
 
 /// Consecutive per-peer budget breaches before we disconnect the peer. Kept
 /// well clear of anything healthy loopback traffic produces.
@@ -175,9 +187,6 @@ const Conn = struct {
     id: usize = 0,
     hello_done: bool = false,
     outbound: bool = false,
-    /// True while the handshake deadline (SO_RCVTIMEO) is armed; reads then
-    /// bypass the Io vtable (see `read`). Reader-thread-local.
-    in_handshake: bool = true,
     /// The peer's advertised (unauthenticated) nodeId from its Hello. Used
     /// only by the test link filter to simulate network partitions.
     peer_node_id: [32]u8 = @splat(0),
@@ -199,18 +208,29 @@ const Conn = struct {
     win_reqs: usize = 0,
     strikes: u32 = 0,
 
+    /// Blocking read into `read_buf`; 0 on EOF. The established-connection
+    /// path — no deadline, straight through the Io vtable.
     fn read(self: *Conn) !usize {
-        if (comptime builtin.target.os.tag != .windows) {
-            if (self.in_handshake) {
-                // The handshake deadline (SO_RCVTIMEO) is armed: read via
-                // std.posix so a timeout surfaces as error.WouldBlock.
-                // Io.Threaded's read path treats EAGAIN as a programmer bug
-                // (debug panic), so it must not see a timed-out read.
-                return std.posix.read(self.stream.socket.handle, self.read_buf);
-            }
-        }
         var bufs: [1][]u8 = .{self.read_buf};
         return self.stream.read(self.io, &bufs);
+    }
+
+    /// Blocking read into `read_buf` under a DEADLINE, returning
+    /// `error.Timeout` if it expires first. Used for the handshake phase
+    /// only.
+    ///
+    /// The deadline is attached to the Io OPERATION rather than to the
+    /// socket: `operateTimeout` bounds the `net_read` itself, so the read
+    /// path never has to interpret a timed-out `recv`. (Arming SO_RCVTIMEO
+    /// instead would make a plain timeout arrive as EAGAIN, which
+    /// `Io.Threaded` classifies as a programmer bug — a debug-build panic.)
+    fn readTimeout(self: *Conn, timeout: std.Io.Timeout) !usize {
+        var bufs: [1][]u8 = .{self.read_buf};
+        const result = try self.io.operateTimeout(.{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = &bufs,
+        } }, timeout);
+        return result.net_read;
     }
 
     /// Copy `bytes` onto the write queue (async) or, before the writer thread
@@ -674,11 +694,13 @@ pub const Overlay = struct {
         });
 
         // Handshake deadline: a peer that never sends its Hello must not
-        // park this thread forever in a blocking read.
-        setRecvTimeout(conn.stream.socket.handle, handshake_timeout_s);
+        // park this thread forever in a blocking read. Resolved to an
+        // ABSOLUTE deadline here so it bounds the whole Hello exchange
+        // rather than restarting on every read.
+        const deadline = handshake_deadline.toDeadline(self.io);
 
         var established = false;
-        if (self.handshake(conn, &framer)) {
+        if (self.handshake(conn, &framer, deadline)) {
             // Start the writer BEFORE the peer is visible to senders, so every
             // enqueue takes the async path (no two threads sync-write). If the
             // writer cannot start, the conn must NOT be published: a published
@@ -691,8 +713,7 @@ pub const Overlay = struct {
         }
 
         if (established) {
-            setRecvTimeout(conn.stream.socket.handle, 0); // clear the deadline
-            conn.in_handshake = false;
+            // Past the Hello: the read loop below runs untimed again.
             self.conns_mu.lockUncancelable(self.io);
             conn.id = self.next_peer_id;
             self.next_peer_id += 1;
@@ -712,12 +733,14 @@ pub const Overlay = struct {
         gpa.destroy(conn);
     }
 
-    /// Send our Hello, then read + validate the peer's Hello. Returns true iff
-    /// the peer is an accepted flood peer.
-    fn handshake(self: *Overlay, conn: *Conn, framer: *framing.Framer) bool {
+    /// Send our Hello, then read + validate the peer's Hello under
+    /// `deadline`. Returns true iff the peer is an accepted flood peer; a
+    /// silent peer trips the deadline and returns false, which runs the same
+    /// teardown as any other rejected conn.
+    fn handshake(self: *Overlay, conn: *Conn, framer: *framing.Framer, deadline: std.Io.Timeout) bool {
         self.sendHello(conn) catch return false;
 
-        const raw = self.nextRawFrame(conn, framer) orelse return false;
+        const raw = self.nextRawFrame(conn, framer, deadline) orelse return false;
         defer self.gpa.free(raw);
         var frame = wire.decode(self.gpa, raw) catch return false;
         defer frame.deinit(self.gpa);
@@ -759,7 +782,8 @@ pub const Overlay = struct {
     fn readLoop(self: *Overlay, conn: *Conn, framer: *framing.Framer) void {
         const gpa = self.gpa;
         while (true) {
-            const raw = self.nextRawFrame(conn, framer) orelse return;
+            // Established: no deadline — an idle peer is a legal peer.
+            const raw = self.nextRawFrame(conn, framer, .none) orelse return;
             defer gpa.free(raw);
             var frame = wire.decode(gpa, raw) catch |err| {
                 // Valid framing, malformed contents: drop the frame, keep peer.
@@ -773,8 +797,9 @@ pub const Overlay = struct {
     }
 
     /// Pull the next complete wire frame (caller frees), or null on EOF, read
-    /// error, framing error, or a byte-budget disconnect.
-    fn nextRawFrame(self: *Overlay, conn: *Conn, framer: *framing.Framer) ?[]u8 {
+    /// error, framing error, an expired `deadline`, or a byte-budget
+    /// disconnect. Pass `.none` for the untimed (established) path.
+    fn nextRawFrame(self: *Overlay, conn: *Conn, framer: *framing.Framer, deadline: std.Io.Timeout) ?[]u8 {
         while (true) {
             const popped = framer.popFrame() catch {
                 framer.reset();
@@ -782,7 +807,15 @@ pub const Overlay = struct {
             };
             if (popped) |f| return f;
 
-            const n = conn.read() catch return null;
+            const n = blk: {
+                if (deadline == .none) break :blk conn.read() catch return null;
+                break :blk conn.readTimeout(deadline) catch |err| {
+                    if (err == error.Timeout) {
+                        log.warn("overlay: handshake deadline expired before Hello; disconnecting", .{});
+                    }
+                    return null;
+                };
+            };
             if (n == 0) return null; // EOF or socket shut down.
             if (!self.chargeBytes(conn, n)) return null;
             framer.push(conn.read_buf[0..n]) catch {
@@ -949,23 +982,6 @@ fn writeAll(io: std.Io, handle: net.Socket.Handle, bytes: []const u8) !void {
         if (n == 0) return error.WriteZero;
         offset += n;
     }
-}
-
-/// Best-effort SO_RCVTIMEO on the raw fd (`seconds == 0` disables it). Used
-/// as the handshake deadline: a timed-out read surfaces as an error on the
-/// reader thread (via `Conn.read`'s posix path) and runs the normal teardown.
-/// No-op on Windows.
-fn setRecvTimeout(handle: net.Socket.Handle, seconds: u32) void {
-    if (comptime builtin.target.os.tag == .windows) return;
-    const tv: std.posix.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
-    std.posix.setsockopt(
-        handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&tv),
-    ) catch |err| {
-        log.debug("overlay: SO_RCVTIMEO({d}s) failed: {t}", .{ seconds, err });
-    };
 }
 
 /// Best-effort TCP_NODELAY; loopback control frames are latency-sensitive.
@@ -1153,6 +1169,21 @@ fn waitPeerCount(io: std.Io, ov: *Overlay, want: usize) !void {
         sleepMs(io, 10);
     }
     return error.PeerCountTimeout;
+}
+
+/// One read from a raw test socket under its own bounded deadline, so a
+/// broken overlay teardown FAILS the test instead of hanging it. Uses the
+/// same `operateTimeout` mechanism the overlay's handshake read does.
+fn readBounded(io: std.Io, handle: net.Socket.Handle, buf: []u8, ms: i64) !usize {
+    var bufs: [1][]u8 = .{buf};
+    const result = try io.operateTimeout(.{ .net_read = .{
+        .socket_handle = handle,
+        .data = &bufs,
+    } }, .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(ms),
+        .clock = .awake,
+    } });
+    return result.net_read;
 }
 
 fn buildEnvelope(gpa: std.mem.Allocator, statement: []const u8, sig: []const u8) ![]u8 {
@@ -1429,6 +1460,55 @@ test "inbound conn cap: over-cap accepts are closed, under-cap conns still work"
     try waitPeerCount(io, &ov_b, 2);
     try testing.expectEqual(@as(usize, 2), b_rec.peerUpCount());
     try testing.expectEqual(@as(usize, 2), ov_b.peerCount());
+}
+
+test "handshake deadline: a silent peer is disconnected, never published" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // Drop the file-private runtime deadline so this costs milliseconds, not
+    // ten seconds. The `handshake_timeout_s` const stays the production
+    // default. (Zig runs tests sequentially, as the inbound-cap test above
+    // already relies on.)
+    const saved_deadline = handshake_deadline;
+    handshake_deadline = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(200),
+        .clock = .awake,
+    } };
+    defer handshake_deadline = saved_deadline;
+
+    var b_rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer b_rec.deinit();
+    var ov_b = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xBB), b_rec.callbacks());
+    b_rec.ov = &ov_b;
+    try ov_b.start();
+    defer ov_b.deinit();
+    defer ov_b.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov_b.boundPort());
+    const c = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c.close(io);
+
+    // We send NOTHING. B sends its own Hello immediately, then blocks on the
+    // deadline read; when it expires B must tear the conn down, so our socket
+    // sees EOF (or a reset) after at most a couple of reads.
+    var rb: [1024]u8 = undefined;
+    var closed = false;
+    var i: usize = 0;
+    while (i < 8 and !closed) : (i += 1) {
+        const n = readBounded(io, c.socket.handle, &rb, 4000) catch |err| {
+            // Timeout here means B never dropped us — the bug this guards.
+            if (err == error.Timeout) return error.HandshakeDeadlineDidNotFire;
+            closed = true; // a reset is a close too
+            continue;
+        };
+        if (n == 0) closed = true;
+    }
+    try testing.expect(closed);
+
+    // The conn was never published: no peer, no on_peer_up.
+    try testing.expectEqual(@as(usize, 0), ov_b.peerCount());
+    try testing.expectEqual(@as(usize, 0), b_rec.peerUpCount());
 }
 
 test "write queue caps: overflow fails the enqueue and shuts the conn down" {
