@@ -34,20 +34,48 @@ pub fn frameFlat(gpa: std.mem.Allocator, flat: []const u8) ![]u8 {
     return framed;
 }
 
+/// A decoded flat message plus the synthetic-table buffer it borrows into.
+/// `Message.init` BORROWS the framed bytes (it does not copy), so the buffer
+/// must outlive the Message — freeing it early is a use-after-free (found by
+/// the M0 vector work; the real fix is the upstream flat validating-decode
+/// entry point, docs/upstream/03).
+pub const FlatMessage = struct {
+    msg: Message,
+    framed: []u8,
+
+    pub fn deinit(self: *FlatMessage, gpa: std.mem.Allocator) void {
+        self.msg.deinit();
+        gpa.free(self.framed);
+        self.* = undefined;
+    }
+};
+
 /// Validating decode of flat bytes (e.g. received statementBytes).
-/// Caller owns the returned Message (call deinit).
-pub fn decodeFlat(gpa: std.mem.Allocator, flat: []const u8, options: ValidationOptions) !Message {
+/// Caller owns the result (call deinit).
+pub fn decodeFlat(gpa: std.mem.Allocator, flat: []const u8, options: ValidationOptions) !FlatMessage {
     const framed = try frameFlat(gpa, flat);
-    defer gpa.free(framed);
-    return Message.init(gpa, framed, options);
+    errdefer gpa.free(framed);
+    const msg = try Message.init(gpa, framed, options);
+    return .{ .msg = msg, .framed = framed };
 }
 
 /// Receive-side canonicality check (§4.2; `strictCanonical` defaults on).
 /// A cheap structural walk — no re-canonicalization, no compare.
-pub fn isCanonicalFlat(gpa: std.mem.Allocator, flat: []const u8) !bool {
-    var msg = decodeFlat(gpa, flat, .{}) catch return false;
-    defer msg.deinit();
-    return capnpc.canonical.isCanonical(&msg);
+pub fn isCanonicalFlat(gpa: std.mem.Allocator, flat: []const u8) bool {
+    var fm = decodeFlat(gpa, flat, .{}) catch return false;
+    defer fm.deinit(gpa);
+    return capnpc.canonical.isCanonical(&fm.msg);
+}
+
+test "decodeFlat keeps the framed buffer alive; canonical bytes pass isCanonicalFlat" {
+    const gpa = std.testing.allocator;
+    // Smallest canonical message: a root empty-struct pointer (offset -1),
+    // one word. canonicalizeFlat of any all-default root produces it.
+    const empty_root: [8]u8 = .{ 0xfc, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+    try std.testing.expect(isCanonicalFlat(gpa, &empty_root));
+    var fm = try decodeFlat(gpa, &empty_root, .{});
+    defer fm.deinit(gpa);
+    try std.testing.expect(capnpc.canonical.isCanonical(&fm.msg));
 }
 
 /// Canonicalize a message built via MessageBuilder: toBytes (framed) →

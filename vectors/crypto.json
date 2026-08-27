@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "networkIds": [
+    {"passphrase": "my-counter-app v1", "networkId": "ba521500e3f3a00474d967e35089ee77e3ea0c1a628d25e1952a72f7e864a9dd"},
+    {"passphrase": "slcp public test network ; august 2026", "networkId": "e408e7d32d1feb86bfb6bc0c27115191be73ac78dd557d720800c88943c8b3f4"},
+    {"passphrase": "", "networkId": "33b4aa3510eee62108a8bdee95b56ff9e2b3330ea98d3417d2f6bd212b16d8c9"}
+  ],
+  "keys": [
+    {"seed": "0101010101010101010101010101010101010101010101010101010101010101", "publicKey": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"},
+    {"seed": "0202020202020202020202020202020202020202020202020202020202020202", "publicKey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"},
+    {"seed": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "publicKey": "76a1592044a6e4f511265bca73a604d90b0529d1df602be30a19a9257660d1f5"}
+  ],
+  "gi": [
+    {"tag": 1, "slot": 1, "prevValue": "", "round": 0, "m": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c", "gi": "4025894534441347114"},
+    {"tag": 1, "slot": 1, "prevValue": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "round": 3, "m": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394", "gi": "11162244454312396195"},
+    {"tag": 2, "slot": 1, "prevValue": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "round": 3, "m": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c", "gi": "5138233827772272483"},
+    {"tag": 2, "slot": 123456789, "prevValue": "deadbeef", "round": 0, "m": "", "gi": "12977615011690005510"},
+    {"tag": 3, "slot": 42, "prevValue": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "round": 7, "m": "deadbeef", "gi": "10956292553350115872"},
+    {"tag": 3, "slot": 0, "prevValue": "", "round": 0, "m": "", "gi": "16584899954747510044"}
+  ],
+  "statements": [
+    {"name": "nominate slot1 single vote, accepted absent", "networkId": "ba521500e3f3a00474d967e35089ee77e3ea0c1a628d25e1952a72f7e864a9dd", "seed": "0101010101010101010101010101010101010101010101010101010101010101", "statementBytes": "000000000200020001000000000000000100000000000000050000000201000010000000000002008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0500000002010000110000000e0000007f98766c05c7f45e35e8eb0a7b7c08c8d91030012c5b318c5075314ae818f5030100000022000000deadbeef00000000", "digest": "d43b1db539cbc823ed5d1b2007557ae4fe34e4c525fd99dba333c65dbeb8a376", "signature": "caadec17c2292bd8966d057444fc60210221bba12f09f631fb6ccbd369e0d5bb292ebccad373fd24a8084444752467ff24a29eabc54525c860077372d9801d0e"},
+    {"name": "prepare slot2 ballot counter1, no prepared", "networkId": "ba521500e3f3a00474d967e35089ee77e3ea0c1a628d25e1952a72f7e864a9dd", "seed": "0202020202020202020202020202020202020202020202020202020202020202", "statementBytes": "000000000200020002000000000000000200000000000000050000000201000010000000000002008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394050000000201000010000000010001007f98766c05c7f45e35e8eb0a7b7c08c8d91030012c5b318c5075314ae818f50301000000000000000100000022000000cafebabe00000000", "digest": "2353baa5ca2a453b3ff6d59cccf81e2158689338fa86f7341d94abf80b150a35", "signature": "8254d0a41b9d5e051b762c281d8aaaacc98d8bd3eb1231d53fd221bfbf96d7329aba7b1098e17c758c7cb4dec0056f366d7f09acce55d4df632a7ae5de82770d"}
+  ]
+}
