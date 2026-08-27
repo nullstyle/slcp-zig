@@ -4,6 +4,16 @@
 //! a fresh one (from OS entropy via `io`) and writes it with 0600 permissions
 //! the first time. The public key (nodeId) is derived from the seed.
 //!
+//! Creation is atomic AND durable: the seed is written to an unnamed/temp
+//! file (0600 from birth), fsync'd (plus F_FULLFSYNC on macOS, where fsync
+//! alone does not flush the drive cache), and only then linked into place
+//! under the final name. A crash, ENOSPC, or power loss mid-ceremony leaves
+//! either no key file at all (next boot mints a fresh identity — fine, the
+//! old one never existed durably) or the complete 32-byte file. It can never
+//! leave a partial file that bricks startup, and it can never expose a name
+//! whose seed bytes are not yet on disk (which could otherwise mint a NEW
+//! identity on the next boot — identity-level equivocation).
+//!
 //! Watcher nodes call `ephemeral(io)` instead: a random nodeId that never
 //! signs (the engine needs one for its maps; §11).
 //!
@@ -28,6 +38,7 @@
 //! ========================================================================
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("slcp-core");
 
 pub const Error = error{ BadKeyFile, EntropyUnavailable } || std.mem.Allocator.Error;
@@ -53,17 +64,37 @@ pub fn loadOrCreate(io: std.Io, path: []const u8) !KeyPair {
         if (n != 32) return error.BadKeyFile;
         seed = buf[0..32].*;
     } else |err| switch (err) {
-        // First run: mint fresh OS entropy and commit it with owner-only perms
-        // set at creation, so the seed never exists on disk world-readable.
-        // A missing parent dir surfaces here as the underlying fs error.
+        // First run: mint fresh OS entropy and commit it atomically + durably
+        // with owner-only perms set at creation, so the seed never exists on
+        // disk world-readable and the final name never refers to a partial or
+        // volatile file. Ceremony: temp file (0600) → write → fsync (and
+        // F_FULLFSYNC on macOS) → link into place. `link` fails with
+        // PathAlreadyExists rather than replacing, so a concurrently created
+        // key is never clobbered. A missing parent dir surfaces here as the
+        // underlying fs error.
         error.FileNotFound => {
             try io.randomSecure(&seed);
-            var file = try cwd.createFile(io, path, .{
-                .exclusive = true,
+            var af = try cwd.createFileAtomic(io, path, .{
                 .permissions = std.Io.File.Permissions.fromMode(0o600),
             });
-            defer file.close(io);
-            try file.writeStreamingAll(io, &seed);
+            // Cleans up the temp file on any failure below; a no-op on the
+            // handles that `link` already consumed on success.
+            defer af.deinit(io);
+            try af.file.writeStreamingAll(io, &seed);
+            // Make the seed bytes durable BEFORE the name appears: a power
+            // loss after link-but-before-flush would otherwise leave a named
+            // key file whose content evaporates, so the next boot silently
+            // mints a different identity.
+            try af.file.sync(io);
+            if (comptime builtin.os.tag == .macos) {
+                // fsync(2) on macOS does not flush the drive's own cache;
+                // F_FULLFSYNC asks for a true flush to media. Filesystems
+                // that lack it (e.g. SMB) fail the fcntl — the plain fsync
+                // above is then the best available, so this is deliberately
+                // non-fatal (the same fallback SQLite uses).
+                _ = std.c.fcntl(af.file.handle, std.posix.F.FULLFSYNC);
+            }
+            try af.link(io);
         },
         else => return err,
     }
@@ -111,6 +142,11 @@ test "loadOrCreate: create then load round-trips to the same key" {
     try testing.expectEqualSlices(u8, &derived, &created.public_key);
 }
 
+// A wrong-length key file is ALWAYS BadKeyFile — never silently overwritten
+// with a fresh key. With atomic creation such a file cannot be a torn write
+// from us; it is operator damage (truncation, edit, wrong file), and minting
+// a new identity over it would be silent equivocation at the identity level.
+// Recovery is a deliberate, manual `rm` of the key file by the operator.
 test "loadOrCreate: a key file that is not exactly 32 bytes is rejected" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -150,9 +186,9 @@ test "ephemeral: two calls produce distinct random identities" {
     try testing.expectEqualSlices(u8, &derived, &a.public_key);
 }
 
-test "loadOrCreate: a freshly created key file is mode 0600" {
+test "loadOrCreate: a freshly created key file is complete (32 bytes) and mode 0600" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -160,5 +196,17 @@ test "loadOrCreate: a freshly created key file is mode 0600" {
     _ = try loadOrCreate(io, path);
 
     const st = try tmp.dir.statFile(io, "perms.seed", .{});
+    // Atomic creation: once the name exists it is the complete seed, never a
+    // partial write (link happens only after write + fsync succeed).
+    try testing.expectEqual(@as(u64, 32), st.size);
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+
+    // And no temp-file debris is left behind: the key file is the only entry.
+    var it = tmp.dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(io)) |entry| {
+        entries += 1;
+        try testing.expectEqualStrings("perms.seed", entry.name);
+    }
+    try testing.expectEqual(@as(usize, 1), entries);
 }

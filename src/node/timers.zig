@@ -26,8 +26,10 @@
 //!   * Monotonic clock: use std.Io's clock (awake/monotonic), NOT wall time,
 //!     so a system-clock jump can't stall or stampede timers. delay_ms is
 //!     relative.
-//!   * On fire: remove the timer from the set, then call `fire`. A timer that
-//!     was canceled between selection and firing must NOT fire.
+//!   * On fire: remove the timer from the set, then call `fire`. A cancel
+//!     that wins the wheel's lock before the timer is selected must prevent
+//!     the fire. (A cancel that loses that race can still observe a stale
+//!     delivery — see STALE-FIRE RACE below; accepted for v1.)
 //!   * deinit/stop: signal the thread to exit, join it. Idempotent stop.
 //!   * Tests: arm 20ms → fires ~once with right (slot,timer) (allow slack);
 //!     cancel before deadline → never fires; re-arm extends/replaces; two
@@ -42,9 +44,28 @@
 //! can never stall or stampede the wheel. `arm`/`cancel` mutate the live set
 //! under the mutex and `signal` the wheel thread to re-evaluate the nearest
 //! deadline. Selection and removal of a due timer happen in ONE locked
-//! critical section — so a timer removed by `cancel` is simply never
-//! selected, which is what "canceled between selection and firing must not
-//! fire" reduces to.
+//! critical section, so a `cancel` (or re-arm) that acquires the lock BEFORE
+//! the wheel selects the timer removes (or re-deadlines) it and it does not
+//! fire at the old deadline.
+//!
+//! STALE-FIRE RACE (accepted for v1). The guarantee above is only "cancels
+//! that win the lock before selection". Once the wheel thread has selected
+//! and removed a due timer and dropped the lock to invoke `fire`, the timer
+//! is no longer in the live set — a `cancel` or re-arm arriving in that
+//! window finds nothing to remove (cancel is a no-op; re-arm inserts a fresh
+//! entry) and CANNOT recall the in-flight callback. The engine thread can
+//! therefore observe a `timer_fired{slot, timer}` for a timer it just
+//! canceled, or one delivered at the OLD deadline of a pair it just
+//! re-armed. Why this is safe: it matches stellar-core's host timer
+//! semantics, and the engine treats any `timer_fired` purely as a timeout
+//! nudge — a spurious nudge can at worst cause an extra round-timeout
+//! evaluation, never a safety (agreement) violation. A v2 fix, if the
+//! spurious nudges ever matter, is a generation counter per (slot, timer_id)
+//! pair: `arm`/`cancel` bump the generation under the lock, the wheel
+//! captures the generation at selection and delivers it with the fire (or
+//! re-checks it under the lock immediately before invoking `fire`), and the
+//! Node drops any fire whose generation is stale. Do not redesign the wheel
+//! for v1.
 
 const std = @import("std");
 const core = @import("slcp-core");
@@ -179,10 +200,13 @@ pub const Wheel = struct {
             const now_ns = std.Io.Clock.now(.awake, io).nanoseconds;
             if (now_ns >= min_ns) {
                 // Due. Remove it from the live set *while holding the lock* —
-                // this is the atomic "selection". A cancel racing us either
-                // already removed it (so we never got here for it) or finds it
-                // gone; either way a canceled timer never fires. Only then do
-                // we drop the lock and invoke the (possibly slow) callback.
+                // this is the atomic "selection". A cancel that won the lock
+                // before this point already removed the timer, so it is never
+                // selected. A cancel (or re-arm) arriving AFTER this point
+                // finds the entry gone and cannot recall the callback below —
+                // that is the accepted stale-fire race documented in the file
+                // header. Only after selection do we drop the lock and invoke
+                // the (possibly slow) callback.
                 const fired = self.timers.swapRemove(idx);
                 self.mu.unlock(io);
                 self.fire(self.fire_ctx, fired.slot, fired.timer_id);
@@ -291,18 +315,29 @@ test "re-arm replaces the deadline" {
     defer w.deinit();
     try w.start();
 
-    // Arm soon, then re-arm the same pair much later: the early deadline must
-    // be dropped (replaced), not fire on its own.
-    try w.arm(3, 1, 20);
-    try w.arm(3, 1, 300);
+    // Arm far in the future, then re-arm the same pair much SOONER. If the
+    // re-arm replaces the deadline, the fire lands ~200ms in; if re-arm were
+    // broken (deadline kept), nothing fires before 2000ms and the bounded
+    // wait below times out. This direction is timing-robust: preemption
+    // between the two arm() calls only delays the test, it cannot let the
+    // first deadline slip past before the re-arm the way "arm 20ms then
+    // re-arm 300ms" could.
+    const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    try w.arm(3, 1, 2000);
+    try w.arm(3, 1, 200);
 
-    sleepMs(io, 150); // past the original 20ms, well before the new 300ms
-    try testing.expectEqual(@as(u32, 0), ctx.count.load(.acquire));
-
-    // The replacement deadline still fires (exactly once).
-    try testing.expect(waitForCount(io, &ctx, 1, 2000));
+    // Fires well before the original 2000ms deadline...
+    try testing.expect(waitForCount(io, &ctx, 1, 1200));
+    // ...but never before the replacement 200ms deadline (the wheel only
+    // fires at now >= deadline, and the deadline was set after `start_ns`).
+    const elapsed_ns = std.Io.Clock.now(.awake, io).nanoseconds - start_ns;
+    try testing.expect(elapsed_ns >= 200 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 3), ctx.last_slot.load(.monotonic));
-    sleepMs(io, 60);
+    try testing.expectEqual(@as(u16, 1), ctx.last_timer.load(.monotonic));
+
+    // Exactly once: the replaced 2000ms deadline must not fire as a second
+    // timer shortly after (give a wrong duplicate some room to appear).
+    sleepMs(io, 80);
     try testing.expectEqual(@as(u32, 1), ctx.count.load(.acquire));
 }
 

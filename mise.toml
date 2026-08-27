@@ -6,4 +6,6 @@ capnp = "latest"
 # build.zig.zon holds only a FLOOR (minimum_zig_version), never a second pin.
 # If you manage Zig with zvm, its PATH entry wins over mise's shims — run
 # `mise exec -- zig ...` to match CI, or drop zvm from PATH.
-zig = "0.17.0-dev.1683+5ceec001b"
+# M5 bump: the node layer targets this std.Io surface (Mutex/Condition under
+# std.Io, net.Server/Stream, File.Atomic); older -dev builds differ.
+zig = "0.17.0-dev.1786+75044cb04"
