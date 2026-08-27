@@ -4,8 +4,8 @@
     .minimum_zig_version = "0.17.0-dev.1683",
     .dependencies = .{
         .capnpc_zig = .{
-            .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.14.0.tar.gz",
-            .hash = "capnpc_zig-0.14.0-nUduFcpENgBjFIYtlhRQTnJEFeVW1-vo6RbfNlsTo7II",
+            .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.16.0.tar.gz",
+            .hash = "capnpc_zig-0.16.0-nUduFXLZNgAmDvsQZOn7lNOEtNbRBYquaALRB24zUAvS",
         },
     },
     .paths = .{""},

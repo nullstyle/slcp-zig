@@ -1295,6 +1295,11 @@ fn tracePeerEnvelope(gpa: std.mem.Allocator, seed: [32]u8, slot: u64, own: emit_
         .limits = .{},
     };
     const drv = driver_mod.Driver.default();
+    // §5.1 latest-envelope byte budget. This generator emits one statement
+    // and discards the engine, so the counter is a local sink — but the
+    // field is required, and omitting it is what silently broke this tool at
+    // M4 (`zig build vectors` is not part of `zig build test`).
+    var stored_bytes: usize = 0;
     var ctx = engine_mod.Ctx{
         .gpa = gpa,
         .cfg = &cfg,
@@ -1303,6 +1308,7 @@ fn tracePeerEnvelope(gpa: std.mem.Allocator, seed: [32]u8, slot: u64, own: emit_
         .qsets = &store,
         .excised = null,
         .local_qset_hash = @splat(0),
+        .stored_bytes = &stored_bytes,
     };
     var env = try emit_mod.emit(&ctx, slot, own);
     defer env.deinit(gpa);
