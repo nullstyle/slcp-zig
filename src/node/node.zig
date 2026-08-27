@@ -202,6 +202,22 @@ pub const Node = struct {
     ext_queue: std.ArrayList(Externalized) = .empty,
     ext_closed: bool = false,
 
+    /// Engine-thread-only: out-of-order externalizations awaiting their turn
+    /// (values owned), and the next slot to hand the app (§11.2 ordering).
+    pending_ext: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    next_deliver: u64,
+    /// Slots below this are purged; the timer wheel drops stale fires for
+    /// them (read on the wheel thread).
+    purge_floor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// qset hashes this node actually asked the network for (bounded).
+    /// Guards the on-disk qset cache: unsolicited qset frames are still fed
+    /// to the engine (it validates + bounds its own memory cache) but are
+    /// never persisted — otherwise any peer could fill the disk (review
+    /// finding, §9.1 trust model).
+    qset_mu: std.Io.Mutex = .init,
+    req_qsets: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+
     pub fn allocator(self: *Node) std.mem.Allocator {
         return self.gpa;
     }
@@ -269,6 +285,7 @@ pub const Node = struct {
             .wheel = undefined,
             .ov = undefined,
             .current_slot = opts.start_slot,
+            .next_deliver = opts.start_slot,
             .last_ext_value = &.{},
         };
 
@@ -328,6 +345,8 @@ pub const Node = struct {
         // Resume proposal slot past the highest externalized slot on disk.
         if (rec.externalized_hwm) |hwm| {
             if (hwm + 1 > self.current_slot) self.current_slot = hwm + 1;
+            // Slots <= hwm were journaled pre-crash; app delivery resumes after.
+            if (hwm + 1 > self.next_deliver) self.next_deliver = hwm + 1;
         }
 
         // ---- Go live ----
@@ -374,6 +393,12 @@ pub const Node = struct {
         if (self.last_ext_value.len > 0) self.gpa.free(self.last_ext_value);
         for (self.ext_queue.items) |e| self.gpa.free(e.value);
         self.ext_queue.deinit(self.gpa);
+        {
+            var it = self.pending_ext.valueIterator();
+            while (it.next()) |v| self.gpa.free(v.*);
+            self.pending_ext.deinit(self.gpa);
+        }
+        self.req_qsets.deinit(self.gpa);
 
         const gpa = self.gpa;
         self.* = undefined;
@@ -442,6 +467,11 @@ pub const Node = struct {
     /// Feed one input and drain all its effects (engine thread only).
     fn applyInput(self: *Node, item_in: InputItem) void {
         var item = item_in;
+        if (self.failed.load(.acquire)) {
+            // Inert: consume and free inputs without touching the engine.
+            core.host_codec.freeInput(self.gpa, &item.input);
+            return;
+        }
         self.cur_source = item.source_peer;
         self.eng.pushInput(item.input) catch |err| {
             core.host_codec.freeInput(self.gpa, &item.input);
@@ -450,23 +480,43 @@ pub const Node = struct {
         };
         core.host_codec.freeInput(self.gpa, &item.input);
         while (self.eng.popEffect()) |eff| {
-            self.dispatch(eff);
+            // A dispatch that trips markFailed (a failed write-ahead append)
+            // must suppress every LATER effect of this input — most
+            // importantly the broadcast paired with a failed persist (§10:
+            // never send what is not durable). The remaining effects are
+            // still committed so their payloads are freed.
+            if (!self.failed.load(.acquire)) self.dispatch(eff);
             self.eng.commitEffect();
         }
         self.cur_source = null;
     }
 
+    /// Latch the node inert: no further inputs are applied, no further
+    /// effects dispatched, and app waiters are woken (waitExternalized
+    /// returns null). §10: a node that cannot persist MUST NOT keep talking —
+    /// going silent is safe; broadcasting unpersisted statements is Byzantine
+    /// after the next crash.
     fn markFailed(self: *Node, err: anyerror) void {
         if (!self.failed.swap(true, .seq_cst)) {
-            log.err("engine failed: {s} — node going inert", .{@errorName(err)});
+            log.err("node failed: {s} — going inert (§10 write-ahead discipline)", .{@errorName(err)});
+            self.ext_mu.lockUncancelable(self.io);
+            self.ext_closed = true;
+            self.ext_cond.broadcast(self.io);
+            self.ext_mu.unlock(self.io);
         }
     }
 
     fn dispatch(self: *Node, eff: *const engine.Effect) void {
         switch (eff.*) {
             .persist_own_envelope => |sb| {
-                self.store.appendOwn(sb.slot, sb.bytes) catch |e|
+                // CRITICAL invariant (§5.3/§10): this append+fsync must
+                // complete before the paired broadcast_envelope may be sent.
+                // On failure the node goes inert — applyInput then suppresses
+                // the rest of this input's effects, including that broadcast.
+                self.store.appendOwn(sb.slot, sb.bytes) catch |e| {
                     log.err("own.log append failed: {s}", .{@errorName(e)});
+                    self.markFailed(e);
+                };
             },
             .broadcast_envelope => |sb| {
                 // Always record as our latest for on-connect catch-up, even
@@ -489,6 +539,7 @@ pub const Node = struct {
             .cancel_timer => |c| self.wheel.cancel(c.slot, @intFromEnum(c.timer)),
             .request_qset => |r| {
                 if (!self.live) return;
+                self.noteQsetRequested(r.hash);
                 // Simplified relay (§9.2): flood the request; any holder
                 // answers. Parked envelopes resolve on the first qset reply.
                 self.ov.broadcast(.{ .get_qset = r.hash });
@@ -500,36 +551,89 @@ pub const Node = struct {
     }
 
     fn onExternalized(self: *Node, slot: u64, value: []const u8) void {
-        self.store.appendExternalized(slot, value) catch |e|
+        // Write-ahead journal first; a failed append is FATAL (the app must
+        // never consume a value the crash-bound computation cannot see, §10).
+        self.store.appendExternalized(slot, value) catch |e| {
             log.err("externalized.log append failed: {s}", .{@errorName(e)});
-
-        // Deliver to the app.
-        const app_copy = self.gpa.dupe(u8, value) catch {
-            log.err("OOM delivering externalized slot {d}", .{slot});
+            self.markFailed(e);
             return;
         };
-        self.ext_mu.lockUncancelable(self.io);
-        self.ext_queue.append(self.gpa, .{ .slot = slot, .value = app_copy }) catch {
-            self.gpa.free(app_copy);
-            self.ext_mu.unlock(self.io);
-            log.err("OOM queueing externalized slot {d}", .{slot});
-            return;
-        };
-        self.ext_cond.signal(self.io);
-        self.ext_mu.unlock(self.io);
 
-        // Advance proposal state.
+        // Advance proposal state off the RAW slot (highest wins) — proposals
+        // target the frontier of consensus, not of app delivery.
         self.prop_mu.lockUncancelable(self.io);
-        if (self.last_ext_value.len > 0) self.gpa.free(self.last_ext_value);
-        self.last_ext_value = self.gpa.dupe(u8, value) catch &.{};
-        if (slot + 1 > self.current_slot) self.current_slot = slot + 1;
+        if (slot + 1 > self.current_slot) {
+            if (self.last_ext_value.len > 0) self.gpa.free(self.last_ext_value);
+            self.last_ext_value = self.gpa.dupe(u8, value) catch &.{};
+            self.current_slot = slot + 1;
+        }
         self.nominating = false;
         self.prop_mu.unlock(self.io);
         self.maybeStartNomination();
 
-        // GC (§10): keep a 16-slot answering window.
-        if (slot >= purge_window) {
-            const max_slot = slot - (purge_window - 1);
+        // App delivery is IN SLOT ORDER (§11.2's stream semantics): buffer
+        // out-of-order externalizations (catch-up delivers slots in arbitrary
+        // peer order) and drain the contiguous frontier. If the buffer
+        // outgrows the answering window, the gap is unrecoverable (peers only
+        // answer 16 slots back) — jump the frontier to the lowest buffered
+        // slot with a loud log.
+        const copy = self.gpa.dupe(u8, value) catch {
+            log.err("OOM buffering externalized slot {d}", .{slot});
+            return;
+        };
+        if (slot < self.next_deliver) {
+            self.gpa.free(copy); // stale duplicate below the frontier
+            return;
+        }
+        const gop = self.pending_ext.getOrPut(self.gpa, slot) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        if (gop.found_existing) {
+            self.gpa.free(copy); // the engine fires once per slot; be safe
+            return;
+        }
+        gop.value_ptr.* = copy;
+
+        if (self.pending_ext.count() > purge_window) {
+            var lowest: u64 = std.math.maxInt(u64);
+            var it = self.pending_ext.keyIterator();
+            while (it.next()) |k| lowest = @min(lowest, k.*);
+            if (lowest > self.next_deliver) {
+                log.warn("externalized gap: slots {d}..{d} unrecoverable; resuming delivery at {d}", .{ self.next_deliver, lowest - 1, lowest });
+                self.next_deliver = lowest;
+            }
+        }
+        self.drainDeliverable();
+    }
+
+    /// Deliver the contiguous frontier of buffered externalizations to the
+    /// app, then GC behind it (engine thread only).
+    fn drainDeliverable(self: *Node) void {
+        var delivered_any = false;
+        while (self.pending_ext.fetchRemove(self.next_deliver)) |kv| {
+            const slot = kv.key;
+            const val = kv.value;
+            self.ext_mu.lockUncancelable(self.io);
+            self.ext_queue.append(self.gpa, .{ .slot = slot, .value = val }) catch {
+                self.gpa.free(val);
+                self.ext_mu.unlock(self.io);
+                log.err("OOM queueing externalized slot {d}", .{slot});
+                return;
+            };
+            self.ext_cond.signal(self.io);
+            self.ext_mu.unlock(self.io);
+            self.next_deliver = slot + 1;
+            delivered_any = true;
+        }
+        if (!delivered_any) return;
+
+        // GC (§10): keep a 16-slot answering window behind the DELIVERED
+        // frontier (never purge a slot the app has not consumed).
+        const frontier = self.next_deliver - 1;
+        if (frontier >= purge_window) {
+            const max_slot = frontier - (purge_window - 1);
+            self.purge_floor.store(max_slot, .release);
             self.pruneOwnLatest(max_slot);
             self.q.push(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
         }
@@ -640,10 +744,32 @@ pub const Node = struct {
         self.q.push(.{ .input = .{ .envelope_received = .{ .bytes = copy } }, .source_peer = source });
     }
 
+    /// Record a hash the engine asked the network for (engine thread).
+    /// Bounded: a full set is cleared — crude, but the set only ever holds
+    /// in-flight fetches and correctness never depends on membership.
+    fn noteQsetRequested(self: *Node, hash: [32]u8) void {
+        self.qset_mu.lockUncancelable(self.io);
+        defer self.qset_mu.unlock(self.io);
+        if (self.req_qsets.count() >= 256) self.req_qsets.clearRetainingCapacity();
+        self.req_qsets.put(self.gpa, hash, {}) catch {};
+    }
+
+    /// True (once) iff we asked for this hash (reader threads).
+    fn consumeQsetRequested(self: *Node, hash: [32]u8) bool {
+        self.qset_mu.lockUncancelable(self.io);
+        defer self.qset_mu.unlock(self.io);
+        return self.req_qsets.remove(hash);
+    }
+
     fn onQsetFrame(self: *Node, framed_qset: []const u8) void {
-        // Persist for future getQset answers, then feed the engine.
+        // Persist for future getQset answers — but ONLY qsets we actually
+        // requested (disk-fill DoS otherwise: any peer could push unlimited
+        // unsolicited qsets into the cache). The engine is always fed; it
+        // validates and bounds its own in-memory cache.
         const h = qsetHashOfFramed(self.gpa, framed_qset) catch null;
-        if (h) |hash| self.store.putQset(hash, framed_qset);
+        if (h) |hash| {
+            if (self.consumeQsetRequested(hash)) self.store.putQset(hash, framed_qset);
+        }
         const copy = self.gpa.dupe(u8, framed_qset) catch return;
         self.q.push(.{ .input = .{ .qset_received = .{ .bytes = copy } }, .source_peer = null });
     }
@@ -687,6 +813,9 @@ pub const Node = struct {
 
     fn onTimerFire(ctx: ?*anyopaque, slot: u64, timer_id: u16) void {
         const self: *Node = @ptrCast(@alignCast(ctx.?));
+        // Drop stale fires for purged slots (a cancel can race an in-flight
+        // fire; feeding a purged slot back would resurrect its state).
+        if (slot < self.purge_floor.load(.acquire)) return;
         const timer: engine.TimerId = @enumFromInt(@as(u8, @intCast(timer_id)));
         self.q.push(.{ .input = .{ .timer_fired = .{ .slot = slot, .timer = timer } }, .source_peer = null });
     }
@@ -761,6 +890,7 @@ test "node: every method compiles (forces body analysis without instantiation)" 
         Node.recordOwnLatest, Node.pruneOwnLatest, Node.onRecv,
         Node.onPeerUp,    Node.enqueueEnvelope, Node.onQsetFrame,
         Node.answerGetQset, Node.answerGetSlotState, Node.onTimerFire,
+        Node.drainDeliverable, Node.noteQsetRequested, Node.consumeQsetRequested,
     };
     inline for (fns) |f| {
         const p = &f;
