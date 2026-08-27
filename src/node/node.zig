@@ -40,6 +40,11 @@ const log = std.log.scoped(.slcp_node);
 /// GC window: keep 16 externalized slots answerable to laggards (§10).
 const purge_window: u64 = 16;
 
+/// A relative-duration Io.Timeout in milliseconds (this Zig's condvar API).
+fn msTimeout(ms: u64) std.Io.Timeout {
+    return .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)), .clock = .awake } };
+}
+
 pub const Error = error{
     NoIdentity,
     EngineFailed,
@@ -95,17 +100,21 @@ const InputItem = struct {
 
 /// Mutex+condvar FIFO of pending engine inputs. Payloads are owned; the engine
 /// thread frees them after `pushInput` (which copies what it keeps).
+/// This Zig's sync primitives live under std.Io and take `io` on every call
+/// (cancellation is a no-op on our raw std.Thread workers, so the
+/// *Uncancelable variants are used to avoid the error union).
 const InputQueue = struct {
     gpa: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    io: std.Io,
+    mu: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     items: std.ArrayList(InputItem) = .empty,
     head: usize = 0,
     closed: bool = false,
 
     fn push(self: *InputQueue, item: InputItem) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         if (self.closed) {
             var in = item.input;
             core.host_codec.freeInput(self.gpa, &in);
@@ -119,14 +128,14 @@ const InputQueue = struct {
             log.err("input queue OOM; dropped one input", .{});
             return;
         };
-        self.cond.signal();
+        self.cond.signal(self.io);
     }
 
     /// Block for the next item; null once closed and drained.
     fn pop(self: *InputQueue) ?InputItem {
-        self.mu.lock();
-        defer self.mu.unlock();
-        while (self.head >= self.items.items.len and !self.closed) self.cond.wait(&self.mu);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        while (self.head >= self.items.items.len and !self.closed) self.cond.waitUncancelable(self.io, &self.mu);
         if (self.head >= self.items.items.len) return null;
         const it = self.items.items[self.head];
         self.head += 1;
@@ -138,10 +147,10 @@ const InputQueue = struct {
     }
 
     fn close(self: *InputQueue) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         self.closed = true;
-        self.cond.broadcast();
+        self.cond.broadcast(self.io);
     }
 
     fn deinit(self: *InputQueue) void {
@@ -179,17 +188,17 @@ pub const Node = struct {
     /// used to exclude the origin from `forward_envelope` relays.
     cur_source: ?usize = null,
 
-    own_mu: std.Thread.Mutex = .{},
+    own_mu: std.Io.Mutex = .init,
     own_latest: std.AutoHashMapUnmanaged(u64, SlotOwn) = .empty,
 
-    prop_mu: std.Thread.Mutex = .{},
+    prop_mu: std.Io.Mutex = .init,
     current_slot: u64,
     last_ext_value: []u8, // owned; empty slice initially
     proposal_queue: std.ArrayList([]u8) = .empty,
     nominating: bool = false,
 
-    ext_mu: std.Thread.Mutex = .{},
-    ext_cond: std.Thread.Condition = .{},
+    ext_mu: std.Io.Mutex = .init,
+    ext_cond: std.Io.Condition = .init,
     ext_queue: std.ArrayList(Externalized) = .empty,
     ext_closed: bool = false,
 
@@ -255,7 +264,7 @@ pub const Node = struct {
             .local_qset_hash = local_hash,
             .watcher = opts.watcher or secret_seed == null,
             .eng = undefined,
-            .q = .{ .gpa = gpa },
+            .q = .{ .gpa = gpa, .io = io },
             .store = undefined,
             .wheel = undefined,
             .ov = undefined,
@@ -331,6 +340,12 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // Wake any app thread blocked in waitExternalized so it returns null.
+        self.ext_mu.lockUncancelable(self.io);
+        self.ext_closed = true;
+        self.ext_cond.broadcast(self.io);
+        self.ext_mu.unlock(self.io);
+
         // Order matters. Close the queue and JOIN the engine thread first, so
         // no effect dispatch can touch the overlay/wheel/store after we start
         // tearing them down. During this final drain the overlay and wheel are
@@ -374,13 +389,13 @@ pub const Node = struct {
     pub fn propose(self: *Node, value: []const u8) !void {
         if (self.watcher) return error.EngineFailed; // watchers never propose
         const copy = try self.gpa.dupe(u8, value);
-        self.prop_mu.lock();
+        self.prop_mu.lockUncancelable(self.io);
         self.proposal_queue.append(self.gpa, copy) catch |e| {
             self.gpa.free(copy);
-            self.prop_mu.unlock();
+            self.prop_mu.unlock(self.io);
             return e;
         };
-        self.prop_mu.unlock();
+        self.prop_mu.unlock(self.io);
         self.maybeStartNomination();
     }
 
@@ -392,13 +407,13 @@ pub const Node = struct {
     /// Block for the next externalized slot in order. Returns null on timeout
     /// or shutdown. The returned `value` is owned by the caller.
     pub fn waitExternalized(self: *Node, wopts: WaitOptions) ?Externalized {
-        self.ext_mu.lock();
-        defer self.ext_mu.unlock();
+        self.ext_mu.lockUncancelable(self.io);
+        defer self.ext_mu.unlock(self.io);
         while (self.ext_queue.items.len == 0 and !self.ext_closed) {
             if (wopts.timeout_ms) |ms| {
-                self.ext_cond.timedWait(&self.ext_mu, ms * std.time.ns_per_ms) catch return null;
+                self.ext_cond.waitTimeout(self.io, &self.ext_mu, msTimeout(ms)) catch return null;
             } else {
-                self.ext_cond.wait(&self.ext_mu);
+                self.ext_cond.waitUncancelable(self.io, &self.ext_mu);
             }
         }
         if (self.ext_queue.items.len == 0) return null;
@@ -493,23 +508,23 @@ pub const Node = struct {
             log.err("OOM delivering externalized slot {d}", .{slot});
             return;
         };
-        self.ext_mu.lock();
+        self.ext_mu.lockUncancelable(self.io);
         self.ext_queue.append(self.gpa, .{ .slot = slot, .value = app_copy }) catch {
             self.gpa.free(app_copy);
-            self.ext_mu.unlock();
+            self.ext_mu.unlock(self.io);
             log.err("OOM queueing externalized slot {d}", .{slot});
             return;
         };
-        self.ext_cond.signal();
-        self.ext_mu.unlock();
+        self.ext_cond.signal(self.io);
+        self.ext_mu.unlock(self.io);
 
         // Advance proposal state.
-        self.prop_mu.lock();
+        self.prop_mu.lockUncancelable(self.io);
         if (self.last_ext_value.len > 0) self.gpa.free(self.last_ext_value);
         self.last_ext_value = self.gpa.dupe(u8, value) catch &.{};
         if (slot + 1 > self.current_slot) self.current_slot = slot + 1;
         self.nominating = false;
-        self.prop_mu.unlock();
+        self.prop_mu.unlock(self.io);
         self.maybeStartNomination();
 
         // GC (§10): keep a 16-slot answering window.
@@ -523,9 +538,9 @@ pub const Node = struct {
     /// If idle and a proposal is queued, nominate the head for current_slot.
     fn maybeStartNomination(self: *Node) void {
         if (self.watcher) return;
-        self.prop_mu.lock();
+        self.prop_mu.lockUncancelable(self.io);
         if (self.nominating or self.proposal_queue.items.len == 0) {
-            self.prop_mu.unlock();
+            self.prop_mu.unlock(self.io);
             return;
         }
         const value = self.proposal_queue.orderedRemove(0);
@@ -533,11 +548,11 @@ pub const Node = struct {
         const prev = self.gpa.dupe(u8, self.last_ext_value) catch {
             // put it back on OOM
             self.proposal_queue.insert(self.gpa, 0, value) catch self.gpa.free(value);
-            self.prop_mu.unlock();
+            self.prop_mu.unlock(self.io);
             return;
         };
         self.nominating = true;
-        self.prop_mu.unlock();
+        self.prop_mu.unlock(self.io);
 
         // value + prev are owned; the input carries them, freed after push.
         self.q.push(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null });
@@ -553,8 +568,8 @@ pub const Node = struct {
             return;
         };
         const copy = self.gpa.dupe(u8, framed_env) catch return;
-        self.own_mu.lock();
-        defer self.own_mu.unlock();
+        self.own_mu.lockUncancelable(self.io);
+        defer self.own_mu.unlock(self.io);
         const gop = self.own_latest.getOrPut(self.gpa, slot) catch {
             self.gpa.free(copy);
             return;
@@ -573,8 +588,8 @@ pub const Node = struct {
     }
 
     fn pruneOwnLatest(self: *Node, max_slot: u64) void {
-        self.own_mu.lock();
-        defer self.own_mu.unlock();
+        self.own_mu.lockUncancelable(self.io);
+        defer self.own_mu.unlock(self.io);
         var it = self.own_latest.iterator();
         var doomed: std.ArrayList(u64) = .empty;
         defer doomed.deinit(self.gpa);
@@ -610,13 +625,13 @@ pub const Node = struct {
         const self: *Node = @ptrCast(@alignCast(ctx.?));
         // Catch-up (§9.2): send our latest own envelopes, then ask for the
         // peer's externalized state.
-        self.own_mu.lock();
+        self.own_mu.lockUncancelable(self.io);
         var it = self.own_latest.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.nom) |b| self.ov.send(peer_id, .{ .envelope = b });
             if (e.value_ptr.ballot) |b| self.ov.send(peer_id, .{ .envelope = b });
         }
-        self.own_mu.unlock();
+        self.own_mu.unlock(self.io);
         self.ov.send(peer_id, .{ .get_slot_state = 0 });
     }
 
@@ -650,7 +665,7 @@ pub const Node = struct {
         defer list.deinit(self.gpa);
         var highest: u64 = 0;
 
-        self.own_mu.lock();
+        self.own_mu.lockUncancelable(self.io);
         var it = self.own_latest.iterator();
         while (it.next()) |e| {
             const slot = e.key_ptr.*;
@@ -663,7 +678,7 @@ pub const Node = struct {
         // Send while holding own_mu so the borrowed env slices stay valid
         // through encode (overlay copies them).
         self.ov.send(peer_id, .{ .slot_state = .{ .slot = highest, .envelopes = list.items } });
-        self.own_mu.unlock();
+        self.own_mu.unlock(self.io);
     }
 
     // -------------------------------------------------------------------
@@ -727,4 +742,45 @@ fn writeOwnedQset(qb: *gen_slcp.QuorumSet.Builder, qs: *const qset.QuorumSetOwne
             try writeOwnedQset(&cb, child);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "node: every method compiles (forces body analysis without instantiation)" {
+    // Taking the address of each method forces the compiler to analyze its
+    // body against the current leaf-module interfaces — a cheap full-compile
+    // check for the Node spine, which the socket-driven e2e exercises at
+    // runtime.
+    const fns = .{
+        Node.create,      Node.deinit,         Node.propose,
+        Node.waitExternalized, Node.stats,     Node.boundPort,
+        Node.engineLoop,  Node.applyInput,     Node.markFailed,
+        Node.dispatch,    Node.onExternalized, Node.maybeStartNomination,
+        Node.recordOwnLatest, Node.pruneOwnLatest, Node.onRecv,
+        Node.onPeerUp,    Node.enqueueEnvelope, Node.onQsetFrame,
+        Node.answerGetQset, Node.answerGetSlotState, Node.onTimerFire,
+    };
+    inline for (fns) |f| {
+        const p = &f;
+        _ = p;
+    }
+}
+
+test "InputQueue: push, pop, and close over std.Io primitives" {
+    const io = std.testing.io;
+    var q = InputQueue{ .gpa = std.testing.allocator, .io = io };
+    defer q.deinit();
+
+    q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 5 } }, .source_peer = null });
+    q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 6 } }, .source_peer = null });
+
+    const a = q.pop().?;
+    try std.testing.expectEqual(@as(u64, 5), a.input.purge_slots.max_slot);
+    const b = q.pop().?;
+    try std.testing.expectEqual(@as(u64, 6), b.input.purge_slots.max_slot);
+
+    q.close();
+    try std.testing.expect(q.pop() == null); // closed + drained
 }
