@@ -760,10 +760,11 @@ fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
         // placeholder so own votes count in own federated math — nothing
         // hits the wire and own_nom (the rebroadcast source) is untouched.
         var placeholder = try placeholderNomStored(gpa, ctx, s);
-        _ = s.storeLatest(gpa, placeholder) catch |err| {
+        const delta = s.storeLatest(gpa, placeholder) catch |err| {
             placeholder.deinit(gpa);
             return err;
         };
+        ctx.addStoredBytes(delta); // §5.1 budget: self-stores must account
     } else {
         var env = try emit_mod.emit(ctx, s.index, .{ .nominate = .{
             .qset_hash = ctx.local_qset_hash,
@@ -773,10 +774,11 @@ fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
         {
             errdefer env.deinit(gpa);
             var dup = try cloneNomStored(gpa, &env);
-            _ = s.storeLatest(gpa, dup) catch |err| {
+            const delta = s.storeLatest(gpa, dup) catch |err| {
                 dup.deinit(gpa);
                 return err;
             };
+            ctx.addStoredBytes(delta); // §5.1 budget: self-stores must account
         }
         // mLastEnvelope replacement (cpp:172-176; own sets only grow, so the
         // freshly emitted statement is always the newer one).
@@ -1086,6 +1088,7 @@ const TestHarness = struct {
     cfg: engine_mod.Config,
     excised: ?qset.QuorumSetOwned,
     ctx: engine_mod.Ctx,
+    stored_bytes: usize = 0,
     s: slot_mod2.Slot,
     local_hash: [32]u8,
     ids: [3][32]u8, // A (local), B, C
@@ -1127,6 +1130,7 @@ const TestHarness = struct {
             }
         }
         self.s = slot_mod2.Slot.init(1);
+        self.stored_bytes = 0; // struct is `undefined`-initialized in tests
         self.ctx = .{
             .gpa = gpa,
             .cfg = &self.cfg,
@@ -1135,6 +1139,7 @@ const TestHarness = struct {
             .qsets = &self.store,
             .excised = if (self.excised) |*e| e else null,
             .local_qset_hash = self.local_hash,
+            .stored_bytes = &self.stored_bytes,
         };
     }
 

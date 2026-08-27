@@ -89,6 +89,7 @@ fn peerEnvelope(gpa: std.mem.Allocator, seed: [32]u8, slot: u64, own: emit_mod.O
         .limits = .{},
     };
     const drv = driver.Driver.default();
+    var stored_bytes: usize = 0;
     var ctx = engine.Ctx{
         .gpa = gpa,
         .cfg = &cfg,
@@ -97,6 +98,7 @@ fn peerEnvelope(gpa: std.mem.Allocator, seed: [32]u8, slot: u64, own: emit_mod.O
         .qsets = &store,
         .excised = null,
         .local_qset_hash = @splat(0),
+        .stored_bytes = &stored_bytes,
     };
     var env = try emit_mod.emit(&ctx, slot, own);
     defer env.deinit(gpa);

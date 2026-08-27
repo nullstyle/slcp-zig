@@ -158,12 +158,79 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_decode.step);
     fuzz_step.dependOn(&run_fuzz_seq.step);
 
-    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e + sim smoke matrix + fuzz smoke");
+    // -----------------------------------------------------------------
+    // WASM host-ABI conformance suite (design §7.2/§7.3, §14-M4), run
+    // WITHOUT a wasm runtime so it is part of plain `zig build test`.
+    // tests/abi/ deliberately does NOT import src/wasm/slcp_host_abi.zig:
+    // that module pins std.heap.wasm_allocator (a @compileError off wasm) and
+    // `export fn` decls are always analyzed — so the ABI source is read as
+    // TEXT for its frozen scalar/name surface, and every pure-logic path is
+    // re-derived natively. The parts that genuinely need a runtime (linear
+    // memory, real imports, handle map) belong to the differential harness.
+    // Both files read fixtures relative to the build root, so cwd is pinned.
+    // -----------------------------------------------------------------
+    const abi_contract_tests = b.addTest(.{
+        .name = "slcp-abi-contract-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/abi/abi_contract_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+        }),
+    });
+    const run_abi_contract_tests = b.addRunArtifact(abi_contract_tests);
+    run_abi_contract_tests.setCwd(b.path("."));
+
+    const abi_fake_host_tests = b.addTest(.{
+        .name = "slcp-abi-fake-host-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/abi/fake_host_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+        }),
+    });
+    const run_abi_fake_host_tests = b.addRunArtifact(abi_fake_host_tests);
+    run_abi_fake_host_tests.setCwd(b.path("."));
+
+    const abi_step = b.step("abi", "Run the WASM host-ABI conformance suite (no wasm runtime needed)");
+    abi_step.dependOn(&run_abi_contract_tests.step);
+    abi_step.dependOn(&run_abi_fake_host_tests.step);
+
+    // Differential native-vs-wasm harness (design §13.5, §14-M4 accept). The
+    // test binary drives zig-out/bin/slcp_core.wasm through a Node runner
+    // (tests/wasm/host.mjs) and byte-compares every effect frame against the
+    // native engine AND the recorded trace vectors.
+    const wasm_diff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/wasm/differential_test.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{
+            .{ .name = "slcp-core", .module = slcp_core_sim },
+            .{ .name = "adversary", .module = adversary_mod },
+        },
+    });
+    const wasm_diff_tests = b.addTest(.{ .name = "slcp-wasm-diff", .root_module = wasm_diff_mod });
+
+    const test_step = b.step("test", "Run unit + vector + e2e + ABI conformance + sim matrix + fuzz smoke + wasm differential (skipped without the wasm artifact)");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
+    test_step.dependOn(abi_step);
     test_step.dependOn(&run_sim_tests.step);
     test_step.dependOn(fuzz_smoke_step);
+
+    // Two run steps over the SAME differential binary, differing only in
+    // whether the wasm artifact is a build dependency:
+    //   `zig build wasm-diff` — depends on the wasm build, so the M4 gate can
+    //     never silently pass by skipping.
+    //   `zig build test`      — no dependency, so a clean tree (or a machine
+    //     without node) reports error.SkipZigTest and stays green.
+    // Both are side-effectful: a gate reading files the build graph does not
+    // declare must never be answered from cache.
+    const run_wasm_diff_soft = b.addRunArtifact(wasm_diff_tests);
+    run_wasm_diff_soft.has_side_effects = true;
+    test_step.dependOn(&run_wasm_diff_soft.step);
 
     // One-line repro runner: zig build sim -- --seed=N --nodes=N --scenario=name
     const sim_exe = b.addExecutable(.{
@@ -236,6 +303,14 @@ pub fn build(b: *std.Build) void {
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step("wasm", "Build slcp_core.wasm (wasm32-freestanding, ReleaseSmall)");
     wasm_step.dependOn(&install_wasm.step);
+
+    // The M4 gate: `zig build wasm && zig build wasm-diff` — this run step
+    // depends on the wasm install, so it always has a real artifact to drive.
+    const run_wasm_diff_gate = b.addRunArtifact(wasm_diff_tests);
+    run_wasm_diff_gate.has_side_effects = true;
+    run_wasm_diff_gate.step.dependOn(&install_wasm.step);
+    const wasm_diff_step = b.step("wasm-diff", "Differential native-vs-wasm replay of the trace vectors + differential fuzz (§13.5)");
+    wasm_diff_step.dependOn(&run_wasm_diff_gate.step);
 
     // Full Byzantine seed matrix (§14-M3 accept: 1000 seeds) — manual step.
     const byz_matrix_mod = b.createModule(.{

@@ -176,6 +176,7 @@ test "emit: persist precedes broadcast; envelope verifies and round-trips" {
     };
     _ = qset;
     const drv = driver_mod.Driver.default();
+    var stored_bytes: usize = 0;
     var ctx = engine.Ctx{
         .gpa = gpa,
         .cfg = &cfg,
@@ -184,6 +185,7 @@ test "emit: persist precedes broadcast; envelope verifies and round-trips" {
         .qsets = &store,
         .excised = null,
         .local_qset_hash = @splat(3),
+        .stored_bytes = &stored_bytes,
     };
 
     var own = try emit(&ctx, 7, .{ .nominate = .{

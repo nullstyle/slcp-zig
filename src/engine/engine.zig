@@ -200,6 +200,18 @@ pub const Ctx = struct {
     excised: ?*const qset.QuorumSetOwned,
     /// qsetHash of cfg.quorum_set (advertised in own statements).
     local_qset_hash: [32]u8,
+    /// The engine-wide §5.1 latest-envelope byte budget counter. Protocol
+    /// code that self-stores into a slot's latest maps MUST account through
+    /// `addStoredBytes`, or the counter under-counts and `purge_slots`
+    /// (which subtracts the slot's real storedBytes) underflows — the
+    /// native-vs-wasm divergence the M4 differential harness caught.
+    stored_bytes: *usize,
+
+    /// Apply a storeLatest byte delta to the engine-wide counter.
+    pub fn addStoredBytes(self: *Ctx, delta: isize) void {
+        const cur: isize = @intCast(self.stored_bytes.*);
+        self.stored_bytes.* = @intCast(@max(0, cur + delta));
+    }
 
     pub fn isWatcher(self: *const Ctx) bool {
         return self.cfg.secret_seed == null;
@@ -288,6 +300,7 @@ pub const Engine = struct {
             .qsets = &self.qsets,
             .excised = if (self.excised) |*e| e else null,
             .local_qset_hash = local_hash,
+            .stored_bytes = &self.stored_statement_bytes,
         };
         return self;
     }

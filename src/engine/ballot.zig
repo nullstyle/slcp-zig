@@ -560,7 +560,10 @@ fn recordSelf(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedSt
     errdefer clone.deinit(gpa);
     const frame = try gpa.alloc(u8, 0);
     errdefer gpa.free(frame);
-    _ = try s.storeLatest(gpa, .{ .envelope_framed = frame, .statement = clone });
+    // §5.1 budget: every self-store must account, or purge_slots (which
+    // subtracts the slot's real storedBytes) under-counts. Zero-length frames
+    // make this a no-op today; accounting anyway keeps the invariant local.
+    ctx.addStoredBytes(try s.storeLatest(gpa, .{ .envelope_framed = frame, .statement = clone }));
 }
 
 /// Oracle: emitCurrentStateStatement (BallotProtocol.cpp:675-729). Builds
@@ -1653,6 +1656,7 @@ const TestEnv = struct {
     drv: driver_mod.Driver,
     cfg: engine_mod.Config,
     ctx: engine_mod.Ctx,
+    stored_bytes: usize = 0,
     slot: slot_mod.Slot,
 
     /// Must be called on a pinned (stack) TestEnv: ctx borrows &cfg/&effects.
@@ -1675,6 +1679,7 @@ const TestEnv = struct {
         try self.store.insert(peer_qset_hash, try makeFlatQs(gpa, 2, &members));
         try self.store.setAdvertised(node_a, peer_qset_hash);
         try self.store.setAdvertised(node_b, peer_qset_hash);
+        self.stored_bytes = 0; // struct is `undefined`-initialized in tests
         self.ctx = .{
             .gpa = gpa,
             .cfg = &self.cfg,
@@ -1683,6 +1688,7 @@ const TestEnv = struct {
             .qsets = &self.store,
             .excised = null,
             .local_qset_hash = test_local_hash,
+            .stored_bytes = &self.stored_bytes,
         };
         self.slot = slot_mod.Slot.init(test_slot_index);
     }

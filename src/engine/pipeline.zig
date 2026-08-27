@@ -79,6 +79,7 @@ fn fixupCtx(eng: *engine.Engine) void {
     eng.ctx.effects = &eng.effects;
     eng.ctx.qsets = &eng.qsets;
     eng.ctx.excised = if (eng.excised) |*e| e else null;
+    eng.ctx.stored_bytes = &eng.stored_statement_bytes;
 }
 
 fn run(eng: *engine.Engine, input: engine.Input) engine.EngineError!engine.InputStatus {
@@ -607,7 +608,10 @@ fn handlePurge(eng: *engine.Engine, max_slot: u64) engine.EngineError!engine.Inp
     for (victims.items) |k| {
         if (eng.slots.fetchSwapRemove(k)) |kv| {
             const p = kv.value;
-            eng.stored_statement_bytes -= p.storedBytes();
+            // Saturating: the counter is maintained incrementally by the
+            // pipeline AND by protocol self-stores (Ctx.addStoredBytes); a
+            // future accounting slip must degrade, never underflow.
+            eng.stored_statement_bytes -|= p.storedBytes();
             p.deinit(gpa);
             gpa.destroy(p);
         }
