@@ -168,6 +168,13 @@ pub const Node = struct {
 
     engine_thread: ?std.Thread = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// False during synchronous restart replay (before the overlay binds);
+    /// true once the node is serving the network. Effect dispatch suppresses
+    /// network sends while false — restore rebroadcasts only need to populate
+    /// `own_latest` for on-connect catch-up, and there are no peers yet.
+    /// Set once (create thread) before the engine thread spawns; the spawn is
+    /// the happens-before edge, so a plain bool is safe.
+    live: bool = false,
     /// Engine-thread-only scratch: the source peer of the input being drained,
     /// used to exclude the origin from `forward_envelope` relays.
     cur_source: ?usize = null,
@@ -318,17 +325,23 @@ pub const Node = struct {
         try self.ov.start();
         errdefer self.ov.stop();
 
+        self.live = true; // dispatch may now emit to the network
         self.engine_thread = try std.Thread.spawn(.{}, engineLoop, .{self});
         return self;
     }
 
     pub fn deinit(self: *Node) void {
-        // Stop input producers first, then the engine consumer, then sinks.
-        self.ov.stop();
-        self.wheel.stop();
+        // Order matters. Close the queue and JOIN the engine thread first, so
+        // no effect dispatch can touch the overlay/wheel/store after we start
+        // tearing them down. During this final drain the overlay and wheel are
+        // still live (safe to call); external producers (overlay readers, the
+        // wheel) may still push, but push-after-close just frees the input.
         self.q.close();
         if (self.engine_thread) |t| t.join();
 
+        // Now nothing dispatches. Stop the producers and free the sinks.
+        self.ov.stop();
+        self.wheel.stop();
         self.ov.deinit();
         self.wheel.deinit();
 
@@ -441,10 +454,13 @@ pub const Node = struct {
                     log.err("own.log append failed: {s}", .{@errorName(e)});
             },
             .broadcast_envelope => |sb| {
+                // Always record as our latest for on-connect catch-up, even
+                // during restore; only touch the network once live.
                 self.recordOwnLatest(sb.slot, sb.bytes);
-                self.ov.broadcast(.{ .envelope = sb.bytes });
+                if (self.live) self.ov.broadcast(.{ .envelope = sb.bytes });
             },
             .forward_envelope => |sb| {
+                if (!self.live) return;
                 if (self.cur_source) |src| {
                     self.ov.broadcastExcept(src, .{ .envelope = sb.bytes });
                 } else {
@@ -457,6 +473,7 @@ pub const Node = struct {
             },
             .cancel_timer => |c| self.wheel.cancel(c.slot, @intFromEnum(c.timer)),
             .request_qset => |r| {
+                if (!self.live) return;
                 // Simplified relay (§9.2): flood the request; any holder
                 // answers. Parked envelopes resolve on the first qset reply.
                 self.ov.broadcast(.{ .get_qset = r.hash });
