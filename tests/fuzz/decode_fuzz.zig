@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const slcp = @import("slcp-core");
+const adversary = @import("adversary");
 
 const engine = slcp.engine;
 const crypto = slcp.crypto;
@@ -147,6 +148,42 @@ fn decodeEntryPoints(gpa: std.mem.Allocator, fuzz: []const u8) !void {
     } else |_| {}
 }
 
+/// Deeper coverage (M3 review finding #3): random bytes never form a valid
+/// capnp frame, so the pure-random path bounces at decode and the
+/// signature/canonicality/admission/protocol pipeline is never fuzzed on
+/// structurally-valid input. This path starts from a VALID in-graph envelope
+/// (node 1 is a validator) and applies fuzz-driven byte mutations: many
+/// mutants still decode and reach — and are rejected deeper in — the
+/// pipeline, so verify/sanity/canonicality/freshness/parking get real
+/// coverage. Property is the same: typed rejection, never panic/UB/leak.
+fn mutatedValidFrame(gpa: std.mem.Allocator, fuzz: []const u8) !void {
+    const net = crypto.networkIdFromPassphrase(sim_passphrase);
+    var forger = try adversary.Forger.init(gpa, nodeSeed(1), net);
+    var eng = try makeEngine(gpa);
+    defer eng.deinit();
+
+    // A valid envelope and a valid qset frame as mutation bases.
+    const qh = eng.ctx.local_qset_hash;
+    const base_env = try forger.sign(1, .{ .prepare = .{ .qset_hash = qh, .ballot = .{ .counter = 1, .value = "v" } } });
+    defer gpa.free(base_env);
+
+    var mbuf: [max_fuzz_bytes]u8 = undefined;
+    const n = @min(base_env.len, mbuf.len);
+    @memcpy(mbuf[0..n], base_env[0..n]);
+    // Apply up to a handful of fuzz-driven single-byte overwrites.
+    if (fuzz.len >= 3) {
+        var i: usize = 0;
+        while (i + 2 < fuzz.len and i < 24) : (i += 3) {
+            const off = (@as(usize, fuzz[i]) | (@as(usize, fuzz[i + 1]) << 8)) % n;
+            mbuf[off] = fuzz[i + 2];
+        }
+    }
+    try pushOne(&eng, .{ .envelope_received = .{ .bytes = mbuf[0..n] } });
+    // Also push the pristine base once (guarantees a deep-pipeline exercise
+    // even when the mutation broke decode).
+    if (!eng.failed) try pushOne(&eng, .{ .envelope_received = .{ .bytes = base_env } });
+}
+
 /// One fuzz iteration: pull an arbitrary buffer from the Smith and run all
 /// three entry points under a leak-checked DebugAllocator. A leak on ANY path
 /// (including error paths inside decodeEntryPoints, which clean up via defer)
@@ -157,10 +194,15 @@ fn fuzzDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const fuzz = buf[0..len];
 
     var da: std.heap.DebugAllocator(.{}) = .init;
-    const result = decodeEntryPoints(da.allocator(), fuzz);
+    const result = decodeAndMutate(da.allocator(), fuzz);
     const leak = da.deinit();
     try result;
     if (leak == .leak) return error.MemoryLeak;
+}
+
+fn decodeAndMutate(gpa: std.mem.Allocator, fuzz: []const u8) !void {
+    try decodeEntryPoints(gpa, fuzz);
+    try mutatedValidFrame(gpa, fuzz);
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +270,6 @@ fn decodeValidFrame(gpa: std.mem.Allocator, frame: []const u8) !void {
 /// Build a handful of VALID envelope frames (deterministic forger seeds) and
 /// run the decoders over each under full OOM injection.
 fn runOomInjection(gpa: std.mem.Allocator) !void {
-    const adversary = @import("adversary");
     const net = crypto.networkIdFromPassphrase(sim_passphrase);
     var forger = try adversary.Forger.init(gpa, nodeSeed(1), net);
 

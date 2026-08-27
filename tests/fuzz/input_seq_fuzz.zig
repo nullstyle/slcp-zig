@@ -218,19 +218,45 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
 /// leak-checked DebugAllocator so leaks fail the iteration.
 fn fuzzInputSeqOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var da: std.heap.DebugAllocator(.{}) = .init;
-    const result = run(da.allocator(), smith);
+    const result = run(da.allocator(), smith, null); // coverage-guided: eos picks the length
     const leak = da.deinit();
     try result;
     if (leak == .leak) return error.MemoryLeak;
 }
 
-fn run(gpa: std.mem.Allocator, smith: *std.testing.Smith) !void {
+/// One deterministic smoke iteration over a fixed `budget` of inputs (finding
+/// #1 fix): guarantees a real multi-input sequence with an invariant check
+/// after each. Leak-checked.
+fn smokeOne(smith: *std.testing.Smith, budget: usize) anyerror!void {
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    const result = run(da.allocator(), smith, budget);
+    const leak = da.deinit();
+    try result;
+    if (leak == .leak) return error.MemoryLeak;
+}
+
+/// `budget == null`: the coverage-guided path — the loop length is chosen by
+/// `smith.eos()` (correct under `zig build fuzz --fuzz`, where the fuzzer
+/// drives eos from coverage). `budget != null`: the deterministic smoke — run
+/// exactly that many steps ignoring eos, because in `Smith{ .in = bytes }`
+/// mode eos() consumes a byte and returns true on any nonzero value, which
+/// would terminate the loop after ~1 step on random input (M3 review finding
+/// #1). A fixed budget is what makes the smoke actually exercise multi-input
+/// sequences and the after-every-input invariant checks.
+fn run(gpa: std.mem.Allocator, smith: *std.testing.Smith, budget: ?usize) !void {
     var fx = try Fixture.init(gpa);
     defer fx.deinit(gpa);
 
     var steps: usize = 0;
-    while (steps < max_inputs and !smith.eos()) : (steps += 1) {
-        if (try stepOnce(gpa, &fx, smith) == .failed) break; // cleanly sticky-failed
+    if (budget) |b| {
+        while (steps < b) : (steps += 1) {
+            executed_steps += 1;
+            if (try stepOnce(gpa, &fx, smith) == .failed) break; // cleanly sticky-failed
+        }
+    } else {
+        while (steps < max_inputs and !smith.eos()) : (steps += 1) {
+            if (try stepOnce(gpa, &fx, smith) == .failed) break;
+        }
     }
 }
 
@@ -256,20 +282,36 @@ test "fuzz: random valid-typed input interleavings preserve §13.1 invariants" {
 pub const smoke_iterations: usize = 5000;
 pub const smoke_seed: u64 = 0x1257_5e9f_a220_1b0d;
 
+/// Actual single inputs executed through the engine (incremented per
+/// stepOnce). Asserted large at the end of runSmoke so a regression to the
+/// vacuous eos-terminated behavior (M3 review finding #1: 15 steps across
+/// 5000 iterations) fails loudly.
+pub var executed_steps: usize = 0;
+
 pub fn runSmoke() !void {
+    executed_steps = 0;
     var prng = std.Random.DefaultPrng.init(smoke_seed);
     const rand = prng.random();
-    var scratch: [512]u8 = undefined;
+    // Big enough that a full budget of steps rarely exhausts the byte stream
+    // (each stepOnce consumes ~10-40 bytes); when it does, Smith yields zeros
+    // — still valid typed inputs.
+    var scratch: [4096]u8 = undefined;
 
     var i: usize = 0;
     while (i < smoke_iterations) : (i += 1) {
-        const len = rand.uintLessThan(usize, scratch.len);
-        rand.bytes(scratch[0..len]);
-        var smith: std.testing.Smith = .{ .in = scratch[0..len] };
-        try fuzzInputSeqOne({}, &smith);
+        rand.bytes(&scratch);
+        // A real per-iteration budget in [8, max_inputs] — never eos-gated.
+        const budget = 8 + rand.uintLessThan(usize, max_inputs - 7);
+        var smith: std.testing.Smith = .{ .in = &scratch };
+        try smokeOne(&smith, budget);
     }
 }
 
 test "fuzz-smoke: input-seq target, 5000 deterministic iterations, leak-free" {
     try runSmoke();
+    // Non-vacuity gate (finding #1): the smoke must drive a real sequence,
+    // not eos-terminate after ~1 input. At budgets in [8, max_inputs] over
+    // 5000 iterations this is tens of thousands of engine inputs, each
+    // invariant-checked.
+    try std.testing.expect(executed_steps > 40_000);
 }

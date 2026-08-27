@@ -734,6 +734,18 @@ test "byz counter inflator: escalating counters to u32 max cannot inflate honest
     const qh = h.sharedHash();
     try seedProposals(&h, 1);
 
+    // REACHABILITY PROOF (finding #2): a u32-max PREPARE must genuinely reach
+    // honest protocol state — not bounce at the door — or the "counter stays
+    // at 1" result would be meaningless. Inject one now to node 0 and assert
+    // it is APPLIED (in-graph sender, valid sig, canonical, sane), so the
+    // measurement below is a real defense against a processed attack.
+    {
+        const probe = try h.forger(0).sign(1, .{ .prepare = .{ .qset_hash = qh, .ballot = .{ .counter = std.math.maxInt(u32), .value = "infl" } } });
+        defer gpa.free(probe);
+        const r = try h.injectNow(0, probe);
+        try testing.expectEqual(engine.InputStatus.applied, r.status);
+    }
+
     const counters = [_]u32{ 100, 1000, 1_000_000, std.math.maxInt(u32) };
     for (counters) |c| {
         const env = try h.forger(0).sign(1, .{ .prepare = .{ .qset_hash = qh, .ballot = .{ .counter = c, .value = "infl" } } });
@@ -879,10 +891,12 @@ test "byz value spammer: max-list nominations stay within the stored-bytes budge
         try testing.expect(h.honest[0].eng.stats().stored_statement_bytes <= budget);
     }
 
-    // The honest node is still healthy and makes progress.
+    // The honest node is still healthy and makes progress (require real
+    // externalization, not just non-contradiction — finding #4).
     try seedProposals(&h, 1);
     try h.run(honestBound(), 1);
     try h.checkAgreement(1);
+    try testing.expect(h.allHonestExternalized(1));
 }
 
 // --- 6. non-canonical encoder ----------------------------------------------
@@ -924,6 +938,7 @@ test "byz non-canonical encoder: strict rejects insane, lenient accepts, both sa
         try seedProposals(&h, 1);
         try h.run(honestBound(), 1);
         try h.checkAgreement(1);
+        try testing.expect(h.allHonestExternalized(1)); // require progress (finding #4)
     }
 }
 
