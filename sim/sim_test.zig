@@ -14,6 +14,8 @@ const sim = @import("sim.zig");
 const scenario = @import("scenario.zig");
 
 test "oracle scenarios (§13.3)" { _ = @import("oracle_scenarios.zig"); } // pulls the stellar-core oracle-port tests into this bundle
+test "byzantine fault-injection suite (§13.2)" { _ = @import("byzantine.zig"); } // Byzantine actor suite + seed matrix
+test "restart safety (§13.1)" { _ = @import("restart.zig"); } // crash/restart own-log replay property
 
 const smoke_seeds_max: u64 = 25;
 const smoke_ns = [_]u8{ 3, 4, 5, 7 };

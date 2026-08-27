@@ -95,11 +95,75 @@ pub fn build(b: *std.Build) void {
     });
     const run_sim_tests = b.addRunArtifact(sim_tests);
 
-    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e + sim smoke matrix");
+    // Fuzz targets (design §13.5). Two std.testing.fuzz targets — a decode
+    // target (arbitrary bytes → typed rejection, never UB/leak) and an
+    // input-sequence target (random valid-typed input interleavings against
+    // one engine, §13.1 invariants after every input). They compile against
+    // the sim-level slcp-core instance (ReleaseSafe by default) and reach the
+    // sibling sim/ helpers (adversary.zig, invariants.zig) via relative
+    // imports, so all three share one module instance.
+    //   `zig build fuzz`        — run both as fuzz targets (add --fuzz to
+    //                             actually fuzz; otherwise replays the corpus).
+    //   `zig build fuzz-smoke`  — a fixed 5000-iteration deterministic run of
+    //                             both, folded into `zig build test` for CI.
+    // The sim/ Byzantine toolkit + invariants, as named modules over the same
+    // slcp-core instance (module identity ⇒ shared engine types).
+    const adversary_mod = b.createModule(.{
+        .root_source_file = b.path("sim/adversary.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{.{ .name = "slcp-core", .module = slcp_core_sim }},
+    });
+    const invariants_mod = b.createModule(.{
+        .root_source_file = b.path("sim/invariants.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{.{ .name = "slcp-core", .module = slcp_core_sim }},
+    });
+    const fuzz_decode_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/decode_fuzz.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{
+            .{ .name = "slcp-core", .module = slcp_core_sim },
+            .{ .name = "adversary", .module = adversary_mod },
+        },
+    });
+    const fuzz_seq_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/input_seq_fuzz.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{
+            .{ .name = "slcp-core", .module = slcp_core_sim },
+            .{ .name = "adversary", .module = adversary_mod },
+            .{ .name = "invariants", .module = invariants_mod },
+        },
+    });
+    const fuzz_decode_tests = b.addTest(.{ .name = "slcp-fuzz-decode", .root_module = fuzz_decode_mod });
+    const fuzz_seq_tests = b.addTest(.{ .name = "slcp-fuzz-input-seq", .root_module = fuzz_seq_mod });
+
+    // fuzz-smoke: run the compiled targets' tests deterministically (includes
+    // the 5000-iteration smoke tests + the OOM-injection corpus).
+    const run_fuzz_decode_smoke = b.addRunArtifact(fuzz_decode_tests);
+    const run_fuzz_seq_smoke = b.addRunArtifact(fuzz_seq_tests);
+    const fuzz_smoke_step = b.step("fuzz-smoke", "Deterministic bounded run of the fuzz targets (part of `test`)");
+    fuzz_smoke_step.dependOn(&run_fuzz_decode_smoke.step);
+    fuzz_smoke_step.dependOn(&run_fuzz_seq_smoke.step);
+
+    // fuzz: same artifacts, intended as `zig build fuzz --fuzz` for
+    // coverage-guided fuzzing; without --fuzz they replay the seed corpus.
+    const run_fuzz_decode = b.addRunArtifact(fuzz_decode_tests);
+    const run_fuzz_seq = b.addRunArtifact(fuzz_seq_tests);
+    const fuzz_step = b.step("fuzz", "Run the decode + input-seq fuzz targets (add --fuzz to fuzz)");
+    fuzz_step.dependOn(&run_fuzz_decode.step);
+    fuzz_step.dependOn(&run_fuzz_seq.step);
+
+    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e + sim smoke matrix + fuzz smoke");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
     test_step.dependOn(&run_sim_tests.step);
+    test_step.dependOn(fuzz_smoke_step);
 
     // One-line repro runner: zig build sim -- --seed=N --nodes=N --scenario=name
     const sim_exe = b.addExecutable(.{
