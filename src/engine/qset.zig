@@ -99,6 +99,7 @@ fn normalizeRec(gpa: std.mem.Allocator, qs: *QuorumSetOwned) !void {
     }
     if (lifted > 0) {
         const new_vals = try gpa.alloc(NodeId, qs.validators.len + lifted);
+        errdefer gpa.free(new_vals);
         @memcpy(new_vals[0..qs.validators.len], qs.validators);
         var vi = qs.validators.len;
         const kept = try gpa.alloc(QuorumSetOwned, qs.inner_sets.len - lifted);
@@ -193,6 +194,70 @@ fn writeInto(b: *gen_slcp.QuorumSet.Builder, qs: *const QuorumSetOwned) !void {
             try writeInto(&ib, inner);
         }
     }
+}
+
+/// Deep copy of `qs` with `node` excised (design §5.4/§12: leader weights run
+/// over the SELF-excised local qset). Transcribed from stellar-core
+/// `normalizeQSetSimplify`'s removal step (QuorumSetUtils.cpp:141-148): at
+/// every level where `node` appears in `validators` it is removed and THAT
+/// level's threshold is decremented by the number of entries removed
+/// (`qSet.threshold -= uint32(v.end() - it_v)`). The copy is then re-run
+/// through `validateAndNormalize`, which supplies the rest of `normalizeQSet`'s
+/// simplification — singleton-inner flattening (QuorumSetUtils.cpp:154-166) —
+/// plus SLCP's canonical ordering.
+///
+/// Returns null when the excised tree is unusable — exactly the shapes a
+/// re-run of `validateAndNormalize` rejects: the whole set emptied (a
+/// singleton-`node` qset), or some level's threshold fell to 0 or its member
+/// list emptied. `node` absent from the tree yields an unchanged (still
+/// deep-copied) set. Caller deinits the returned set.
+pub fn exciseNode(gpa: std.mem.Allocator, qs: *const QuorumSetOwned, node: NodeId) !?QuorumSetOwned {
+    var copy = try exciseCopy(gpa, qs, node);
+    validateAndNormalize(gpa, &copy) catch |err| switch (err) {
+        error.OutOfMemory => {
+            copy.deinit(gpa);
+            return error.OutOfMemory;
+        },
+        else => {
+            copy.deinit(gpa);
+            return null;
+        },
+    };
+    return copy;
+}
+
+fn exciseCopy(gpa: std.mem.Allocator, qs: *const QuorumSetOwned, node: NodeId) !QuorumSetOwned {
+    var removed: u32 = 0;
+    for (qs.validators) |*v| {
+        if (std.mem.eql(u8, v, &node)) removed += 1;
+    }
+    const vals = try gpa.alloc(NodeId, qs.validators.len - removed);
+    errdefer gpa.free(vals);
+    var vi: usize = 0;
+    for (qs.validators) |*v| {
+        if (std.mem.eql(u8, v, &node)) continue;
+        vals[vi] = v.*;
+        vi += 1;
+    }
+
+    var inners = try gpa.alloc(QuorumSetOwned, qs.inner_sets.len);
+    var built: usize = 0;
+    errdefer {
+        for (inners[0..built]) |*inner| inner.deinit(gpa);
+        gpa.free(inners);
+    }
+    for (qs.inner_sets, 0..) |*inner, i| {
+        inners[i] = try exciseCopy(gpa, inner, node);
+        built += 1;
+    }
+
+    return .{
+        // Saturating only for defense: a validated tree has unique nodes and
+        // threshold >= 1, so removed <= 1 <= threshold and this never clips.
+        .threshold = qs.threshold -| removed,
+        .validators = vals,
+        .inner_sets = inners,
+    };
 }
 
 /// qsetHash of an already-normalized set (§4.3).
@@ -361,6 +426,131 @@ test "wire roundtrip: build → read → normalize → hash matches direct hash"
     const h1 = try hashNormalized(gpa, &owned);
     const h2 = try hashNormalized(gpa, &direct);
     try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "exciseNode: flat 2-of-3 excising a member yields 1-of-2" {
+    const gpa = std.testing.allocator;
+    var qs = try ownedFlat(gpa, 2, &.{ 1, 2, 3 });
+    defer qs.deinit(gpa);
+    try validateAndNormalize(gpa, &qs);
+
+    var out = (try exciseNode(gpa, &qs, nodeId(2))).?;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), out.threshold);
+    try std.testing.expectEqual(@as(usize, 2), out.validators.len);
+    try std.testing.expectEqualSlices(u8, &nodeId(1), &out.validators[0]);
+    try std.testing.expectEqualSlices(u8, &nodeId(3), &out.validators[1]);
+    try std.testing.expectEqual(@as(usize, 0), out.inner_sets.len);
+    // the input is untouched
+    try std.testing.expectEqual(@as(u32, 2), qs.threshold);
+    try std.testing.expectEqual(@as(usize, 3), qs.validators.len);
+}
+
+test "exciseNode: non-member excision is an unchanged deep copy" {
+    const gpa = std.testing.allocator;
+    var qs = try ownedFlat(gpa, 2, &.{ 1, 2, 3 });
+    defer qs.deinit(gpa);
+    try validateAndNormalize(gpa, &qs);
+
+    var out = (try exciseNode(gpa, &qs, nodeId(9))).?;
+    defer out.deinit(gpa);
+    const h_in = try hashNormalized(gpa, &qs);
+    const h_out = try hashNormalized(gpa, &out);
+    try std.testing.expectEqualSlices(u8, &h_in, &h_out);
+    // deep copy, not a borrow
+    try std.testing.expect(out.validators.ptr != qs.validators.ptr);
+}
+
+test "exciseNode: nested — excision hits the inner org level only" {
+    const gpa = std.testing.allocator;
+    // 2-of-{A, {2-of-{10,11,12}}, {2-of-{20,21,22}}}; excise 11.
+    var qs: QuorumSetOwned = blk: {
+        const vals = try gpa.alloc(NodeId, 1);
+        vals[0] = nodeId(1);
+        const inners = try gpa.alloc(QuorumSetOwned, 2);
+        inners[0] = try ownedFlat(gpa, 2, &.{ 0x10, 0x11, 0x12 });
+        inners[1] = try ownedFlat(gpa, 2, &.{ 0x20, 0x21, 0x22 });
+        break :blk .{ .threshold = 2, .validators = vals, .inner_sets = inners };
+    };
+    defer qs.deinit(gpa);
+    try validateAndNormalize(gpa, &qs);
+
+    var out = (try exciseNode(gpa, &qs, nodeId(0x11))).?;
+    defer out.deinit(gpa);
+    // top level untouched: threshold 2, validator A, two inner sets
+    try std.testing.expectEqual(@as(u32, 2), out.threshold);
+    try std.testing.expectEqual(@as(usize, 1), out.validators.len);
+    try std.testing.expectEqual(@as(usize, 2), out.inner_sets.len);
+    // org1 became 1-of-{10,12}; org2 stayed 2-of-3
+    var saw_excised = false;
+    var saw_intact = false;
+    for (out.inner_sets) |*inner| {
+        if (inner.validators.len == 2) {
+            try std.testing.expectEqual(@as(u32, 1), inner.threshold);
+            try std.testing.expectEqualSlices(u8, &nodeId(0x10), &inner.validators[0]);
+            try std.testing.expectEqualSlices(u8, &nodeId(0x12), &inner.validators[1]);
+            saw_excised = true;
+        } else {
+            try std.testing.expectEqual(@as(u32, 2), inner.threshold);
+            try std.testing.expectEqual(@as(usize, 3), inner.validators.len);
+            saw_intact = true;
+        }
+    }
+    try std.testing.expect(saw_excised and saw_intact);
+}
+
+test "exciseNode: singleton-self and other unusable shapes yield null" {
+    const gpa = std.testing.allocator;
+
+    // 1-of-{self} → empty set → null
+    var single = try ownedFlat(gpa, 1, &.{7});
+    defer single.deinit(gpa);
+    try validateAndNormalize(gpa, &single);
+    try std.testing.expect((try exciseNode(gpa, &single, nodeId(7))) == null);
+
+    // 1-of-{self, other} → 0-of-{other}: threshold fell to 0 → null
+    var pair = try ownedFlat(gpa, 1, &.{ 7, 8 });
+    defer pair.deinit(gpa);
+    try validateAndNormalize(gpa, &pair);
+    try std.testing.expect((try exciseNode(gpa, &pair, nodeId(7))) == null);
+
+    // inner 1-of-{self, A} inside 2-of-{B, C, inner} → inner 0-of-{A}
+    // → validateAndNormalize rejects → null
+    var nested: QuorumSetOwned = blk: {
+        const vals = try gpa.alloc(NodeId, 2);
+        vals[0] = nodeId(2);
+        vals[1] = nodeId(3);
+        const inners = try gpa.alloc(QuorumSetOwned, 1);
+        inners[0] = try ownedFlat(gpa, 1, &.{ 7, 8 });
+        break :blk .{ .threshold = 2, .validators = vals, .inner_sets = inners };
+    };
+    defer nested.deinit(gpa);
+    try validateAndNormalize(gpa, &nested);
+    try std.testing.expect((try exciseNode(gpa, &nested, nodeId(7))) == null);
+}
+
+test "exciseNode: re-normalization flattens an inner set reduced to 1-of-1" {
+    const gpa = std.testing.allocator;
+    // 2-of-{B, {2-of-{self, A}}}: excision leaves inner 1-of-{A}, which
+    // re-normalization flattens into the parent (oracle's singleton-inner
+    // merge, QuorumSetUtils.cpp:154-166) → 2-of-{A, B} flat.
+    var qs: QuorumSetOwned = blk: {
+        const vals = try gpa.alloc(NodeId, 1);
+        vals[0] = nodeId(2);
+        const inners = try gpa.alloc(QuorumSetOwned, 1);
+        inners[0] = try ownedFlat(gpa, 2, &.{ 7, 1 });
+        break :blk .{ .threshold = 2, .validators = vals, .inner_sets = inners };
+    };
+    defer qs.deinit(gpa);
+    try validateAndNormalize(gpa, &qs);
+
+    var out = (try exciseNode(gpa, &qs, nodeId(7))).?;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), out.threshold);
+    try std.testing.expectEqual(@as(usize, 2), out.validators.len);
+    try std.testing.expectEqual(@as(usize, 0), out.inner_sets.len);
+    try std.testing.expectEqualSlices(u8, &nodeId(1), &out.validators[0]);
+    try std.testing.expectEqualSlices(u8, &nodeId(2), &out.validators[1]);
 }
 
 test "lint: 2-of-3 warns below-two-thirds is absent, 1-of-3 is sub-majority, 3-of-3 critical" {

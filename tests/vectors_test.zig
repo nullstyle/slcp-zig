@@ -12,7 +12,9 @@ const slcp = @import("slcp-core");
 const capnpc = slcp.capnpc;
 const canonical = slcp.canonical;
 const crypto = slcp.crypto;
+const nomination = slcp.nomination;
 const qset = slcp.qset;
+const statement = slcp.statement;
 const gen_slcp = slcp.gen.slcp;
 
 const Message = capnpc.message.Message;
@@ -272,6 +274,205 @@ test "sanity vectors: decode and canonicality flags replay" {
         try std.testing.expectEqual(field(c, "decodes").bool, flags.decodes);
         try std.testing.expectEqual(field(c, "canonical").bool, flags.is_canonical);
     }
+}
+
+test "sanity vectors: statement sanity replay" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const root = (try loadVector(gpa, "sanity.json")) orelse return error.SkipZigTest;
+
+    const stmts = field(root, "statements").array.items;
+    try std.testing.expect(stmts.len >= 27);
+    var sane_seen: usize = 0;
+    // every InsaneReason arm must be exercised by at least one vector
+    var arm_seen: [std.enums.values(statement.InsaneReason).len]bool = @splat(false);
+    for (stmts) |c| {
+        const flat = try hexAlloc(gpa, field(c, "statementBytes").string);
+        var fm = try canonical.decodeFlat(gpa, flat, .{});
+        defer fm.deinit(gpa);
+        const reader = try gen_slcp.Statement.Reader.init(&fm.msg);
+        const result = statement.checkStatementSane(reader, .{});
+        switch (field(c, "insane")) {
+            .null => {
+                try std.testing.expect(result == null);
+                sane_seen += 1;
+            },
+            .string => |expected| {
+                try std.testing.expect(result != null);
+                try std.testing.expectEqualStrings(expected, @tagName(result.?));
+                arm_seen[@intFromEnum(result.?)] = true;
+            },
+            else => return error.MalformedVector,
+        }
+    }
+    // sane nominate + sane prepare + sane externalize (Externalize wire
+    // encoding is pinned by the third)
+    try std.testing.expect(sane_seen >= 3);
+    for (std.enums.values(statement.InsaneReason)) |arm| {
+        if (!arm_seen[@intFromEnum(arm)]) {
+            std.debug.print("no sanity vector for InsaneReason.{s}\n", .{@tagName(arm)});
+            return error.MissingInsaneReasonArm;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// leader.json (M1, vector set 3)
+// ---------------------------------------------------------------------------
+
+/// Dedup-append every node in `qs`'s tree in declaration order (mirror of the
+/// generator's collectQsNodes: the vector's weight/priority lists cover the
+/// CONFIGURED tree's nodes, localNode first).
+fn collectQsNodes(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned, out: *std.ArrayList(qset.NodeId)) !void {
+    for (qs.validators) |v| {
+        var seen = false;
+        for (out.items) |*n| {
+            if (std.mem.eql(u8, n, &v)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try out.append(gpa, v);
+    }
+    for (qs.inner_sets) |*inner| try collectQsNodes(gpa, inner, out);
+}
+
+test "leader vectors: weights, neighbors, priorities, leader, accumulation replay" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const root = (try loadVector(gpa, "leader.json")) orelse return error.SkipZigTest;
+
+    const cases = field(root, "cases").array.items;
+    try std.testing.expect(cases.len >= 4);
+    for (cases) |c| {
+        // rebuild the CONFIGURED qset through the same receive pipeline as
+        // generation, then re-derive the SELF-EXCISED round qset the same way
+        // the generator does — the vectors thereby pin qset.exciseNode.
+        var owned = try pipelineFromValue(gpa, field(c, "qset"));
+        const local = try hexFixed(32, field(c, "localNode").string);
+        var excised = try qset.exciseNode(gpa, &owned, local);
+        const r: nomination.LeaderRound = .{
+            .slot = @intCast(field(c, "slot").integer),
+            .prev_value = try hexAlloc(gpa, field(c, "prevValue").string),
+            .round = @intCast(field(c, "round").integer),
+            .local_node = local,
+            .qs = if (excised) |*e| e else null,
+        };
+
+        // localNode first, then the configured tree's nodes (generator order)
+        var member_list: std.ArrayList(qset.NodeId) = .empty;
+        try member_list.append(gpa, local);
+        try collectQsNodes(gpa, &owned, &member_list);
+        const members = member_list.items;
+
+        // weights: same order (memberNodes), same values
+        const weights = field(c, "weights").array.items;
+        try std.testing.expectEqual(members.len, weights.len);
+        for (weights, members) |wv, node| {
+            const wnode = try hexFixed(32, field(wv, "node").string);
+            try std.testing.expectEqualSlices(u8, &wnode, &node);
+            const expected = try std.fmt.parseInt(u64, field(wv, "weight").string, 10);
+            try std.testing.expectEqual(expected, nomination.weight(r, node));
+        }
+
+        // neighbors: the isNeighbor-filtered member list, in order
+        const neighbors = field(c, "neighbors").array.items;
+        var ni: usize = 0;
+        for (members) |node| {
+            if (!nomination.isNeighbor(r, node)) continue;
+            try std.testing.expect(ni < neighbors.len);
+            const expected = try hexFixed(32, neighbors[ni].string);
+            try std.testing.expectEqualSlices(u8, &expected, &node);
+            ni += 1;
+        }
+        try std.testing.expectEqual(neighbors.len, ni);
+
+        // priorities: every member, in order
+        const priorities = field(c, "priorities").array.items;
+        try std.testing.expectEqual(members.len, priorities.len);
+        for (priorities, members) |pv, node| {
+            const pnode = try hexFixed(32, field(pv, "node").string);
+            try std.testing.expectEqualSlices(u8, &pnode, &node);
+            const expected = try std.fmt.parseInt(u64, field(pv, "priority").string, 10);
+            try std.testing.expectEqual(expected, nomination.priority(r, node));
+        }
+
+        // leader
+        const leader = try nomination.roundLeader(gpa, r);
+        switch (field(c, "leader")) {
+            .null => try std.testing.expect(leader == null),
+            .string => |s| {
+                const expected = try hexFixed(32, s);
+                try std.testing.expect(leader != null);
+                try std.testing.expectEqualSlices(u8, &expected, &leader.?);
+            },
+            else => return error.MalformedVector,
+        }
+
+        // accumulatedLeaders: advance rounds 0..=round (file-level contract)
+        var rl: nomination.RoundLeaders = .{};
+        var round: u32 = 0;
+        while (round <= r.round) : (round += 1) {
+            var round_r = r;
+            round_r.round = round;
+            _ = try rl.advance(gpa, round_r);
+        }
+        const acc = field(c, "accumulatedLeaders").array.items;
+        try std.testing.expectEqual(acc.len, rl.items().len);
+        for (acc, rl.items()) |av, node| {
+            const expected = try hexFixed(32, av.string);
+            try std.testing.expectEqualSlices(u8, &expected, &node);
+            try std.testing.expect(rl.contains(node));
+        }
+    }
+}
+
+test "leader vectors: valuePicks replay (pickLeaderValue)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const root = (try loadVector(gpa, "leader.json")) orelse return error.SkipZigTest;
+
+    const picks = field(root, "valuePicks").array.items;
+    try std.testing.expect(picks.len >= 4);
+    var tie_seen = false;
+    var single_seen = false;
+    for (picks) |c| {
+        // the qset plays no part in value hashing (file-level contract)
+        const r: nomination.LeaderRound = .{
+            .slot = @intCast(field(c, "slot").integer),
+            .prev_value = try hexAlloc(gpa, field(c, "prevValue").string),
+            .round = @intCast(field(c, "round").integer),
+            .local_node = try hexFixed(32, field(c, "localNode").string),
+            .qs = null,
+        };
+        const value_items = field(c, "values").array.items;
+        var values: std.ArrayList([]const u8) = .empty;
+        for (value_items) |v| try values.append(gpa, try hexAlloc(gpa, v.string));
+        if (values.items.len == 1) single_seen = true;
+        if (values.items.len == 2 and std.mem.eql(u8, values.items[0], values.items[1]))
+            tie_seen = true;
+
+        const picked = nomination.pickLeaderValue(r, values.items);
+        switch (field(c, "pickedIndex")) {
+            .null => {
+                try std.testing.expect(picked == null);
+                try std.testing.expectEqual(@as(usize, 0), values.items.len);
+            },
+            .integer => |idx| {
+                try std.testing.expect(picked != null);
+                try std.testing.expectEqual(@as(usize, @intCast(idx)), picked.?);
+                const expected_value = try hexAlloc(gpa, field(c, "pickedValue").string);
+                try std.testing.expectEqualSlices(u8, expected_value, values.items[picked.?]);
+            },
+            else => return error.MalformedVector,
+        }
+    }
+    // the required tie (later index wins) and single-value cases are present
+    try std.testing.expect(tie_seen);
+    try std.testing.expect(single_seen);
 }
 
 // ---------------------------------------------------------------------------

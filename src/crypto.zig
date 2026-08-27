@@ -118,6 +118,50 @@ test "domain tags are 12 bytes and distinct" {
     }
 }
 
+test "gi byte layout pinned against hand-derived literal" {
+    // Pins the §5.4 preimage LAYOUT against the spec, independently of this
+    // file: the expected value was derived with python3 hashlib, NOT by
+    // running crypto.zig. Inputs: tag = priority (2), slot = 1,
+    // prevValue = "prev", round = 0, m = "node".
+    //
+    // preimage = "SLCP-GI-V1\x00\x00" ‖ slot:u64be ‖ prevValue ‖ tag:u32be
+    //            ‖ round:u32be ‖ m
+    //          = 534c43502d47492d56310000              ("SLCP-GI-V1\0\0")
+    //            0000000000000001                      (slot 1, u64 BE)
+    //            70726576                              ("prev")
+    //            00000002                              (tag 2 priority, u32 BE)
+    //            00000000                              (round 0, u32 BE)
+    //            6e6f6465                              ("node")
+    // sha256(preimage) =
+    //   e5f9611891f28bf7ca6316e709df83dc02b3212692be2db991b15dfa46186914
+    // gi = first 8 bytes big-endian = 0xe5f9611891f28bf7
+    try std.testing.expectEqual(
+        @as(u64, 0xe5f9611891f28bf7), // = 16571383062042151927
+        gi(.priority, 1, "prev", 0, "node"),
+    );
+}
+
+test "statementDigest pinned against hand-derived literal" {
+    // Same discipline as the gi literal test: expected digest derived with
+    // python3 hashlib from the §4.2 preimage, not from this file.
+    // Inputs: networkId = 32 bytes of 0x11, statementBytes = "stmt".
+    //
+    // preimage = "SLCP-STMT-V1" ‖ networkId ‖ statementBytes
+    //          = 534c43502d53544d542d5631              ("SLCP-STMT-V1")
+    //            1111…11 (32 bytes)                    (networkId)
+    //            73746d74                              ("stmt")
+    // sha256(preimage) =
+    //   e9b5a5aa3dafd809a9962d23ad267915127bd5e2fcb329a60d2a2c88d9343d74
+    const expected: [32]u8 = .{
+        0xe9, 0xb5, 0xa5, 0xaa, 0x3d, 0xaf, 0xd8, 0x09,
+        0xa9, 0x96, 0x2d, 0x23, 0xad, 0x26, 0x79, 0x15,
+        0x12, 0x7b, 0xd5, 0xe2, 0xfc, 0xb3, 0x29, 0xa6,
+        0x0d, 0x2a, 0x2c, 0x88, 0xd9, 0x34, 0x3d, 0x74,
+    };
+    const actual = statementDigest(@splat(0x11), "stmt");
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
 test "gi depends on every layout component" {
     const base = gi(.priority, 1, "prev", 0, "node");
     try std.testing.expect(base != gi(.neighbor, 1, "prev", 0, "node"));

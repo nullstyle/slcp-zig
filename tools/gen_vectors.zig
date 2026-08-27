@@ -1,6 +1,6 @@
 //! Deterministic conformance-vector generator (design §13.4).
 //! Writes vectors/*.json. M0 scope: sets 1 (crypto), 2 (qset), 5 (lint),
-//! 4-partial (sanity).
+//! 4-partial (sanity). M1 adds set 3 (leader — Gi leader election).
 //!
 //! Determinism contract: fixed inputs only, fixed iteration order, no
 //! timestamps, hand-rolled JSON rendering — two runs must be byte-identical.
@@ -13,7 +13,9 @@ const slcp = @import("slcp-core");
 const capnpc = slcp.capnpc;
 const canonical = slcp.canonical;
 const crypto = slcp.crypto;
+const nomination = slcp.nomination;
 const qset = slcp.qset;
+const statement = slcp.statement;
 const gen_slcp = slcp.gen.slcp;
 
 const MessageBuilder = capnpc.message.MessageBuilder;
@@ -477,7 +479,315 @@ fn renderLint(gpa: std.mem.Allocator) ![]const u8 {
 }
 
 // ---------------------------------------------------------------------------
-// sanity.json (M0 partial: decode/canonicality level only)
+// sanity.json statements section (M1): canonical statement bytes → expected
+// checkStatementSane outcome. Every "insane" expectation is DERIVED by
+// calling statement.checkStatementSane, never hand-written.
+// ---------------------------------------------------------------------------
+
+const SanityB = struct { counter: u32, value: []const u8 };
+
+const SanityPrepSpec = struct {
+    ballot: SanityB,
+    prepared: ?SanityB = null,
+    prepared_prime: ?SanityB = null,
+    n_c: u32 = 0,
+    n_h: u32 = 0,
+};
+
+const StatementSanityCase = struct { name: []const u8, flat: []const u8 };
+
+fn sanityStatementBuilder(mb: *MessageBuilder, node_id: []const u8) !gen_slcp.Statement.Builder {
+    var st = try gen_slcp.Statement.Builder.init(mb);
+    try st.setNodeId(node_id);
+    try st.setSlotIndex(1);
+    return st;
+}
+
+fn sanityNominateBytes(
+    gpa: std.mem.Allocator,
+    node_id: []const u8,
+    qsh: []const u8,
+    votes: []const []const u8,
+    accepted: []const []const u8,
+) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    var st = try sanityStatementBuilder(&mb, node_id);
+    var pledges = st.getPledges();
+    var nom = try pledges.initNominate();
+    try nom.setQuorumSetHash(qsh);
+    if (votes.len > 0) {
+        const vl = try nom.initVotes(@intCast(votes.len));
+        for (votes, 0..) |v, i| try vl.set(@intCast(i), v);
+    }
+    if (accepted.len > 0) {
+        const al = try nom.initAccepted(@intCast(accepted.len));
+        for (accepted, 0..) |v, i| try al.set(@intCast(i), v);
+    }
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+fn sanityPrepareBytes(
+    gpa: std.mem.Allocator,
+    node_id: []const u8,
+    qsh: []const u8,
+    spec: SanityPrepSpec,
+) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    var st = try sanityStatementBuilder(&mb, node_id);
+    var pledges = st.getPledges();
+    var prep = try pledges.initPrepare();
+    try prep.setQuorumSetHash(qsh);
+    var ballot = try prep.initBallot();
+    try ballot.setCounter(spec.ballot.counter);
+    try ballot.setValue(spec.ballot.value);
+    if (spec.prepared) |b| {
+        var pb = try prep.initPrepared();
+        try pb.setCounter(b.counter);
+        try pb.setValue(b.value);
+    }
+    if (spec.prepared_prime) |b| {
+        var pb = try prep.initPreparedPrime();
+        try pb.setCounter(b.counter);
+        try pb.setValue(b.value);
+    }
+    try prep.setNC(spec.n_c);
+    try prep.setNH(spec.n_h);
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+fn sanityConfirmBytes(
+    gpa: std.mem.Allocator,
+    node_id: []const u8,
+    qsh: []const u8,
+    ballot: SanityB,
+    n_prepared: u32,
+    n_commit: u32,
+    n_h: u32,
+) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    var st = try sanityStatementBuilder(&mb, node_id);
+    var pledges = st.getPledges();
+    var conf = try pledges.initConfirm();
+    try conf.setQuorumSetHash(qsh);
+    var bb = try conf.initBallot();
+    try bb.setCounter(ballot.counter);
+    try bb.setValue(ballot.value);
+    try conf.setNPrepared(n_prepared);
+    try conf.setNCommit(n_commit);
+    try conf.setNH(n_h);
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+fn sanityExternalizeBytes(
+    gpa: std.mem.Allocator,
+    node_id: []const u8,
+    qsh: []const u8,
+    commit: SanityB,
+    n_h: u32,
+) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    var st = try sanityStatementBuilder(&mb, node_id);
+    var pledges = st.getPledges();
+    var ext = try pledges.initExternalize();
+    var cb = try ext.initCommit();
+    try cb.setCounter(commit.counter);
+    try cb.setValue(commit.value);
+    try ext.setNH(n_h);
+    try ext.setCommitQuorumSetHash(qsh);
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+fn sanityUnsetBytes(gpa: std.mem.Allocator, node_id: []const u8) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    _ = try sanityStatementBuilder(&mb, node_id);
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+/// Statement with the pledges discriminant written RAW and NO arm struct
+/// initialized — unreachable through the normal builders. tag > 4 exercises
+/// unknown_pledges_tag; tags 1-4 leave the pledges pointer null (review
+/// finding #9): capnp readStruct on a null pointer fails, so today's expected
+/// reason is decode_error — DERIVED below by calling checkStatementSane, like
+/// every other expectation. Both shapes survive canonical re-encoding (the
+/// discriminant is plain data; the never-written arm pointer is a trailing
+/// zero pointer word that canonicalization simply trims).
+fn sanityRawPledgesTagBytes(gpa: std.mem.Allocator, node_id: []const u8, tag: u16) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    var st = try sanityStatementBuilder(&mb, node_id);
+    st._builder.writeU16(8, tag);
+    const framed = try mb.toBytes();
+    return canonical.canonicalFlatFromFramed(gpa, framed);
+}
+
+/// The M1 statement-sanity case list. Sane cases reuse the crypto.json
+/// statement bytes so both files pin the same encodings. EVERY InsaneReason
+/// arm has at least one case (S2/S4/S7/#9), enforced by the replay test.
+fn sanityStatementCases(
+    gpa: std.mem.Allocator,
+    qsh: [32]u8,
+    nominate_bytes: []const u8,
+    prepare_bytes: []const u8,
+) ![]const StatementSanityCase {
+    const node_id = try crypto.publicKeyFromSeed(seeds[0]);
+    const node = try gpa.dupe(u8, &node_id);
+    const qs = try gpa.dupe(u8, &qsh);
+
+    // > default maxValueBytes (4096)
+    const oversized = try gpa.alloc(u8, 4097);
+    @memset(oversized, 0x77);
+
+    // 65 one-byte strictly-ascending values: breaches the frozen
+    // maxNominationValues = 64 (§4.5) with nothing else wrong.
+    const many_storage = try gpa.alloc([1]u8, 65);
+    const many = try gpa.alloc([]const u8, 65);
+    for (many_storage, 0..) |*s, i| {
+        s[0] = @intCast(i);
+        many[i] = s;
+    }
+
+    var cases: std.ArrayList(StatementSanityCase) = .empty;
+    try cases.append(gpa, .{ .name = "sane nominate", .flat = nominate_bytes });
+    try cases.append(gpa, .{ .name = "sane prepare", .flat = prepare_bytes });
+    try cases.append(gpa, .{
+        .name = "prepare counter-0 ballot",
+        .flat = try sanityPrepareBytes(gpa, node, qs, .{ .ballot = .{ .counter = 0, .value = &prepare_value } }),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination unsorted votes",
+        // 0xde… before 0xca… — descending byte order
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{ &nominate_vote, &prepare_value }, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination empty votes",
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{}, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination duplicate vote",
+        // equal adjacent = not strictly ascending
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{ &nominate_vote, &nominate_vote }, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination oversized value",
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{oversized}, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "prepare bad nC nH relation",
+        .flat = try sanityPrepareBytes(gpa, node, qs, .{
+            .ballot = .{ .counter = 2, .value = &prepare_value },
+            .prepared = .{ .counter = 2, .value = &prepare_value },
+            .n_c = 2,
+            .n_h = 1,
+        }),
+    });
+    try cases.append(gpa, .{
+        .name = "prepare preparedPrime without prepared",
+        .flat = try sanityPrepareBytes(gpa, node, qs, .{
+            .ballot = .{ .counter = 1, .value = &prepare_value },
+            .prepared_prime = .{ .counter = 1, .value = &nominate_vote },
+        }),
+    });
+    try cases.append(gpa, .{
+        .name = "unset pledges",
+        .flat = try sanityUnsetBytes(gpa, node),
+    });
+    try cases.append(gpa, .{
+        .name = "wrong-length nodeId",
+        .flat = try sanityNominateBytes(gpa, node[0..31], qs, &.{&nominate_vote}, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "confirm nPrepared zero",
+        .flat = try sanityConfirmBytes(gpa, node, qs, .{ .counter = 1, .value = &prepare_value }, 0, 1, 1),
+    });
+    // -- S2/S4/S7/#9 coverage: the remaining InsaneReason arms ---------------
+    try cases.append(gpa, .{
+        // no sane Externalize existed in any vector file before this case —
+        // it pins the Externalize wire encoding
+        .name = "sane externalize",
+        .flat = try sanityExternalizeBytes(gpa, node, qs, .{ .counter = 2, .value = &prepare_value }, 5),
+    });
+    try cases.append(gpa, .{
+        .name = "externalize nH below commit counter",
+        .flat = try sanityExternalizeBytes(gpa, node, qs, .{ .counter = 3, .value = &prepare_value }, 2),
+    });
+    try cases.append(gpa, .{
+        .name = "nominate 16-byte quorumSetHash",
+        .flat = try sanityNominateBytes(gpa, node, qs[0..16], &.{&nominate_vote}, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination too many votes",
+        .flat = try sanityNominateBytes(gpa, node, qs, many, &.{}),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination unsorted accepted",
+        // votes fine; accepted 0xde… before 0xca… — descending byte order
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{&nominate_vote}, &.{ &nominate_vote, &prepare_value }),
+    });
+    try cases.append(gpa, .{
+        .name = "nomination too many accepted",
+        .flat = try sanityNominateBytes(gpa, node, qs, &.{&nominate_vote}, many),
+    });
+    try cases.append(gpa, .{
+        .name = "prepare preparedPrime compatible with prepared",
+        // pp < p but SAME value bytes: fails the ⋦ (less AND incompatible) rule
+        .flat = try sanityPrepareBytes(gpa, node, qs, .{
+            .ballot = .{ .counter = 3, .value = &prepare_value },
+            .prepared = .{ .counter = 2, .value = &prepare_value },
+            .prepared_prime = .{ .counter = 1, .value = &prepare_value },
+        }),
+    });
+    try cases.append(gpa, .{
+        .name = "prepare nH without prepared",
+        .flat = try sanityPrepareBytes(gpa, node, qs, .{
+            .ballot = .{ .counter = 1, .value = &prepare_value },
+            .n_h = 1,
+        }),
+    });
+    try cases.append(gpa, .{
+        .name = "confirm nCommit zero",
+        .flat = try sanityConfirmBytes(gpa, node, qs, .{ .counter = 1, .value = &prepare_value }, 1, 0, 1),
+    });
+    try cases.append(gpa, .{
+        .name = "confirm nCommit above nH",
+        .flat = try sanityConfirmBytes(gpa, node, qs, .{ .counter = 5, .value = &prepare_value }, 1, 3, 2),
+    });
+    try cases.append(gpa, .{
+        .name = "unknown pledges discriminant 5 (raw tag write)",
+        .flat = try sanityRawPledgesTagBytes(gpa, node, 5),
+    });
+    // finding #9: discriminant set, pledges arm pointer null — one per arm
+    try cases.append(gpa, .{
+        .name = "nominate discriminant with null pledges pointer",
+        .flat = try sanityRawPledgesTagBytes(gpa, node, 1),
+    });
+    try cases.append(gpa, .{
+        .name = "prepare discriminant with null pledges pointer",
+        .flat = try sanityRawPledgesTagBytes(gpa, node, 2),
+    });
+    try cases.append(gpa, .{
+        .name = "confirm discriminant with null pledges pointer",
+        .flat = try sanityRawPledgesTagBytes(gpa, node, 3),
+    });
+    try cases.append(gpa, .{
+        .name = "externalize discriminant with null pledges pointer",
+        .flat = try sanityRawPledgesTagBytes(gpa, node, 4),
+    });
+    return cases.toOwnedSlice(gpa);
+}
+
+/// Derived by CALLING checkStatementSane on the decoded bytes.
+fn statementInsaneName(gpa: std.mem.Allocator, flat: []const u8) !?[]const u8 {
+    var fm = try canonical.decodeFlat(gpa, flat, .{});
+    const reader = try gen_slcp.Statement.Reader.init(&fm.msg);
+    return if (statement.checkStatementSane(reader, .{})) |r| @tagName(r) else null;
+}
+
+// ---------------------------------------------------------------------------
+// sanity.json (M0 partial: decode/canonicality level; M1 adds statements)
 // ---------------------------------------------------------------------------
 
 /// Derived straight through the library helpers: decodeFlat returns a
@@ -491,7 +801,11 @@ fn sanityFlags(gpa: std.mem.Allocator, flat: []const u8) !struct { decodes: bool
     return .{ .decodes = true, .is_canonical = capnpc.canonical.isCanonical(&fm.msg) };
 }
 
-fn renderSanity(gpa: std.mem.Allocator, statement_bytes: []const u8) ![]const u8 {
+fn renderSanity(
+    gpa: std.mem.Allocator,
+    statement_bytes: []const u8,
+    stmt_cases: []const StatementSanityCase,
+) ![]const u8 {
     var sink = std.Io.Writer.Allocating.init(gpa);
     const w = &sink.writer;
 
@@ -510,7 +824,7 @@ fn renderSanity(gpa: std.mem.Allocator, statement_bytes: []const u8) ![]const u8
     };
 
     try w.writeAll("{\n  \"version\": 1,\n");
-    try w.writeAll("  \"note\": \"M0 partial: decode/canonicality level only; engine input_status cases land at M2\",\n");
+    try w.writeAll("  \"note\": \"M0 decode/canonicality cases; M1 extended with the statements section (checkStatementSane — every InsaneReason arm has at least one case; decode_error cases are discriminant-set-but-null-pledges-pointer shapes); full engine input_status cases land at M2\",\n");
     try w.writeAll("  \"cases\": [\n");
     for (cases, 0..) |c, i| {
         const flags = try sanityFlags(gpa, c.flat);
@@ -520,6 +834,236 @@ fn renderSanity(gpa: std.mem.Allocator, statement_bytes: []const u8) ![]const u8
         try jsonHex(w, c.flat);
         try w.print(", \"decodes\": {}, \"canonical\": {}", .{ flags.decodes, flags.is_canonical });
         try w.writeAll(if (i + 1 < cases.len) "},\n" else "}\n");
+    }
+    try w.writeAll("  ],\n  \"statements\": [\n");
+    for (stmt_cases, 0..) |c, i| {
+        const insane = try statementInsaneName(gpa, c.flat);
+        try w.writeAll("    {\"name\": ");
+        try jsonString(w, c.name);
+        try w.writeAll(", \"statementBytes\": ");
+        try jsonHex(w, c.flat);
+        try w.writeAll(", \"insane\": ");
+        if (insane) |n| try jsonString(w, n) else try w.writeAll("null");
+        try w.writeAll(if (i + 1 < stmt_cases.len) "},\n" else "}\n");
+    }
+    try w.writeAll("  ]\n}\n");
+
+    return sink.written();
+}
+
+// ---------------------------------------------------------------------------
+// leader.json (M1, vector set 3): Gi leader election. Every expectation is
+// DERIVED by calling src/engine/nomination.zig — weights, neighbors,
+// priorities, the round leader, and the accumulated leader set. The "qset"
+// field is the CONFIGURED set; the round is computed over
+// qset.exciseNode(configured, localNode) (design §5.4/§12 self-excision),
+// so these vectors pin exciseNode cross-implementation.
+// ---------------------------------------------------------------------------
+
+const LeaderCase = struct {
+    name: []const u8,
+    slot: u64,
+    round: u32,
+    local: qset.NodeId,
+    spec: QSpec,
+};
+
+/// Dedup-append every node in `qs`'s tree in declaration order.
+fn collectQsNodes(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned, out: *std.ArrayList(qset.NodeId)) !void {
+    for (qs.validators) |v| {
+        var seen = false;
+        for (out.items) |*n| {
+            if (std.mem.eql(u8, n, &v)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try out.append(gpa, v);
+    }
+    for (qs.inner_sets) |*inner| try collectQsNodes(gpa, inner, out);
+}
+
+fn renderLeaderCase(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    c: LeaderCase,
+    prev: []const u8,
+) !void {
+    const outcome = try processSpec(gpa, c.spec);
+    // The round runs over the SELF-EXCISED local qset (F1: stellar-core
+    // normalizeQSet(myQSet, &localID), NominationProtocol.cpp:226); null
+    // when excision emptied it.
+    var excised = try qset.exciseNode(gpa, &outcome.ok.owned, c.local);
+    const r: nomination.LeaderRound = .{
+        .slot = c.slot,
+        .prev_value = prev,
+        .round = c.round,
+        .local_node = c.local,
+        .qs = if (excised) |*e| e else null,
+    };
+    // Weights/neighbors/priorities are listed for every node in the
+    // CONFIGURED normalized tree plus localNode (localNode first, dedup'd) —
+    // NOT the excised tree — so a case where excision zeroes a node's weight
+    // still lists that node.
+    var member_list: std.ArrayList(qset.NodeId) = .empty;
+    try member_list.append(gpa, c.local);
+    try collectQsNodes(gpa, &outcome.ok.owned, &member_list);
+    const members = member_list.items;
+
+    try w.writeAll("    {\"name\": ");
+    try jsonString(w, c.name);
+    try w.print(",\n     \"slot\": {d}, \"prevValue\": ", .{c.slot});
+    try jsonHex(w, prev);
+    try w.print(", \"round\": {d}, \"localNode\": ", .{c.round});
+    try jsonHex(w, &c.local);
+    try w.writeAll(",\n     \"qset\": ");
+    try writeSpecJson(w, c.spec);
+
+    try w.writeAll(",\n     \"weights\": [");
+    for (members, 0..) |node, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"node\": ");
+        try jsonHex(w, &node);
+        try w.print(", \"weight\": \"{d}\"}}", .{nomination.weight(r, node)});
+    }
+
+    try w.writeAll("],\n     \"neighbors\": [");
+    var first = true;
+    for (members) |node| {
+        if (!nomination.isNeighbor(r, node)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try jsonHex(w, &node);
+    }
+
+    try w.writeAll("],\n     \"priorities\": [");
+    for (members, 0..) |node, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"node\": ");
+        try jsonHex(w, &node);
+        try w.print(", \"priority\": \"{d}\"}}", .{nomination.priority(r, node)});
+    }
+
+    try w.writeAll("],\n     \"leader\": ");
+    if (try nomination.roundLeader(gpa, r)) |leader| {
+        try jsonHex(w, &leader);
+    } else {
+        try w.writeAll("null");
+    }
+
+    // accumulatedLeaders: RoundLeaders.advance over rounds 0..=round with the
+    // same (slot, prevValue, localNode, qset) — see the file-level note.
+    var rl: nomination.RoundLeaders = .{};
+    var rr: u32 = 0;
+    while (rr <= c.round) : (rr += 1) {
+        var round_r = r;
+        round_r.round = rr;
+        _ = try rl.advance(gpa, round_r);
+    }
+    try w.writeAll(",\n     \"accumulatedLeaders\": [");
+    for (rl.items(), 0..) |*node, i| {
+        if (i > 0) try w.writeByte(',');
+        try jsonHex(w, node);
+    }
+    try w.writeAll("]");
+}
+
+fn renderLeader(gpa: std.mem.Allocator) ![]const u8 {
+    var sink = std.Io.Writer.Allocating.init(gpa);
+    const w = &sink.writer;
+
+    const prev: [32]u8 = @splat(0xaa);
+
+    const flat_vals = ids(&.{ 0x01, 0x02, 0x03 });
+    const flat: QSpec = .{ .threshold = 2, .validators = &flat_vals };
+
+    const org1_vals = ids(&.{ 0x10, 0x11, 0x12 });
+    const org2_vals = ids(&.{ 0x20, 0x21, 0x22 });
+    const org3_vals = ids(&.{ 0x30, 0x31, 0x32 });
+    const nested: QSpec = .{ .threshold = 2, .validators = &.{}, .inners = &.{
+        .{ .threshold = 2, .validators = &org1_vals },
+        .{ .threshold = 2, .validators = &org2_vals },
+        .{ .threshold = 2, .validators = &org3_vals },
+    } };
+
+    var cases: std.ArrayList(LeaderCase) = .empty;
+    try cases.append(gpa, .{ .name = "flat 2-of-3, local inside", .slot = 1, .round = 0, .local = @splat(0x02), .spec = flat });
+    try cases.append(gpa, .{ .name = "flat 2-of-3, local outside", .slot = 1, .round = 0, .local = @splat(0x99), .spec = flat });
+    try cases.append(gpa, .{ .name = "nested 2-of-3-orgs, local outside", .slot = 2, .round = 1, .local = @splat(0x99), .spec = nested });
+    try cases.append(gpa, .{ .name = "nested 2-of-3-orgs, local inside org1", .slot = 2, .round = 0, .local = @splat(0x11), .spec = nested });
+    // At (slot 6, round 0) the excision is decisive: over the unexcised
+    // configured tree node 03 would be a neighbor (weight 2/3) and win, but
+    // over the excised 1-of-{01,03} round qset (weight 1/2) it fails the
+    // neighbor test and node 01 leads — this case pins the F1 fix.
+    try cases.append(gpa, .{ .name = "flat 2-of-3, local inside, excision flips leader", .slot = 6, .round = 0, .local = @splat(0x02), .spec = flat });
+    var rr: u32 = 0;
+    while (rr <= 3) : (rr += 1) {
+        const names = [_][]const u8{
+            "accumulation flat 2-of-3, round 0",
+            "accumulation flat 2-of-3, round 1",
+            "accumulation flat 2-of-3, round 2",
+            "accumulation flat 2-of-3, round 3",
+        };
+        try cases.append(gpa, .{ .name = names[rr], .slot = 3, .round = rr, .local = @splat(0x99), .spec = flat });
+    }
+
+    try w.writeAll("{\n  \"version\": 1,\n");
+    try w.writeAll("  \"note\": \"qset is the CONFIGURED local set; every result is computed over the SELF-EXCISED round qset = exciseNode(configured, localNode) (self removed, that level's threshold decremented, re-normalized; null when excision empties it) — stellar-core normalizeQSet(myQSet, &localID) semantics, design section 5.4/12. weights/neighbors/priorities are listed localNode first, then every node of the normalized CONFIGURED tree in declaration order, dedup'd; accumulatedLeaders = RoundLeaders.advance over rounds 0..=round with the case's fixed slot/prevValue/localNode/excised qset, sorted ascending by NodeId. valuePicks pins pickLeaderValue: pickedIndex = argmax of Gi(tag=3 valueHash, slot, prevValue, round, value) over values, ties keeping the LATER index, null for an empty list — the qset plays no part in value hashing\",\n");
+    try w.writeAll("  \"cases\": [\n");
+    for (cases.items, 0..) |c, i| {
+        try renderLeaderCase(gpa, w, c, &prev);
+        try w.writeAll(if (i + 1 < cases.items.len) "},\n" else "}\n");
+    }
+
+    // -- valuePicks: pickLeaderValue coverage (review gap) -------------------
+    // Every pickedIndex/pickedValue is DERIVED by calling
+    // nomination.pickLeaderValue; the qset plays no part (qs = null).
+    const vp_local: qset.NodeId = @splat(0x99);
+    const distinct = [_][]const u8{ "alpha", "bravo", "charlie", "delta" };
+    const single = [_][]const u8{"only"};
+    const tie = [_][]const u8{ &nominate_vote, &nominate_vote };
+    const VpCase = struct {
+        name: []const u8,
+        slot: u64,
+        round: u32,
+        values: []const []const u8,
+    };
+    const vp_cases = [_]VpCase{
+        .{ .name = "four distinct values, max-Gi pick", .slot = 4, .round = 0, .values = &distinct },
+        .{ .name = "four distinct values, later round reshuffles", .slot = 4, .round = 2, .values = &distinct },
+        .{ .name = "single value", .slot = 4, .round = 0, .values = &single },
+        .{ .name = "tie: identical values, later index wins", .slot = 4, .round = 0, .values = &tie },
+        .{ .name = "empty list", .slot = 4, .round = 0, .values = &.{} },
+    };
+    try w.writeAll("  ],\n  \"valuePicks\": [\n");
+    for (vp_cases, 0..) |c, i| {
+        const r: nomination.LeaderRound = .{
+            .slot = c.slot,
+            .prev_value = &prev,
+            .round = c.round,
+            .local_node = vp_local,
+            .qs = null,
+        };
+        const picked = nomination.pickLeaderValue(r, c.values);
+        try w.writeAll("    {\"name\": ");
+        try jsonString(w, c.name);
+        try w.print(",\n     \"slot\": {d}, \"prevValue\": ", .{c.slot});
+        try jsonHex(w, &prev);
+        try w.print(", \"round\": {d}, \"localNode\": ", .{c.round});
+        try jsonHex(w, &vp_local);
+        try w.writeAll(",\n     \"values\": [");
+        for (c.values, 0..) |v, j| {
+            if (j > 0) try w.writeByte(',');
+            try jsonHex(w, v);
+        }
+        try w.writeAll("], \"pickedIndex\": ");
+        if (picked) |idx| {
+            try w.print("{d}, \"pickedValue\": ", .{idx});
+            try jsonHex(w, c.values[idx]);
+        } else {
+            try w.writeAll("null, \"pickedValue\": null");
+        }
+        try w.writeAll(if (i + 1 < vp_cases.len) "},\n" else "}\n");
     }
     try w.writeAll("  ]\n}\n");
 
@@ -546,8 +1090,11 @@ pub fn main(init: std.process.Init) !void {
         try makeStatementVector(gpa, "prepare slot2 ballot counter1, no prepared", seeds[1], prepare_bytes),
     };
 
+    const stmt_cases = try sanityStatementCases(gpa, qsh, nominate_bytes, prepare_bytes);
+
     try writeFile(io, "vectors/crypto.json", try renderCrypto(gpa, &statements));
     try writeFile(io, "vectors/qset.json", try renderQset(gpa));
     try writeFile(io, "vectors/lint.json", try renderLint(gpa));
-    try writeFile(io, "vectors/sanity.json", try renderSanity(gpa, nominate_bytes));
+    try writeFile(io, "vectors/sanity.json", try renderSanity(gpa, nominate_bytes, stmt_cases));
+    try writeFile(io, "vectors/leader.json", try renderLeader(gpa));
 }
