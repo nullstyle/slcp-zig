@@ -1007,7 +1007,19 @@ test "byz crash-at-phase: adversary nominates then goes silent; honest quorum ex
 // per-hop bus latency and the adversary's value/counter choices; every cell
 // must preserve agreement and never trip an invariant or leak.
 
-fn matrixCell(gpa: std.mem.Allocator, seed: u64, actor: enum { equivocator, inflator }) !void {
+pub const MatrixActor = enum { equivocator, inflator };
+
+/// Run every seed in [1, seeds] × {equivocator, inflator}. The §14-M3 accept
+/// gate; `zig build test` runs 50 seeds, `zig build byz-matrix` runs 1000.
+pub fn runMatrix(gpa: std.mem.Allocator, seeds: u64) !void {
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        try matrixCell(gpa, seed, .equivocator);
+        try matrixCell(gpa, seed, .inflator);
+    }
+}
+
+fn matrixCell(gpa: std.mem.Allocator, seed: u64, actor: MatrixActor) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
     const latency: u32 = 5 + rnd.uintAtMost(u32, 200);
@@ -1050,12 +1062,7 @@ fn matrixCell(gpa: std.mem.Allocator, seed: u64, actor: enum { equivocator, infl
 }
 
 test "byz seed matrix: seeds 1..50 x {equivocator, counter-inflator} preserve agreement" {
-    const gpa = testing.allocator;
-    var seed: u64 = 1;
-    while (seed <= 50) : (seed += 1) {
-        try matrixCell(gpa, seed, .equivocator);
-        try matrixCell(gpa, seed, .inflator);
-    }
+    try runMatrix(testing.allocator, 50);
 }
 
 // --- baseline sanity: the harness itself converges with no adversary --------

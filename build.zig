@@ -199,6 +199,18 @@ pub fn build(b: *std.Build) void {
     const sim_matrix_step = b.step("sim-matrix", "Run the FULL 1000-seed simulation matrix (long)");
     sim_matrix_step.dependOn(&run_sim_matrix.step);
 
+    // Full Byzantine seed matrix (§14-M3 accept: 1000 seeds) — manual step.
+    const byz_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("sim/byz_matrix_main.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{.{ .name = "slcp-core", .module = slcp_core_sim }},
+    });
+    const byz_matrix_exe = b.addExecutable(.{ .name = "slcp-byz-matrix", .root_module = byz_matrix_mod });
+    const run_byz_matrix = b.addRunArtifact(byz_matrix_exe);
+    const byz_matrix_step = b.step("byz-matrix", "Run the FULL 1000-seed Byzantine matrix (long)");
+    byz_matrix_step.dependOn(&run_byz_matrix.step);
+
     // Deterministic conformance-vector generator: writes vectors/*.json.
     const gen_vectors = b.addExecutable(.{
         .name = "gen-vectors",
