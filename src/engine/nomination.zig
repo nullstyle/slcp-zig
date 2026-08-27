@@ -519,3 +519,9 @@ pub fn setStateFromEnvelope(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot, st: *const
     _ = st;
     return error.NotImplemented;
 }
+
+/// Ballot protocol calls this at externalize: nomination stops permanently
+/// (§5.4). Implemented by the nomination agent.
+pub fn stopNomination(s: *slot_mod2.Slot) void {
+    _ = s;
+}
