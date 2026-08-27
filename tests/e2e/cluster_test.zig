@@ -455,6 +455,55 @@ fn halfOf(pk: [32]u8) u8 {
 // §10 crash-window carve-out; flood re-delivery also repeats bytes).
 // -----------------------------------------------------------------------
 
+/// Human-readable one-liner for a statement, for violation diagnostics.
+/// Writes into the CALLER's buffer so two descriptions can be formatted into
+/// one print without clobbering each other.
+fn describeStatement(buf: []u8, sr: gen_slcp.Statement.Reader) []const u8 {
+    const describe_buf = buf;
+    const which = sr.getPledges().which() catch return "<bad-union>";
+    const p = sr.getPledges();
+    return switch (which) {
+        .unset => "unset",
+        .nominate => blk: {
+            const n = p.getNominate() catch break :blk "<bad-nominate>";
+            const v = n.getVotes() catch break :blk "<bad-votes>";
+            const a = n.getAccepted() catch break :blk "<bad-accepted>";
+            break :blk std.fmt.bufPrint(describe_buf, "NOMINATE votes={d} accepted={d}", .{ v.len(), a.len() }) catch "<fmt>";
+        },
+        .prepare => blk: {
+            const pr = p.getPrepare() catch break :blk "<bad-prepare>";
+            const b = pr.getBallot() catch break :blk "<bad-ballot>";
+            break :blk std.fmt.bufPrint(describe_buf, "PREPARE b.n={d} nC={d} nH={d}", .{
+                b.getCounter() catch 0, pr.getNC() catch 0, pr.getNH() catch 0,
+            }) catch "<fmt>";
+        },
+        .confirm => blk: {
+            const c = p.getConfirm() catch break :blk "<bad-confirm>";
+            const b = c.getBallot() catch break :blk "<bad-ballot>";
+            break :blk std.fmt.bufPrint(describe_buf, "CONFIRM b.n={d} nPrep={d} nCommit={d} nH={d}", .{
+                b.getCounter() catch 0, c.getNPrepared() catch 0, c.getNCommit() catch 0, c.getNH() catch 0,
+            }) catch "<fmt>";
+        },
+        .externalize => blk: {
+            const e = p.getExternalize() catch break :blk "<bad-ext>";
+            const b = e.getCommit() catch break :blk "<bad-commit>";
+            break :blk std.fmt.bufPrint(describe_buf, "EXTERNALIZE commit.n={d} nH={d}", .{
+                b.getCounter() catch 0, e.getNH() catch 0,
+            }) catch "<fmt>";
+        },
+    };
+}
+
+/// The committed VALUE if this statement is an EXTERNALIZE, else null.
+/// Borrows from the reader's message — use before it is deinitialized.
+fn externalizeCommits(sr: gen_slcp.Statement.Reader) ?[]const u8 {
+    const which = sr.getPledges().which() catch return null;
+    if (which != .externalize) return null;
+    const e = sr.getPledges().getExternalize() catch return null;
+    const commit = e.getCommit() catch return null;
+    return commit.getValue() catch return null;
+}
+
 const Watchdog = struct {
     const Key = struct { slot: u64, is_nom: bool };
 
@@ -480,6 +529,8 @@ const Watchdog = struct {
     /// the non-vacuity witness (a raw seen-counter could be satisfied by
     /// unbaselined new-slot traffic).
     checked_after_mark: std.atomic.Value(u32) = .init(0),
+    /// Legitimate same-value EXTERNALIZE re-emissions (nH growth) observed.
+    ext_regrow: std.atomic.Value(u32) = .init(0),
     marked: std.atomic.Value(bool) = .init(false),
 
     fn create(gpa: std.mem.Allocator, io: std.Io, base_port: u16, target: [32]u8) !*Watchdog {
@@ -559,6 +610,45 @@ const Watchdog = struct {
             var psmsg = core.canonical.decodeFlat(gpa, pstmt, .{}) catch return;
             defer psmsg.deinit();
             const psr = gen_slcp.Statement.Reader.init(&psmsg) catch return;
+
+            // EXTERNALIZE/EXTERNALIZE needs its own rule. `isNewerStatement`
+            // returns false for ANY such pair ("can't have duplicate
+            // EXTERNALIZE") — that is the right answer for the STORAGE
+            // question it exists to answer, but it is not a §10 verdict: a
+            // node legitimately re-emits EXTERNALIZE for one slot with a
+            // GROWN nH as it learns more, and those bytes differ. Judging
+            // that pair by "not newer" would flag normal operation.
+            // What actually matters here is the COMMIT VALUE: two
+            // EXTERNALIZEs committing DIFFERENT values for one slot is a
+            // fork — the most serious violation this watchdog can find — so
+            // check that directly and treat same-value nH growth as legal.
+            if (externalizeCommits(psr)) |base_commit| {
+                if (externalizeCommits(sr)) |new_commit| {
+                    if (post_mark) _ = self.checked_after_mark.fetchAdd(1, .monotonic);
+                    if (!std.mem.eql(u8, base_commit, new_commit)) {
+                        _ = self.violations.fetchAdd(1, .monotonic);
+                        std.debug.print(
+                            "WATCHDOG: FORK — target externalized two different values for slot {d}\n",
+                            .{slot},
+                        );
+                    } else {
+                        // Same value, different bytes ⇒ nH growth. Counted so
+                        // the suite can PROVE this is the shape that a
+                        // comparator-only check would have mis-flagged.
+                        const n = self.ext_regrow.fetchAdd(1, .monotonic);
+                        if (n == 0) {
+                            var b1: [256]u8 = undefined;
+                            var b2: [256]u8 = undefined;
+                            std.debug.print(
+                                "WATCHDOG(info): legitimate EXTERNALIZE re-emit, slot {d}\n  was: {s}\n  now: {s}\n",
+                                .{ slot, describeStatement(&b1, psr), describeStatement(&b2, sr) },
+                            );
+                        }
+                    }
+                    return; // same commit value: nH growth is legitimate
+                }
+            }
+
             const newer = core.statement.isNewerStatement(psr, sr) catch return;
 
             if (post_mark) {
@@ -572,7 +662,12 @@ const Watchdog = struct {
                 _ = self.checked_after_mark.fetchAdd(1, .monotonic);
                 if (!newer) {
                     _ = self.violations.fetchAdd(1, .monotonic);
-                    std.debug.print("WATCHDOG: stale-vs-self from target at slot {d} (nom={})\n", .{ slot, key.is_nom });
+                    var b1: [256]u8 = undefined;
+                    var b2: [256]u8 = undefined;
+                    std.debug.print(
+                        "WATCHDOG: stale-vs-self slot {d} nom={}\n  baseline: {s}\n  offender: {s}\n",
+                        .{ slot, key.is_nom, describeStatement(&b1, psr), describeStatement(&b2, sr) },
+                    );
                 }
                 return; // baseline stays frozen
             }
@@ -792,4 +887,73 @@ test "e2e: an equivocating quorum member cannot fork the honest nodes" {
             try std.testing.expect(!std.mem.startsWith(u8, buf.items, "evil-"));
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// Why the watchdog needs an EXTERNALIZE-specific rule (deterministic proof
+// of the mechanism, so this does not rely on catching a race in a live run).
+//
+// `isNewerStatement` answers a STORAGE question — "should this replace my
+// stored latest for this node+slot?" — and for two EXTERNALIZEs it always
+// answers no ("can't have duplicate EXTERNALIZE"). But the engine
+// legitimately re-emits EXTERNALIZE for one slot with a GROWN nH, and those
+// bytes differ. A watchdog judging §10 by "not byte-identical and not
+// newer ⇒ stale-vs-self" therefore mis-flags normal operation — which is
+// exactly what happened before `externalizeCommits` was introduced.
+// -----------------------------------------------------------------------
+
+fn buildExternalize(gpa: std.mem.Allocator, slot: u64, value: []const u8, n_h: u32) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var st = try gen_slcp.Statement.Builder.init(&mb);
+    const node_id = pubFor(0);
+    try st.setNodeId(&node_id);
+    try st.setSlotIndex(slot);
+    var pledges = st.getPledges();
+    var ext = try pledges.initExternalize();
+    var commit = try ext.initCommit();
+    try commit.setCounter(1);
+    try commit.setValue(value);
+    try ext.setNH(n_h);
+    const qh: [32]u8 = @splat(7);
+    try ext.setCommitQuorumSetHash(&qh);
+    return core.canonical.canonicalFlatFromBuilder(gpa, &mb);
+}
+
+test "watchdog rule: same-value EXTERNALIZE with grown nH is legal but never 'newer'" {
+    const gpa = std.testing.allocator;
+
+    const a = try buildExternalize(gpa, 15, "the-value", 5);
+    defer gpa.free(a);
+    const b = try buildExternalize(gpa, 15, "the-value", 8); // same commit, higher nH
+    defer gpa.free(b);
+
+    // The engine really does produce DIFFERENT bytes for these.
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+
+    var amsg = try core.canonical.decodeFlat(gpa, a, .{});
+    defer amsg.deinit();
+    var bmsg = try core.canonical.decodeFlat(gpa, b, .{});
+    defer bmsg.deinit();
+    const ar = try gen_slcp.Statement.Reader.init(&amsg);
+    const br = try gen_slcp.Statement.Reader.init(&bmsg);
+
+    // The comparator says "not newer" in BOTH directions — so a
+    // comparator-only watchdog would call this pair a self-conflict.
+    try std.testing.expect(!try core.statement.isNewerStatement(ar, br));
+    try std.testing.expect(!try core.statement.isNewerStatement(br, ar));
+
+    // The rule the watchdog actually uses sees them as the same commitment,
+    // which is the truth: no fork, so no §10 violation.
+    const av = externalizeCommits(ar).?;
+    const bv = externalizeCommits(br).?;
+    try std.testing.expectEqualSlices(u8, av, bv);
+
+    // And it still catches the case that IS a violation: a different value.
+    const c = try buildExternalize(gpa, 15, "OTHER-value", 5);
+    defer gpa.free(c);
+    var cmsg = try core.canonical.decodeFlat(gpa, c, .{});
+    defer cmsg.deinit();
+    const cr = try gen_slcp.Statement.Reader.init(&cmsg);
+    try std.testing.expect(!std.mem.eql(u8, av, externalizeCommits(cr).?));
 }
