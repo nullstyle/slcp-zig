@@ -40,6 +40,9 @@ const log = std.log.scoped(.slcp_node);
 /// GC window: keep 16 externalized slots answerable to laggards (§10).
 const purge_window: u64 = 16;
 
+/// Anti-entropy period (§9.2 host policy; see the resync_thread field).
+const resync_interval_ms: u64 = 3_000;
+
 /// A relative-duration Io.Timeout in milliseconds (this Zig's condvar API).
 fn msTimeout(ms: u64) std.Io.Timeout {
     return .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)), .clock = .awake } };
@@ -218,6 +221,22 @@ pub const Node = struct {
     qset_mu: std.Io.Mutex = .init,
     req_qsets: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
 
+    /// Node-owned copies of the peer dial specs. The overlay's dialer threads
+    /// re-parse these on every reconnect for the node's whole lifetime, so
+    /// borrowing the caller's slices would be a use-after-free footgun (it
+    /// WAS one — an e2e dialer crashed parsing a freed string).
+    peer_specs: [][]u8 = &.{},
+
+    /// Anti-entropy thread (§9.2 host policy): every `resync_interval_ms` it
+    /// re-floods our latest own envelopes for live slots + getSlotState(0).
+    /// The engine (faithfully to stellar-core) only emits when its state
+    /// CHANGES — so after a partition heals with connections intact, or after
+    /// message loss, two quiescent sides would otherwise wait on each other
+    /// forever. Periodic re-flooding is the liveness backstop; receivers dedup
+    /// via engine freshness, so there is no relay amplification.
+    resync_thread: ?std.Thread = null,
+    resync_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     pub fn allocator(self: *Node) std.mem.Allocator {
         return self.gpa;
     }
@@ -299,9 +318,23 @@ pub const Node = struct {
         self.store.putQset(local_hash, framed_local);
 
         self.wheel = timers_mod.Wheel.init(gpa, io, onTimerFire, self);
+
+        // Own the peer specs: the overlay's dialers re-parse them on every
+        // reconnect for the node's lifetime; never borrow the caller's.
+        self.peer_specs = try gpa.alloc([]u8, opts.peers.len);
+        var specs_done: usize = 0;
+        errdefer {
+            for (self.peer_specs[0..specs_done]) |s| gpa.free(s);
+            gpa.free(self.peer_specs);
+        }
+        for (opts.peers, 0..) |p, i| {
+            self.peer_specs[i] = try gpa.dupe(u8, p);
+            specs_done += 1;
+        }
+
         self.ov = try overlay_mod.Overlay.init(gpa, io, .{
             .listen_port = opts.listen_port,
-            .peers = opts.peers,
+            .peers = self.peer_specs,
             .network_id_prefix = self.network_id[0..8].*,
             .node_id = node_id,
         }, .{
@@ -362,10 +395,15 @@ pub const Node = struct {
 
         self.live = true; // dispatch may now emit to the network
         self.engine_thread = try std.Thread.spawn(.{}, engineLoop, .{self});
+        self.resync_thread = try std.Thread.spawn(.{}, resyncLoop, .{self});
         return self;
     }
 
     pub fn deinit(self: *Node) void {
+        // The resync thread touches own_mu and the overlay — stop it first.
+        self.resync_stop.store(true, .release);
+        if (self.resync_thread) |t| t.join();
+
         // Wake any app thread blocked in waitExternalized so it returns null.
         self.ext_mu.lockUncancelable(self.io);
         self.ext_closed = true;
@@ -385,6 +423,10 @@ pub const Node = struct {
         self.wheel.stop();
         self.ov.deinit();
         self.wheel.deinit();
+
+        // Dialer threads (the peer-spec readers) were joined in ov.stop().
+        for (self.peer_specs) |s| self.gpa.free(s);
+        self.gpa.free(self.peer_specs);
 
         self.q.deinit();
         self.store.deinit();
@@ -468,6 +510,31 @@ pub const Node = struct {
     fn engineLoop(self: *Node) void {
         while (self.q.pop()) |item| {
             self.applyInput(item);
+        }
+    }
+
+    /// Anti-entropy loop (own thread): re-flood our latest own envelopes for
+    /// live slots + getSlotState(0) every resync_interval_ms. Sleeps in short
+    /// ticks so deinit joins promptly.
+    fn resyncLoop(self: *Node) void {
+        const tick_ms: u64 = 250;
+        var since_ms: u64 = 0;
+        while (!self.resync_stop.load(.acquire)) {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(tick_ms)), .awake) catch {};
+            since_ms += tick_ms;
+            if (since_ms < resync_interval_ms) continue;
+            since_ms = 0;
+            if (self.failed.load(.acquire)) continue;
+
+            // Borrow envelopes under own_mu; the overlay copies on enqueue.
+            self.own_mu.lockUncancelable(self.io);
+            var it = self.own_latest.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.nom) |b| self.ov.broadcast(.{ .envelope = b });
+                if (e.value_ptr.ballot) |b| self.ov.broadcast(.{ .envelope = b });
+            }
+            self.own_mu.unlock(self.io);
+            self.ov.broadcast(.{ .get_slot_state = 0 });
         }
     }
 
@@ -904,6 +971,7 @@ test "node: every method compiles (forces body analysis without instantiation)" 
         Node.onPeerUp,    Node.enqueueEnvelope, Node.onQsetFrame,
         Node.answerGetQset, Node.answerGetSlotState, Node.onTimerFire,
         Node.drainDeliverable, Node.noteQsetRequested, Node.consumeQsetRequested,
+        Node.resyncLoop,
     };
     inline for (fns) |f| {
         const p = &f;
