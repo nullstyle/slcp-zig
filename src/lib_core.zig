@@ -29,6 +29,7 @@ pub const pending = @import("engine/pending.zig");
 pub const qset_store = @import("engine/qset_store.zig");
 pub const emit = @import("engine/emit.zig");
 pub const engine = @import("engine/engine.zig");
+pub const host_codec = @import("engine/host_codec.zig");
 
 test {
     std.testing.refAllDecls(@This());

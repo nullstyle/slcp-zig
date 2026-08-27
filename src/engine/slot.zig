@@ -337,8 +337,13 @@ pub const Slot = struct {
     nom: nomination_mod.State = .{},
     ballot: ballot_mod.State = .{},
     /// Latest stored envelope per node, per protocol (freshness-gated).
-    latest_nom: std.AutoHashMapUnmanaged([32]u8, stored.StoredEnvelope) = .empty,
-    latest_ballot: std.AutoHashMapUnmanaged([32]u8, stored.StoredEnvelope) = .empty,
+    /// Values are BOXED for pointer stability: protocol dispatch can
+    /// self-store into these maps while callers hold a `latestFor` pointer,
+    /// and an inline-value rehash would dangle it (engine bug #1, found by
+    /// the M2 simulator at n>=6). Replacement reuses the box, so a held
+    /// pointer stays valid across updates too.
+    latest_nom: std.AutoHashMapUnmanaged([32]u8, *stored.StoredEnvelope) = .empty,
+    latest_ballot: std.AutoHashMapUnmanaged([32]u8, *stored.StoredEnvelope) = .empty,
     /// Own last-emitted envelopes (persist/rebroadcast source).
     own_nom: ?stored.StoredEnvelope = null,
     own_ballot: ?stored.StoredEnvelope = null,
@@ -358,7 +363,10 @@ pub const Slot = struct {
         self.ballot.deinit(gpa);
         inline for (.{ &self.latest_nom, &self.latest_ballot }) |map| {
             var it = map.valueIterator();
-            while (it.next()) |env| env.deinit(gpa);
+            while (it.next()) |boxed| {
+                boxed.*.deinit(gpa);
+                gpa.destroy(boxed.*);
+            }
             map.deinit(gpa);
         }
         if (self.own_nom) |*e| e.deinit(gpa);
@@ -374,7 +382,7 @@ pub const Slot = struct {
         var total: usize = 0;
         inline for (.{ &self.latest_nom, &self.latest_ballot }) |map| {
             var it = map.valueIterator();
-            while (it.next()) |env| total += env.byteSize();
+            while (it.next()) |boxed| total += boxed.*.byteSize();
         }
         return total;
     }
@@ -382,21 +390,32 @@ pub const Slot = struct {
     /// Replace the stored latest envelope for (node, protocol), returning
     /// the byte-size delta (new - old). Takes ownership of `env`.
     pub fn storeLatest(self: *Slot, gpa: std.mem.Allocator, env: stored.StoredEnvelope) !isize {
-        const map = if (env.statement.isNomination()) &self.latest_nom else &self.latest_ballot;
-        const new_size: isize = @intCast(env.byteSize());
-        const gop = try map.getOrPut(gpa, env.statement.node_id);
+        var owned = env;
+        const map = if (owned.statement.isNomination()) &self.latest_nom else &self.latest_ballot;
+        const new_size: isize = @intCast(owned.byteSize());
+        const gop = map.getOrPut(gpa, owned.statement.node_id) catch |err| {
+            owned.deinit(gpa);
+            return err;
+        };
         if (gop.found_existing) {
-            const old_size: isize = @intCast(gop.value_ptr.byteSize());
-            gop.value_ptr.deinit(gpa);
-            gop.value_ptr.* = env;
+            // Reuse the box: held pointers stay valid across replacement.
+            const old_size: isize = @intCast(gop.value_ptr.*.byteSize());
+            gop.value_ptr.*.deinit(gpa);
+            gop.value_ptr.*.* = owned;
             return new_size - old_size;
         }
-        gop.value_ptr.* = env;
+        const boxed = gpa.create(stored.StoredEnvelope) catch |err| {
+            map.removeByPtr(gop.key_ptr);
+            owned.deinit(gpa);
+            return err;
+        };
+        boxed.* = owned;
+        gop.value_ptr.* = boxed;
         return new_size;
     }
 
     pub fn latestFor(self: *Slot, node: [32]u8, nomination_protocol: bool) ?*stored.StoredEnvelope {
         const map = if (nomination_protocol) &self.latest_nom else &self.latest_ballot;
-        return map.getPtr(node);
+        return map.get(node);
     }
 };

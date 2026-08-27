@@ -310,7 +310,7 @@ const BallotLookup = struct {
 
     fn get(raw: *const anyopaque, node: qset.NodeId) ?*const qset.QuorumSetOwned {
         const self: *const BallotLookup = @ptrCast(@alignCast(raw));
-        if (self.s.latest_ballot.getPtr(node)) |env| {
+        if (self.s.latest_ballot.get(node)) |env| {
             if (env.statement.pledges == .externalize) {
                 return self.s.ballot.singletons.get(node);
             }
@@ -334,7 +334,7 @@ fn collectNodes(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, pred: anytype) ![]qset.
     errdefer out.deinit(ctx.gpa);
     var it = s.latest_ballot.iterator();
     while (it.next()) |entry| {
-        if (pred.matches(&entry.value_ptr.statement)) {
+        if (pred.matches(&entry.value_ptr.*.statement)) {
             try out.append(ctx.gpa, entry.key_ptr.*);
         }
     }
@@ -877,7 +877,7 @@ fn getPrepareCandidates(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, hint: *const st
         // find candidates that may have been prepared (:823-873)
         var it = s.latest_ballot.iterator();
         while (it.next()) |entry| {
-            const st = &entry.value_ptr.statement;
+            const st = &entry.value_ptr.*.statement;
             switch (st.pledges) {
                 .nominate => {},
                 .prepare => |*p| { // :829-847
@@ -1174,7 +1174,7 @@ fn getCommitBoundaries(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, ballot: BV, out:
     const gpa = ctx.gpa;
     var it = s.latest_ballot.iterator();
     while (it.next()) |entry| {
-        const st = &entry.value_ptr.statement;
+        const st = &entry.value_ptr.*.statement;
         switch (st.pledges) {
             .nominate => {},
             .prepare => |*p| { // :1270-1282
@@ -1491,7 +1491,7 @@ fn attemptBump(ctx: *engine_mod.Ctx, s: *slot_mod.Slot) Error!bool {
     defer all_counters.deinit(gpa);
     var it = s.latest_ballot.valueIterator();
     while (it.next()) |env| {
-        const c = statementBallotCounter(&env.statement);
+        const c = statementBallotCounter(&env.*.statement);
         if (c > local_counter) try insertBoundary(gpa, &all_counters, c);
     }
 

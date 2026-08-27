@@ -476,6 +476,136 @@ test "leader vectors: valuePicks replay (pickLeaderValue)" {
 }
 
 // ---------------------------------------------------------------------------
+// traces/*.bin (M2, vector set 6 — §13.4-6): full engine trace replay.
+// Format: magic "SLCPTRC1", then records {u8 kind; u32 LE len; bytes = one
+// framed host.capnp message}; kind 0=config (first record), 1=input,
+// 2=normative effect, 3=observable effect (phase_event only). The replay
+// decodes the config, re-runs every input through a REAL engine, re-encodes
+// our effects via host_codec, and byte-compares against the recorded effect
+// records IN ORDER. kind-3 records are compared through a separate assert:
+// they happen to be deterministic here, but the normative/observability
+// split (§13.4) stays visible — a conforming replayer may ignore them.
+// ---------------------------------------------------------------------------
+
+const engine = slcp.engine;
+const driver = slcp.driver;
+const host_codec = slcp.host_codec;
+
+const trace_magic = "SLCPTRC1";
+const trace_names = [_][]const u8{
+    "single-node-1of1",
+    "insane-and-stale",
+    "qset-park-resume",
+    "timer-bump",
+};
+
+const TraceRecord = struct { kind: u8, payload: []const u8 };
+
+/// Parse one trace file into records (payloads borrow `bytes`).
+fn parseTrace(gpa: std.mem.Allocator, bytes: []const u8) ![]TraceRecord {
+    if (bytes.len < trace_magic.len or !std.mem.eql(u8, bytes[0..trace_magic.len], trace_magic))
+        return error.BadTraceMagic;
+    var recs: std.ArrayList(TraceRecord) = .empty;
+    var i: usize = trace_magic.len;
+    while (i < bytes.len) {
+        if (bytes.len - i < 5) return error.TruncatedTraceRecord;
+        const kind = bytes[i];
+        const len = std.mem.readInt(u32, bytes[i + 1 ..][0..4], .little);
+        i += 5;
+        if (bytes.len - i < len) return error.TruncatedTraceRecord;
+        try recs.append(gpa, .{ .kind = kind, .payload = bytes[i .. i + len] });
+        i += len;
+    }
+    return recs.items;
+}
+
+fn replayTrace(gpa: std.mem.Allocator, recs: []const TraceRecord) !void {
+    try std.testing.expect(recs.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0), recs[0].kind); // config first
+    const cfg = try host_codec.decodeEngineConfig(gpa, recs[0].payload);
+    var eng = try engine.Engine.init(gpa, cfg, driver.Driver.default());
+    defer eng.deinit();
+
+    var statuses_seen = std.enums.EnumSet(engine.InputStatus){};
+    var idx: usize = 1;
+    while (idx < recs.len) {
+        // Record streams alternate: one input record, then its effects.
+        try std.testing.expectEqual(@as(u8, 1), recs[idx].kind);
+        var input = try host_codec.decodeInput(gpa, recs[idx].payload);
+        defer host_codec.deinitInput(gpa, &input);
+        idx += 1;
+        try eng.pushInput(input);
+        while (eng.popEffect()) |eff| {
+            try std.testing.expect(idx < recs.len); // engine produced extra effects
+            const expected = recs[idx];
+            idx += 1;
+            const ours = try host_codec.encodeEffect(gpa, eff);
+            if (expected.kind == 3) {
+                // OBSERVABLE channel (phase_event): pinned here because these
+                // traces are deterministic, via a SEPARATE assert — replayers
+                // may legitimately ignore kind-3 records instead.
+                try std.testing.expect(eff.* == .phase_event);
+                try std.testing.expectEqualSlices(u8, expected.payload, ours);
+            } else {
+                // NORMATIVE channel: byte-exact, no exceptions.
+                try std.testing.expectEqual(@as(u8, 2), expected.kind);
+                try std.testing.expect(eff.* != .phase_event);
+                try std.testing.expectEqualSlices(u8, expected.payload, ours);
+            }
+            if (eff.* == .input_status) statuses_seen.insert(eff.input_status.code);
+            eng.commitEffect();
+        }
+    }
+    try std.testing.expectEqual(recs.len, idx); // recorded effects all consumed
+
+    // Scenario-content guards (the traces must keep exercising what their
+    // names promise).
+    if (statuses_seen.contains(.parked_awaiting_qset)) {
+        try std.testing.expect(statuses_seen.contains(.applied));
+    }
+}
+
+test "trace vectors: byte-exact replay through a real engine" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var any_missing = false;
+    inline for (trace_names) |name| {
+        if (readVector(gpa, "traces/" ++ name ++ ".bin") == null) any_missing = true;
+    }
+    if (any_missing) return error.SkipZigTest; // pre-first-generation bootstrap
+
+    inline for (trace_names) |name| {
+        const bytes = readVector(gpa, "traces/" ++ name ++ ".bin").?;
+        const recs = try parseTrace(gpa, bytes);
+        replayTrace(gpa, recs) catch |err| {
+            std.debug.print("trace replay diverged: {s}\n", .{name});
+            return err;
+        };
+    }
+}
+
+test "trace vectors: scenario statuses cover insane, stale, ignored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const bytes = readVector(gpa, "traces/insane-and-stale.bin") orelse return error.SkipZigTest;
+    const recs = try parseTrace(gpa, bytes);
+    var seen = std.enums.EnumSet(engine.InputStatus){};
+    for (recs) |rec| {
+        if (rec.kind != 2) continue;
+        const eff = try host_codec.decodeEffect(gpa, rec.payload);
+        if (eff == .input_status) seen.insert(eff.input_status.code);
+    }
+    try std.testing.expect(seen.contains(.insane));
+    try std.testing.expect(seen.contains(.stale));
+    try std.testing.expect(seen.contains(.ignored));
+    try std.testing.expect(seen.contains(.applied));
+}
+
+// ---------------------------------------------------------------------------
 // Differential: our canonical bytes vs `capnp convert binary:canonical`
 // (reference CLI; skips when capnp is not installed)
 // ---------------------------------------------------------------------------

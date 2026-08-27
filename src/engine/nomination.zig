@@ -575,7 +575,7 @@ fn nodesWith(gpa: std.mem.Allocator, s: *slot_mod2.Slot, v: []const u8, which: M
     errdefer out.deinit(gpa);
     var it = s.latest_nom.iterator();
     while (it.next()) |e| {
-        const st = &e.value_ptr.statement;
+        const st = &e.value_ptr.*.statement;
         if (st.pledges != .nominate) continue;
         const nom = &st.pledges.nominate;
         const list = switch (which) {
@@ -958,7 +958,7 @@ fn nominateInternal(
     // Add a few more values from other leaders' latest statements
     // (cpp:597-613), cap-gated per §5.4.
     for (s.nom.leaders.items()) |leader| {
-        if (s.latest_nom.getPtr(leader)) |env| {
+        if (s.latest_nom.get(leader)) |env| {
             if (env.statement.pledges != .nominate) continue;
             const nom = &env.statement.pledges.nominate;
             if (ownSetFull(ctx, &s.nom.votes)) break;

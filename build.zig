@@ -63,10 +63,77 @@ pub fn build(b: *std.Build) void {
     });
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
 
-    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e");
+    // Deterministic multi-engine simulator (design §13.1). The smoke matrix
+    // is compute-heavy (hundreds of full consensus runs, Ed25519 throughout),
+    // so the sim binaries upgrade Debug to ReleaseSafe — safety checks stay
+    // on; any explicit -Doptimize choice is respected. The sim gets its own
+    // slcp-core module instance at that optimize level (per-module optimize:
+    // reusing the Debug instance would keep the hot path slow).
+    const sim_optimize: std.builtin.OptimizeMode = if (optimize == .debug) .safe else optimize;
+    const capnpc_core_sim = b.dependency("capnpc_zig", .{
+        .target = target,
+        .optimize = sim_optimize,
+    }).module("capnpc-zig-core");
+    const slcp_core_sim = b.createModule(.{
+        .root_source_file = b.path("src/lib_core.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{
+            .{ .name = "capnpc-zig", .module = capnpc_core_sim },
+        },
+    });
+    const sim_tests = b.addTest(.{
+        .name = "slcp-sim-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/sim_test.zig"),
+            .target = target,
+            .optimize = sim_optimize,
+            .imports = &.{
+                .{ .name = "slcp-core", .module = slcp_core_sim },
+            },
+        }),
+    });
+    const run_sim_tests = b.addRunArtifact(sim_tests);
+
+    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e + sim smoke matrix");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
+    test_step.dependOn(&run_sim_tests.step);
+
+    // One-line repro runner: zig build sim -- --seed=N --nodes=N --scenario=name
+    const sim_exe = b.addExecutable(.{
+        .name = "slcp-sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/main.zig"),
+            .target = target,
+            .optimize = sim_optimize,
+            .imports = &.{
+                .{ .name = "slcp-core", .module = slcp_core_sim },
+            },
+        }),
+    });
+    const run_sim = b.addRunArtifact(sim_exe);
+    run_sim.addPassthruArgs(); // forwards everything after `--`
+    const sim_step = b.step("sim", "Run one simulator cell: -- --seed=N --nodes=N --scenario=name");
+    sim_step.dependOn(&run_sim.step);
+
+    // Full §13.1 matrix (1000 seeds x n 3..7 x 3 scenarios) — manual step.
+    const sim_matrix_exe = b.addExecutable(.{
+        .name = "slcp-sim-matrix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/matrix_main.zig"),
+            .target = target,
+            .optimize = sim_optimize,
+            .imports = &.{
+                .{ .name = "slcp-core", .module = slcp_core_sim },
+            },
+        }),
+    });
+    const run_sim_matrix = b.addRunArtifact(sim_matrix_exe);
+    run_sim_matrix.addPassthruArgs();
+    const sim_matrix_step = b.step("sim-matrix", "Run the FULL 1000-seed simulation matrix (long)");
+    sim_matrix_step.dependOn(&run_sim_matrix.step);
 
     // Deterministic conformance-vector generator: writes vectors/*.json.
     const gen_vectors = b.addExecutable(.{

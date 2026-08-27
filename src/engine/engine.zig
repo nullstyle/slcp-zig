@@ -271,6 +271,14 @@ pub const Engine = struct {
         // Self-insert the local qset: peers advertising our hash must never
         // park on a qset this engine already knows by construction.
         try self.qsets.insert(local_hash, try qset.clone(gpa, &self.cfg.quorum_set));
+        // Self-advertise it too: quorum checks resolve every voter's qset
+        // through the advertised map, and the local node's own statements
+        // (self-processed on emission, §5.4) always advertise local_hash —
+        // without this a quorum that NEEDS self (e.g. a 1-of-{self}
+        // configuration) can never form. Oracle: stellar-core's
+        // getQuorumSetFromStatement always resolves the local node's own
+        // qset. The hash never changes for the engine's lifetime.
+        try self.qsets.setAdvertised(config.node_id, local_hash);
         self.ctx = .{
             .gpa = gpa,
             .cfg = &self.cfg,
