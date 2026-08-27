@@ -299,3 +299,171 @@ fn reserializeQset(gpa: std.mem.Allocator, r: gen_slcp.QuorumSet.Reader) Error![
     try copyQsetReaderInto(&qb, r, core.qset.max_depth);
     return @constCast(mb.toBytes() catch return error.OutOfMemory);
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Build standalone framed Envelope bytes with arbitrary Data fields (wire.zig
+/// only copies the two blobs; they need not be a valid statement).
+fn fakeEnvelope(gpa: std.mem.Allocator, stmt: []const u8, sig: []const u8) ![]u8 {
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var eb = try gen_slcp.Envelope.Builder.init(&mb);
+    try eb.setStatementBytes(stmt);
+    try eb.setSignature(sig);
+    return @constCast(try mb.toBytes());
+}
+
+fn envStatement(gpa: std.mem.Allocator, framed_env: []const u8) ![]u8 {
+    var msg = try Message.init(gpa, framed_env, .{});
+    defer msg.deinit();
+    const r = try gen_slcp.Envelope.Reader.init(&msg);
+    return gpa.dupe(u8, try r.getStatementBytes());
+}
+
+test "wire: scalar frames round-trip" {
+    const gpa = testing.allocator;
+    const cases = [_]OverlayFrame{
+        .{ .ping = 0xDEADBEEF },
+        .{ .pong = 42 },
+        .{ .get_slot_state = 123456789 },
+        .{ .get_qset = @splat(7) },
+        .{ .hello = .{
+            .protocol_version = 1,
+            .network_id_prefix = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            .node_id = @splat(9),
+            .current_slot = 77,
+            .listen_port = 7311,
+        } },
+    };
+    for (cases) |c| {
+        const bytes = try encode(gpa, c);
+        defer gpa.free(bytes);
+        var got = try decode(gpa, bytes);
+        defer got.deinit(gpa);
+        try testing.expectEqual(std.meta.activeTag(c), std.meta.activeTag(got));
+        switch (c) {
+            .ping => |n| try testing.expectEqual(n, got.ping),
+            .pong => |n| try testing.expectEqual(n, got.pong),
+            .get_slot_state => |n| try testing.expectEqual(n, got.get_slot_state),
+            .get_qset => |h| try testing.expectEqualSlices(u8, &h, &got.get_qset),
+            .hello => |h| {
+                try testing.expectEqual(h.protocol_version, got.hello.protocol_version);
+                try testing.expectEqualSlices(u8, &h.network_id_prefix, &got.hello.network_id_prefix);
+                try testing.expectEqualSlices(u8, &h.node_id, &got.hello.node_id);
+                try testing.expectEqual(h.current_slot, got.hello.current_slot);
+                try testing.expectEqual(h.listen_port, got.hello.listen_port);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "wire: dont_have round-trips its id" {
+    const gpa = testing.allocator;
+    const id: [32]u8 = @splat(0xAB);
+    const bytes = try encode(gpa, .{ .dont_have = .{ .kind = 3, .id = &id } });
+    defer gpa.free(bytes);
+    var got = try decode(gpa, bytes);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(u8, 3), got.dont_have.kind);
+    try testing.expectEqualSlices(u8, &id, got.dont_have.id);
+}
+
+test "wire: envelope frame preserves statement + signature bytes" {
+    const gpa = testing.allocator;
+    const sig: [64]u8 = @splat(0x5A);
+    const env = try fakeEnvelope(gpa, "statement-bytes-here", &sig);
+    defer gpa.free(env);
+
+    const frame = try encode(gpa, .{ .envelope = env });
+    defer gpa.free(frame);
+    var got = try decode(gpa, frame);
+    defer got.deinit(gpa);
+
+    const got_stmt = try envStatement(gpa, got.envelope);
+    defer gpa.free(got_stmt);
+    try testing.expectEqualSlices(u8, "statement-bytes-here", got_stmt);
+}
+
+test "wire: qset frame preserves a nested tree" {
+    const gpa = testing.allocator;
+    // Build { threshold=2, validators=[a,b], inner=[{threshold=1, [c]}] }.
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    const va: [32]u8 = @splat(0xA1);
+    const vb_val: [32]u8 = @splat(0xB2);
+    const vc: [32]u8 = @splat(0xC3);
+    var qb = try gen_slcp.QuorumSet.Builder.init(&mb);
+    try qb.setThreshold(2);
+    var vb = try qb.initValidators(2);
+    try vb.set(0, &va);
+    try vb.set(1, &vb_val);
+    var ib = try qb.initInnerSets(1);
+    var child = try ib.get(0);
+    try child.setThreshold(1);
+    var cvb = try child.initValidators(1);
+    try cvb.set(0, &vc);
+    const qbytes = @constCast(try mb.toBytes());
+    defer gpa.free(qbytes);
+
+    const frame = try encode(gpa, .{ .qset = qbytes });
+    defer gpa.free(frame);
+    var got = try decode(gpa, frame);
+    defer got.deinit(gpa);
+
+    var msg = try Message.init(gpa, got.qset, .{});
+    defer msg.deinit();
+    const r = try gen_slcp.QuorumSet.Reader.init(&msg);
+    try testing.expectEqual(@as(u32, 2), try r.getThreshold());
+    const vr = try r.getValidators();
+    try testing.expectEqual(@as(u32, 2), vr.len());
+    try testing.expectEqualSlices(u8, &va, try vr.get(0));
+    const ir = try r.getInnerSets();
+    try testing.expectEqual(@as(u32, 1), ir.len());
+    const cr = try ir.get(0);
+    try testing.expectEqual(@as(u32, 1), try cr.getThreshold());
+}
+
+test "wire: slot_state carries multiple envelopes; over-cap rejected" {
+    const gpa = testing.allocator;
+    const sig0: [64]u8 = @splat(1);
+    const sig1: [64]u8 = @splat(2);
+    const e0 = try fakeEnvelope(gpa, "s0", &sig0);
+    defer gpa.free(e0);
+    const e1 = try fakeEnvelope(gpa, "s1", &sig1);
+    defer gpa.free(e1);
+    const envs = [_][]const u8{ e0, e1 };
+
+    const frame = try encode(gpa, .{ .slot_state = .{ .slot = 9, .envelopes = &envs } });
+    defer gpa.free(frame);
+    var got = try decode(gpa, frame);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(u64, 9), got.slot_state.slot);
+    try testing.expectEqual(@as(usize, 2), got.slot_state.envelopes.len);
+    const s0 = try envStatement(gpa, got.slot_state.envelopes[0]);
+    defer gpa.free(s0);
+    try testing.expectEqualSlices(u8, "s0", s0);
+
+    // Over-cap on encode is rejected.
+    var big: [max_slot_state_envelopes + 1][]const u8 = undefined;
+    for (&big) |*p| p.* = e0;
+    try testing.expectError(error.TooManyEnvelopes, encode(gpa, .{ .slot_state = .{ .slot = 1, .envelopes = &big } }));
+}
+
+test "wire: unset union and garbage are rejected, not UB" {
+    const gpa = testing.allocator;
+    // A Frame with the union left at member 0 (unset) must be rejected.
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var fb = try gen_overlay.Frame.Builder.init(&mb);
+    try fb.setUnset({});
+    const bytes = @constCast(try mb.toBytes());
+    defer gpa.free(bytes);
+    try testing.expectError(error.UnsetUnion, decode(gpa, bytes));
+
+    try testing.expectError(error.MalformedFrame, decode(gpa, &[_]u8{ 0, 1, 2, 3 }));
+}

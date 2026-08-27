@@ -39,13 +39,126 @@ pub const KeyPair = struct {
 
 /// Load the seed at `path`, or create a fresh 0600 key file there.
 pub fn loadOrCreate(io: std.Io, path: []const u8) !KeyPair {
-    _ = io;
-    _ = path;
-    @panic("stub: keys.loadOrCreate — M5 agent");
+    const cwd = std.Io.Dir.cwd();
+    var seed: [32]u8 = undefined;
+
+    if (cwd.openFile(io, path, .{})) |opened| {
+        // Existing key file: it must be exactly 32 raw seed bytes. The buffer
+        // is one byte longer than the seed so an over-length file reads 33 and
+        // fails the `!= 32` check alongside a short one.
+        var file = opened;
+        defer file.close(io);
+        var buf: [33]u8 = undefined;
+        const n = try file.readPositionalAll(io, &buf, 0);
+        if (n != 32) return error.BadKeyFile;
+        seed = buf[0..32].*;
+    } else |err| switch (err) {
+        // First run: mint fresh OS entropy and commit it with owner-only perms
+        // set at creation, so the seed never exists on disk world-readable.
+        // A missing parent dir surfaces here as the underlying fs error.
+        error.FileNotFound => {
+            try io.randomSecure(&seed);
+            var file = try cwd.createFile(io, path, .{
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            });
+            defer file.close(io);
+            try file.writeStreamingAll(io, &seed);
+        },
+        else => return err,
+    }
+
+    return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
 }
 
 /// A random, non-signing identity for watcher mode.
 pub fn ephemeral(io: std.Io) !KeyPair {
-    _ = io;
-    @panic("stub: keys.ephemeral — M5 agent");
+    var seed: [32]u8 = undefined;
+    try io.randomSecure(&seed);
+    return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// The absolute path of `name` inside `tmp`, written into `buf`. Keeps the file
+/// tests off the tmpDir internal layout: `loadOrCreate` resolves paths against
+/// `Dir.cwd()`, and an absolute path is cwd-independent.
+fn tmpPath(io: std.Io, tmp: *std.testing.TmpDir, buf: []u8, name: []const u8) ![]const u8 {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir_buf[0..dir_len], name });
+}
+
+test "loadOrCreate: create then load round-trips to the same key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "node.seed");
+
+    const created = try loadOrCreate(io, path); // first call generates
+    const loaded = try loadOrCreate(io, path); // second call reads it back
+
+    try testing.expectEqualSlices(u8, &created.seed, &loaded.seed);
+    try testing.expectEqualSlices(u8, &created.public_key, &loaded.public_key);
+    // The public key really is the Ed25519 pubkey of the stored seed.
+    const derived = try core.crypto.publicKeyFromSeed(created.seed);
+    try testing.expectEqualSlices(u8, &derived, &created.public_key);
+}
+
+test "loadOrCreate: a key file that is not exactly 32 bytes is rejected" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 31 bytes: one short of the seed length.
+    {
+        const short: [31]u8 = @splat(0xab);
+        var f = try tmp.dir.createFile(io, "short.seed", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, &short);
+    }
+    var short_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const short_path = try tmpPath(io, &tmp, &short_buf, "short.seed");
+    try testing.expectError(error.BadKeyFile, loadOrCreate(io, short_path));
+
+    // 33 bytes: one past the seed length.
+    {
+        const long: [33]u8 = @splat(0xcd);
+        var f = try tmp.dir.createFile(io, "long.seed", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, &long);
+    }
+    var long_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const long_path = try tmpPath(io, &tmp, &long_buf, "long.seed");
+    try testing.expectError(error.BadKeyFile, loadOrCreate(io, long_path));
+}
+
+test "ephemeral: two calls produce distinct random identities" {
+    const io = testing.io;
+    const a = try ephemeral(io);
+    const b = try ephemeral(io);
+    try testing.expect(!std.mem.eql(u8, &a.seed, &b.seed));
+    try testing.expect(!std.mem.eql(u8, &a.public_key, &b.public_key));
+    // Even a non-signing identity carries a valid derived public key.
+    const derived = try core.crypto.publicKeyFromSeed(a.seed);
+    try testing.expectEqualSlices(u8, &derived, &a.public_key);
+}
+
+test "loadOrCreate: a freshly created key file is mode 0600" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "perms.seed");
+    _ = try loadOrCreate(io, path);
+
+    const st = try tmp.dir.statFile(io, "perms.seed", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 }
