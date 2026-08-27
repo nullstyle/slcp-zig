@@ -199,6 +199,44 @@ pub fn build(b: *std.Build) void {
     const sim_matrix_step = b.step("sim-matrix", "Run the FULL 1000-seed simulation matrix (long)");
     sim_matrix_step.dependOn(&run_sim_matrix.step);
 
+    // -----------------------------------------------------------------
+    // WASM host ABI (design §7): `zig build wasm` → slcp_core.wasm.
+    // Settings copied from capnp-zig's wasm-host build step
+    // (build/modules.zig): entry disabled, rdynamic, exported memory,
+    // 4 MiB initial / 64 MiB max (§16's memory-ceiling budget).
+    // The wasm graph needs a WASM-TARGETED slcp-core instance — mixing the
+    // host target into it breaks cross builds.
+    // -----------------------------------------------------------------
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_optimize: std.builtin.OptimizeMode = if (optimize == .debug) .small else optimize;
+    const capnpc_core_wasm = b.dependency("capnpc_zig", .{
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+    }).module("capnpc-zig-core");
+    const slcp_core_wasm = b.createModule(.{
+        .root_source_file = b.path("src/lib_core.zig"),
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+        .imports = &.{.{ .name = "capnpc-zig", .module = capnpc_core_wasm }},
+    });
+    const wasm_exe = b.addExecutable(.{
+        .name = "slcp_core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm/slcp_host_abi.zig"),
+            .target = wasm_target,
+            .optimize = wasm_optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core_wasm }},
+        }),
+    });
+    wasm_exe.entry = .disabled;
+    wasm_exe.rdynamic = true;
+    wasm_exe.export_memory = true;
+    wasm_exe.initial_memory = 4 * 1024 * 1024;
+    wasm_exe.max_memory = 64 * 1024 * 1024;
+    const install_wasm = b.addInstallArtifact(wasm_exe, .{});
+    const wasm_step = b.step("wasm", "Build slcp_core.wasm (wasm32-freestanding, ReleaseSmall)");
+    wasm_step.dependOn(&install_wasm.step);
+
     // Full Byzantine seed matrix (§14-M3 accept: 1000 seeds) — manual step.
     const byz_matrix_mod = b.createModule(.{
         .root_source_file = b.path("sim/byz_matrix_main.zig"),

@@ -83,6 +83,23 @@ pub fn encodeInput(gpa: std.mem.Allocator, input: engine.Input) ![]u8 {
 
 /// Decode a framed host.capnp Input message into an engine Input whose byte
 /// payloads are OWNED copies (free with deinitInput).
+/// Release the owned byte slices a `decodeInput` result carries. (The engine
+/// BORROWS input bytes for the duration of pushInput and copies what it
+/// keeps, so the caller frees right after the push — see the WASM ABI.)
+pub fn freeInput(gpa: std.mem.Allocator, input: *engine.Input) void {
+    switch (input.*) {
+        .envelope_received => |a| gpa.free(a.bytes),
+        .qset_received => |a| gpa.free(a.bytes),
+        .restore_own_envelope => |a| gpa.free(a.bytes),
+        .nominate => |a| {
+            gpa.free(a.value);
+            gpa.free(a.prev_value);
+        },
+        .timer_fired, .purge_slots => {},
+    }
+    input.* = undefined;
+}
+
 pub fn decodeInput(gpa: std.mem.Allocator, bytes: []const u8) !engine.Input {
     var msg = Message.init(gpa, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

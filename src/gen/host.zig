@@ -7,7 +7,7 @@ const message = capnpc.message;
 const schema = capnpc.schema;
 pub const slcp = @import("slcp.zig");
 
-pub const CAPNP_SCHEMA_MANIFEST_JSON: []const u8 = "{\"schema\":\"host.capnp\",\"module\":\"host\",\"serde\":[{\"id\":15903124405932629666,\"type_name\":\"ArmTimer\",\"to_json_export\":\"capnp_host_arm_timer_to_json\",\"from_json_export\":\"capnp_host_arm_timer_from_json\"},{\"id\":9257786637030433681,\"type_name\":\"Effect\",\"to_json_export\":\"capnp_host_effect_to_json\",\"from_json_export\":\"capnp_host_effect_from_json\"},{\"id\":10915493647160307988,\"type_name\":\"EngineConfig\",\"to_json_export\":\"capnp_host_engine_config_to_json\",\"from_json_export\":\"capnp_host_engine_config_from_json\"},{\"id\":15326477830179191870,\"type_name\":\"Input\",\"to_json_export\":\"capnp_host_input_to_json\",\"from_json_export\":\"capnp_host_input_from_json\"},{\"id\":13626237565057910377,\"type_name\":\"Limits\",\"to_json_export\":\"capnp_host_limits_to_json\",\"from_json_export\":\"capnp_host_limits_from_json\"},{\"id\":12360710329149670394,\"type_name\":\"Nominate\",\"to_json_export\":\"capnp_host_nominate_to_json\",\"from_json_export\":\"capnp_host_nominate_from_json\"},{\"id\":13103521417572319097,\"type_name\":\"PhaseEvent\",\"to_json_export\":\"capnp_host_phase_event_to_json\",\"from_json_export\":\"capnp_host_phase_event_from_json\"},{\"id\":18362588208795875415,\"type_name\":\"SlotBytes\",\"to_json_export\":\"capnp_host_slot_bytes_to_json\",\"from_json_export\":\"capnp_host_slot_bytes_from_json\"},{\"id\":12714743831630456463,\"type_name\":\"TimerKey\",\"to_json_export\":\"capnp_host_timer_key_to_json\",\"from_json_export\":\"capnp_host_timer_key_from_json\"},{\"id\":14926265123966185808,\"type_name\":\"ValueList\",\"to_json_export\":\"capnp_host_value_list_to_json\",\"from_json_export\":\"capnp_host_value_list_from_json\"}]}";
+pub const CAPNP_SCHEMA_MANIFEST_JSON: []const u8 = "{\"schema\":\"host.capnp\",\"module\":\"host\",\"serde\":[{\"id\":15903124405932629666,\"type_name\":\"ArmTimer\",\"to_json_export\":\"capnp_host_arm_timer_to_json\",\"from_json_export\":\"capnp_host_arm_timer_from_json\"},{\"id\":9257786637030433681,\"type_name\":\"Effect\",\"to_json_export\":\"capnp_host_effect_to_json\",\"from_json_export\":\"capnp_host_effect_from_json\"},{\"id\":10915493647160307988,\"type_name\":\"EngineConfig\",\"to_json_export\":\"capnp_host_engine_config_to_json\",\"from_json_export\":\"capnp_host_engine_config_from_json\"},{\"id\":15326477830179191870,\"type_name\":\"Input\",\"to_json_export\":\"capnp_host_input_to_json\",\"from_json_export\":\"capnp_host_input_from_json\"},{\"id\":13626237565057910377,\"type_name\":\"Limits\",\"to_json_export\":\"capnp_host_limits_to_json\",\"from_json_export\":\"capnp_host_limits_from_json\"},{\"id\":13233143382098443844,\"type_name\":\"LintDiagnostics\",\"to_json_export\":\"capnp_host_lint_diagnostics_to_json\",\"from_json_export\":\"capnp_host_lint_diagnostics_from_json\"},{\"id\":15028525185792804729,\"type_name\":\"LintFinding\",\"to_json_export\":\"capnp_host_lint_finding_to_json\",\"from_json_export\":\"capnp_host_lint_finding_from_json\"},{\"id\":12360710329149670394,\"type_name\":\"Nominate\",\"to_json_export\":\"capnp_host_nominate_to_json\",\"from_json_export\":\"capnp_host_nominate_from_json\"},{\"id\":13103521417572319097,\"type_name\":\"PhaseEvent\",\"to_json_export\":\"capnp_host_phase_event_to_json\",\"from_json_export\":\"capnp_host_phase_event_from_json\"},{\"id\":18362588208795875415,\"type_name\":\"SlotBytes\",\"to_json_export\":\"capnp_host_slot_bytes_to_json\",\"from_json_export\":\"capnp_host_slot_bytes_from_json\"},{\"id\":12714743831630456463,\"type_name\":\"TimerKey\",\"to_json_export\":\"capnp_host_timer_key_to_json\",\"from_json_export\":\"capnp_host_timer_key_from_json\"},{\"id\":14926265123966185808,\"type_name\":\"ValueList\",\"to_json_export\":\"capnp_host_value_list_to_json\",\"from_json_export\":\"capnp_host_value_list_from_json\"}]}";
 pub fn capnpSchemaManifestJson() []const u8 {
     return CAPNP_SCHEMA_MANIFEST_JSON;
 }
@@ -781,6 +781,112 @@ pub const ValueList = struct {
         pub fn initValues(self: *Builder, element_count: u32) !DataListBuilder {
             const raw = try self._builder.writePointerList(0, element_count);
             return DataListBuilder{ ._list = raw };
+        }
+
+    };
+};
+
+pub const LintFinding = struct {
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn getLevel(self: Reader) !u8 {
+            return self._reader.readU8(0);
+        }
+
+        pub fn getCode(self: Reader) !u16 {
+            return self._reader.readU16(2);
+        }
+
+        pub fn getMembers(self: Reader) !u32 {
+            return self._reader.readU32(4);
+        }
+
+        pub fn getThreshold(self: Reader) !u32 {
+            return self._reader.readU32(8);
+        }
+
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(2, 0);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn setLevel(self: *Builder, value: u8) !void {
+            self._builder.writeU8(0, @bitCast(value));
+        }
+
+        pub fn setCode(self: *Builder, value: u16) !void {
+            self._builder.writeU16(2, @bitCast(value));
+        }
+
+        pub fn setMembers(self: *Builder, value: u32) !void {
+            self._builder.writeU32(4, @bitCast(value));
+        }
+
+        pub fn setThreshold(self: *Builder, value: u32) !void {
+            self._builder.writeU32(8, @bitCast(value));
+        }
+
+    };
+};
+
+pub const LintDiagnostics = struct {
+    const StructListReader = message.typed_list_helpers.StructListReader;
+    const StructListBuilder = message.typed_list_helpers.StructListBuilder;
+
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn getFindings(self: Reader) !StructListReader(LintFinding) {
+            if (self._reader.isPointerNull(0)) return StructListReader(LintFinding){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(0);
+            return StructListReader(LintFinding){ ._list = raw };
+        }
+
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(0, 1);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn initFindings(self: *Builder, element_count: u32) !StructListBuilder(LintFinding) {
+            const raw = try self._builder.writeStructList(0, element_count, 2, 0);
+            return StructListBuilder(LintFinding){ ._list = raw };
         }
 
     };

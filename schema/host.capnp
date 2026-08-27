@@ -50,3 +50,13 @@ struct ArmTimer  { slot @0 :UInt64; timer @1 :UInt8; delayMs @2 :UInt32; }
 struct Nominate  { slot @0 :UInt64; value @1 :Data; prevValue @2 :Data; }
 struct PhaseEvent { slot @0 :UInt64; kind @1 :UInt16; detail @2 :UInt64; }
 struct ValueList { values @0 :List(Data); }   # combine_candidates input frame (§7.3)
+
+# Quorum-set lint diagnostics (§12), returned by the ABI's slcp_lint_qset so
+# every host renders byte-identical findings. Codes mirror qset.LintCode.
+struct LintFinding {
+  level     @0 :UInt8;    # 0 = error (refuse to start), 1 = warning
+  code      @1 :UInt16;   # qset.LintCode ordinal
+  members   @2 :UInt32;   # top-level member count n
+  threshold @3 :UInt32;
+}
+struct LintDiagnostics { findings @0 :List(LintFinding); }
