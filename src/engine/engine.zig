@@ -265,6 +265,7 @@ pub const Engine = struct {
         try self.qsets.addToGraph(&self.cfg.quorum_set);
         try self.qsets.graph.put(gpa, self.cfg.node_id, {});
         self.excised = if (try qset.exciseNode(gpa, &self.cfg.quorum_set, config.node_id)) |e| e else null;
+        errdefer if (self.excised) |*e| e.deinit(gpa);
         const flat = try qset.canonicalBytes(gpa, &self.cfg.quorum_set);
         defer gpa.free(flat);
         const local_hash = crypto.qsetHash(flat);

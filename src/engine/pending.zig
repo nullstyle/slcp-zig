@@ -55,15 +55,19 @@ pub const Pending = struct {
             owned.deinit(self.gpa);
             return false;
         }
-        try self.items.append(self.gpa, .{ .needed_hash = needed_hash, .env = owned });
+        self.items.append(self.gpa, .{ .needed_hash = needed_hash, .env = owned }) catch |err| {
+            owned.deinit(self.gpa);
+            return err;
+        };
         self.total_bytes += owned.byteSize();
         // FIFO-evict past inputs until within caps (never the one just added
         // unless it alone exceeds the byte budget).
         while ((self.items.items.len > self.max_envelopes or self.total_bytes > self.max_bytes) and self.items.items.len > 0) {
             var victim = self.items.orderedRemove(0);
             self.total_bytes -= victim.env.byteSize();
-            try evicted_slots.append(self.gpa, victim.env.statement.slot);
-            victim.env.deinit(self.gpa);
+            const victim_slot = victim.env.statement.slot;
+            victim.env.deinit(self.gpa); // free BEFORE the fallible append: no leak on OOM
+            try evicted_slots.append(self.gpa, victim_slot);
         }
         return true;
     }
@@ -80,9 +84,12 @@ pub const Pending = struct {
         var i: usize = 0;
         while (i < self.items.items.len) {
             if (std.mem.eql(u8, &self.items.items[i].needed_hash, &hash)) {
-                const p = self.items.orderedRemove(i);
+                var p = self.items.orderedRemove(i);
                 self.total_bytes -= p.env.byteSize();
-                try out.append(self.gpa, p.env);
+                out.append(self.gpa, p.env) catch |err| {
+                    p.env.deinit(self.gpa);
+                    return err;
+                };
             } else {
                 i += 1;
             }

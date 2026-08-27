@@ -384,6 +384,16 @@ fn minValidity(a: driver_mod.Validity, b: driver_mod.Validity) driver_mod.Validi
 /// statementValidationLevel over getStatementValues,
 /// BallotProtocol.cpp:2086-2150; the PREPARE b-value is skipped at counter 0
 /// exactly as getStatementValues does).
+/// Pre-store gate for the pipeline (oracle BallotProtocol.cpp:189-249:
+/// validation PRECEDES recordEnvelope, so a driver-invalid PREPARE never
+/// enters the voting universe and the sender's previous statement survives).
+/// Only PREPARE rejects; invalid CONFIRM/EXTERNALIZE demote to maybe_valid
+/// during processing (§5.4 validation-level collapse).
+pub fn statementRejectsPreStore(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedStatement) !bool {
+    if (st.pledges != .prepare) return false;
+    return (try statementValidationLevel(ctx, s, st)) == .invalid;
+}
+
 fn statementValidationLevel(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedStatement) !driver_mod.Validity {
     var lvl: driver_mod.Validity = .valid;
     switch (st.pledges) {

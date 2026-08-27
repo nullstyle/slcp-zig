@@ -62,9 +62,15 @@ pub const Store = struct {
             owned.deinit(self.gpa);
             return;
         }
-        const boxed = try self.gpa.create(qset.QuorumSetOwned);
-        errdefer self.gpa.destroy(boxed);
+        const boxed = self.gpa.create(qset.QuorumSetOwned) catch |err| {
+            owned.deinit(self.gpa);
+            return err;
+        };
         boxed.* = owned;
+        errdefer {
+            boxed.deinit(self.gpa);
+            self.gpa.destroy(boxed);
+        }
         try self.order.append(self.gpa, hash);
         errdefer _ = self.order.pop();
         try self.by_hash.put(self.gpa, hash, boxed);

@@ -70,11 +70,19 @@ pub const ValueSet = struct {
 };
 
 /// Per-slot driver-verdict cache: SHA-256(value) → Validity.
+/// BOUNDED (adversary-fillable: ballot counter-churn with fresh values would
+/// otherwise grow it without limit — M2 safety review F1; the §16 wasm
+/// budget counts it at max_entries × ~40 B). FIFO eviction, deterministic;
+/// a re-validated evictee gets the same verdict (drivers are deterministic).
 pub const ValidationCache = struct {
+    pub const max_entries: usize = 4096;
+
     map: std.AutoHashMapUnmanaged([32]u8, driver_mod.Validity) = .empty,
+    order: std.ArrayList([32]u8) = .empty,
 
     pub fn deinit(self: *ValidationCache, gpa: std.mem.Allocator) void {
         self.map.deinit(gpa);
+        self.order.deinit(gpa);
         self.* = undefined;
     }
 
@@ -89,7 +97,21 @@ pub const ValidationCache = struct {
     }
 
     pub fn put(self: *ValidationCache, gpa: std.mem.Allocator, bytes: []const u8, v: driver_mod.Validity) !void {
-        try self.map.put(gpa, key(bytes), v);
+        const k = key(bytes);
+        const gop = try self.map.getOrPut(gpa, k);
+        if (gop.found_existing) {
+            gop.value_ptr.* = v;
+            return;
+        }
+        gop.value_ptr.* = v;
+        self.order.append(gpa, k) catch |err| {
+            _ = self.map.remove(k);
+            return err;
+        };
+        while (self.map.count() > max_entries and self.order.items.len > 0) {
+            const victim = self.order.orderedRemove(0);
+            _ = self.map.remove(victim);
+        }
     }
 };
 

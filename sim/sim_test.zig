@@ -13,6 +13,8 @@ const std = @import("std");
 const sim = @import("sim.zig");
 const scenario = @import("scenario.zig");
 
+test "oracle scenarios (§13.3)" { _ = @import("oracle_scenarios.zig"); } // pulls the stellar-core oracle-port tests into this bundle
+
 const smoke_seeds_max: u64 = 25;
 const smoke_ns = [_]u8{ 3, 4, 5, 7 };
 const smoke_scenarios = [_]scenario.Name{ .healthy, .lossy20, .partition_heal };

@@ -706,6 +706,28 @@ fn cloneNomStored(gpa: std.mem.Allocator, env: *const stored_mod.StoredEnvelope)
     };
 }
 
+/// Unsigned zero-frame self-record of the current own sets (lagger path —
+/// mirrors ballot.zig's zero-frame self placeholders; M5's slot-state
+/// answering must skip zero-length frames).
+fn placeholderNomStored(gpa: std.mem.Allocator, ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) !stored_mod.StoredEnvelope {
+    const votes = try dupeValueList(gpa, s.nom.votes.slice());
+    errdefer freeValueList(gpa, votes);
+    const accepted = try dupeValueList(gpa, s.nom.accepted.slice());
+    errdefer freeValueList(gpa, accepted);
+    return .{
+        .envelope_framed = try gpa.alloc(u8, 0),
+        .statement = .{
+            .node_id = ctx.cfg.node_id,
+            .slot = s.index,
+            .pledges = .{ .nominate = .{
+                .qset_hash = ctx.local_qset_hash,
+                .votes = votes,
+                .accepted = accepted,
+            } },
+        },
+    };
+}
+
 /// Transcribed from NominationProtocol::emitNomination
 /// (NominationProtocol.cpp:146-189). Emission is gated on started, watcher
 /// mode (§5.1: watcher = zero emissions) and slot fully_validated (the
@@ -727,27 +749,40 @@ fn cloneNomStored(gpa: std.mem.Allocator, env: *const stored_mod.StoredEnvelope)
 /// therefore newest-first under recursion).
 fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
     if (!s.nom.started or s.nom.stopped) return;
-    if (ctx.isWatcher() or !s.fully_validated) return;
+    if (ctx.isWatcher()) return; // non-validators have no own statements
     if (s.nom.votes.len() == 0) return; // wire-sane: votes nonempty (§4.1)
     const gpa = ctx.gpa;
 
-    var env = try emit_mod.emit(ctx, s.index, .{ .nominate = .{
-        .qset_hash = ctx.local_qset_hash,
-        .votes = @ptrCast(s.nom.votes.slice()),
-        .accepted = @ptrCast(s.nom.accepted.slice()),
-    } });
-    {
-        errdefer env.deinit(gpa);
-        var dup = try cloneNomStored(gpa, &env);
-        _ = s.storeLatest(gpa, dup) catch |err| {
-            dup.deinit(gpa);
+    if (!s.fully_validated) {
+        // Lagger self-record (fidelity review F2; oracle self-processes
+        // unconditionally and gates only the WIRE emission,
+        // NominationProtocol.cpp:170-180): store an unsigned zero-frame
+        // placeholder so own votes count in own federated math — nothing
+        // hits the wire and own_nom (the rebroadcast source) is untouched.
+        var placeholder = try placeholderNomStored(gpa, ctx, s);
+        _ = s.storeLatest(gpa, placeholder) catch |err| {
+            placeholder.deinit(gpa);
             return err;
         };
+    } else {
+        var env = try emit_mod.emit(ctx, s.index, .{ .nominate = .{
+            .qset_hash = ctx.local_qset_hash,
+            .votes = @ptrCast(s.nom.votes.slice()),
+            .accepted = @ptrCast(s.nom.accepted.slice()),
+        } });
+        {
+            errdefer env.deinit(gpa);
+            var dup = try cloneNomStored(gpa, &env);
+            _ = s.storeLatest(gpa, dup) catch |err| {
+                dup.deinit(gpa);
+                return err;
+            };
+        }
+        // mLastEnvelope replacement (cpp:172-176; own sets only grow, so the
+        // freshly emitted statement is always the newer one).
+        if (s.own_nom) |*old| old.deinit(gpa);
+        s.own_nom = env;
     }
-    // mLastEnvelope replacement (cpp:172-176; own sets only grow, so the
-    // freshly emitted statement is always the newer one).
-    if (s.own_nom) |*old| old.deinit(gpa);
-    s.own_nom = env;
 
     // Self-process over recursion-safe copies of the emitted sets.
     const lv = try dupeValueList(gpa, s.nom.votes.slice());

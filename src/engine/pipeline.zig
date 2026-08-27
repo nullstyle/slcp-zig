@@ -248,17 +248,40 @@ fn admitResolved(eng: *engine.Engine, s: *slot_mod.Slot, env: stored.StoredEnvel
         return .over_budget;
     }
 
-    // EXTERNALIZE's audit hash is never advertised for quorum math (§5.4:
-    // the sender counts as the singleton {sender, 1}).
-    if (!is_ext) try eng.qsets.setAdvertised(node, qh);
+    // ORACLE ORDER (BallotProtocol.cpp:189-249): driver validation precedes
+    // recording — a driver-invalid PREPARE is rejected WITHOUT storing, so
+    // the sender's previous statement stays in the voting universe.
+    if (!is_nom) {
+        const rejects = ballot_mod.statementRejectsPreStore(&eng.ctx, s, &owned.statement) catch |err| {
+            owned.deinit(gpa);
+            // exhaustive: a new error in the gate's set must be mapped here
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        if (rejects) {
+            owned.deinit(gpa);
+            return .value_invalid;
+        }
+    }
 
     const delta = try s.storeLatest(gpa, owned);
     eng.stored_statement_bytes = @intCast(@as(isize, @intCast(eng.stored_statement_bytes)) + delta);
+    // Advertised AFTER the store (ownership review: an advertise failure
+    // must not leak the in-flight envelope). EXTERNALIZE's audit hash is
+    // never advertised (§5.4: the sender counts as the singleton {sender,1}).
+    if (!is_ext) try eng.qsets.setAdvertised(node, qh);
     const kept = s.latestFor(node, is_nom).?;
 
     // Process BEFORE relaying (stellar-core broadcasts only VALID
-    // envelopes): a driver-invalid value is stored but never forwarded.
-    if (!try dispatchProtocol(eng, s, &kept.statement)) return .value_invalid;
+    // envelopes). A residual protocol rejection (the EXTERNALIZE-phase
+    // value-mismatch arm) purges the stored statement — it must count in no
+    // federated predicate (oracle: never recorded).
+    if (!try dispatchProtocol(eng, s, &kept.statement)) {
+        const freed = s.removeLatest(gpa, node, is_nom);
+        eng.stored_statement_bytes -= freed;
+        return .value_invalid;
+    }
 
     // Freshness advanced + processed ⇒ relay (§5.3): engine freshness IS
     // the dedup.
