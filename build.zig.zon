@@ -1,0 +1,13 @@
+.{
+    .name = .slcp,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.1683",
+    .dependencies = .{
+        .capnpc_zig = .{
+            .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.13.0.tar.gz",
+            .hash = "capnpc_zig-0.13.0-nUduFf0lNgCaVVQ9o0GaglInZ30FjqCq0HBI5PREoDjq",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x7d6ab72da9f52a7,
+}
