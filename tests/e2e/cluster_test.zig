@@ -147,6 +147,9 @@ const Cluster = struct {
     threshold: u32 = 3,
     nodes: [N]?*Node = @splat(null),
     consumers: [N]Consumer = undefined,
+    /// consumers[i] is initialized (spawnNode can fail partway; deinit must
+    /// not touch undefined Consumer memory — review finding).
+    consumers_live: [N]bool = @splat(false),
 
     fn dataDir(self: *Cluster, gpa: std.mem.Allocator, i: usize) ![]u8 {
         return std.fmt.allocPrint(gpa, "{s}/node{d}", .{ self.data_root, i });
@@ -173,12 +176,15 @@ const Cluster = struct {
         });
         self.nodes[i] = node;
         self.consumers[i] = .{ .node = node, .gpa = gpa, .io = self.io };
+        self.consumers_live[i] = true;
         try self.consumers[i].start();
     }
 
     fn killNode(self: *Cluster, i: usize) void {
-        self.consumers[i].stopJoin();
-        self.consumers[i].deinit(); // spawnNode overwrites the slot; free now
+        if (self.consumers_live[i]) {
+            self.consumers[i].stopJoin();
+            self.consumers[i].deinit(); // spawnNode overwrites the slot; free now
+        }
         if (self.nodes[i]) |n| {
             n.deinit();
             self.nodes[i] = null;
@@ -256,10 +262,24 @@ const Cluster = struct {
 
     fn deinit(self: *Cluster) void {
         for (0..N) |i| self.killNode(i);
-        for (0..N) |i| self.consumers[i].deinit();
+        for (0..N) |i| {
+            if (self.consumers_live[i]) self.consumers[i].deinit();
+        }
         removeTree(self.io, self.data_root);
     }
 };
+
+
+/// Bounded progress wait (a stalled cluster must FAIL the test with a
+/// timeout, never hang the runner — review finding).
+fn waitFor(io: std.Io, deadline_ms: u64, cl: *Cluster, pred: *const fn (*Cluster) bool) !void {
+    var waited: u64 = 0;
+    while (!pred(cl)) {
+        if (waited >= deadline_ms) return error.ProgressTimeout;
+        sleepMs(io, 100);
+        waited += 100;
+    }
+}
 
 fn sleepMs(io: std.Io, ms: u64) void {
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
@@ -341,11 +361,19 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
     try cl.proposeAll("r", target);
 
     // Let the cluster make progress, then kill node 3 mid-run.
-    while (cl.minHighestLive() < @max(4, target / 4)) sleepMs(io, 100);
+    try waitFor(io, 120_000, &cl, struct {
+        fn ok(c: *Cluster) bool {
+            return c.minHighestLive() >= @max(4, RESTART_SLOTS / 4);
+        }
+    }.ok);
     cl.killNode(3);
 
     // Cluster keeps going with 3 of 4 (still a quorum).
-    while (cl.consumers[0].highestSlot() < @max(8, target / 2)) sleepMs(io, 100);
+    try waitFor(io, 120_000, &cl, struct {
+        fn ok(c: *Cluster) bool {
+            return c.consumers[0].highestSlot() >= @max(8, RESTART_SLOTS / 2);
+        }
+    }.ok);
 
     // Restart node 3 from its own.log; it must catch up. Re-queue its
     // proposals (the queue died with the process; values are per-node fuel).
@@ -365,7 +393,7 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
     // Watchdog verdict: node 3 was observed BOTH overall and after the
     // restart (non-vacuity), and never conflicted with itself.
     try std.testing.expect(wd.seen.load(.acquire) > 0);
-    try std.testing.expect(wd.seen_after_mark.load(.acquire) > 0);
+    try std.testing.expect(wd.checked_after_mark.load(.acquire) > 0);
     try std.testing.expectEqual(@as(u32, 0), wd.violations.load(.acquire));
 }
 
@@ -387,7 +415,11 @@ test "e2e: partition halts without quorum, heals on reconnect" {
     const target: u64 = PARTITION_SLOTS;
     try cl.proposeAll("p", target);
 
-    while (cl.minHighestLive() < @max(4, target / 5)) sleepMs(io, 100);
+    try waitFor(io, 120_000, &cl, struct {
+        fn ok(c: *Cluster) bool {
+            return c.minHighestLive() >= @max(4, PARTITION_SLOTS / 5);
+        }
+    }.ok);
 
     // Partition {0,1} | {2,3}. Neither half has 3-of-4 → the cluster halts.
     slcp.overlay.setTestLinkFilter(partitionFilter);
@@ -432,10 +464,22 @@ const Watchdog = struct {
     ov: *slcp.overlay.Overlay,
     peers_owned: []const []const u8 = &.{},
     mu: std.Io.Mutex = .init,
+    /// Pre-mark: the newest statement seen per key (kept fresh under flood
+    /// reordering). At mark() this map FREEZES and becomes the §10 baseline:
+    /// every post-mark statement for a baselined key must be byte-identical
+    /// to it (the allowed rebroadcast) or strictly newer — anything else is
+    /// exactly the stale-vs-self / self-conflict Byzantine signature. A
+    /// frozen baseline cannot false-positive on flood reordering of
+    /// POST-restart emissions (those are all newer than the baseline), and a
+    /// stale re-emission is flagged WHENEVER it arrives, so the dialer's
+    /// reconnect-backoff window only delays detection, never loses it.
     latest: std.AutoHashMapUnmanaged(Key, []u8) = .empty,
     violations: std.atomic.Value(u32) = .init(0),
     seen: std.atomic.Value(u32) = .init(0),
-    seen_after_mark: std.atomic.Value(u32) = .init(0),
+    /// Post-mark statements actually CHECKED against a frozen baseline —
+    /// the non-vacuity witness (a raw seen-counter could be satisfied by
+    /// unbaselined new-slot traffic).
+    checked_after_mark: std.atomic.Value(u32) = .init(0),
     marked: std.atomic.Value(bool) = .init(false),
 
     fn create(gpa: std.mem.Allocator, io: std.Io, base_port: u16, target: [32]u8) !*Watchdog {
@@ -497,13 +541,17 @@ const Watchdog = struct {
         const key = Key{ .slot = slot, .is_nom = which == .nominate };
 
         _ = self.seen.fetchAdd(1, .monotonic);
-        if (self.marked.load(.acquire)) _ = self.seen_after_mark.fetchAdd(1, .monotonic);
+        const post_mark = self.marked.load(.acquire);
 
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.latest.get(key)) |prev| {
-            if (std.mem.eql(u8, prev, framed_env)) return; // identical rebroadcast: allowed
-            // Must be strictly newer than what we last saw from this node.
+            if (std.mem.eql(u8, prev, framed_env)) {
+                // Byte-identical: the §10-allowed rebroadcast. Post-mark it is
+                // a real baseline check (the carve-out being exercised).
+                if (post_mark) _ = self.checked_after_mark.fetchAdd(1, .monotonic);
+                return;
+            }
             var pmsg = core.capnpc.message.Message.init(gpa, prev, .{}) catch return;
             defer pmsg.deinit();
             const per = gen_slcp.Envelope.Reader.init(&pmsg) catch return;
@@ -512,17 +560,35 @@ const Watchdog = struct {
             defer psmsg.deinit();
             const psr = gen_slcp.Statement.Reader.init(&psmsg) catch return;
             const newer = core.statement.isNewerStatement(psr, sr) catch return;
+
+            if (post_mark) {
+                // FROZEN-BASELINE check (§10 across the restart): anything
+                // not byte-identical and not strictly newer than the
+                // pre-kill baseline — an older re-emission OR a same-level
+                // conflict — is the stale-vs-self violation. (Late flood
+                // copies of PRE-kill statements cannot arrive here: in-flight
+                // deliveries are millisecond-scale and peers' anti-entropy
+                // re-floods only their own latest.)
+                _ = self.checked_after_mark.fetchAdd(1, .monotonic);
+                if (!newer) {
+                    _ = self.violations.fetchAdd(1, .monotonic);
+                    std.debug.print("WATCHDOG: stale-vs-self from target at slot {d} (nom={})\n", .{ slot, key.is_nom });
+                }
+                return; // baseline stays frozen
+            }
+
+            // Pre-mark: keep the newest (flood reordering makes strictly
+            // older arrivals benign), but a same-level DIFFERENT statement is
+            // live equivocation — flag it.
             if (!newer) {
-                // Flood reordering can deliver an OLDER emission late — that
-                // is benign (receivers drop it as stale). The §10 violation
-                // is a CONFLICT: two different statements where neither is
-                // newer (an equivocating / stale re-emission pair).
                 const older = core.statement.isNewerStatement(sr, psr) catch return;
                 if (older) return; // late delivery of a superseded statement
                 _ = self.violations.fetchAdd(1, .monotonic);
                 std.debug.print("WATCHDOG: self-conflict from target at slot {d} (nom={})\n", .{ slot, key.is_nom });
-                return; // keep the previously-stored statement
+                return;
             }
+        } else if (post_mark) {
+            return; // new key post-mark: no baseline to check against
         }
         const copy = gpa.dupe(u8, framed_env) catch return;
         if (self.latest.fetchPut(gpa, key, copy) catch {

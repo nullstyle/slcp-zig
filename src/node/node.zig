@@ -385,8 +385,20 @@ pub const Node = struct {
         // Resume proposal slot past the highest externalized slot on disk.
         if (rec.externalized_hwm) |hwm| {
             if (hwm + 1 > self.current_slot) self.current_slot = hwm + 1;
-            // Slots <= hwm were journaled pre-crash; app delivery resumes after.
+            // Consensus delivery resumes after the journal high-water mark.
             if (hwm + 1 > self.next_deliver) self.next_deliver = hwm + 1;
+        }
+        // §10: externalized.log is the app-visible journal. A crash can land
+        // between journal append and app consumption, so REPLAY the (compaction
+        // -bounded) journal tail into the app stream — the app dedups by slot
+        // (the §10 contract). Without this, journaled-but-unconsumed values
+        // would be silently lost across a restart (review finding).
+        for (rec.ext_tail) |r| {
+            const v = try gpa.dupe(u8, r.value);
+            self.ext_queue.append(gpa, .{ .slot = r.slot, .value = v }) catch |e| {
+                gpa.free(v);
+                return e;
+            };
         }
 
         // ---- Go live ----
@@ -395,6 +407,14 @@ pub const Node = struct {
 
         self.live = true; // dispatch may now emit to the network
         self.engine_thread = try std.Thread.spawn(.{}, engineLoop, .{self});
+        // If the SECOND spawn fails, the unwind must join the engine thread
+        // BEFORE the earlier errdefers tear down the store/engine/overlay it
+        // is actively using (and before gpa.destroy frees the queue it is
+        // parked on) — review finding: spawn-failure UAF.
+        errdefer {
+            self.q.close();
+            if (self.engine_thread) |t| t.join();
+        }
         self.resync_thread = try std.Thread.spawn(.{}, resyncLoop, .{self});
         return self;
     }
@@ -673,7 +693,10 @@ pub const Node = struct {
         // answer 16 slots back) — jump the frontier to the lowest buffered
         // slot with a loud log.
         const copy = self.gpa.dupe(u8, value) catch {
+            // A journaled slot the app can never see = silent divergence;
+            // going inert is the honest failure (review finding).
             log.err("OOM buffering externalized slot {d}", .{slot});
+            self.markFailed(error.OutOfMemory);
             return;
         };
         if (slot < self.next_deliver) {
@@ -682,6 +705,7 @@ pub const Node = struct {
         }
         const gop = self.pending_ext.getOrPut(self.gpa, slot) catch {
             self.gpa.free(copy);
+            self.markFailed(error.OutOfMemory);
             return;
         };
         if (gop.found_existing) {
@@ -690,14 +714,21 @@ pub const Node = struct {
         }
         gop.value_ptr.* = copy;
 
-        if (self.pending_ext.count() > purge_window) {
-            var lowest: u64 = std.math.maxInt(u64);
-            var it = self.pending_ext.keyIterator();
-            while (it.next()) |k| lowest = @min(lowest, k.*);
-            if (lowest > self.next_deliver) {
-                log.warn("externalized gap: slots {d}..{d} unrecoverable; resuming delivery at {d}", .{ self.next_deliver, lowest - 1, lowest });
-                self.next_deliver = lowest;
-            }
+        // Gap-jump on UNANSWERABILITY: once any buffered slot sits a full
+        // answering window past the frontier, the gap slot is older than
+        // window-16 on every peer — no protocol can ever fill it. (A count
+        // threshold is unreachable: peers can supply at most `purge_window`
+        // old slots — review finding.)
+        var highest: u64 = 0;
+        var lowest: u64 = std.math.maxInt(u64);
+        var it = self.pending_ext.keyIterator();
+        while (it.next()) |k| {
+            highest = @max(highest, k.*);
+            lowest = @min(lowest, k.*);
+        }
+        if (self.pending_ext.count() > 0 and highest >= self.next_deliver + purge_window and lowest > self.next_deliver) {
+            log.warn("externalized gap: slots {d}..{d} unrecoverable; resuming delivery at {d}", .{ self.next_deliver, lowest - 1, lowest });
+            self.next_deliver = lowest;
         }
         self.drainDeliverable();
     }
@@ -714,6 +745,7 @@ pub const Node = struct {
                 self.gpa.free(val);
                 self.ext_mu.unlock(self.io);
                 log.err("OOM queueing externalized slot {d}", .{slot});
+                self.markFailed(error.OutOfMemory);
                 return;
             };
             self.ext_cond.signal(self.io);

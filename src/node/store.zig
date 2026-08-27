@@ -99,12 +99,25 @@ pub const OwnRecord = struct {
     envelope: []u8,
 };
 
+/// One recovered externalized value from the journal.
+pub const ExtRecord = struct {
+    slot: u64,
+    /// Owned by the Recovery.
+    value: []u8,
+};
+
 pub const Recovery = struct {
     /// Latest own envelope per (slot, protocol), ascending. Replay these as
     /// `restore_own_envelope` inputs BEFORE any other input (§10).
     own_latest: []OwnRecord,
     /// Highest externalized slot on disk, or null if none.
     externalized_hwm: ?u64,
+    /// The valid journal records, deduped last-wins per slot, ascending by
+    /// slot (bounded by compaction). §10: externalized.log is the
+    /// app-visible journal — the Node replays this tail into the app stream
+    /// after a restart (the app dedups by slot), so a crash between journal
+    /// append and app consumption never silently loses a value.
+    ext_tail: []ExtRecord,
     /// A structurally complete own.log record failed its crc — the log is
     /// untrusted; the §10 fallback applies.
     own_log_corrupt: bool,
@@ -251,17 +264,39 @@ pub const Store = struct {
 
         var ext_iter = RecordIter{ .data = ext_data };
         var hwm: ?u64 = null;
+        // Journal tail: last-wins per slot (restart replay can append the
+        // same slot twice; agreement makes the values identical anyway).
+        var tail_map: std.AutoArrayHashMapUnmanaged(u64, []u8) = .empty;
+        errdefer {
+            for (tail_map.values()) |v| gpa.free(v);
+            tail_map.deinit(gpa);
+        }
         while (ext_iter.next()) |item| {
             if (hwm == null or item.slot > hwm.?) hwm = item.slot;
+            const copy = try gpa.dupe(u8, item.payload);
+            const gop = try tail_map.getOrPut(gpa, item.slot);
+            if (gop.found_existing) gpa.free(gop.value_ptr.*);
+            gop.value_ptr.* = copy;
         }
         if (ext_iter.tail != .clean) {
             try truncateTo(self.io, self.ext_file, ext_iter.pos);
             if (ext_iter.tail == .torn) torn_tail_repaired = true;
         }
 
+        // Flatten ascending by slot.
+        const ext_tail = try gpa.alloc(ExtRecord, tail_map.count());
+        for (tail_map.keys(), tail_map.values(), 0..) |k, v, i| ext_tail[i] = .{ .slot = k, .value = v };
+        std.mem.sort(ExtRecord, ext_tail, {}, struct {
+            fn lt(_: void, a: ExtRecord, b: ExtRecord) bool {
+                return a.slot < b.slot;
+            }
+        }.lt);
+        tail_map.deinit(gpa); // values now owned by ext_tail
+
         return .{
             .own_latest = own_scan.records,
             .externalized_hwm = hwm,
+            .ext_tail = ext_tail,
             .own_log_corrupt = own_scan.tail == .corrupt,
             .torn_tail_repaired = torn_tail_repaired,
         };
@@ -330,6 +365,8 @@ pub const Store = struct {
     pub fn deinitRecovery(gpa: std.mem.Allocator, rec: *Recovery) void {
         for (rec.own_latest) |r| gpa.free(r.envelope);
         gpa.free(rec.own_latest);
+        for (rec.ext_tail) |r| gpa.free(r.value);
+        gpa.free(rec.ext_tail);
         rec.* = undefined;
     }
 
