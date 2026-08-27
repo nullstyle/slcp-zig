@@ -459,7 +459,13 @@ pub const Overlay = struct {
 
     fn emit(self: *Overlay, frame: wire.OverlayFrame, target: Target) void {
         const bytes = wire.encode(self.gpa, frame) catch |err| {
-            log.warn("overlay: dropping frame, encode failed: {t}", .{err});
+            const detail: usize = switch (frame) {
+                .envelope => |b| b.len,
+                .qset => |b| b.len,
+                .slot_state => |ss| ss.envelopes.len,
+                else => 0,
+            };
+            log.warn("overlay: dropping {s} frame (detail={d}), encode failed: {t}", .{ @tagName(frame), detail, err });
             return;
         };
         defer self.gpa.free(bytes);

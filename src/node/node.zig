@@ -507,6 +507,27 @@ pub const Node = struct {
     // Engine thread
     // -------------------------------------------------------------------
 
+
+    const EmitTarget = union(enum) { all, one: usize, except: usize };
+
+    /// Envelope-emit chokepoint. The engine's latest maps can hold ZERO-FRAME
+    /// placeholder self-records (the lagger path — see nomination.zig's
+    /// placeholderNomStored / ballot.zig's zero-frame self placeholders),
+    /// whose bytes are deliberately empty and MUST NOT go on the wire — the
+    /// engine contract says the host skips zero-length frames. This is that
+    /// skip, for every envelope-bearing send path.
+    fn emitEnvelope(self: *Node, comptime site: []const u8, target: EmitTarget, bytes: []const u8) void {
+        if (bytes.len == 0) {
+            log.debug("skipping zero-frame placeholder envelope at {s}", .{site});
+            return;
+        }
+        switch (target) {
+            .all => self.ov.broadcast(.{ .envelope = bytes }),
+            .one => |id| self.ov.send(id, .{ .envelope = bytes }),
+            .except => |id| self.ov.broadcastExcept(id, .{ .envelope = bytes }),
+        }
+    }
+
     fn engineLoop(self: *Node) void {
         while (self.q.pop()) |item| {
             self.applyInput(item);
@@ -530,8 +551,8 @@ pub const Node = struct {
             self.own_mu.lockUncancelable(self.io);
             var it = self.own_latest.iterator();
             while (it.next()) |e| {
-                if (e.value_ptr.nom) |b| self.ov.broadcast(.{ .envelope = b });
-                if (e.value_ptr.ballot) |b| self.ov.broadcast(.{ .envelope = b });
+                if (e.value_ptr.nom) |b| self.emitEnvelope("resync-nom", .all, b);
+                if (e.value_ptr.ballot) |b| self.emitEnvelope("resync-ballot", .all, b);
             }
             self.own_mu.unlock(self.io);
             self.ov.broadcast(.{ .get_slot_state = 0 });
@@ -596,14 +617,14 @@ pub const Node = struct {
                 // Always record as our latest for on-connect catch-up, even
                 // during restore; only touch the network once live.
                 self.recordOwnLatest(sb.slot, sb.bytes);
-                if (self.live) self.ov.broadcast(.{ .envelope = sb.bytes });
+                if (self.live) self.emitEnvelope("dispatch-broadcast", .all, sb.bytes);
             },
             .forward_envelope => |sb| {
                 if (!self.live) return;
                 if (self.cur_source) |src| {
-                    self.ov.broadcastExcept(src, .{ .envelope = sb.bytes });
+                    self.emitEnvelope("dispatch-forward", .{ .except = src }, sb.bytes);
                 } else {
-                    self.ov.broadcast(.{ .envelope = sb.bytes });
+                    self.emitEnvelope("dispatch-forward-all", .all, sb.bytes);
                 }
             },
             .arm_timer => |a| {
@@ -747,6 +768,10 @@ pub const Node = struct {
     // -------------------------------------------------------------------
 
     fn recordOwnLatest(self: *Node, slot: u64, framed_env: []const u8) void {
+        // Zero-frame placeholders (engine lagger self-records) never reach
+        // effects today, but the skip-zero-frames host contract applies here
+        // too — never let an empty frame into the catch-up source.
+        if (framed_env.len == 0) return;
         const bucket = envelopeBucket(self.gpa, framed_env) catch {
             log.warn("could not bucket own envelope for slot {d}", .{slot});
             return;
@@ -812,8 +837,8 @@ pub const Node = struct {
         self.own_mu.lockUncancelable(self.io);
         var it = self.own_latest.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.nom) |b| self.ov.send(peer_id, .{ .envelope = b });
-            if (e.value_ptr.ballot) |b| self.ov.send(peer_id, .{ .envelope = b });
+            if (e.value_ptr.nom) |b| self.emitEnvelope("peerup-nom", .{ .one = peer_id }, b);
+            if (e.value_ptr.ballot) |b| self.emitEnvelope("peerup-ballot", .{ .one = peer_id }, b);
         }
         self.own_mu.unlock(self.io);
         self.ov.send(peer_id, .{ .get_slot_state = 0 });
