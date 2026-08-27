@@ -580,3 +580,34 @@ test "lint: 2-of-3 warns below-two-thirds is absent, 1-of-3 is sub-majority, 3-o
     try std.testing.expectEqual(@as(usize, 1), f3.len);
     try std.testing.expectEqual(LintCode.all_members_critical, f3[0].code);
 }
+
+/// Deep copy; an already-normalized set stays normalized.
+pub fn clone(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) std.mem.Allocator.Error!QuorumSetOwned {
+    const vals = try gpa.dupe(NodeId, qs.validators);
+    errdefer gpa.free(vals);
+    const inners = try gpa.alloc(QuorumSetOwned, qs.inner_sets.len);
+    var built: usize = 0;
+    errdefer {
+        for (inners[0..built]) |*inner| inner.deinit(gpa);
+        gpa.free(inners);
+    }
+    for (qs.inner_sets, 0..) |*inner, i| {
+        inners[i] = try clone(gpa, inner);
+        built += 1;
+    }
+    return .{ .threshold = qs.threshold, .validators = vals, .inner_sets = inners };
+}
+
+test "clone: deep, hash-identical, independent lifetime" {
+    const gpa = std.testing.allocator;
+    var a = try ownedFlat(gpa, 2, &.{ 1, 2, 3 });
+    defer a.deinit(gpa);
+    try validateAndNormalize(gpa, &a);
+    var b = try clone(gpa, &a);
+    const ha = try hashNormalized(gpa, &a);
+    const hb = try hashNormalized(gpa, &b);
+    try std.testing.expectEqualSlices(u8, &ha, &hb);
+    b.deinit(gpa); // a must stay usable
+    const ha2 = try hashNormalized(gpa, &a);
+    try std.testing.expectEqualSlices(u8, &ha, &ha2);
+}

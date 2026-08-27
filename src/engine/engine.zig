@@ -268,6 +268,9 @@ pub const Engine = struct {
         const flat = try qset.canonicalBytes(gpa, &self.cfg.quorum_set);
         defer gpa.free(flat);
         const local_hash = crypto.qsetHash(flat);
+        // Self-insert the local qset: peers advertising our hash must never
+        // park on a qset this engine already knows by construction.
+        try self.qsets.insert(local_hash, try qset.clone(gpa, &self.cfg.quorum_set));
         self.ctx = .{
             .gpa = gpa,
             .cfg = &self.cfg,

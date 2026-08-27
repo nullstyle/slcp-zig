@@ -50,9 +50,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_vector_tests = b.addRunArtifact(vector_tests);
 
-    const test_step = b.step("test", "Run slcp-core unit tests + vector tests");
+    const e2e_tests = b.addTest(.{
+        .name = "slcp-engine-e2e-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/engine_e2e_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "slcp-core", .module = slcp_core },
+            },
+        }),
+    });
+    const run_e2e_tests = b.addRunArtifact(e2e_tests);
+
+    const test_step = b.step("test", "Run slcp-core unit tests + vector tests + engine e2e");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
+    test_step.dependOn(&run_e2e_tests.step);
 
     // Deterministic conformance-vector generator: writes vectors/*.json.
     const gen_vectors = b.addExecutable(.{
