@@ -1,6 +1,6 @@
 # Validating decode entry point for flat (table-less) single-segment bytes
 
-> **Filed 2026-08-26** as https://github.com/nullstyle/capnp-zig/issues/14 (verbatim, citations re-verified at capnp-zig HEAD 1456826).
+> **DELIVERED 2026-08-26** in capnp-zig v0.14.0 (https://github.com/nullstyle/capnp-zig/releases/tag/v0.14.0). Originally filed as a GitHub issue, later deleted: that repo does not track work in issues — future asks go as drafts/messages. slcp-zig pins v0.14.0 and uses the delivered APIs.
 
 **Ask:** a `Message.initFlat` that validates and decodes a bare single
 segment — the shape `canonical.canonicalizeFlat` emits and `capnp convert

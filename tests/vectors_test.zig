@@ -55,13 +55,13 @@ fn hexFixed(comptime n: usize, s: []const u8) ![n]u8 {
     return out;
 }
 
-/// Straight through the library helpers: decodeFlat returns a FlatMessage
-/// that owns its framed buffer (use-after-free fixed in src/canonical.zig).
+/// Straight through the library helpers: decodeFlat is the zero-copy
+/// `Message.initFlat` (capnp-zig v0.14.0); `flat` outlives the message here.
 fn sanityFlags(gpa: std.mem.Allocator, flat: []const u8) struct { decodes: bool, is_canonical: bool } {
-    var fm = canonical.decodeFlat(gpa, flat, .{}) catch
+    var msg = canonical.decodeFlat(gpa, flat, .{}) catch
         return .{ .decodes = false, .is_canonical = false };
-    defer fm.deinit(gpa);
-    return .{ .decodes = true, .is_canonical = capnpc.canonical.isCanonical(&fm.msg) };
+    defer msg.deinit();
+    return .{ .decodes = true, .is_canonical = capnpc.canonical.isCanonical(&msg) };
 }
 
 /// Rebuild a wire QuorumSet message from a vector-file QS object
@@ -289,9 +289,9 @@ test "sanity vectors: statement sanity replay" {
     var arm_seen: [std.enums.values(statement.InsaneReason).len]bool = @splat(false);
     for (stmts) |c| {
         const flat = try hexAlloc(gpa, field(c, "statementBytes").string);
-        var fm = try canonical.decodeFlat(gpa, flat, .{});
-        defer fm.deinit(gpa);
-        const reader = try gen_slcp.Statement.Reader.init(&fm.msg);
+        var msg = try canonical.decodeFlat(gpa, flat, .{});
+        defer msg.deinit();
+        const reader = try gen_slcp.Statement.Reader.init(&msg);
         const result = statement.checkStatementSane(reader, .{});
         switch (field(c, "insane")) {
             .null => {

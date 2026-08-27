@@ -781,8 +781,8 @@ fn sanityStatementCases(
 
 /// Derived by CALLING checkStatementSane on the decoded bytes.
 fn statementInsaneName(gpa: std.mem.Allocator, flat: []const u8) !?[]const u8 {
-    var fm = try canonical.decodeFlat(gpa, flat, .{});
-    const reader = try gen_slcp.Statement.Reader.init(&fm.msg);
+    var msg = try canonical.decodeFlat(gpa, flat, .{});
+    const reader = try gen_slcp.Statement.Reader.init(&msg);
     return if (statement.checkStatementSane(reader, .{})) |r| @tagName(r) else null;
 }
 
@@ -790,15 +790,14 @@ fn statementInsaneName(gpa: std.mem.Allocator, flat: []const u8) !?[]const u8 {
 // sanity.json (M0 partial: decode/canonicality level; M1 adds statements)
 // ---------------------------------------------------------------------------
 
-/// Derived straight through the library helpers: decodeFlat returns a
-/// FlatMessage that owns its framed buffer (the earlier use-after-free is
-/// fixed in src/canonical.zig; the long-term fix is the upstream flat
-/// validating-decode entry point, docs/upstream/03).
+/// Straight through the library helpers: decodeFlat is the zero-copy
+/// `Message.initFlat` (capnp-zig v0.14.0 — the delivered upstream ask);
+/// `flat` stays alive for the message's lifetime here.
 fn sanityFlags(gpa: std.mem.Allocator, flat: []const u8) !struct { decodes: bool, is_canonical: bool } {
-    var fm = canonical.decodeFlat(gpa, flat, .{}) catch
+    var msg = canonical.decodeFlat(gpa, flat, .{}) catch
         return .{ .decodes = false, .is_canonical = false };
-    defer fm.deinit(gpa);
-    return .{ .decodes = true, .is_canonical = capnpc.canonical.isCanonical(&fm.msg) };
+    defer msg.deinit();
+    return .{ .decodes = true, .is_canonical = capnpc.canonical.isCanonical(&msg) };
 }
 
 fn renderSanity(
