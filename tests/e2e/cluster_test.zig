@@ -331,6 +331,12 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
 
     for (0..N) |i| try cl.spawnNode(i);
     try cl.waitMesh(20_000);
+
+    // Watchdog peer (§14-M5 accept): observes node 3's emissions and asserts
+    // no stale-vs-self conflict, especially after the restart.
+    var wd = try Watchdog.create(gpa, io, cl.base_port, pubFor(3));
+    defer wd.deinit();
+
     const target: u64 = RESTART_SLOTS;
     try cl.proposeAll("r", target);
 
@@ -343,6 +349,7 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
 
     // Restart node 3 from its own.log; it must catch up. Re-queue its
     // proposals (the queue died with the process; values are per-node fuel).
+    wd.mark(); // everything from here on is post-restart
     try cl.spawnNode(3);
     {
         var vbuf: [48]u8 = undefined;
@@ -354,6 +361,12 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
 
     try cl.waitAllReached(target, 180_000);
     try assertAgreement(&cl, target);
+
+    // Watchdog verdict: node 3 was observed BOTH overall and after the
+    // restart (non-vacuity), and never conflicted with itself.
+    try std.testing.expect(wd.seen.load(.acquire) > 0);
+    try std.testing.expect(wd.seen_after_mark.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u32, 0), wd.violations.load(.acquire));
 }
 
 test "e2e: partition halts without quorum, heals on reconnect" {
@@ -401,6 +414,135 @@ fn halfOf(pk: [32]u8) u8 {
     }
     return 2; // unknown (e.g. equivocator) — its own island
 }
+
+// -----------------------------------------------------------------------
+// Watchdog peer (§14-M5 accept): a raw overlay observer that records every
+// envelope a TARGET node emits and asserts the per-(slot, protocol) stream
+// is never stale-vs-self — each successive statement must be strictly newer
+// (core.statement.isNewerStatement) or a byte-identical rebroadcast (the
+// §10 crash-window carve-out; flood re-delivery also repeats bytes).
+// -----------------------------------------------------------------------
+
+const Watchdog = struct {
+    const Key = struct { slot: u64, is_nom: bool };
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    target: [32]u8,
+    ov: *slcp.overlay.Overlay,
+    peers_owned: []const []const u8 = &.{},
+    mu: std.Io.Mutex = .init,
+    latest: std.AutoHashMapUnmanaged(Key, []u8) = .empty,
+    violations: std.atomic.Value(u32) = .init(0),
+    seen: std.atomic.Value(u32) = .init(0),
+    seen_after_mark: std.atomic.Value(u32) = .init(0),
+    marked: std.atomic.Value(bool) = .init(false),
+
+    fn create(gpa: std.mem.Allocator, io: std.Io, base_port: u16, target: [32]u8) !*Watchdog {
+        const self = try gpa.create(Watchdog);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .io = io, .target = target, .ov = undefined };
+
+        const network_id = crypto.networkIdFromPassphrase(NETWORK);
+        const peers = try addrList(gpa, base_port, N, N); // dial all real nodes
+        errdefer freeAddrList(gpa, peers);
+        const ov = try gpa.create(slcp.overlay.Overlay);
+        errdefer gpa.destroy(ov);
+        ov.* = try slcp.overlay.Overlay.init(gpa, io, .{
+            .listen_port = 0,
+            .peers = peers,
+            .network_id_prefix = network_id[0..8].*,
+            .node_id = pubFor(N + 1),
+        }, .{ .ctx = self, .on_recv = onRecv, .on_peer_up = onPeerUp });
+        self.ov = ov;
+        self.peers_owned = peers;
+        try self.ov.start();
+        return self;
+    }
+
+    /// Everything from here on counts as "after the restart".
+    fn mark(self: *Watchdog) void {
+        self.marked.store(true, .release);
+    }
+
+    fn onPeerUp(ctx: ?*anyopaque, peer_id: usize) void {
+        _ = ctx;
+        _ = peer_id;
+    }
+
+    fn onRecv(ctx: ?*anyopaque, peer_id: usize, frame: *const slcp.wire.OverlayFrame) void {
+        _ = peer_id;
+        const self: *Watchdog = @ptrCast(@alignCast(ctx.?));
+        switch (frame.*) {
+            .envelope => |bytes| self.observe(bytes),
+            else => {},
+        }
+    }
+
+    fn observe(self: *Watchdog, framed_env: []const u8) void {
+        const gpa = self.gpa;
+        // Decode: framed envelope -> statement reader; filter to the target.
+        var emsg = core.capnpc.message.Message.init(gpa, framed_env, .{}) catch return;
+        defer emsg.deinit();
+        const er = gen_slcp.Envelope.Reader.init(&emsg) catch return;
+        const stmt_bytes = er.getStatementBytes() catch return;
+        var smsg = core.canonical.decodeFlat(gpa, stmt_bytes, .{}) catch return;
+        defer smsg.deinit();
+        const sr = gen_slcp.Statement.Reader.init(&smsg) catch return;
+        const nid = sr.getNodeId() catch return;
+        if (nid.len != 32 or !std.mem.eql(u8, nid, &self.target)) return;
+
+        const slot = sr.getSlotIndex() catch return;
+        const which = sr.getPledges().which() catch return;
+        const key = Key{ .slot = slot, .is_nom = which == .nominate };
+
+        _ = self.seen.fetchAdd(1, .monotonic);
+        if (self.marked.load(.acquire)) _ = self.seen_after_mark.fetchAdd(1, .monotonic);
+
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.latest.get(key)) |prev| {
+            if (std.mem.eql(u8, prev, framed_env)) return; // identical rebroadcast: allowed
+            // Must be strictly newer than what we last saw from this node.
+            var pmsg = core.capnpc.message.Message.init(gpa, prev, .{}) catch return;
+            defer pmsg.deinit();
+            const per = gen_slcp.Envelope.Reader.init(&pmsg) catch return;
+            const pstmt = per.getStatementBytes() catch return;
+            var psmsg = core.canonical.decodeFlat(gpa, pstmt, .{}) catch return;
+            defer psmsg.deinit();
+            const psr = gen_slcp.Statement.Reader.init(&psmsg) catch return;
+            const newer = core.statement.isNewerStatement(psr, sr) catch return;
+            if (!newer) {
+                // Flood reordering can deliver an OLDER emission late — that
+                // is benign (receivers drop it as stale). The §10 violation
+                // is a CONFLICT: two different statements where neither is
+                // newer (an equivocating / stale re-emission pair).
+                const older = core.statement.isNewerStatement(sr, psr) catch return;
+                if (older) return; // late delivery of a superseded statement
+                _ = self.violations.fetchAdd(1, .monotonic);
+                std.debug.print("WATCHDOG: self-conflict from target at slot {d} (nom={})\n", .{ slot, key.is_nom });
+                return; // keep the previously-stored statement
+            }
+        }
+        const copy = gpa.dupe(u8, framed_env) catch return;
+        if (self.latest.fetchPut(gpa, key, copy) catch {
+            gpa.free(copy);
+            return;
+        }) |old| gpa.free(old.value);
+    }
+
+    fn deinit(self: *Watchdog) void {
+        self.ov.stop();
+        self.ov.deinit();
+        self.gpa.destroy(self.ov);
+        var it = self.latest.valueIterator();
+        while (it.next()) |v| self.gpa.free(v.*);
+        self.latest.deinit(self.gpa);
+        freeAddrList(self.gpa, self.peers_owned);
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+};
 
 // -----------------------------------------------------------------------
 // Scenario 4: an equivocating quorum member
