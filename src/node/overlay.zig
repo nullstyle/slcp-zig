@@ -31,6 +31,9 @@
 //!
 //!   * One accept thread (`acceptLoop`) blocks in `Server.accept`. Each
 //!     accepted stream becomes a heap `Conn` and a reader thread (`connThread`).
+//!     Inbound conns are capped at `max_inbound_conns` (over-cap accepts are
+//!     closed immediately), and finished reader threads are reaped on each
+//!     accept iteration, so thread/handle growth is bounded by LIVE conns.
 //!   * One dialer thread per configured peer (`dialerLoop`) owns exactly one
 //!     outbound connection at a time and reconnects with exponential backoff
 //!     (1s→60s) plus deterministic per-peer jitter (Wyhash over the attempt
@@ -39,22 +42,43 @@
 //!     the `Conn`, send OUR Hello first, read the peer's first frame and
 //!     require a matching Hello, then start the writer, assign a stable
 //!     peer_id, fire `on_peer_up`, and enter the read loop delivering frames
-//!     to `on_recv`.
+//!     to `on_recv`. A conn whose writer thread fails to start is torn down,
+//!     never published (a writer-less conn would sync-write under conns_mu).
+//!
+//! Resource bounds (§9.1 hardening):
+//!   * Frames are capped at `max_frame_bytes` (1 MiB): the framer's buffered
+//!     bytes are limited to one max-size frame plus one read chunk, and since
+//!     frames are popped after every push, exceeding that means an oversized
+//!     frame — framing error, disconnect.
+//!   * Each conn's write queue is bounded (`max_write_queue_items` /
+//!     `max_write_queue_bytes`). A Hello-complete peer that stops draining
+//!     overflows it; the overflow fails the enqueue and force-disconnects the
+//!     conn (socket shutdown → its reader unblocks → normal teardown).
+//!   * The handshake has a receive deadline (`handshake_timeout_s`, via
+//!     SO_RCVTIMEO, cleared once the Hello completes): a peer that connects
+//!     but never sends its Hello cannot wedge a reader thread forever. While
+//!     the deadline is armed, reads go through `std.posix.read` (not the Io
+//!     vtable) so a timeout surfaces as error.WouldBlock — Io.Threaded treats
+//!     EAGAIN as a programmer bug and would panic in debug builds.
 //!
 //! Shutdown (`stop`, idempotent): flip `stopping`, wake the dialers' backoff
-//! condvar, `shutdown`+close the listener (which — per `Server.accept`'s
-//! documented contract — unblocks a parked accept), join the accept thread
-//! (after which no new inbound conns appear), `shutdown` every live socket
-//! (so every reader's blocking `read` returns EOF and every writer wakes),
-//! then join every reader and dialer thread. Each reader frees its own `Conn`
-//! on the way out, so after the joins the peer table is empty; `deinit` frees
+//! condvar, wake the accept thread WITHOUT invalidating the listener fd
+//! (netShutdown per `Server.accept`'s documented cancellation contract, plus
+//! a loopback self-connect for OSes where shutting down a listening socket is
+//! a no-op — e.g. macOS), JOIN the accept thread, and only then close the
+//! listener and clear the field (so the accept thread can never see a null
+//! server or a closed/recycled fd). Then `shutdown` every live socket (so
+//! every reader's blocking `read` returns EOF and every writer wakes), and
+//! join every reader and dialer thread. Each reader frees its own `Conn` on
+//! the way out, so after the joins the peer table is empty; `deinit` frees
 //! the table.
 //!
 //! Sends hold the peer-table mutex across `enqueue` (which only touches the
-//! connection's own queue lock, never blocking I/O), while a reader's teardown
-//! removes its `Conn` from the table under the same mutex before tearing the
-//! socket down — so a send never races a free. Readers enter the table only
-//! AFTER starting the writer, so `enqueue` is always the async path and no two
+//! connection's own queue lock and — on overflow — a non-blocking socket
+//! shutdown, never blocking I/O), while a reader's teardown removes its
+//! `Conn` from the table under the same mutex before tearing the socket down
+//! — so a send never races a free. Readers enter the table only AFTER
+//! starting the writer, so `enqueue` is always the async path and no two
 //! threads ever sync-write the same fd.
 //! ========================================================================
 
@@ -72,6 +96,27 @@ const framing = capnpc.rpc.wire.framing;
 pub const default_read_buffer_size: usize = 256 * 1024;
 pub const inbound_rate_soft_cap_bytes_per_s: usize = 256 * 1024;
 pub const max_outstanding_requests: usize = 64;
+
+/// §9.1: largest wire frame we accept (1 MiB). Enforced through the framer's
+/// buffered-bytes cap — see the implementation notes above.
+pub const max_frame_bytes: usize = 1 << 20;
+/// Per-conn write queue bounds. Overflow means the peer stopped draining:
+/// the enqueue fails and the conn is force-disconnected.
+pub const max_write_queue_items: usize = 1024;
+pub const max_write_queue_bytes: usize = 16 * 1024 * 1024;
+/// Maximum concurrently-live inbound connections; over-cap accepts are
+/// closed immediately, before any per-conn resources are allocated.
+pub const max_inbound_conns: usize = 128;
+
+/// Runtime inbound cap. Production always runs the `max_inbound_conns`
+/// default; file-private so a test can lower it to something small without
+/// opening 128 real sockets.
+var inbound_conn_cap: usize = max_inbound_conns;
+
+/// Handshake receive deadline (seconds): a peer that connects but never
+/// sends its Hello is disconnected after this long (SO_RCVTIMEO on the raw
+/// fd, cleared once the Hello exchange completes).
+const handshake_timeout_s: u32 = 10;
 
 /// Consecutive per-peer budget breaches before we disconnect the peer. Kept
 /// well clear of anything healthy loopback traffic produces.
@@ -130,14 +175,20 @@ const Conn = struct {
     id: usize = 0,
     hello_done: bool = false,
     outbound: bool = false,
+    /// True while the handshake deadline (SO_RCVTIMEO) is armed; reads then
+    /// bypass the Io vtable (see `read`). Reader-thread-local.
+    in_handshake: bool = true,
     /// The peer's advertised (unauthenticated) nodeId from its Hello. Used
     /// only by the test link filter to simulate network partitions.
     peer_node_id: [32]u8 = @splat(0),
 
-    // Async write queue drained by the writer thread.
+    // Async write queue drained by the writer thread. Bounded by
+    // `max_write_queue_items` / `max_write_queue_bytes` (`wq_bytes` tracks
+    // the queued payload bytes; zeroed when the writer takes the batch).
     wq_mu: std.Io.Mutex = .init,
     wq_cond: std.Io.Condition = .init,
     wq: std.ArrayListUnmanaged([]u8) = .empty,
+    wq_bytes: usize = 0,
     wq_closed: bool = false,
     writer_started: bool = false,
     writer_thread: ?std.Thread = null,
@@ -148,24 +199,55 @@ const Conn = struct {
     win_reqs: usize = 0,
     strikes: u32 = 0,
 
-    fn read(self: *Conn) net.Stream.Reader.Error!usize {
+    fn read(self: *Conn) !usize {
+        if (comptime builtin.target.os.tag != .windows) {
+            if (self.in_handshake) {
+                // The handshake deadline (SO_RCVTIMEO) is armed: read via
+                // std.posix so a timeout surfaces as error.WouldBlock.
+                // Io.Threaded's read path treats EAGAIN as a programmer bug
+                // (debug panic), so it must not see a timed-out read.
+                return std.posix.read(self.stream.socket.handle, self.read_buf);
+            }
+        }
         var bufs: [1][]u8 = .{self.read_buf};
         return self.stream.read(self.io, &bufs);
     }
 
     /// Copy `bytes` onto the write queue (async) or, before the writer thread
     /// exists (handshake), write them synchronously on the caller's thread.
+    /// The queue is bounded: on overflow the peer is treated as dead — the
+    /// queue closes, the socket is shut down (so the conn's reader unblocks
+    /// and the normal teardown path runs), and the enqueue fails. Never
+    /// blocks on I/O once the writer is started.
     fn enqueue(self: *Conn, bytes: []const u8) !void {
         if (!self.writer_started) {
             return writeAll(self.io, self.stream.socket.handle, bytes);
         }
-        self.wq_mu.lockUncancelable(self.io);
-        defer self.wq_mu.unlock(self.io);
-        if (self.wq_closed) return error.WriteClosed;
-        const copy = try self.gpa.dupe(u8, bytes);
-        errdefer self.gpa.free(copy);
-        try self.wq.append(self.gpa, copy);
-        self.wq_cond.signal(self.io);
+        {
+            self.wq_mu.lockUncancelable(self.io);
+            defer self.wq_mu.unlock(self.io);
+            if (self.wq_closed) return error.WriteClosed;
+            if (self.wq.items.len < max_write_queue_items and
+                self.wq_bytes + bytes.len <= max_write_queue_bytes)
+            {
+                const copy = try self.gpa.dupe(u8, bytes);
+                self.wq.append(self.gpa, copy) catch |err| {
+                    self.gpa.free(copy);
+                    return err;
+                };
+                self.wq_bytes += copy.len;
+                self.wq_cond.signal(self.io);
+                return;
+            }
+            log.warn("overlay: peer {d} write queue overflow ({d} items, {d} B); disconnecting", .{
+                self.id, self.wq.items.len, self.wq_bytes,
+            });
+            self.wq_closed = true;
+            self.wq_cond.broadcast(self.io);
+        }
+        // Shut the socket down outside wq_mu (shutdown() would re-lock it).
+        self.stream.shutdown(self.io, .both) catch {};
+        return error.WriteQueueFull;
     }
 
     fn startWriter(self: *Conn) !void {
@@ -188,6 +270,7 @@ const Conn = struct {
             }
             var batch = self.wq;
             self.wq = .empty;
+            self.wq_bytes = 0;
             self.wq_mu.unlock(io);
 
             var failed = false;
@@ -234,6 +317,15 @@ const Conn = struct {
     }
 };
 
+/// Join-handle record for one inbound reader thread. Heap-allocated so the
+/// thread can flip `done` (its very last action) after its `Conn` is already
+/// destroyed; freed by whoever joins the thread — the accept loop's reaper,
+/// or `joinAll` at stop.
+const InboundSlot = struct {
+    thread: std.Thread = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
 pub const Overlay = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -250,12 +342,15 @@ pub const Overlay = struct {
 
     server: ?net.Server = null,
     accept_thread: ?std.Thread = null,
-    /// Reader threads spawned by the accept thread (one per inbound conn).
-    conn_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    /// One record per inbound reader thread (spawned by the accept thread).
+    /// Finished threads are reaped on each accept iteration, so this grows
+    /// with LIVE inbound conns (≤ the inbound cap), not historical ones.
+    inbound_slots: std.ArrayListUnmanaged(*InboundSlot) = .empty,
     /// One dialer thread per configured peer (fixed for our lifetime).
     dialer_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
 
-    /// Guards `conns`, per-conn id/hello_done, and `next_peer_id`.
+    /// Guards `conns`, `inbound_slots`, per-conn id/hello_done, and
+    /// `next_peer_id`.
     conns_mu: std.Io.Mutex = .init,
     /// Every live connection (handshaking + established), for send/broadcast
     /// iteration and for shutdown fan-out.
@@ -347,7 +442,7 @@ pub const Overlay = struct {
         // itself and freed its own socket/buffers; only the backing lists are
         // left.
         self.conns.deinit(self.gpa);
-        self.conn_threads.deinit(self.gpa);
+        self.inbound_slots.deinit(self.gpa);
         self.dialer_threads.deinit(self.gpa);
         self.server = null;
     }
@@ -380,7 +475,8 @@ pub const Overlay = struct {
             }
             // Test-only partition simulation; a no-op in production.
             if (!linkAllowed(self.cfg.node_id, conn.peer_node_id)) continue;
-            // enqueue copies `bytes` and only touches the conn's queue lock; it
+            // enqueue copies `bytes` and only touches the conn's queue lock
+            // (plus, on queue overflow, a non-blocking socket shutdown); it
             // never blocks on I/O, so holding conns_mu is fine.
             conn.enqueue(bytes) catch |err| {
                 log.debug("overlay: enqueue to peer {d} failed: {t}", .{ conn.id, err });
@@ -404,27 +500,77 @@ pub const Overlay = struct {
                 stream.close(self.io);
                 break;
             }
+            // Reap finished reader threads, then enforce the inbound cap
+            // BEFORE allocating anything for this conn.
+            self.reapInboundThreads();
+            if (self.inboundConnCount() >= inbound_conn_cap) {
+                log.warn("overlay: inbound conn cap ({d}) reached; closing new conn", .{inbound_conn_cap});
+                stream.close(self.io);
+                continue;
+            }
             setTcpNoDelay(stream.socket.handle);
             self.startInboundConn(stream);
         }
     }
 
+    fn inboundConnCount(self: *Overlay) usize {
+        self.conns_mu.lockUncancelable(self.io);
+        defer self.conns_mu.unlock(self.io);
+        return self.inbound_slots.items.len;
+    }
+
+    /// Join and free inbound-thread records whose reader has finished (its
+    /// `done` flag is its last action, so these joins cannot block). Runs on
+    /// the accept thread between accepts, a bounded batch per call; `joinAll`
+    /// handles whatever is left at stop.
+    fn reapInboundThreads(self: *Overlay) void {
+        var done_buf: [16]*InboundSlot = undefined;
+        var done_n: usize = 0;
+        {
+            self.conns_mu.lockUncancelable(self.io);
+            defer self.conns_mu.unlock(self.io);
+            var i: usize = 0;
+            while (i < self.inbound_slots.items.len and done_n < done_buf.len) {
+                const slot = self.inbound_slots.items[i];
+                if (slot.done.load(.acquire)) {
+                    done_buf[done_n] = slot;
+                    done_n += 1;
+                    _ = self.inbound_slots.swapRemove(i);
+                    continue; // a new item moved into index i
+                }
+                i += 1;
+            }
+        }
+        for (done_buf[0..done_n]) |slot| {
+            slot.thread.join();
+            self.gpa.destroy(slot);
+        }
+    }
+
     fn startInboundConn(self: *Overlay, stream: net.Stream) void {
         const conn = self.makeConn(stream, false) orelse return;
+        const slot = self.gpa.create(InboundSlot) catch {
+            conn.deinit();
+            self.gpa.destroy(conn);
+            return;
+        };
+        slot.* = .{};
         self.conns_mu.lockUncancelable(self.io);
         defer self.conns_mu.unlock(self.io);
         // Reserve the join slot before spawning so we can never lose a handle.
-        self.conn_threads.ensureUnusedCapacity(self.gpa, 1) catch {
+        self.inbound_slots.ensureUnusedCapacity(self.gpa, 1) catch {
+            self.gpa.destroy(slot);
             conn.deinit();
             self.gpa.destroy(conn);
             return;
         };
-        const t = std.Thread.spawn(.{}, connThread, .{ self, conn }) catch {
+        slot.thread = std.Thread.spawn(.{}, connThread, .{ self, conn, slot }) catch {
+            self.gpa.destroy(slot);
             conn.deinit();
             self.gpa.destroy(conn);
             return;
         };
-        self.conn_threads.appendAssumeCapacity(t);
+        self.inbound_slots.appendAssumeCapacity(slot);
     }
 
     fn dialerLoop(self: *Overlay, peer_index: usize) void {
@@ -486,8 +632,10 @@ pub const Overlay = struct {
     // Per-connection lifecycle (reader thread)
     // -----------------------------------------------------------------------
 
-    fn connThread(self: *Overlay, conn: *Conn) void {
+    fn connThread(self: *Overlay, conn: *Conn, slot: *InboundSlot) void {
         self.runConnection(conn);
+        // Last action: publish that this thread is joinable (see reaper).
+        slot.done.store(true, .release);
     }
 
     fn runConnection(self: *Overlay, conn: *Conn) void {
@@ -511,14 +659,34 @@ pub const Overlay = struct {
         };
         self.conns_mu.unlock(self.io);
 
-        var framer = framing.Framer.init(gpa);
+        // §9.1 frame cap: frames are popped after every push, so the framer
+        // never legitimately buffers more than one incomplete frame plus one
+        // read chunk. A push past this cap ⇒ oversized frame ⇒ framing
+        // error ⇒ disconnect.
+        var framer = framing.Framer.initWithOptions(gpa, .{
+            .max_buffered_bytes = max_frame_bytes + default_read_buffer_size,
+        });
 
+        // Handshake deadline: a peer that never sends its Hello must not
+        // park this thread forever in a blocking read.
+        setRecvTimeout(conn.stream.socket.handle, handshake_timeout_s);
+
+        var established = false;
         if (self.handshake(conn, &framer)) {
             // Start the writer BEFORE the peer is visible to senders, so every
-            // enqueue takes the async path (no two threads sync-write).
-            conn.startWriter() catch |err| {
-                log.warn("overlay: startWriter failed: {t}", .{err});
-            };
+            // enqueue takes the async path (no two threads sync-write). If the
+            // writer cannot start, the conn must NOT be published: a published
+            // writer-less conn would sync-write (blocking) under conns_mu.
+            if (conn.startWriter()) {
+                established = true;
+            } else |err| {
+                log.warn("overlay: startWriter failed; dropping peer: {t}", .{err});
+            }
+        }
+
+        if (established) {
+            setRecvTimeout(conn.stream.socket.handle, 0); // clear the deadline
+            conn.in_handshake = false;
             self.conns_mu.lockUncancelable(self.io);
             conn.id = self.next_peer_id;
             self.next_peer_id += 1;
@@ -683,30 +851,53 @@ pub const Overlay = struct {
         for (self.conns.items) |conn| conn.shutdown();
     }
 
-    /// Shut down (to wake a parked accept — see `Server.accept`) then close the
-    /// listening socket. Idempotent.
+    /// Close the listening socket and clear the field. Idempotent. Must only
+    /// run while no accept thread is live (before it is spawned, or after it
+    /// is joined) — the accept thread reads `self.server` unsynchronized.
     fn closeListener(self: *Overlay) void {
         if (self.server) |*s| {
-            self.io.vtable.netShutdown(self.io.userdata, s.socket.handle, .both) catch {};
             s.socket.close(self.io);
             self.server = null;
         }
     }
 
+    /// Wake a possibly-parked accept WITHOUT invalidating the listener fd.
+    /// `netShutdown` fulfills `Server.accept`'s documented cancellation
+    /// contract where the OS honors it (Linux); on macOS shutting down a
+    /// listening socket is a no-op (ENOTCONN, accept stays parked), so ALSO
+    /// nudge the listener with a loopback self-connect — the accept thread
+    /// wakes holding either an error or the nudge conn, observes `stopping`,
+    /// and exits. The fd stays open (and `self.server` stays set) until
+    /// after the join, so the accept thread can never unwrap a nulled field
+    /// or accept on a closed/recycled fd.
+    fn wakeAcceptThread(self: *Overlay) void {
+        const srv = self.server orelse return;
+        self.io.vtable.netShutdown(self.io.userdata, srv.socket.handle, .both) catch {};
+        var addr = net.IpAddress.parse("127.0.0.1", self.bound_port) catch return;
+        const stream = net.IpAddress.connect(&addr, self.io, .{ .mode = .stream }) catch return;
+        stream.close(self.io);
+    }
+
     fn joinAll(self: *Overlay) void {
         // Wake any dialer parked in backoff.
         self.wakeWaiters();
-        // Unblock the accept thread, then join it: after this, no NEW inbound
-        // connection threads can be spawned.
-        self.closeListener();
+        // Wake and join the accept thread while the listener fd is still
+        // valid; only then close the listener. After the join, no NEW
+        // inbound connection threads can be spawned.
         if (self.accept_thread) |t| {
+            self.wakeAcceptThread();
             t.join();
             self.accept_thread = null;
         }
-        // Unblock every reader's blocking read, then join the reader threads.
+        self.closeListener();
+        // Unblock every reader's blocking read, then join the reader threads
+        // (done or not — a finished one joins immediately).
         self.shutdownAllConns();
-        for (self.conn_threads.items) |t| t.join();
-        self.conn_threads.clearAndFree(self.gpa);
+        for (self.inbound_slots.items) |slot| {
+            slot.thread.join();
+            self.gpa.destroy(slot);
+        }
+        self.inbound_slots.clearAndFree(self.gpa);
         for (self.dialer_threads.items) |t| t.join();
         self.dialer_threads.clearAndFree(self.gpa);
     }
@@ -752,6 +943,23 @@ fn writeAll(io: std.Io, handle: net.Socket.Handle, bytes: []const u8) !void {
         if (n == 0) return error.WriteZero;
         offset += n;
     }
+}
+
+/// Best-effort SO_RCVTIMEO on the raw fd (`seconds == 0` disables it). Used
+/// as the handshake deadline: a timed-out read surfaces as an error on the
+/// reader thread (via `Conn.read`'s posix path) and runs the normal teardown.
+/// No-op on Windows.
+fn setRecvTimeout(handle: net.Socket.Handle, seconds: u32) void {
+    if (comptime builtin.target.os.tag == .windows) return;
+    const tv: std.posix.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
+    std.posix.setsockopt(
+        handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch |err| {
+        log.debug("overlay: SO_RCVTIMEO({d}s) failed: {t}", .{ seconds, err });
+    };
 }
 
 /// Best-effort TCP_NODELAY; loopback control frames are latency-sensitive.
@@ -928,10 +1136,13 @@ fn sleepMs(io: std.Io, ms: u64) void {
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
-/// Poll `ov.peerCount()` until it reaches `want`, or fail after a bounded wait.
+/// Poll `ov.peerCount()` until it reaches `want`, or fail after a bounded
+/// wait. Returns as soon as the count is reached; the bound is generous
+/// (~8s) so a cold-start hiccup (first-run firewall stalls, loaded CI) does
+/// not flake the suite.
 fn waitPeerCount(io: std.Io, ov: *Overlay, want: usize) !void {
     var i: usize = 0;
-    while (i < 300) : (i += 1) { // up to ~3s
+    while (i < 800) : (i += 1) {
         if (ov.peerCount() >= want) return;
         sleepMs(io, 10);
     }
@@ -1158,4 +1369,133 @@ test "stop joins cleanly with a live connection" {
     ov_a.deinit();
     ov_a.deinit(); // idempotent
     ov_b.deinit();
+}
+
+test "inbound conn cap: over-cap accepts are closed, under-cap conns still work" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // Lower the file-private runtime cap so the test needs 3 sockets, not
+    // 129. The pub const stays the production default.
+    const saved_cap = inbound_conn_cap;
+    inbound_conn_cap = 2;
+    defer inbound_conn_cap = saved_cap;
+
+    var b_rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer b_rec.deinit();
+    var ov_b = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xBB), b_rec.callbacks());
+    b_rec.ov = &ov_b;
+    try ov_b.start();
+    defer ov_b.deinit();
+    defer ov_b.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov_b.boundPort());
+
+    // Three raw conns, connected in order. The accept queue is FIFO and
+    // startInboundConn registers each reader slot synchronously on the
+    // accept thread, so B accepts c1 and c2 and must close c3 at the cap.
+    const c1 = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c1.close(io);
+    const c2 = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c2.close(io);
+    const c3 = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c3.close(io);
+
+    // c3 must see EOF without ever receiving B's Hello (an accepted conn
+    // would have been sent one immediately).
+    var rb: [64]u8 = undefined;
+    var rbufs: [1][]u8 = .{&rb};
+    const n = c3.read(io, &rbufs) catch 0;
+    try testing.expectEqual(@as(usize, 0), n);
+
+    // c1 and c2 were kept: complete their Hello exchanges and become peers.
+    inline for (.{ c1, c2 }, .{ 0x01, 0x02 }) |c, id_byte| {
+        const hello = try wire.encode(gpa, .{ .hello = .{
+            .protocol_version = wire.protocol_version,
+            .network_id_prefix = test_prefix,
+            .node_id = @as([32]u8, @splat(id_byte)),
+            .current_slot = 0,
+            .listen_port = 0,
+        } });
+        defer gpa.free(hello);
+        try writeAll(io, c.socket.handle, hello);
+    }
+    try waitPeerCount(io, &ov_b, 2);
+    try testing.expectEqual(@as(usize, 2), b_rec.peerUpCount());
+    try testing.expectEqual(@as(usize, 2), ov_b.peerCount());
+}
+
+test "write queue caps: overflow fails the enqueue and shuts the conn down" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // A loopback pair per scenario; the Conn owns the client end.
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{
+        .mode = .stream,
+        .reuse_address = true,
+    });
+    defer server.deinit(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", portOf(server.socket.address));
+
+    // --- item-count cap ----------------------------------------------------
+    {
+        const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+        const srv_side = try server.accept(io);
+        defer srv_side.close(io);
+
+        const conn = try gpa.create(Conn);
+        conn.* = .{
+            .io = io,
+            .gpa = gpa,
+            .stream = client,
+            .read_buf = try gpa.alloc(u8, 64),
+        };
+        defer {
+            conn.deinit();
+            gpa.destroy(conn);
+        }
+        // Pretend the writer thread exists but never drains: enqueue takes
+        // the queued (async) path and the queue only ever grows.
+        conn.writer_started = true;
+
+        var i: usize = 0;
+        while (i < max_write_queue_items) : (i += 1) try conn.enqueue("x");
+        try testing.expectError(error.WriteQueueFull, conn.enqueue("x"));
+        // The overflow closed the queue…
+        try testing.expectError(error.WriteClosed, conn.enqueue("x"));
+        // …and shut the socket down: the peer side sees EOF.
+        var rb: [8]u8 = undefined;
+        var rbufs: [1][]u8 = .{&rb};
+        const n = srv_side.read(io, &rbufs) catch 0;
+        try testing.expectEqual(@as(usize, 0), n);
+    }
+
+    // --- byte cap ----------------------------------------------------------
+    {
+        const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+        const srv_side = try server.accept(io);
+        defer srv_side.close(io);
+
+        const conn = try gpa.create(Conn);
+        conn.* = .{
+            .io = io,
+            .gpa = gpa,
+            .stream = client,
+            .read_buf = try gpa.alloc(u8, 64),
+        };
+        defer {
+            conn.deinit();
+            gpa.destroy(conn);
+        }
+        conn.writer_started = true;
+
+        const chunk = try gpa.alloc(u8, max_write_queue_bytes / 8);
+        defer gpa.free(chunk);
+        @memset(chunk, 0xAB);
+        var i: usize = 0;
+        while (i < 8) : (i += 1) try conn.enqueue(chunk); // exactly the byte cap
+        try testing.expectError(error.WriteQueueFull, conn.enqueue("y"));
+        try testing.expectError(error.WriteClosed, conn.enqueue("y"));
+    }
 }
