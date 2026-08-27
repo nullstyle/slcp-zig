@@ -11,6 +11,11 @@ pub fn build(b: *std.Build) void {
     // slcp-core depends ONLY on capnpc-zig-core: serialization + codegen,
     // no RPC, no std.Io in the module graph (wasm32-freestanding-safe).
     const capnpc_core = capnpc_dep.module("capnpc-zig-core");
+    // The FULL capnpc-zig module carries the RPC surfaces the native node
+    // layer reuses (design §9.3): the Stable `rpc.wire.framing` Framer, the
+    // TCP `rpc.transport.tcp` sockets, and `io_backend`. Native-only — never
+    // in the wasm graph.
+    const capnpc_full = capnpc_dep.module("capnpc-zig");
 
     const slcp_core = b.addModule("slcp-core", .{
         .root_source_file = b.path("src/lib_core.zig"),
@@ -21,15 +26,42 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // "slcp": the native omakase layer (node/, M5). For now it re-exports core.
-    _ = b.addModule("slcp", .{
+    // "slcp": the native omakase layer (node/, M5): overlay, timers, store,
+    // keys, Node. It needs BOTH the engine and the full capnpc-zig transport
+    // surfaces in ONE module graph — but `capnpc-zig-core` and the full
+    // `capnpc-zig` share source files and cannot coexist in a single
+    // compilation. So the node layer gets its OWN slcp-core instance bound to
+    // the FULL capnp module (a superset of core); there is exactly one capnp
+    // module in this graph. The wasm/sim graphs keep their core-only
+    // instances untouched.
+    const slcp_core_native = b.createModule(.{
+        .root_source_file = b.path("src/lib_core.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "capnpc-zig", .module = capnpc_full },
+        },
+    });
+    const slcp_mod = b.addModule("slcp", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "slcp-core", .module = slcp_core },
+            .{ .name = "slcp-core", .module = slcp_core_native },
+            .{ .name = "capnpc-zig", .module = capnpc_full },
         },
     });
+
+    // node-tests: the whole native node layer's unit tests (store byte
+    // format + restart recovery, timer wheel, key file, overlay framing,
+    // Node lifecycle). Runs under `zig build test`.
+    const node_tests = b.addTest(.{
+        .name = "slcp-node-tests",
+        .root_module = slcp_mod,
+    });
+    const run_node_tests = b.addRunArtifact(node_tests);
+    const node_tests_step = b.step("node-tests", "Run the native node-layer unit tests");
+    node_tests_step.dependOn(&run_node_tests.step);
 
     const core_tests = b.addTest(.{
         .name = "slcp-core-tests",
@@ -216,6 +248,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
+    test_step.dependOn(&run_node_tests.step);
     test_step.dependOn(abi_step);
     test_step.dependOn(&run_sim_tests.step);
     test_step.dependOn(fuzz_smoke_step);
@@ -340,4 +373,53 @@ pub fn build(b: *std.Build) void {
     run_gen_vectors.setCwd(b.path("."));
     const vectors_step = b.step("vectors", "Regenerate conformance vectors into vectors/");
     vectors_step.dependOn(&run_gen_vectors.step);
+
+    // -----------------------------------------------------------------
+    // End-to-end (design §13.6 / §14-M5 accept). Four full Zig nodes in
+    // ONE process over real loopback TCP, 3-of-4 quorum, 200 slots — plus
+    // kill/restart mid-slot, partition/heal, and one equivocator. This is
+    // the milestone gate. Kept out of `zig build test` (real sockets, real
+    // clocks, minutes-scale) and run explicitly: `zig build e2e`.
+    // -----------------------------------------------------------------
+    const e2e_optimize: std.builtin.OptimizeMode = if (optimize == .debug) .safe else optimize;
+    const capnpc_full_e2e = b.dependency("capnpc_zig", .{
+        .target = target,
+        .optimize = e2e_optimize,
+    }).module("capnpc-zig");
+    // One capnp module in the e2e graph: a full-bound slcp-core instance
+    // shared by the `slcp` module and the test root (module identity ⇒ shared
+    // engine types across both imports).
+    const slcp_core_e2e = b.createModule(.{
+        .root_source_file = b.path("src/lib_core.zig"),
+        .target = target,
+        .optimize = e2e_optimize,
+        .imports = &.{
+            .{ .name = "capnpc-zig", .module = capnpc_full_e2e },
+        },
+    });
+    const slcp_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = e2e_optimize,
+        .imports = &.{
+            .{ .name = "slcp-core", .module = slcp_core_e2e },
+            .{ .name = "capnpc-zig", .module = capnpc_full_e2e },
+        },
+    });
+    const e2e_node_tests = b.addTest(.{
+        .name = "slcp-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e/cluster_test.zig"),
+            .target = target,
+            .optimize = e2e_optimize,
+            .imports = &.{
+                .{ .name = "slcp", .module = slcp_e2e_mod },
+                .{ .name = "slcp-core", .module = slcp_core_e2e },
+            },
+        }),
+    });
+    const run_e2e = b.addRunArtifact(e2e_node_tests);
+    run_e2e.has_side_effects = true; // real sockets/files: never answer from cache
+    const e2e_step = b.step("e2e", "Run the 4-node end-to-end cluster (200 slots, kill/restart, partition/heal, equivocator)");
+    e2e_step.dependOn(&run_e2e.step);
 }
