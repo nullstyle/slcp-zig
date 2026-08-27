@@ -27,13 +27,11 @@ const crypto = core.crypto;
 const NETWORK = "slcp-e2e-v1";
 const N = 4;
 
-// Per-scenario slot targets. The milestone gate (design §13.6) is
-// 200/60/50/40; these are dialed down for a fast smoke and bumped back up for
-// the real gate run.
-const HAPPY_SLOTS: u64 = 24;
-const RESTART_SLOTS: u64 = 24;
-const PARTITION_SLOTS: u64 = 24;
-const EQUIV_SLOTS: u64 = 20;
+// Per-scenario slot targets — the §14-M5 gate numbers.
+const HAPPY_SLOTS: u64 = 200;
+const RESTART_SLOTS: u64 = 60;
+const PARTITION_SLOTS: u64 = 50;
+const EQUIV_SLOTS: u64 = 40;
 
 // Deterministic identities (seed i = all-byte i+1). Index N is the
 // equivocator's key (only used by scenario 4's 5-node config).
