@@ -449,3 +449,73 @@ test "pickLeaderValue: max-Gi selection, single value, empty list" {
     try testing.expectEqual(@as(?usize, 1), pickLeaderValue(r, &dup));
 }
 
+
+// ---------------------------------------------------------------------------
+// M2: per-slot nomination protocol state (design §5.4 nomination.zig bullet).
+// The X/Y/Z sets, round tracking, and leader accumulation for one slot.
+// Owned by slot.Slot; protocol logic (M2) operates on (*slot.Slot, *engine.Ctx).
+// ---------------------------------------------------------------------------
+
+const values_mod = @import("values.zig");
+
+pub const State = struct {
+    started: bool = false,
+    round: u32 = 0,
+    /// X / Y / Z (§5.4): own votes, own accepted, confirmed candidates.
+    votes: values_mod.ValueSet = .{},
+    accepted: values_mod.ValueSet = .{},
+    candidates: values_mod.ValueSet = .{},
+    leaders: RoundLeaders = .{},
+    previous_value: ?[]u8 = null,
+    latest_composite: ?[]u8 = null,
+
+    pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
+        self.votes.deinit(gpa);
+        self.accepted.deinit(gpa);
+        self.candidates.deinit(gpa);
+        self.leaders.deinit(gpa);
+        if (self.previous_value) |v| gpa.free(v);
+        if (self.latest_composite) |v| gpa.free(v);
+        self.* = undefined;
+    }
+};
+
+// --- M2 protocol entry points (implemented by the nomination agent; ---
+// --- signatures are the pinned contract for pipeline.zig / ballot.zig) ---
+
+const engine_mod = @import("engine.zig");
+const slot_mod2 = @import("slot.zig");
+const stored_mod = @import("stored.zig");
+
+/// Process a fresh (freshness-checked, stored) peer nomination statement.
+pub fn processEnvelope(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot, st: *const stored_mod.OwnedStatement) !void {
+    _ = ctx;
+    _ = s;
+    _ = st;
+    return error.NotImplemented;
+}
+
+/// Application nominate input. Returns false when nomination is not legal
+/// for this slot (already externalized / stopped) → pipeline reports ignored.
+pub fn nominate(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot, value: []const u8, prev_value: []const u8) !bool {
+    _ = ctx;
+    _ = s;
+    _ = value;
+    _ = prev_value;
+    return error.NotImplemented;
+}
+
+/// Nomination timer fired: next round.
+pub fn timerFired(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) !void {
+    _ = ctx;
+    _ = s;
+    return error.NotImplemented;
+}
+
+/// restore_own_envelope replay (stellar-core setStateFromEnvelope semantics).
+pub fn setStateFromEnvelope(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot, st: *const stored_mod.OwnedStatement) !void {
+    _ = ctx;
+    _ = s;
+    _ = st;
+    return error.NotImplemented;
+}

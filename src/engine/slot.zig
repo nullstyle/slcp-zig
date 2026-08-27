@@ -319,3 +319,84 @@ test "federatedRatify: quorum over accepted alone" {
         tl_partial.lookup(),
     ));
 }
+
+// ---------------------------------------------------------------------------
+// M2: the per-slot container (design §5.4 slot.zig bullet): nomination +
+// ballot state plus the latest_envelopes maps (one latest statement per node
+// per protocol — engine freshness IS the relay dedup, §5.3). Protocol logic
+// lives in nomination.zig / ballot.zig; the envelope pipeline dispatches.
+// ---------------------------------------------------------------------------
+
+const ballot_mod = @import("ballot.zig");
+const nomination_mod = @import("nomination.zig");
+const stored = @import("stored.zig");
+const values_mod = @import("values.zig");
+
+pub const Slot = struct {
+    index: u64,
+    nom: nomination_mod.State = .{},
+    ballot: ballot_mod.State = .{},
+    /// Latest stored envelope per node, per protocol (freshness-gated).
+    latest_nom: std.AutoHashMapUnmanaged([32]u8, stored.StoredEnvelope) = .empty,
+    latest_ballot: std.AutoHashMapUnmanaged([32]u8, stored.StoredEnvelope) = .empty,
+    /// Own last-emitted envelopes (persist/rebroadcast source).
+    own_nom: ?stored.StoredEnvelope = null,
+    own_ballot: ?stored.StoredEnvelope = null,
+    /// §5.4: peers' maybe_valid statements mark the slot not fully validated
+    /// and suppress own emissions (watchers/laggers run passively).
+    fully_validated: bool = true,
+    externalized_value: ?[]u8 = null,
+    /// Per-slot driver-verdict cache (§5.4 values.zig bullet).
+    validation_cache: values_mod.ValidationCache = .{},
+
+    pub fn init(index: u64) Slot {
+        return .{ .index = index };
+    }
+
+    pub fn deinit(self: *Slot, gpa: std.mem.Allocator) void {
+        self.nom.deinit(gpa);
+        self.ballot.deinit(gpa);
+        inline for (.{ &self.latest_nom, &self.latest_ballot }) |map| {
+            var it = map.valueIterator();
+            while (it.next()) |env| env.deinit(gpa);
+            map.deinit(gpa);
+        }
+        if (self.own_nom) |*e| e.deinit(gpa);
+        if (self.own_ballot) |*e| e.deinit(gpa);
+        if (self.externalized_value) |v| gpa.free(v);
+        self.validation_cache.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// Total stored envelope bytes in this slot (for the engine-wide
+    /// max_stored_statement_bytes budget, §5.1).
+    pub fn storedBytes(self: *const Slot) usize {
+        var total: usize = 0;
+        inline for (.{ &self.latest_nom, &self.latest_ballot }) |map| {
+            var it = map.valueIterator();
+            while (it.next()) |env| total += env.byteSize();
+        }
+        return total;
+    }
+
+    /// Replace the stored latest envelope for (node, protocol), returning
+    /// the byte-size delta (new - old). Takes ownership of `env`.
+    pub fn storeLatest(self: *Slot, gpa: std.mem.Allocator, env: stored.StoredEnvelope) !isize {
+        const map = if (env.statement.isNomination()) &self.latest_nom else &self.latest_ballot;
+        const new_size: isize = @intCast(env.byteSize());
+        const gop = try map.getOrPut(gpa, env.statement.node_id);
+        if (gop.found_existing) {
+            const old_size: isize = @intCast(gop.value_ptr.byteSize());
+            gop.value_ptr.deinit(gpa);
+            gop.value_ptr.* = env;
+            return new_size - old_size;
+        }
+        gop.value_ptr.* = env;
+        return new_size;
+    }
+
+    pub fn latestFor(self: *Slot, node: [32]u8, nomination_protocol: bool) ?*stored.StoredEnvelope {
+        const map = if (nomination_protocol) &self.latest_nom else &self.latest_ballot;
+        return map.getPtr(node);
+    }
+};
