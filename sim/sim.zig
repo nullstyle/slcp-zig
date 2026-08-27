@@ -65,6 +65,14 @@ pub const SimConfig = struct {
 
 pub const max_nodes: u8 = 7;
 
+/// The sim's fixed network passphrase and per-node seed scheme, exposed so
+/// the Byzantine harness (which builds mixed honest+adversary quorums) can
+/// mint envelopes the honest engines accept. node i's seed is 0x10 + i.
+pub const sim_passphrase = "slcp-sim v1";
+pub fn nodeSeed(i: u8) [32]u8 {
+    return @splat(@as(u8, 0x10) + i);
+}
+
 /// Shared flat qset threshold: ceil(2n/3) = (2n+2)/3.
 pub fn thresholdFor(n: u8) u32 {
     return (2 * @as(u32, n) + 2) / 3;
@@ -239,7 +247,7 @@ pub const Sim = struct {
         var seeds: [max_nodes][32]u8 = undefined;
         var pks: [max_nodes][32]u8 = undefined;
         for (0..cfg.n) |i| {
-            seeds[i] = @splat(@as(u8, 0x10) + @as(u8, @intCast(i)));
+            seeds[i] = nodeSeed(@intCast(i));
             pks[i] = try crypto.publicKeyFromSeed(seeds[i]);
         }
 
@@ -261,7 +269,7 @@ pub const Sim = struct {
         const shared_framed = try canonical.frameFlat(gpa, shared_flat);
         errdefer gpa.free(shared_framed);
 
-        const network_id = crypto.networkIdFromPassphrase("slcp-sim v1");
+        const network_id = crypto.networkIdFromPassphrase(sim_passphrase);
 
         const nodes = try gpa.alloc(Node, cfg.n);
         var made: usize = 0;
