@@ -249,6 +249,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_abi_contract_tests = b.addRunArtifact(abi_contract_tests);
     run_abi_contract_tests.setCwd(b.path("."));
+    // Reads src/wasm/slcp_host_abi.zig as TEXT (the frozen-surface parse) and
+    // vectors/lint.json — neither is a declared build input, so without this
+    // a corrupted vector or an edited ABI surface leaves the previous pass
+    // standing. Verified: mutating vectors/lint.json kept `zig build abi`
+    // green until this line was added.
+    run_abi_contract_tests.has_side_effects = true;
 
     const abi_fake_host_tests = b.addTest(.{
         .name = "slcp-abi-fake-host-tests",
@@ -300,6 +306,9 @@ pub fn build(b: *std.Build) void {
     // Both are side-effectful: a gate reading files the build graph does not
     // declare must never be answered from cache.
     const run_wasm_diff_soft = b.addRunArtifact(wasm_diff_tests);
+    // Opens zig-out/bin/slcp_core.wasm and tests/wasm/host.mjs by RELATIVE
+    // path, so cwd is pinned like the other artifact-reading gates.
+    run_wasm_diff_soft.setCwd(b.path("."));
     run_wasm_diff_soft.has_side_effects = true;
     test_step.dependOn(&run_wasm_diff_soft.step);
 
@@ -378,6 +387,7 @@ pub fn build(b: *std.Build) void {
     // The M4 gate: `zig build wasm && zig build wasm-diff` — this run step
     // depends on the wasm install, so it always has a real artifact to drive.
     const run_wasm_diff_gate = b.addRunArtifact(wasm_diff_tests);
+    run_wasm_diff_gate.setCwd(b.path("."));
     run_wasm_diff_gate.has_side_effects = true;
     run_wasm_diff_gate.step.dependOn(&install_wasm.step);
     const wasm_diff_step = b.step("wasm-diff", "Differential native-vs-wasm replay of the trace vectors + differential fuzz (§13.5)");
