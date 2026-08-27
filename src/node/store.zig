@@ -10,8 +10,18 @@
 //!
 //! Record framing (both logs): little-endian u64 slot, little-endian u32
 //! payload length, `len` payload bytes, little-endian u32 crc32 (IEEE, over
-//! slot ++ len ++ payload). A torn tail (short read / bad crc at the end) is
-//! recoverable: everything up to the first bad record is a valid prefix.
+//! slot ++ len ++ payload). Recovery distinguishes two failure shapes:
+//!
+//!   * TORN TAIL — the file physically ends mid-record (short header, or the
+//!     declared payload+crc extends past EOF). This is the routine power-loss
+//!     artifact: §10's persist-precedes-broadcast means a torn final record
+//!     was never broadcast, so the valid prefix is fully trustworthy. Not
+//!     corruption. `recover()` truncates the log back to the prefix.
+//!   * TRUE CORRUPTION — a structurally complete record (full header +
+//!     payload + crc present) whose crc mismatches. The log is untrusted;
+//!     for own.log the §10 corrupt-log fallback applies. The log is still
+//!     truncated to the prefix before the bad record so later appends do not
+//!     land behind unreachable garbage.
 //!
 //! ==== IMPLEMENTATION BRIEF (M5 agent) ====================================
 //! Public interface below is FROZEN — implement bodies + tests, do not change
@@ -28,18 +38,24 @@
 //!   * putQset: write qsets/<hex of hash>.bin (best-effort; swallow errors,
 //!     log). getQset: read it back if present (caller frees), else null.
 //!   * recover(): read both logs.
-//!       - own.log: parse records front-to-back. On the FIRST bad/short
-//!         record, stop and set `own_log_corrupt = (that record is not simply
-//!         EOF)` — i.e. a crc mismatch or truncated-mid-record tail means the
-//!         whole own.log is untrusted (§10 corrupt-log fallback). A clean EOF
-//!         on a record boundary is NOT corrupt. Dedup the valid records to
-//!         the LAST record per (slot, protocol-kind) — protocol-kind is the
-//!         pledge union tag of the statement inside the envelope (nominate /
-//!         prepare / confirm / externalize), parsed via core.gen.slcp. Return
-//!         them in ascending (slot, then kind) order — deterministic.
+//!       - own.log: parse records front-to-back. On the FIRST bad record,
+//!         stop and classify it: a torn tail (file ends mid-record) is safe
+//!         and only sets `torn_tail_repaired`; a structurally complete record
+//!         with a crc mismatch sets `own_log_corrupt` (§10 corrupt-log
+//!         fallback). Either way the log file is truncated back to its valid
+//!         prefix. A clean EOF on a record boundary sets neither. Dedup the
+//!         valid records to the LAST record per (slot, protocol-kind) —
+//!         protocol-kind is the pledge union tag of the statement inside the
+//!         envelope (nominate / prepare / confirm / externalize), parsed via
+//!         core.gen.slcp. Return them in ascending (slot, then kind) order —
+//!         deterministic.
 //!       - externalized.log: parse records; `externalized_hwm` = the highest
-//!         slot in any valid record (null if none). A torn tail still yields
-//!         the valid prefix's high-water mark.
+//!         slot in any valid record (null if none). A bad tail still yields
+//!         the valid prefix's high-water mark, and the file is likewise
+//!         truncated to that prefix (a torn tail sets `torn_tail_repaired`).
+//!   * compact(keep_from_slot): atomically rewrite both logs keeping only
+//!     records with slot >= keep_from_slot (§10's 16-slot answering window).
+//!     Temp file + fsync + rename-over — crash-safe at every point.
 //!   * deinitRecovery frees everything recover() allocated.
 //!   * Tests (use std.testing.tmpDir): round-trip append→recover; last-wins
 //!     dedup across two prepares for one slot; a hand-corrupted own.log tail
@@ -50,6 +66,7 @@
 //! ========================================================================
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("slcp-core");
 
 const Crc32 = std.hash.Crc32;
@@ -58,6 +75,11 @@ pub const Error = error{ BadRecord, IoFailed } || std.mem.Allocator.Error;
 
 const own_log_name = "own.log";
 const ext_log_name = "externalized.log";
+/// Scratch names compact() writes before the atomic rename-over. A leftover
+/// (from a crash mid-compact) is harmless: the real names always hold a
+/// complete log, and the next compact truncates the scratch file.
+const own_tmp_name = "own.log.compact";
+const ext_tmp_name = "externalized.log.compact";
 const qsets_dir_name = "qsets";
 /// "qsets/" ++ 64 hex chars ++ ".bin".
 const qset_path_len = qsets_dir_name.len + 1 + 64 + 4;
@@ -83,9 +105,12 @@ pub const Recovery = struct {
     own_latest: []OwnRecord,
     /// Highest externalized slot on disk, or null if none.
     externalized_hwm: ?u64,
-    /// own.log failed integrity → the Node must fall back to watcher mode
-    /// for slots ≤ max(peer_high, externalized_hwm + 1) (§10).
+    /// A structurally complete own.log record failed its crc — the log is
+    /// untrusted; the §10 fallback applies.
     own_log_corrupt: bool,
+    /// recover() found a torn final append (file ends mid-record) in either
+    /// log and TRUNCATED that log back to its valid prefix. Informational.
+    torn_tail_repaired: bool,
 };
 
 pub const Store = struct {
@@ -108,10 +133,11 @@ pub const Store = struct {
         dir.createDirPath(io, qsets_dir_name) catch return Error.IoFailed;
 
         // truncate=false: preserve an existing log across a restart (recovery).
-        const own_file = dir.createFile(io, own_log_name, .{ .truncate = false }) catch
+        // read=true: compact() re-reads each log through its open handle.
+        const own_file = dir.createFile(io, own_log_name, .{ .truncate = false, .read = true }) catch
             return Error.IoFailed;
         errdefer own_file.close(io);
-        const ext_file = dir.createFile(io, ext_log_name, .{ .truncate = false }) catch
+        const ext_file = dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true }) catch
             return Error.IoFailed;
         errdefer ext_file.close(io);
 
@@ -167,7 +193,7 @@ pub const Store = struct {
         w.pos = end;
         w.interface.writeAll(rec) catch return Error.IoFailed;
         w.interface.flush() catch return Error.IoFailed;
-        file.sync(self.io) catch return Error.IoFailed;
+        try fullSync(self.io, file);
     }
 
     /// Best-effort write of a verified foreign qset (no fsync).
@@ -194,18 +220,27 @@ pub const Store = struct {
         };
     }
 
-    /// Read both logs and compute the restart plan (§10).
+    /// Read both logs and compute the restart plan (§10). Whenever a log's
+    /// parse stops before EOF — torn tail or true corruption — the file is
+    /// truncated back to its valid prefix through the open handle, so
+    /// subsequent appends land on a clean record boundary.
     pub fn recover(self: *Store, gpa: std.mem.Allocator) !Recovery {
+        var torn_tail_repaired = false;
+
         const own_data = self.dir.readFileAlloc(self.io, own_log_name, gpa, .unlimited) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             else => return Error.IoFailed,
         };
         defer gpa.free(own_data);
 
-        const own_latest, const own_corrupt = try recoverOwn(gpa, own_data);
+        const own_scan = try recoverOwn(gpa, own_data);
         errdefer {
-            for (own_latest) |r| gpa.free(r.envelope);
-            gpa.free(own_latest);
+            for (own_scan.records) |r| gpa.free(r.envelope);
+            gpa.free(own_scan.records);
+        }
+        if (own_scan.tail != .clean) {
+            try truncateTo(self.io, self.own_file, own_scan.valid_len);
+            if (own_scan.tail == .torn) torn_tail_repaired = true;
         }
 
         const ext_data = self.dir.readFileAlloc(self.io, ext_log_name, gpa, .unlimited) catch |err| switch (err) {
@@ -219,19 +254,32 @@ pub const Store = struct {
         while (ext_iter.next()) |item| {
             if (hwm == null or item.slot > hwm.?) hwm = item.slot;
         }
+        if (ext_iter.tail != .clean) {
+            try truncateTo(self.io, self.ext_file, ext_iter.pos);
+            if (ext_iter.tail == .torn) torn_tail_repaired = true;
+        }
 
         return .{
-            .own_latest = own_latest,
+            .own_latest = own_scan.records,
             .externalized_hwm = hwm,
-            .own_log_corrupt = own_corrupt,
+            .own_log_corrupt = own_scan.tail == .corrupt,
+            .torn_tail_repaired = torn_tail_repaired,
         };
     }
 
+    /// recoverOwn's result: the deduped valid records, how the parse of the
+    /// log ended, and the byte length of the valid prefix (where a repair
+    /// truncation must cut).
+    const OwnScan = struct {
+        records: []OwnRecord,
+        tail: RecordIter.Tail,
+        valid_len: usize,
+    };
+
     /// Parse own.log's valid prefix, dedup to the last record per (slot, kind),
-    /// and return them ascending by (slot, then kind). The bool is
-    /// `own_log_corrupt`: true when parsing stopped on a bad/short record rather
-    /// than a clean record-boundary EOF.
-    fn recoverOwn(gpa: std.mem.Allocator, data: []const u8) Error!struct { []OwnRecord, bool } {
+    /// and return them ascending by (slot, then kind), together with the tail
+    /// classification (clean / torn / corrupt) and the valid-prefix length.
+    fn recoverOwn(gpa: std.mem.Allocator, data: []const u8) Error!OwnScan {
         const Entry = struct { slot: u64, kind: Kind, payload: []const u8 };
         const Key = struct { slot: u64, kind: Kind };
 
@@ -276,7 +324,7 @@ pub const Store = struct {
             built += 1;
         }
 
-        return .{ own_latest, !iter.clean };
+        return .{ .records = own_latest, .tail = iter.tail, .valid_len = iter.pos };
     }
 
     pub fn deinitRecovery(gpa: std.mem.Allocator, rec: *Recovery) void {
@@ -284,16 +332,111 @@ pub const Store = struct {
         gpa.free(rec.own_latest);
         rec.* = undefined;
     }
+
+    /// Atomically rewrite both logs keeping only records with slot >= keep_from_slot.
+    /// (own.log keeps consensus state for the answering window; externalized.log
+    /// keeps the recent journal — its high-water mark is preserved because the
+    /// max-slot record always survives.) Called occasionally by the Node.
+    pub fn compact(self: *Store, keep_from_slot: u64) Error!void {
+        try self.compactLog(&self.own_file, own_log_name, own_tmp_name, keep_from_slot);
+        try self.compactLog(&self.ext_file, ext_log_name, ext_tmp_name, keep_from_slot);
+    }
+
+    /// Rewrite one log, dropping records with slot < keep_from_slot. Surviving
+    /// record bytes are copied verbatim IN ORDER (so own.log's last-wins replay
+    /// semantics are preserved). Crash-safe: the new content goes to a temp
+    /// file which is fsync'd and then atomically renamed over the real name —
+    /// at any interruption point the real name holds either the old or the new
+    /// complete log. On success `file` is swapped to a handle on the new file.
+    fn compactLog(
+        self: *Store,
+        file: *std.Io.File,
+        log_name: []const u8,
+        tmp_name: []const u8,
+        keep_from_slot: u64,
+    ) Error!void {
+        const io = self.io;
+        const gpa = self.gpa;
+
+        // Read + parse the current log through the open handle.
+        const file_len_u64 = file.length(io) catch return Error.IoFailed;
+        const file_len = std.math.cast(usize, file_len_u64) orelse return Error.IoFailed;
+        const data = try gpa.alloc(u8, file_len);
+        defer gpa.free(data);
+        const n_read = file.readPositionalAll(io, data, 0) catch return Error.IoFailed;
+        if (n_read != file_len) return Error.IoFailed;
+
+        var kept: std.ArrayList(u8) = .empty;
+        defer kept.deinit(gpa);
+        var iter = RecordIter{ .data = data };
+        while (true) {
+            const rec_start = iter.pos;
+            const item = iter.next() orelse break;
+            if (item.slot >= keep_from_slot)
+                try kept.appendSlice(gpa, data[rec_start..iter.pos]);
+        }
+
+        // Write + durably sync the survivors under the temp name.
+        var tmp = self.dir.createFile(io, tmp_name, .{ .read = true }) catch
+            return Error.IoFailed;
+        var tmp_is_temp = true;
+        errdefer if (tmp_is_temp) {
+            tmp.close(io);
+            self.dir.deleteFile(io, tmp_name) catch {};
+        };
+        tmp.writeStreamingAll(io, kept.items) catch return Error.IoFailed;
+        try fullSync(io, tmp);
+
+        // Atomic swap under the real name. The open `tmp` handle follows the
+        // inode across the rename, so it IS the new log handle.
+        self.dir.rename(tmp_name, self.dir, log_name, io) catch return Error.IoFailed;
+        tmp_is_temp = false;
+        file.close(io);
+        file.* = tmp;
+
+        // Durability barrier for the rename itself (on darwin F_FULLFSYNC
+        // flushes the journal and the drive cache; a lost-but-atomic rename on
+        // other targets still leaves the old complete log, which is safe).
+        try fullSync(io, tmp);
+    }
 };
 
-/// Front-to-back reader over a log's framed records. `clean` starts true and is
-/// cleared the moment a truncated-mid-record tail or a crc mismatch stops the
-/// walk; a run of the iterator to `null` at an exact record boundary leaves it
-/// true (clean EOF).
+/// fsync `file`, upgraded to a real media flush on macOS. Plain fsync there
+/// only reaches the drive cache; F_FULLFSYNC asks the drive to flush to
+/// stable media — required for the §10 persist-precedes-broadcast guarantee.
+/// If the filesystem rejects F_FULLFSYNC (e.g. SMB), the completed fsync is
+/// the strongest barrier available, so — like SQLite — fall back to it.
+fn fullSync(io: std.Io, file: std.Io.File) Error!void {
+    file.sync(io) catch return Error.IoFailed;
+    if (comptime builtin.os.tag == .macos) {
+        _ = std.c.fcntl(file.handle, std.c.F.FULLFSYNC);
+    }
+}
+
+/// Cut `file` back to `new_len` bytes (a log's valid prefix) and sync, so the
+/// next append lands on a clean record boundary.
+fn truncateTo(io: std.Io, file: std.Io.File, new_len: usize) Error!void {
+    file.setLength(io, new_len) catch return Error.IoFailed;
+    try fullSync(io, file);
+}
+
+/// Front-to-back reader over a log's framed records. `pos` only advances past
+/// records that fully verify, so after the walk it is the byte length of the
+/// log's valid prefix. `tail` records how the walk ended:
+///
+///   * .clean   — `null` was returned at an exact record boundary (EOF).
+///   * .torn    — the file physically ends mid-record: fewer than the 12
+///                header bytes remain, or the declared payload+crc extends
+///                past EOF. The routine power-loss artifact; the prefix is
+///                trustworthy (§10: persist precedes broadcast).
+///   * .corrupt — a structurally complete record (full header + payload + crc
+///                all present) failed its crc. The log is untrusted.
 const RecordIter = struct {
     data: []const u8,
     pos: usize = 0,
-    clean: bool = true,
+    tail: Tail = .clean,
+
+    const Tail = enum { clean, torn, corrupt };
 
     const Item = struct { slot: u64, payload: []const u8 };
 
@@ -302,26 +445,24 @@ const RecordIter = struct {
         const i = self.pos;
         if (i >= data.len) return null; // clean boundary EOF
         if (data.len - i < rec_header_len) {
-            self.clean = false; // truncated header
+            self.tail = .torn; // file ends mid-header
             return null;
         }
         const slot = std.mem.readInt(u64, data[i..][0..8], .little);
         const len = std.mem.readInt(u32, data[i + 8 ..][0..4], .little);
-        if (len > data.len) {
-            self.clean = false;
-            return null;
-        }
         const payload_start = i + rec_header_len;
-        const crc_start = payload_start + len;
-        const rec_end = crc_start + rec_crc_len;
-        if (rec_end > data.len) {
-            self.clean = false; // truncated payload / crc
+        // Widen: payload_start + len + crc must not overflow usize on 32-bit.
+        const rec_end_wide = @as(u64, payload_start) + len + rec_crc_len;
+        if (rec_end_wide > data.len) {
+            self.tail = .torn; // declared payload+crc extends past EOF
             return null;
         }
+        const rec_end: usize = @intCast(rec_end_wide);
+        const crc_start = payload_start + len;
         const stored_crc = std.mem.readInt(u32, data[crc_start..][0..4], .little);
         const calc_crc = Crc32.hash(data[i..crc_start]); // slot ++ len ++ payload
         if (calc_crc != stored_crc) {
-            self.clean = false; // corrupt record
+            self.tail = .corrupt; // complete record, bad crc
             return null;
         }
         self.pos = rec_end;
@@ -445,6 +586,7 @@ test "store: append then recover round-trips across reopen" {
     defer Store.deinitRecovery(gpa, &rec);
 
     try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
     try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
     try testing.expectEqual(@as(u64, 5), rec.own_latest[0].slot);
     try testing.expectEqualSlices(u8, env, rec.own_latest[0].envelope);
@@ -474,6 +616,7 @@ test "store: last-wins dedup for two prepares in one slot (ballot bucket)" {
     defer Store.deinitRecovery(gpa, &rec);
 
     try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
     try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
     try testing.expectEqual(@as(u64, 4), rec.own_latest[0].slot);
     try testing.expectEqualSlices(u8, prep_b, rec.own_latest[0].envelope); // last wins
@@ -502,6 +645,7 @@ test "store: nominate + prepare in one slot yield two ordered records" {
     defer Store.deinitRecovery(gpa, &rec);
 
     try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
     try testing.expectEqual(@as(usize, 2), rec.own_latest.len);
     // nom (kind 0) sorts before ballot (kind 1)
     try testing.expectEqual(@as(u64, 9), rec.own_latest[0].slot);
@@ -548,7 +692,10 @@ test "store: corrupted own.log tail sets own_log_corrupt but keeps externalized 
     var rec = try store.recover(gpa);
     defer Store.deinitRecovery(gpa, &rec);
 
+    // The final record is structurally COMPLETE with a bad crc → true
+    // corruption, not a torn tail.
     try testing.expect(rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
     // The intact prefix (record 1) still recovers.
     try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
     try testing.expectEqual(@as(u64, 1), rec.own_latest[0].slot);
@@ -557,7 +704,7 @@ test "store: corrupted own.log tail sets own_log_corrupt but keeps externalized 
     try testing.expectEqual(@as(?u64, 42), rec.externalized_hwm);
 }
 
-test "store: truncated mid-record own.log tail is a recoverable prefix" {
+test "store: torn own.log tail is repaired, not corruption" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -569,6 +716,8 @@ test "store: truncated mid-record own.log tail is a recoverable prefix" {
     defer gpa.free(env_a);
     const env_b = try buildTestEnvelope(gpa, 2, .prepare, 0x02);
     defer gpa.free(env_b);
+    const env_c = try buildTestEnvelope(gpa, 3, .prepare, 0x03);
+    defer gpa.free(env_c);
 
     {
         var store = try Store.open(gpa, io, data_dir);
@@ -578,7 +727,7 @@ test "store: truncated mid-record own.log tail is a recoverable prefix" {
     }
 
     // Cut the file a few bytes into record 2's header (record 1 is
-    // rec_header_len + env_a.len + rec_crc_len bytes).
+    // rec_header_len + env_a.len + rec_crc_len bytes) — the power-loss shape.
     const rec1_end = rec_header_len + env_a.len + rec_crc_len;
     var op_buf: [128]u8 = undefined;
     const own_path = try std.fmt.bufPrint(&op_buf, "data/{s}", .{own_log_name});
@@ -591,13 +740,111 @@ test "store: truncated mid-record own.log tail is a recoverable prefix" {
 
     var store = try Store.open(gpa, io, data_dir);
     defer store.deinit();
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        // A torn final append is the routine crash artifact — NOT corruption.
+        try testing.expect(!rec.own_log_corrupt);
+        try testing.expect(rec.torn_tail_repaired);
+        try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
+        try testing.expectEqual(@as(u64, 1), rec.own_latest[0].slot);
+        try testing.expectEqualSlices(u8, env_a, rec.own_latest[0].envelope);
+    }
+
+    // recover() physically truncated the log back to its valid prefix.
+    const after = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqual(@as(usize, rec1_end), after.len);
+
+    // A second recover is clean (nothing left to repair) with the same records.
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        try testing.expect(!rec.own_log_corrupt);
+        try testing.expect(!rec.torn_tail_repaired);
+        try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
+        try testing.expectEqualSlices(u8, env_a, rec.own_latest[0].envelope);
+    }
+
+    // Fresh appends land on the repaired boundary; recover sees prefix + new.
+    try store.appendOwn(3, env_c);
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        try testing.expect(!rec.own_log_corrupt);
+        try testing.expect(!rec.torn_tail_repaired);
+        try testing.expectEqual(@as(usize, 2), rec.own_latest.len);
+        try testing.expectEqual(@as(u64, 1), rec.own_latest[0].slot);
+        try testing.expectEqualSlices(u8, env_a, rec.own_latest[0].envelope);
+        try testing.expectEqual(@as(u64, 3), rec.own_latest[1].slot);
+        try testing.expectEqualSlices(u8, env_c, rec.own_latest[1].envelope);
+    }
+
+    // And the repair + append survive a full reopen.
+    store.deinit();
+    store = try Store.open(gpa, io, data_dir);
     var rec = try store.recover(gpa);
     defer Store.deinitRecovery(gpa, &rec);
-
-    try testing.expect(rec.own_log_corrupt); // torn tail → untrusted (§10)
-    try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
-    try testing.expectEqual(@as(u64, 1), rec.own_latest[0].slot);
+    try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
+    try testing.expectEqual(@as(usize, 2), rec.own_latest.len);
     try testing.expectEqualSlices(u8, env_a, rec.own_latest[0].envelope);
+    try testing.expectEqualSlices(u8, env_c, rec.own_latest[1].envelope);
+}
+
+test "store: mid-file crc corruption truncates to the prefix before the bad record" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try tmpDataDir(&tmp, &path_buf);
+
+    const env_a = try buildTestEnvelope(gpa, 1, .nominate, 0x01);
+    defer gpa.free(env_a);
+    const env_b = try buildTestEnvelope(gpa, 2, .prepare, 0x02);
+    defer gpa.free(env_b);
+    const env_c = try buildTestEnvelope(gpa, 3, .prepare, 0x03);
+    defer gpa.free(env_c);
+
+    {
+        var store = try Store.open(gpa, io, data_dir);
+        defer store.deinit();
+        try store.appendOwn(1, env_a);
+        try store.appendOwn(2, env_b);
+        try store.appendOwn(3, env_c);
+    }
+
+    // Flip one payload byte of record 2 — a COMPLETE record surrounded by
+    // valid neighbors — i.e. true silent corruption, not a torn tail.
+    const rec1_end = rec_header_len + env_a.len + rec_crc_len;
+    var op_buf: [128]u8 = undefined;
+    const own_path = try std.fmt.bufPrint(&op_buf, "data/{s}", .{own_log_name});
+    const bytes = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(bytes);
+    bytes[rec1_end + rec_header_len] ^= 0xff;
+    var f = try tmp.dir.createFile(io, own_path, .{});
+    try f.writeStreamingAll(io, bytes);
+    f.close(io);
+
+    var store = try Store.open(gpa, io, data_dir);
+    defer store.deinit();
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        try testing.expect(rec.own_log_corrupt);
+        try testing.expect(!rec.torn_tail_repaired);
+        // Only the prefix before the bad record survives (record 3 is
+        // unreachable behind it).
+        try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
+        try testing.expectEqual(@as(u64, 1), rec.own_latest[0].slot);
+        try testing.expectEqualSlices(u8, env_a, rec.own_latest[0].envelope);
+    }
+
+    // The file was cut back to the prefix before the corrupt record.
+    const after = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqual(@as(usize, rec1_end), after.len);
 }
 
 test "store: crc rejects a flipped payload byte" {
@@ -632,9 +879,14 @@ test "store: crc rejects a flipped payload byte" {
     var rec = try store.recover(gpa);
     defer Store.deinitRecovery(gpa, &rec);
 
-    // The single record fails crc → nothing recovered, log flagged corrupt.
+    // The single record is complete but fails crc → nothing recovered, log
+    // flagged corrupt (this is not a torn tail), file cut back to empty.
     try testing.expect(rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
     try testing.expectEqual(@as(usize, 0), rec.own_latest.len);
+    const after = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "store: qset put/get round-trips and absent returns null" {
@@ -659,4 +911,140 @@ test "store: qset put/get round-trips and absent returns null" {
 
     const absent: [32]u8 = @splat(0xff);
     try testing.expectEqual(@as(?[]u8, null), try store.getQset(gpa, absent));
+}
+
+test "store: torn externalized.log tail is repaired and keeps prefix hwm" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try tmpDataDir(&tmp, &path_buf);
+
+    const env = try buildTestEnvelope(gpa, 1, .nominate, 0x01);
+    defer gpa.free(env);
+
+    {
+        var store = try Store.open(gpa, io, data_dir);
+        defer store.deinit();
+        try store.appendOwn(1, env);
+        try store.appendExternalized(10, "ext-a");
+        try store.appendExternalized(42, "ext-b");
+    }
+
+    // Cut externalized.log mid-way into record 2 ("ext-a" record 1 is
+    // rec_header_len + 5 + rec_crc_len bytes). own.log stays intact.
+    const rec1_end = rec_header_len + "ext-a".len + rec_crc_len;
+    var ep_buf: [128]u8 = undefined;
+    const ext_path = try std.fmt.bufPrint(&ep_buf, "data/{s}", .{ext_log_name});
+    const bytes = try tmp.dir.readFileAlloc(io, ext_path, gpa, .unlimited);
+    defer gpa.free(bytes);
+    var f = try tmp.dir.createFile(io, ext_path, .{});
+    try f.writeStreamingAll(io, bytes[0 .. rec1_end + 3]);
+    f.close(io);
+
+    var store = try Store.open(gpa, io, data_dir);
+    defer store.deinit();
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        try testing.expect(!rec.own_log_corrupt); // own.log untouched
+        try testing.expect(rec.torn_tail_repaired); // ext tail was torn
+        try testing.expectEqual(@as(usize, 1), rec.own_latest.len);
+        try testing.expectEqual(@as(?u64, 10), rec.externalized_hwm); // prefix hwm
+    }
+
+    // Physically truncated back to the valid prefix.
+    const after = try tmp.dir.readFileAlloc(io, ext_path, gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqual(@as(usize, rec1_end), after.len);
+
+    // Appends land on the repaired boundary and advance the hwm again.
+    try store.appendExternalized(43, "ext-c");
+    var rec = try store.recover(gpa);
+    defer Store.deinitRecovery(gpa, &rec);
+    try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
+    try testing.expectEqual(@as(?u64, 43), rec.externalized_hwm);
+}
+
+test "store: compact keeps only slots >= keep_from_slot and stays appendable" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try tmpDataDir(&tmp, &path_buf);
+
+    var envs: [41]?[]const u8 = @splat(null);
+    defer for (envs) |e| {
+        if (e) |bytes| gpa.free(bytes);
+    };
+
+    var store = try Store.open(gpa, io, data_dir);
+    defer store.deinit();
+
+    // Records for slots 1..40 in both logs, plus a qset that must survive.
+    const qset_hash: [32]u8 = @splat(0x5c);
+    store.putQset(qset_hash, "framed-qset-bytes");
+    var slot: u64 = 1;
+    while (slot <= 40) : (slot += 1) {
+        const env = try buildTestEnvelope(gpa, slot, .prepare, @intCast(slot));
+        envs[slot] = env;
+        try store.appendOwn(slot, env);
+        var vbuf: [8]u8 = undefined;
+        const value = try std.fmt.bufPrint(&vbuf, "v{d}", .{slot});
+        try store.appendExternalized(slot, value);
+    }
+
+    var op_buf: [128]u8 = undefined;
+    const own_path = try std.fmt.bufPrint(&op_buf, "data/{s}", .{own_log_name});
+    const before = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(before);
+
+    try store.compact(25);
+
+    // The rewritten log physically shrank.
+    const after = try tmp.dir.readFileAlloc(io, own_path, gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expect(after.len < before.len);
+
+    {
+        var rec = try store.recover(gpa);
+        defer Store.deinitRecovery(gpa, &rec);
+        try testing.expect(!rec.own_log_corrupt);
+        try testing.expect(!rec.torn_tail_repaired);
+        // Only slots 25..40 remain, ascending, bytes intact.
+        try testing.expectEqual(@as(usize, 16), rec.own_latest.len);
+        for (rec.own_latest, 0..) |r, i| {
+            try testing.expectEqual(@as(u64, 25 + i), r.slot);
+            try testing.expectEqualSlices(u8, envs[r.slot].?, r.envelope);
+        }
+        // hwm preserved: the max-slot externalized record always survives.
+        try testing.expectEqual(@as(?u64, 40), rec.externalized_hwm);
+    }
+
+    // qsets/ dir untouched by compaction.
+    const qset = try store.getQset(gpa, qset_hash);
+    try testing.expect(qset != null);
+    defer gpa.free(qset.?);
+    try testing.expectEqualSlices(u8, "framed-qset-bytes", qset.?);
+
+    // Appends still work on the swapped handles, and survive a reopen.
+    const env41 = try buildTestEnvelope(gpa, 41, .prepare, 41);
+    defer gpa.free(env41);
+    try store.appendOwn(41, env41);
+    try store.appendExternalized(41, "v41");
+
+    store.deinit();
+    store = try Store.open(gpa, io, data_dir);
+    var rec = try store.recover(gpa);
+    defer Store.deinitRecovery(gpa, &rec);
+    try testing.expect(!rec.own_log_corrupt);
+    try testing.expect(!rec.torn_tail_repaired);
+    try testing.expectEqual(@as(usize, 17), rec.own_latest.len);
+    try testing.expectEqual(@as(u64, 25), rec.own_latest[0].slot);
+    try testing.expectEqual(@as(u64, 41), rec.own_latest[16].slot);
+    try testing.expectEqualSlices(u8, env41, rec.own_latest[16].envelope);
+    try testing.expectEqual(@as(?u64, 41), rec.externalized_hwm);
 }

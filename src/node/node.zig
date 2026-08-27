@@ -317,6 +317,13 @@ pub const Node = struct {
         var rec = try self.store.recover(gpa);
         defer store_mod.Store.deinitRecovery(gpa, &rec);
 
+        if (rec.torn_tail_repaired) {
+            // The ROUTINE crash artifact (power loss mid-append): the store
+            // truncated the torn record; the valid prefix is fully trusted
+            // (§10: persist precedes broadcast, so a torn final record was
+            // never sent). The node stays a validator.
+            log.warn("torn log tail repaired on recovery (normal after a crash)", .{});
+        }
         if (rec.own_log_corrupt and !self.watcher) {
             log.err("own.log integrity failure — falling back to WATCHER mode " ++
                 "for the node's lifetime (safe: a watcher never emits, so it " ++
@@ -636,6 +643,12 @@ pub const Node = struct {
             self.purge_floor.store(max_slot, .release);
             self.pruneOwnLatest(max_slot);
             self.q.push(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
+            // §10 "and compacts": rewrite the logs occasionally so they do
+            // not grow without bound (every 64 delivered slots).
+            if (frontier % 64 == 0) {
+                self.store.compact(max_slot) catch |e|
+                    log.warn("log compaction failed (will retry later): {s}", .{@errorName(e)});
+            }
         }
     }
 
