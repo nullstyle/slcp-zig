@@ -1,5 +1,7 @@
 # Validating decode entry point for flat (table-less) single-segment bytes
 
+> **Filed 2026-08-26** as https://github.com/nullstyle/capnp-zig/issues/14 (verbatim, citations re-verified at capnp-zig HEAD 1456826).
+
 **Ask:** a `Message.initFlat` that validates and decodes a bare single
 segment — the shape `canonical.canonicalizeFlat` emits and `capnp convert
 binary:canonical` writes — without requiring the caller to synthesize a

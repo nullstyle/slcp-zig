@@ -1,5 +1,7 @@
 # Direct `MessageBuilder` → canonical-bytes path
 
+> **Filed 2026-08-26** as https://github.com/nullstyle/capnp-zig/issues/13 (verbatim, citations re-verified at capnp-zig HEAD 1456826).
+
 **Ask:** a canonicalization entry point that consumes a `MessageBuilder`
 directly, so locally built messages can be canonicalized without a framed
 serialize → re-parse → re-validate round trip.

@@ -1,5 +1,7 @@
 # Promote the schema-free `canonical` module to the frozen Stable API snapshot
 
+> **Filed 2026-08-26** as https://github.com/nullstyle/capnp-zig/issues/12 (verbatim, citations re-verified at capnp-zig HEAD 1456826).
+
 **Ask:** move `canonical.canonicalize`, `canonical.canonicalizeFlat`,
 `canonical.isCanonical`, `CanonicalError`, and `CanonicalizeError` from the
 informational experimental snapshot into the CI-gated `docs/api-snapshot.txt`
