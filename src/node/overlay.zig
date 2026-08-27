@@ -111,6 +111,15 @@ pub const max_write_queue_bytes: usize = 16 * 1024 * 1024;
 /// closed immediately, before any per-conn resources are allocated.
 pub const max_inbound_conns: usize = 128;
 
+/// How EVERY consensus-network Framer in this process is constructed: one
+/// max-size frame plus one read chunk of headroom. This is the single
+/// definition — `runConnection` builds its framer from it, and the vendored
+/// framing conformance replay (tests/framing_vectors_test.zig) imports it, so
+/// a change to the cap is a change to what that suite asserts.
+pub const framer_options: framing.Framer.Options = .{
+    .max_buffered_bytes = max_frame_bytes + default_read_buffer_size,
+};
+
 /// Runtime inbound cap. Production always runs the `max_inbound_conns`
 /// default; file-private so a test can lower it to something small without
 /// opening 128 real sockets.
@@ -689,9 +698,7 @@ pub const Overlay = struct {
         // never legitimately buffers more than one incomplete frame plus one
         // read chunk. A push past this cap ⇒ oversized frame ⇒ framing
         // error ⇒ disconnect.
-        var framer = framing.Framer.initWithOptions(gpa, .{
-            .max_buffered_bytes = max_frame_bytes + default_read_buffer_size,
-        });
+        var framer = framing.Framer.initWithOptions(gpa, framer_options);
 
         // Handshake deadline: a peer that never sends its Hello must not
         // park this thread forever in a blocking read. Resolved to an

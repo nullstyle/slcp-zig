@@ -82,6 +82,35 @@ pub fn build(b: *std.Build) void {
     });
     const run_vector_tests = b.addRunArtifact(vector_tests);
 
+    // Vendored framing conformance replay (design §9.1): capnp-zig's published
+    // fixtures for the segment framer, checked in under vectors/framing/ and
+    // replayed against the Framer AS THE OVERLAY CONFIGURES IT. It therefore
+    // lives in the FULL-capnp graph (`slcp_mod` → slcp_core_native →
+    // capnpc-zig), not the core-only one: `rpc.wire.framing` exists only
+    // there, and capnpc-zig-core cannot coexist with it in one compilation.
+    // Reads the checked-in JSON relative to the build root, so cwd is pinned;
+    // absent file ⇒ error.SkipZigTest.
+    const framing_vector_tests = b.addTest(.{
+        .name = "slcp-framing-vector-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/framing_vectors_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "slcp", .module = slcp_mod },
+            },
+        }),
+    });
+    const run_framing_vector_tests = b.addRunArtifact(framing_vector_tests);
+    run_framing_vector_tests.setCwd(b.path("."));
+    // The fixture JSON is read at runtime, so the build graph cannot see it as
+    // an input (and must not declare it, or a missing file would fail the
+    // build instead of skipping). Never answer this conformance gate from
+    // cache — same reasoning as the wasm differential run steps below.
+    run_framing_vector_tests.has_side_effects = true;
+    const framing_vectors_step = b.step("framing-vectors", "Replay the vendored capnp-zig framing conformance fixtures");
+    framing_vectors_step.dependOn(&run_framing_vector_tests.step);
+
     const e2e_tests = b.addTest(.{
         .name = "slcp-engine-e2e-tests",
         .root_module = b.createModule(.{
@@ -244,9 +273,10 @@ pub fn build(b: *std.Build) void {
     });
     const wasm_diff_tests = b.addTest(.{ .name = "slcp-wasm-diff", .root_module = wasm_diff_mod });
 
-    const test_step = b.step("test", "Run unit + vector + e2e + ABI conformance + sim matrix + fuzz smoke + wasm differential (skipped without the wasm artifact)");
+    const test_step = b.step("test", "Run unit + vector + framing conformance + e2e + ABI conformance + sim matrix + fuzz smoke + wasm differential (skipped without the wasm artifact)");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
+    test_step.dependOn(&run_framing_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
     test_step.dependOn(&run_node_tests.step);
     test_step.dependOn(abi_step);
