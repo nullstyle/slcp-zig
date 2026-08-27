@@ -81,6 +81,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_vector_tests = b.addRunArtifact(vector_tests);
+    // Reads vectors/*.json and vectors/traces/*.bin relative to the build
+    // root, so cwd is pinned. And since those files are not declared build
+    // inputs, a gate reading files the build graph does not declare must
+    // never be answered from cache — otherwise a regenerated or hand-edited
+    // vector leaves the previous "pass" standing and the replay silently
+    // does not re-run.
+    run_vector_tests.setCwd(b.path("."));
+    run_vector_tests.has_side_effects = true;
 
     // Vendored framing conformance replay (design §9.1): capnp-zig's published
     // fixtures for the segment framer, checked in under vectors/framing/ and
@@ -403,6 +411,14 @@ pub fn build(b: *std.Build) void {
     run_gen_vectors.setCwd(b.path("."));
     const vectors_step = b.step("vectors", "Regenerate conformance vectors into vectors/");
     vectors_step.dependOn(&run_gen_vectors.step);
+
+    // `zig build test` COMPILES the vector generator (without running it —
+    // running rewrites vectors/ as a side effect). The generator is the
+    // frozen protocol definition's source, but nothing in `test` referenced
+    // it, so an engine API change silently broke it and `just vectors`
+    // stayed dead until the next re-vendor. Compiling it here catches that
+    // class of rot at the same gate as everything else.
+    test_step.dependOn(&gen_vectors.step);
 
     // -----------------------------------------------------------------
     // End-to-end (design §13.6 / §14-M5 accept). Four full Zig nodes in
