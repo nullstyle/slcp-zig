@@ -13,9 +13,9 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg| try args.append(init.gpa, arg);
 
     var out_buf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    var out = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
     var err_buf: [4096]u8 = undefined;
-    var err_out = std.Io.File.stderr().writer(init.io, &err_buf);
+    var err_out = std.Io.File.stderr().writerStreaming(init.io, &err_buf);
 
     const code = cli.run(init.gpa, init.io, args.items, &out.interface, &err_out.interface);
     out.interface.flush() catch {};
