@@ -1,0 +1,10 @@
+.{
+    .name = .counter_example,
+    .version = "0.0.0",
+    .fingerprint = 0xe087c7bef45f9b52, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1786",
+    .dependencies = .{
+        .slcp = .{ .path = "../.." },
+    },
+    .paths = .{""},
+}

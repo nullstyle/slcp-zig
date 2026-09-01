@@ -44,6 +44,9 @@ const purge_window: u64 = 16;
 /// Anti-entropy period (§9.2 host policy; see the resync_thread field).
 const resync_interval_ms: u64 = 3_000;
 
+/// M6:example logs — cadence of the "waiting for peers" reminder.
+const peers_waiting_reminder_ms: u64 = 60_000;
+
 /// A relative-duration Io.Timeout in milliseconds (this Zig's condvar API).
 /// Public: `AppNode.waitApplied` reuses it.
 pub fn msTimeout(ms: u64) std.Io.Timeout {
@@ -413,6 +416,15 @@ pub const Node = struct {
     resync_thread: ?std.Thread = null,
     resync_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    // M6:example logs — hobbyist-facing connectivity counters. `peers_live`
+    // is the number of Hello-complete connections right now (up minus down;
+    // a pair of nodes that dial EACH OTHER holds two — one per direction —
+    // so a full 3-node mesh shows up to 4), `peer_downs` counts on_peer_down
+    // events. Both feed only log lines and tests; no protocol decision reads
+    // them.
+    peers_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    peer_downs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     pub fn allocator(self: *Node) std.mem.Allocator {
         return self.gpa;
     }
@@ -679,6 +691,7 @@ pub const Node = struct {
             .ctx = self,
             .on_recv = onRecv,
             .on_peer_up = onPeerUp,
+            .on_peer_down = onPeerDown, // M6:example logs
         });
 
         // ---- Restart recovery (§10), synchronous, pre-threads ----
@@ -778,6 +791,8 @@ pub const Node = struct {
             else => return fail(diag, error.ListenFailed, "cannot listen on .listen_port {d}: {t}; check the port and the network stack.", .{ opts.listen_port, e }),
         };
         errdefer self.ov.stop();
+        // M6:example logs — the first line a hobbyist looks for.
+        create_log.info("node {s} listening on port {d}; dialing {d} peer(s)", .{ &std.fmt.bytesToHex(node_id, .lower), self.ov.boundPort(), self.peer_specs.len });
 
         self.live = true; // dispatch may now emit to the network
         self.engine_thread = std.Thread.spawn(.{}, engineLoop, .{self}) catch |e| {
@@ -1046,9 +1061,22 @@ pub const Node = struct {
     fn resyncLoop(self: *Node) void {
         const tick_ms: u64 = 250;
         var since_ms: u64 = 0;
+        // M6:example logs — while fewer connections are live than peers are
+        // configured, remind (at most once per 60 s) that a quorum is needed.
+        var waiting_ms: u64 = 0;
         while (!self.resync_stop.load(.acquire)) {
             std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(tick_ms)), .awake) catch {};
             since_ms += tick_ms;
+            const live = self.peers_live.load(.acquire);
+            if (live < self.peer_specs.len) {
+                waiting_ms += tick_ms;
+                if (waiting_ms >= peers_waiting_reminder_ms) {
+                    waiting_ms = 0;
+                    log.info("{d} live connection(s) to {d} configured peer(s) — consensus needs a quorum; waiting", .{ live, self.peer_specs.len });
+                }
+            } else {
+                waiting_ms = 0;
+            }
             if (since_ms < resync_interval_ms) continue;
             since_ms = 0;
             if (self.failed.load(.acquire)) continue;
@@ -1371,6 +1399,9 @@ pub const Node = struct {
 
     fn onPeerUp(ctx: ?*anyopaque, peer_id: usize) void {
         const self: *Node = @ptrCast(@alignCast(ctx.?));
+        // M6:example logs
+        const live = self.peers_live.fetchAdd(1, .acq_rel) + 1;
+        log.info("peer {d} up ({d} live connection(s); {d} peer(s) configured)", .{ peer_id, live, self.peer_specs.len });
         // Catch-up (§9.2): send our latest own envelopes, then ask for the
         // peer's externalized state.
         self.own_mu.lockUncancelable(self.io);
@@ -1381,6 +1412,17 @@ pub const Node = struct {
         }
         self.own_mu.unlock(self.io);
         self.ov.send(peer_id, .{ .get_slot_state = 0 });
+    }
+
+    /// M6:example logs — `Callbacks.on_peer_down`: fires on the peer's
+    /// reader thread after its read loop ends (the connection is still
+    /// counted by `ov.peerCount()` at this instant; `peers_live` is the
+    /// Node's own up-minus-down tally). Log only; no protocol effect.
+    fn onPeerDown(ctx: ?*anyopaque, peer_id: usize) void {
+        const self: *Node = @ptrCast(@alignCast(ctx.?));
+        const live = self.peers_live.fetchSub(1, .acq_rel) - 1;
+        _ = self.peer_downs.fetchAdd(1, .acq_rel);
+        log.info("peer {d} down ({d} live connection(s); {d} peer(s) configured)", .{ peer_id, live, self.peer_specs.len });
     }
 
     fn enqueueEnvelope(self: *Node, framed_env: []const u8, source: usize) void {
@@ -1535,7 +1577,7 @@ test "node: every method compiles (forces body analysis without instantiation)" 
         Node.onPeerUp,         Node.enqueueEnvelope,    Node.onQsetFrame,
         Node.answerGetQset,    Node.answerGetSlotState, Node.onTimerFire,
         Node.drainDeliverable, Node.noteQsetRequested,  Node.consumeQsetRequested,
-        Node.resyncLoop,       Node.deliverSlot,
+        Node.resyncLoop,       Node.deliverSlot,        Node.onPeerDown,
     };
     inline for (fns) |f| {
         const p = &f;
@@ -1715,4 +1757,79 @@ test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascen
         try std.testing.expectEqualSlices(u64, &[_]u64{3}, hook.slots.items); // stopped at the refusal
         try std.testing.expect(hook.failed_with == null); // create failed; no latch, no on_failed
     }
+}
+
+// -- M6:example logs: peer up/down wiring ------------------------------------
+
+/// Poll `cond` every 50 ms for up to `max_ms`; error.Timeout when it never held.
+fn pollUntil(io: std.Io, max_ms: u64, ctx: anytype, comptime cond: fn (@TypeOf(ctx)) bool) !void {
+    var waited: u64 = 0;
+    while (!cond(ctx)) {
+        if (waited >= max_ms) return error.Timeout;
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+        waited += 50;
+    }
+}
+
+// Non-vacuity: dropping `.on_peer_down = onPeerDown` from create()'s overlay
+// Callbacks leaves `peer_downs` at 0 and `peers_live` stuck at 1 — the
+// second poll times out (red); dropping the fetchAdd in `onPeerUp` keeps
+// `peers_live` at 0 — the first poll times out (red). `ov.peerCount() == 0`
+// pins that the survivor really dropped the dead connection (the overlay's
+// own teardown), not merely counted it.
+test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount drops to 0 and on_peer_down fired" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
+    const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
+
+    const seed_a: [32]u8 = @splat(0x61);
+    const seed_b: [32]u8 = @splat(0x62);
+    const ids = [2][32]u8{ try crypto.publicKeyFromSeed(seed_a), try crypto.publicKeyFromSeed(seed_b) };
+    var diag: Diagnostic = .{};
+
+    const a = try Node.create(gpa, io, .{
+        .network = "peer-down v1",
+        .secret_seed = seed_a,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .data_dir = dir_a,
+        .diagnostic = &diag,
+    });
+    defer a.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{a.boundPort()});
+    const b = try Node.create(gpa, io, .{
+        .network = "peer-down v1",
+        .secret_seed = seed_b,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .peers = &.{spec},
+        .data_dir = dir_b,
+        .diagnostic = &diag,
+    });
+    var b_live = true;
+    defer if (b_live) b.deinit();
+
+    const Probe = struct {
+        fn up(n: *Node) bool {
+            return n.peers_live.load(.acquire) >= 1;
+        }
+        fn down(n: *Node) bool {
+            return n.peer_downs.load(.acquire) >= 1 and n.peers_live.load(.acquire) == 0 and n.ov.peerCount() == 0;
+        }
+    };
+    try pollUntil(io, 10_000, a, Probe.up);
+    try std.testing.expectEqual(@as(u64, 0), a.peer_downs.load(.acquire));
+
+    b.deinit();
+    b_live = false;
+    try pollUntil(io, 10_000, a, Probe.down);
+    try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
 }

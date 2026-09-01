@@ -582,6 +582,66 @@ pub fn build(b: *std.Build) void {
     // and its run steps. Insert under this anchor only; never above it.
     // Keep the blank line between anchors so parallel stages merge cleanly.
 
+    // counter-intree: the §0 program (examples/counter/src/main.zig — the
+    // README block, byte-identical) compiled against the in-tree `slcp`
+    // module. NOT installed and never run here (it would dial example.com):
+    // `zig build test` proves the published program still compiles. The
+    // docs-smoke step (M6:docs) also depends on it.
+    const counter_intree = b.addExecutable(.{
+        .name = "counter-intree",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/counter/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+        }),
+    });
+    test_step.dependOn(&counter_intree.step);
+
+    // example-smoke: builds examples/counter three times as a CONSUMER
+    // (nested `zig build` per scratch copy, the repo as a path dependency),
+    // then runs the three counters over loopback, kills node0 -9 at count 8
+    // and restarts it. Prints `[example-smoke] nodes=3 slots=N count=N`.
+    // Minutes-scale and network/filesystem-bound: its own step, not part of
+    // `test` — `test` only compiles the tool and runs its unit tests. The
+    // tool reads examples/counter/* and writes .zig-cache/example-smoke/,
+    // none of it declared to the build graph: cwd pinned + side effects.
+    const example_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("tools/example_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+    });
+    const example_smoke = b.addExecutable(.{ .name = "example-smoke", .root_module = example_smoke_mod });
+    test_step.dependOn(&example_smoke.step);
+
+    const run_example_smoke = b.addRunArtifact(example_smoke);
+    run_example_smoke.addArgs(&.{ "--zig", b.graph.zig_exe });
+    run_example_smoke.addPassthruArgs();
+    run_example_smoke.setCwd(b.path("."));
+    run_example_smoke.has_side_effects = true;
+    const example_smoke_step = b.step("example-smoke", "Build examples/counter as a consumer x3, run 3 loopback counters (kill -9 + restart node0), 20 slots (`-- --slots N --keep`)");
+    example_smoke_step.dependOn(&run_example_smoke.step);
+
+    const run_example_build = b.addRunArtifact(example_smoke);
+    run_example_build.addArgs(&.{ "--zig", b.graph.zig_exe, "--build-only" });
+    run_example_build.addPassthruArgs();
+    run_example_build.setCwd(b.path("."));
+    run_example_build.has_side_effects = true;
+    const example_build_step = b.step("example-build", "Nested consumer build of examples/counter only (exit 0 iff it builds)");
+    example_build_step.dependOn(&run_example_build.step);
+
+    // The tool's unit tests (the five-line rewriter against the REAL
+    // examples/counter/src/main.zig, the evidence-line formatter): they read
+    // an undeclared file, hence cwd + side effects. Part of `test`.
+    const example_smoke_tests = b.addTest(.{ .name = "slcp-example-smoke-tests", .root_module = example_smoke_mod });
+    const run_example_smoke_tests = b.addRunArtifact(example_smoke_tests);
+    run_example_smoke_tests.setCwd(b.path("."));
+    run_example_smoke_tests.has_side_effects = true;
+    const example_smoke_tests_step = b.step("example-smoke-tests", "Run the example-smoke tool's unit tests (part of `test`)");
+    example_smoke_tests_step.dependOn(&run_example_smoke_tests.step);
+    test_step.dependOn(&run_example_smoke_tests.step);
+
     // ===== M6:docs =====
     // M6 stage anchor (docs): docs_smoke tool + run step, bytes_node example
     // compile, the docs-smoke step. Insert under this anchor only.
