@@ -26,6 +26,7 @@ slcp.Node.io: field Io
 slcp.Node.last_ext_value: field []u8
 slcp.Node.live: field bool = false
 slcp.Node.local_qset_hash: field [32]u8
+slcp.Node.max_value_bytes: field u32
 slcp.Node.network_id: field [32]u8
 slcp.Node.next_deliver: field u64
 slcp.Node.node_id: field [32]u8
@@ -46,19 +47,27 @@ slcp.Node.resync_thread: field ?Thread = null
 slcp.Node.store: field node.store.Store
 slcp.Node.watcher: field bool
 slcp.Node.wheel: field node.timers.Wheel
+slcp.NodeId: type = [32]u8
+slcp.NodeOptions.allow_unsafe_quorum: field bool = false
 slcp.NodeOptions.data_dir: field []const u8
+slcp.NodeOptions.diagnostic: field ?*node.node.Diagnostic = null
 slcp.NodeOptions.driver: field ?driver.Driver = null
-slcp.NodeOptions.key_path: field ?[]const u8 = null
+slcp.NodeOptions.include_self: field bool = true
+slcp.NodeOptions.key_file: field ?[]const u8 = null
 slcp.NodeOptions.listen_port: field u16
 slcp.NodeOptions.max_value_bytes: field u32 = 4096
 slcp.NodeOptions.network: field []const u8
 slcp.NodeOptions.node_id: field ?[32]u8 = null
 slcp.NodeOptions.peers: field []const []const u8 = <default>
-slcp.NodeOptions.quorum_set: field engine.qset.QuorumSetOwned
+slcp.NodeOptions.quorum: field quorum.Quorum
 slcp.NodeOptions.secret_seed: field ?[32]u8 = null
 slcp.NodeOptions.start_slot: field u64 = 1
 slcp.NodeOptions.strict_canonical: field bool = true
 slcp.NodeOptions.watcher: field bool = false
+slcp.Quorum.inner_sets: field []const quorum.Quorum = <default>
+slcp.Quorum.threshold: field u32
+slcp.Quorum.validators: field []const [32]u8 = <default>
+slcp.Quorum: struct
 slcp.Validity.invalid: enumerant = 0
 slcp.Validity.maybe_valid: enumerant = 1
 slcp.Validity.valid: enumerant = 2
@@ -983,12 +992,37 @@ slcp.core.values.dupe: fn (mem.Allocator, []const u8) error{OutOfMemory}![]u8
 slcp.core.values.order: fn ([]const u8, []const u8) math.Order
 slcp.core.values: struct
 slcp.core: struct
+slcp.keys.createNew: fn (Io, []const u8) error{AccessDenied,AntivirusInterference,BadPathName,BrokenPipe,Canceled,CrossDevice,DeviceBusy,DirNotEmpty,DiskQuota,EntropyUnavailable,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,HardwareFailure,IdentityElement,InputOutput,IsDir,KeyFileExists,LinkQuotaExceeded,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,OperationUnsupported,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.keys.KeyPair
+slcp.keys.load: fn (Io, []const u8) error{AccessDenied,AntivirusInterference,BadKeyFile,BadPathName,Canceled,DeviceBusy,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,IdentityElement,InputOutput,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForReading,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,Unseekable,WouldBlock}!node.keys.KeyPair
 slcp.keys: struct
-slcp.node.Error: type = error{EngineFailed,NoIdentity,OutOfMemory}
+slcp.lint_report.Level.members: field u32
+slcp.lint_report.Level.threshold: field u32
+slcp.lint_report.Level: struct
+slcp.lint_report.Report.findings: field []const engine.qset.LintFinding
+slcp.lint_report.Report.hash: field [32]u8
+slcp.lint_report.Report.qs: field *const engine.qset.QuorumSetOwned
+slcp.lint_report.Report: struct
+slcp.lint_report.byzantineTolerance: fn (u32, u32) u32
+slcp.lint_report.depth: fn (*const engine.qset.QuorumSetOwned) u32
+slcp.lint_report.firstBadThreshold: fn (*const engine.qset.QuorumSetOwned) ?node.lint_report.Level
+slcp.lint_report.firstDuplicate: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!?[32]u8
+slcp.lint_report.hasErrors: fn ([]const engine.qset.LintFinding) bool
+slcp.lint_report.totalValidators: fn (*const engine.qset.QuorumSetOwned) usize
+slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFailed}!void
+slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding) error{WriteFailed}!void
+slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
+slcp.lint_report: struct
+slcp.node.CreateError: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
+slcp.node.Diagnostic.buf: field [1024]u8 = <default>
+slcp.node.Diagnostic.len: field usize = 0
+slcp.node.Diagnostic.message: fn (*const node.node.Diagnostic) []const u8
+slcp.node.Diagnostic: struct
+slcp.node.Error: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
 slcp.node.Node.eng: field engine.engine.Engine
 slcp.node.Node.engine_thread: field ?Thread = null
+slcp.node.Node.explain: fn (error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}) []const u8
 slcp.node.Node.ext_closed: field bool = false
 slcp.node.Node.ext_cond: field Io.Condition = <default>
 slcp.node.Node.ext_mu: field Io.Mutex = <default>
@@ -999,6 +1033,7 @@ slcp.node.Node.io: field Io
 slcp.node.Node.last_ext_value: field []u8
 slcp.node.Node.live: field bool = false
 slcp.node.Node.local_qset_hash: field [32]u8
+slcp.node.Node.max_value_bytes: field u32
 slcp.node.Node.network_id: field [32]u8
 slcp.node.Node.next_deliver: field u64
 slcp.node.Node.node_id: field [32]u8
@@ -1019,7 +1054,11 @@ slcp.node.Node.resync_thread: field ?Thread = null
 slcp.node.Node.store: field node.store.Store
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel
+slcp.node.ProposeError: type = error{OutOfMemory,ValueEmpty,ValueTooLarge,WatcherCannotPropose}
+slcp.node.explain: fn (error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}) []const u8
+slcp.node.msTimeout: fn (u64) Io.Timeout
 slcp.node: struct
+slcp.nodeId: fn (comptime *const [64]u8) [32]u8
 slcp.overlay.Callbacks.ctx: field ?*anyopaque = null
 slcp.overlay.Callbacks.on_peer_down: field ?*const fn (?*anyopaque, usize) void = null
 slcp.overlay.Callbacks.on_peer_up: field *const fn (?*anyopaque, usize) void
@@ -1030,6 +1069,9 @@ slcp.overlay.Config.network_id_prefix: field [8]u8
 slcp.overlay.Config.node_id: field [32]u8
 slcp.overlay.Config.peers: field []const []const u8
 slcp.overlay.Config: struct
+slcp.overlay.HostPort.host: field []const u8
+slcp.overlay.HostPort.port: field u16
+slcp.overlay.HostPort: struct
 slcp.overlay.Overlay._placeholder: field usize = 0
 slcp.overlay.Overlay.accept_thread: field ?Thread = null
 slcp.overlay.Overlay.boundPort: fn (*node.overlay.Overlay) u16
@@ -1051,7 +1093,7 @@ slcp.overlay.Overlay.next_peer_id: field usize = 1
 slcp.overlay.Overlay.peerCount: fn (*node.overlay.Overlay) usize
 slcp.overlay.Overlay.send: fn (*node.overlay.Overlay, usize, node.wire.OverlayFrame) void
 slcp.overlay.Overlay.server: field ?Io.net.Server = null
-slcp.overlay.Overlay.start: fn (*node.overlay.Overlay) error{AccessDenied,AddressFamilyUnsupported,AddressInUse,AddressUnavailable,Canceled,LockedMemoryLimitExceeded,NetworkDown,OptionUnsupported,OutOfMemory,ProcessFdQuotaExceeded,ProtocolUnsupportedByAddressFamily,ProtocolUnsupportedBySystem,SocketModeUnsupported,SystemFdQuotaExceeded,SystemResources,ThreadQuotaExceeded,Unexpected}!void
+slcp.overlay.Overlay.start: fn (*node.overlay.Overlay) error{AccessDenied,AddressFamilyUnsupported,AddressInUse,AddressUnavailable,Canceled,NetworkDown,OptionUnsupported,OutOfMemory,ProcessFdQuotaExceeded,ProtocolUnsupportedByAddressFamily,ProtocolUnsupportedBySystem,SocketModeUnsupported,SystemFdQuotaExceeded,SystemResources,ThreadSpawnFailed,Unexpected}!void
 slcp.overlay.Overlay.started: field bool = false
 slcp.overlay.Overlay.stop: fn (*node.overlay.Overlay) void
 slcp.overlay.Overlay.stopping: field atomic.Value(bool) = <default>
@@ -1059,6 +1101,7 @@ slcp.overlay.Overlay.wait_cond: field Io.Condition = <default>
 slcp.overlay.Overlay.wait_mu: field Io.Mutex = <default>
 slcp.overlay.Overlay: struct
 slcp.overlay.PeerEventFn: type = *const fn (?*anyopaque, usize) void
+slcp.overlay.PeerSpecError: type = error{BadHost,BadPort,EmptyHost,MissingPort}
 slcp.overlay.RecvFn: type = *const fn (?*anyopaque, usize, *const node.wire.OverlayFrame) void
 slcp.overlay.TestLinkFilter: type = *const fn ([32]u8, [32]u8) bool
 slcp.overlay.default_read_buffer_size: const usize = 262144
@@ -1069,8 +1112,11 @@ slcp.overlay.max_inbound_conns: const usize = 128
 slcp.overlay.max_outstanding_requests: const usize = 64
 slcp.overlay.max_write_queue_bytes: const usize = 16777216
 slcp.overlay.max_write_queue_items: const usize = 1024
+slcp.overlay.parseHostPort: fn ([]const u8) error{BadPeerSpec}!node.overlay.HostPort
 slcp.overlay.setTestLinkFilter: fn (?*const fn ([32]u8, [32]u8) bool) void
+slcp.overlay.validatePeerSpec: fn ([]const u8) error{BadHost,BadPort,EmptyHost,MissingPort}!void
 slcp.overlay: struct
+slcp.parseNodeId: fn ([]const u8) error{BadNodeIdHex,BadNodeIdLength}![32]u8
 slcp.store.Error: type = error{BadRecord,IoFailed,OutOfMemory}
 slcp.store.ExtRecord.slot: field u64
 slcp.store.ExtRecord.value: field []u8
