@@ -184,7 +184,7 @@ pub const Externalized = struct {
     value: []u8,
 };
 
-pub const Quorum = core.quorum.Quorum;
+const Quorum = core.quorum.Quorum;
 
 pub const Options = struct {
     /// Passphrase → networkId (domain separation). Must be non-empty.
