@@ -18,7 +18,7 @@ frozen by accident — only by a deliberate rule.
 | Tier | File | Gate |
 |---|---|---|
 | **Stable** — the frozen contract | `docs/api-snapshot.txt` | `zig build check-api` (inside `zig build test`) is RED on any drift, on every OS. |
-| **Experimental** — may change at any 0.x bump | `docs/api-snapshot-experimental.txt` | Refreshed in place by `check-api`; CI's ubuntu leg runs `-Dstrict-experimental=true`, which is RED when the committed file is stale. |
+| **Experimental** — may change at any 0.x bump | `docs/api-snapshot-experimental.txt` | Refreshed in place by `check-api`; CI's `test` job runs `-Dstrict-experimental=true` on both ubuntu and macOS, which is RED when the committed file is stale. |
 
 A third, implicit tier is **Internal**: anything not `pub`, plus test-only
 code. It never appears in either file.
@@ -196,7 +196,7 @@ expect in the Stable list and that are deliberately **not**:
 | Leg | Gate |
 |---|---|
 | Linux x86_64 (ubuntu-latest) | `test` (incl. `check-api -Dstrict-experimental=true`, `api-closure`, `docs-smoke`), `wasm`, `wasm-diff`, `e2e`, `example-smoke`, `fmt-check`, `gen-check`. |
-| macOS arm64 (macos-latest) | `test` (incl. `check-api` — Stable file strict; the experimental file is refreshed, not gated, until one green run shows both OSes render it identically — R20), `wasm`, `wasm-diff`, `example-smoke`. |
+| macOS arm64 (macos-latest) | `test` (incl. `check-api -Dstrict-experimental=true` — strict on both files since CI run 33567835014 showed both OSes render the experimental file identically, R20), `api-closure`, `docs-smoke`, `wasm`, `wasm-diff`, `example-smoke`. |
 | wasm32-freestanding | the ABI artifact (`zig build wasm`) + its differential replay. |
 
 Platform-dependent spellings of the same std type are canonicalized by
