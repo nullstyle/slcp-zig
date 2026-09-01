@@ -51,6 +51,18 @@ appnode-errors:
 # ===== M6:example =====
 # M6 stage anchor (example): example-smoke / example-build recipes go here.
 
+# Build examples/counter three times as a consumer package, run the three
+# counters over loopback (ports 47311-47313), kill -9 node0 at count 8 and
+# restart it, until every node prints 20 slots. Evidence line:
+# `[example-smoke] nodes=3 slots=20 count=20`. Extra args pass through:
+# `just example-smoke --slots 40 --keep`.
+example-smoke *ARGS:
+    zig build example-smoke -- {{ARGS}}
+
+# Only the nested consumer build of examples/counter (exit 0 iff it builds).
+example-build:
+    zig build example-build
+
 # ===== M6:docs =====
 # M6 stage anchor (docs): docs-smoke recipe goes here.
 
