@@ -1,6 +1,11 @@
+# CAPNPC_ZIG = path to the plugin binary (CI builds it from the fetched
+# capnp-zig package and points here). Unset, the default `zig` makes `capnp`
+# search $PATH for `capnpc-zig` — that is capnp's `-o<lang>` rule: a bare
+# word means "the plugin capnpc-<lang> on PATH", a path with a slash is the
+# exact executable. (`-ocapnpc-zig` would look for `capnpc-capnpc-zig`.)
 # Regenerate src/gen/*.zig from schema/*.capnp using the capnpc-zig plugin.
 gen:
-    capnp compile -ozig:src/gen --src-prefix=schema schema/slcp.capnp schema/overlay.capnp schema/host.capnp
+    capnp compile -o${CAPNPC_ZIG:-zig}:src/gen --src-prefix=schema schema/slcp.capnp schema/overlay.capnp schema/host.capnp
 
 # Run all tests (unit + conformance vectors).
 test:
@@ -33,6 +38,32 @@ e2e:
 
 # ===== M6:apisnap_ci =====
 # M6 stage anchor (apisnap_ci): fmt / fmt-check / ci-lint / api-snapshot / check-api go here.
+
+# src/gen is deliberately NOT listed: capnpc-zig output is not fmt-clean (R10;
+# docs/upstream/06). `examples` joins the list in S6, once the example stage has
+# created the directory (zig fmt fails on a missing path, and CI must be green
+# from its first run).
+# Format the hand-written trees.
+fmt:
+    zig fmt build.zig src/*.zig src/node src/engine src/wasm sim tests tools
+
+# CI twin of `fmt`: same paths, --check.
+fmt-check:
+    zig fmt --check build.zig src/*.zig src/node src/engine src/wasm sim tests tools
+
+# Lint the GitHub Actions workflows (brew install actionlint).
+ci-lint:
+    actionlint .github/workflows/*.yml
+
+# Regenerate BOTH API snapshots (docs/api-snapshot*.txt) from the live surface.
+api-snapshot:
+    zig build api-snapshot
+
+# docs/stability.md is the review reference. Add -Dstrict-experimental=true to
+# also gate the experimental file, as CI's ubuntu job does.
+# Fail when the STABLE public API drifts from docs/api-snapshot.txt.
+check-api:
+    zig build check-api
 
 # ===== M6:release =====
 # M6 stage anchor (release): preflight / package-preflight / release-hash / release-tag / verify-release-hash go here.
