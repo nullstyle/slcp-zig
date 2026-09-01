@@ -132,8 +132,10 @@ fn encodeValue(comptime T: type, v: T, buf: []u8) usize {
             return 1;
         },
         .@"enum" => |e| {
-            const tag_bits = @typeInfo(e.tag_type).int.bits;
-            return encodeInt(tag_bits, false, @as(@Int(.unsigned, tag_bits), @bitCast(@backingInt(v))), buf);
+            // The tag keeps its own signedness so a signed-tag enum biases
+            // like any signed int (byte order == tag order, negatives decode).
+            const ti = @typeInfo(e.tag_type).int;
+            return encodeInt(ti.bits, ti.signedness == .signed, @backingInt(v), buf);
         },
         .array => |a| {
             var off: usize = 0;
@@ -181,8 +183,8 @@ fn decodeValue(comptime T: type, bytes: []const u8, off: *usize) ?T {
             };
         },
         .@"enum" => |e| {
-            const tag_bits = @typeInfo(e.tag_type).int.bits;
-            const raw = decodeInt(tag_bits, false, bytes, off) orelse return null;
+            const ti = @typeInfo(e.tag_type).int;
+            const raw = decodeInt(ti.bits, ti.signedness == .signed, bytes, off) orelse return null;
             return std.enums.fromInt(T, raw); // null unless the tag names a variant
         },
         .array => |a| {
@@ -574,6 +576,28 @@ test "codec strict rejections, each paired with a one-byte-fixed sibling that de
     try std.testing.expect(KitchenCodec.decode(&m) == null);
     m[11] = 2;
     try std.testing.expectEqual(Color.blue, KitchenCodec.decode(&m).?.e);
+}
+
+// Non-vacuity: encoding the tag as its raw unsigned bits (instead of with the
+// tag type's own signedness) makes the negative tag decode to null and orders
+// its byte .gt while the oracle says .lt.
+test "codec signed-tag enum: negative tags round-trip and order like their backing int" {
+    const S = enum(i8) { neg = -5, zero = 0, pos = 5 };
+    const C = Codec(struct { s: S });
+    var b1: [1]u8 = undefined;
+    var b2: [1]u8 = undefined;
+    const all = [_]S{ .neg, .zero, .pos };
+    for (all) |x| {
+        try std.testing.expectEqual(x, C.decode(C.encode(.{ .s = x }, &b1)).?.s);
+        for (all) |y| {
+            const want = C.order(.{ .s = x }, .{ .s = y });
+            const got = std.mem.order(u8, C.encode(.{ .s = x }, &b1), C.encode(.{ .s = y }, &b2));
+            try std.testing.expectEqual(want, got);
+        }
+    }
+    // Biased spelling of -5 is 0x7B; 0x81 unbiases to 1, which names no variant.
+    try std.testing.expectEqual(S.neg, C.decode(&[_]u8{0x7B}).?.s);
+    try std.testing.expect(C.decode(&[_]u8{0x81}) == null);
 }
 
 // -- contract acceptance ------------------------------------------------------
