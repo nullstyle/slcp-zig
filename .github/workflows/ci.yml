@@ -30,17 +30,18 @@ jobs:
         include:
           # R20: the STABLE snapshot (docs/api-snapshot.txt) is strict on
           # every OS — it is the frozen contract. The EXPERIMENTAL file is
-          # strict on Linux only: `@typeName` can spell std types per-OS
-          # (capnp-zig hit the `sockaddr` family), and a platform rendering
-          # difference there is noise, not a contract change. macOS runs the
-          # non-strict form, which refreshes the file in place and only
-          # WARNS on drift; flip it to strict after one green run shows the
-          # two renderings agree (`platform_type_aliases` is where a
-          # disagreement gets canonicalized).
+          # strict on both OSes too: `@typeName` can spell std types per-OS
+          # (capnp-zig hit the `sockaddr` family), so macOS first ran the
+          # non-strict form, which only WARNS on drift; run 33567835014
+          # (f4effab) showed the two renderings agree (no warning on macOS),
+          # so it was flipped to strict. If a future std bump makes the
+          # macOS leg red on the EXPERIMENTAL file only, canonicalize the
+          # spelling in tools/api_snapshot.zig's `platform_type_aliases`
+          # rather than dropping the flag.
           - os: ubuntu-latest
             strict_experimental: -Dstrict-experimental=true
           - os: macos-latest
-            strict_experimental: ""
+            strict_experimental: -Dstrict-experimental=true
     steps:
       - uses: actions/checkout@v6
 
