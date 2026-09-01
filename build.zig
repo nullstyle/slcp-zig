@@ -503,6 +503,81 @@ pub fn build(b: *std.Build) void {
     // M6 stage anchor (apisnap_ci): api-snapshot / check-api / api-closure
     // steps and the tool's tests. Insert under this anchor only.
     // Keep the blank line between anchors so parallel stages merge cleanly.
+    //
+    // Public API snapshot gate (design §13.8 / §14-M6, capnp-zig's check-api
+    // pattern). tools/api_snapshot.zig imports `slcp` in a NON-test build, so
+    // it sees exactly the surface a consumer sees, and renders it into two
+    // files: docs/api-snapshot.txt (STABLE — frozen; drift is red) and
+    // docs/api-snapshot-experimental.txt (informational). It also reads
+    // src/wasm/slcp_host_abi.zig as TEXT for the `slcp-abi.*` lines (the
+    // module cannot be imported natively — see the tests/abi section), and
+    // `--check` reads the committed snapshots. None of those files are
+    // declared build inputs, so EVERY run step below pins cwd AND is marked
+    // side-effectful. Measured on this toolchain (S1c ablations): the TEST
+    // step is the one that is actually served from cache without the flag
+    // (second run prints `cached`); the exe steps are side-effectful by
+    // construction — the runner treats `.infer_from_args` stdio with no
+    // output args as never cacheable (lib/compiler/Maker/Step/Run.zig:253-259)
+    // — but the flag is kept on them too, because a later `expectExitCode`
+    // / `addCheck` flips stdio to `.check`, which IS cached, and the gate
+    // would then answer a hand-edited snapshot from the previous pass. See
+    // docs/upstream/06-check-api-cache-and-fmt-clean-gen.md.
+    //
+    // `check-api` / `api-closure` are deliberately NOT folded into `test`
+    // yet: the surface is still moving through M6. S6 (the API freeze) adds
+    // them; only the tool's unit tests run under `test` today.
+    const strict_experimental = b.option(
+        bool,
+        "strict-experimental",
+        "check-api: also fail when docs/api-snapshot-experimental.txt is stale (CI ubuntu job; default false)",
+    ) orelse false;
+    const api_snapshot_mod = b.createModule(.{
+        .root_source_file = b.path("tools/api_snapshot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+    });
+    const api_snapshot_tool = b.addExecutable(.{
+        .name = "api-snapshot",
+        .root_module = api_snapshot_mod,
+    });
+
+    const run_api_snapshot_write = b.addRunArtifact(api_snapshot_tool);
+    run_api_snapshot_write.addArg("--write");
+    run_api_snapshot_write.setCwd(b.path("."));
+    run_api_snapshot_write.has_side_effects = true;
+    const api_snapshot_step = b.step("api-snapshot", "Regenerate docs/api-snapshot.txt + docs/api-snapshot-experimental.txt from the live public API");
+    api_snapshot_step.dependOn(&run_api_snapshot_write.step);
+
+    const run_api_snapshot_check = b.addRunArtifact(api_snapshot_tool);
+    run_api_snapshot_check.addArg("--check");
+    if (strict_experimental) run_api_snapshot_check.addArg("--strict-experimental");
+    run_api_snapshot_check.setCwd(b.path("."));
+    run_api_snapshot_check.has_side_effects = true;
+    const check_api_step = b.step("check-api", "Fail when the STABLE public API drifts from docs/api-snapshot.txt (-Dstrict-experimental=true also gates the experimental file)");
+    check_api_step.dependOn(&run_api_snapshot_check.step);
+
+    const run_api_closure = b.addRunArtifact(api_snapshot_tool);
+    run_api_closure.addArg("--closure");
+    run_api_closure.setCwd(b.path("."));
+    run_api_closure.has_side_effects = true;
+    const api_closure_step = b.step("api-closure", "Fail when a Stable signature mentions an Experimental type");
+    api_closure_step.dependOn(&run_api_closure.step);
+
+    // The tool's own unit tests (error-set sort, line normalization, the ABI
+    // text parser on fixtures AND on the real ABI source — hence cwd + side
+    // effects). Compiling them also evaluates the rule-liveness assertion, so
+    // a stale Stable rule is a compile error at the `test` gate.
+    const api_snapshot_tests = b.addTest(.{
+        .name = "slcp-api-snapshot-tests",
+        .root_module = api_snapshot_mod,
+    });
+    const run_api_snapshot_tests = b.addRunArtifact(api_snapshot_tests);
+    run_api_snapshot_tests.setCwd(b.path("."));
+    run_api_snapshot_tests.has_side_effects = true;
+    const api_snapshot_tests_step = b.step("api-snapshot-tests", "Run the API-snapshot tool's unit tests (part of `test`)");
+    api_snapshot_tests_step.dependOn(&run_api_snapshot_tests.step);
+    test_step.dependOn(&run_api_snapshot_tests.step);
 
     // ===== M6:release =====
     // M6 stage anchor (release): the preflight aggregate step. Insert under
