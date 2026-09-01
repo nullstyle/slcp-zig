@@ -150,7 +150,9 @@ pub const Diagnostic = struct {
         return self.buf[0..self.len];
     }
 
-    fn set(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+    /// Overwrite the message. Public so `AppNode.create` can report its own
+    /// members (`CommandExceedsMaxValueBytes`, …) through the same buffer.
+    pub fn set(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
         var w: std.Io.Writer = .fixed(&self.buf);
         w.print(fmt, args) catch {
             const ellipsis = "…";
@@ -182,6 +184,28 @@ fn fail(diag: ?*Diagnostic, err: CreateError, comptime fmt: []const u8, args: an
 pub const Externalized = struct {
     slot: u64,
     value: []u8,
+};
+
+/// Engine-thread delivery (design §8.5 "where apply runs"). When set, every
+/// externalized slot goes to `on_externalized` INSTEAD of the
+/// `waitExternalized` queue — on the engine thread, after the journal
+/// append, before the next input reaches the engine — so a typed `apply`
+/// and the driver's `validate` read the same state without a lock.
+/// Delivery is strictly slot-ascending on every path, including the
+/// journal-tail replay inside `create` (where the hook runs on the creating
+/// thread, before any thread starts). `value` is borrowed for the call.
+///
+/// An error from `on_externalized` is an invariant break (the app cannot
+/// consume a value the network already agreed on): inside `create` the node
+/// refuses to start (`EngineFailed`, the error named in the diagnostic);
+/// at runtime the node logs loudly and latches inert (§10 discipline), then
+/// calls `on_failed` exactly once. `on_failed` also fires for every other
+/// latch (a failed write-ahead append, an engine fault), so the app can
+/// stop waiting.
+pub const DeliveryHook = struct {
+    ctx: *anyopaque,
+    on_externalized: *const fn (ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void,
+    on_failed: *const fn (ctx: *anyopaque, err: anyerror) void,
 };
 
 const Quorum = core.quorum.Quorum;
@@ -222,6 +246,9 @@ pub const Options = struct {
     start_slot: u64 = 1,
     /// Application driver; null → the omakase default (§8.4).
     driver: ?core.driver.Driver = null,
+    /// Engine-thread delivery hook; null → the `waitExternalized` queue.
+    /// `AppNode` supplies its own (§8.5); bytes-level apps rarely need it.
+    delivery: ?DeliveryHook = null,
     /// Receives the failure message when `create` errors.
     diagnostic: ?*Diagnostic = null,
 };
@@ -345,6 +372,10 @@ pub const Node = struct {
     ext_cond: std.Io.Condition = .init,
     ext_queue: std.ArrayList(Externalized) = .empty,
     ext_closed: bool = false,
+    /// `Options.delivery`: when set, `deliverSlot` calls it instead of
+    /// queueing for `waitExternalized`. Read on the engine thread (and on
+    /// the creating thread during the journal-tail replay).
+    delivery: ?DeliveryHook,
 
     /// Engine-thread-only: out-of-order externalizations awaiting their turn
     /// (values owned), and the next slot to hand the app (§11.2 ordering).
@@ -601,6 +632,7 @@ pub const Node = struct {
             .current_slot = opts.start_slot,
             .next_deliver = opts.start_slot,
             .last_ext_value = &.{},
+            .delivery = opts.delivery,
             .max_value_bytes = opts.max_value_bytes,
         };
 
@@ -696,14 +728,15 @@ pub const Node = struct {
             self.watcher = true;
         }
 
-        if (!rec.own_log_corrupt) {
-            for (rec.own_latest) |r| {
-                self.applyInput(.{
-                    .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
-                    .source_peer = null,
-                });
-            }
-        }
+        // Order matters (M6 S3; the M5 order was restore → frontier → tail):
+        //   1. the delivery frontier comes from the journal high-water mark
+        //      FIRST, so nothing the own.log restore below can emit for a
+        //      journaled slot is ever handed to the app out of order;
+        //   2. the journal tail is replayed through `deliverSlot` — the same
+        //      chokepoint the engine thread uses — in ascending slot order
+        //      (a delivery hook sees it here, synchronously, before any
+        //      thread exists);
+        //   3. THEN the own.log restore rebuilds protocol state.
         // Resume proposal slot past the highest externalized slot on disk.
         if (rec.externalized_hwm) |hwm| {
             if (hwm + 1 > self.current_slot) self.current_slot = hwm + 1;
@@ -717,10 +750,18 @@ pub const Node = struct {
         // would be silently lost across a restart (review finding).
         for (rec.ext_tail) |r| {
             const v = try gpa.dupe(u8, r.value);
-            self.ext_queue.append(gpa, .{ .slot = r.slot, .value = v }) catch |e| {
-                gpa.free(v);
-                return e;
+            self.deliverSlot(r.slot, v) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return fail(diag, error.EngineFailed, ".delivery hook refused journaled slot {d} of {s} during restart replay: {t}; the app cannot consume a value the network already agreed on, so the node will not start.", .{ r.slot, opts.data_dir, e }),
             };
+        }
+        if (!rec.own_log_corrupt) {
+            for (rec.own_latest) |r| {
+                self.applyInput(.{
+                    .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
+                    .source_peer = null,
+                });
+            }
         }
 
         // ---- Go live ----
@@ -1063,6 +1104,8 @@ pub const Node = struct {
             self.ext_closed = true;
             self.ext_cond.broadcast(self.io);
             self.ext_mu.unlock(self.io);
+            // Exactly once, after the latch: the hook's waiters stop too.
+            if (self.delivery) |h| h.on_failed(h.ctx, err);
         }
     }
 
@@ -1184,17 +1227,15 @@ pub const Node = struct {
         var delivered_any = false;
         while (self.pending_ext.fetchRemove(self.next_deliver)) |kv| {
             const slot = kv.key;
-            const val = kv.value;
-            self.ext_mu.lockUncancelable(self.io);
-            self.ext_queue.append(self.gpa, .{ .slot = slot, .value = val }) catch {
-                self.gpa.free(val);
-                self.ext_mu.unlock(self.io);
-                log.err("OOM queueing externalized slot {d}", .{slot});
-                self.markFailed(error.OutOfMemory);
+            self.deliverSlot(slot, kv.value) catch |e| {
+                // Either OOM on the queue path or the delivery hook refusing
+                // a value the network agreed on: both mean the app can no
+                // longer see what was journaled — going inert is the honest
+                // failure (never silently diverge).
+                log.err("delivery of externalized slot {d} failed: {s}", .{ slot, @errorName(e) });
+                self.markFailed(e);
                 return;
             };
-            self.ext_cond.signal(self.io);
-            self.ext_mu.unlock(self.io);
             self.next_deliver = slot + 1;
             delivered_any = true;
         }
@@ -1215,6 +1256,27 @@ pub const Node = struct {
                     log.warn("log compaction failed (will retry later): {s}", .{@errorName(e)});
             }
         }
+    }
+
+    /// The single app hand-off for one externalized slot: the delivery hook
+    /// when `Options.delivery` is set (engine thread, or the creating thread
+    /// during the journal-tail replay), else the `waitExternalized` queue.
+    /// Takes ownership of `val` on every path. Callers keep slots ascending
+    /// (`next_deliver`); a hook error or a queue OOM is returned unchanged
+    /// for the caller to turn into a create failure or an inert latch.
+    fn deliverSlot(self: *Node, slot: u64, val: []u8) anyerror!void {
+        if (self.delivery) |h| {
+            defer self.gpa.free(val);
+            try h.on_externalized(h.ctx, slot, val);
+            return;
+        }
+        self.ext_mu.lockUncancelable(self.io);
+        defer self.ext_mu.unlock(self.io);
+        self.ext_queue.append(self.gpa, .{ .slot = slot, .value = val }) catch |e| {
+            self.gpa.free(val);
+            return e;
+        };
+        self.ext_cond.signal(self.io);
     }
 
     /// If idle and a proposal is queued, nominate the head for current_slot.
@@ -1473,7 +1535,7 @@ test "node: every method compiles (forces body analysis without instantiation)" 
         Node.onPeerUp,         Node.enqueueEnvelope,    Node.onQsetFrame,
         Node.answerGetQset,    Node.answerGetSlotState, Node.onTimerFire,
         Node.drainDeliverable, Node.noteQsetRequested,  Node.consumeQsetRequested,
-        Node.resyncLoop,
+        Node.resyncLoop,       Node.deliverSlot,
     };
     inline for (fns) |f| {
         const p = &f;
@@ -1496,4 +1558,157 @@ test "InputQueue: push, pop, and close over std.Io primitives" {
 
     q.close();
     try std.testing.expect(q.pop() == null); // closed + drained
+}
+
+// -- delivery hook + create() reorder (M6 S3) ---------------------------------
+
+const RecordingHook = struct {
+    gpa: std.mem.Allocator,
+    slots: std.ArrayList(u64) = .empty,
+    values: std.ArrayList([]u8) = .empty,
+    /// Refuse this slot with error.HookRefused.
+    refuse: ?u64 = null,
+    failed_with: ?anyerror = null,
+
+    fn onExternalized(ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void {
+        const self: *RecordingHook = @ptrCast(@alignCast(ctx));
+        if (self.refuse == slot) return error.HookRefused;
+        try self.slots.append(self.gpa, slot);
+        try self.values.append(self.gpa, try self.gpa.dupe(u8, value));
+    }
+
+    fn onFailed(ctx: *anyopaque, err: anyerror) void {
+        const self: *RecordingHook = @ptrCast(@alignCast(ctx));
+        self.failed_with = err;
+    }
+
+    fn hook(self: *RecordingHook) DeliveryHook {
+        return .{ .ctx = @ptrCast(self), .on_externalized = onExternalized, .on_failed = onFailed };
+    }
+
+    fn deinit(self: *RecordingHook) void {
+        for (self.values.items) |v| self.gpa.free(v);
+        self.values.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
+    }
+};
+
+/// A validly-signed, framed EXTERNALIZE envelope for `slot` by `seed` — what
+/// own.log holds for a slot this node externalized before a crash.
+fn buildSignedExternalize(gpa: std.mem.Allocator, seed: [32]u8, network_id: [32]u8, slot: u64, value: []const u8) ![]u8 {
+    const node_id = try crypto.publicKeyFromSeed(seed);
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var st = try gen_slcp.Statement.Builder.init(&mb);
+    try st.setNodeId(&node_id);
+    try st.setSlotIndex(slot);
+    var pledges = st.getPledges();
+    var ext = try pledges.initExternalize();
+    var commit = try ext.initCommit();
+    try commit.setCounter(1);
+    try commit.setValue(value);
+    try ext.setNH(1);
+    const qh: [32]u8 = @splat(7);
+    try ext.setCommitQuorumSetHash(&qh);
+    const stmt_bytes = try canonical.canonicalFlatFromBuilder(gpa, &mb);
+    defer gpa.free(stmt_bytes);
+    const digest = crypto.statementDigest(network_id, stmt_bytes);
+    const sig = try crypto.sign(seed, digest);
+
+    var emb = MessageBuilder.init(gpa);
+    defer emb.deinit();
+    var env = try gen_slcp.Envelope.Builder.init(&emb);
+    try env.setStatementBytes(stmt_bytes);
+    try env.setSignature(&sig);
+    return @constCast(try emb.toBytes());
+}
+
+// Non-vacuity: moving the journal-tail replay back BEFORE the frontier set
+// (the M5 order) or replaying it through `ext_queue.append` instead of
+// `deliverSlot` leaves the hook with zero slots inside create (the
+// `{3,5,7}` assertion goes red); dropping the `else` branch of `deliverSlot`
+// makes the hookless reopen see nothing; ignoring the hook's error in the
+// replay loop turns the `EngineFailed` expectation into a successful create.
+test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascending inside create; the queue path sees each once; a refusing hook fails create" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const data_dir = dir_buf[0..dir_len];
+
+    const passphrase = "delivery-hook-test v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+
+    // A crashed node's data_dir: the journal holds 3, 5, 7 and own.log the
+    // EXTERNALIZE this node emitted for 5 (the half the M5 order mishandled).
+    {
+        var st = try store_mod.Store.open(gpa, io, data_dir);
+        defer st.deinit();
+        try st.appendExternalized(3, "three");
+        try st.appendExternalized(5, "five");
+        try st.appendExternalized(7, "seven");
+        const env = try buildSignedExternalize(gpa, seed, network_id, 5, "five");
+        defer gpa.free(env);
+        try st.appendOwn(5, env);
+    }
+
+    var diag: Diagnostic = .{};
+    const base = Options{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    };
+    const want_slots = [_]u64{ 3, 5, 7 };
+    const want_values = [_][]const u8{ "three", "five", "seven" };
+
+    // Hook path: all three arrive synchronously inside create, ascending,
+    // and the waitExternalized queue stays empty.
+    {
+        var hook = RecordingHook{ .gpa = gpa };
+        defer hook.deinit();
+        var o = base;
+        o.delivery = hook.hook();
+        const n = try Node.create(gpa, io, o);
+        defer n.deinit();
+        try std.testing.expectEqualSlices(u64, &want_slots, hook.slots.items);
+        for (want_values, hook.values.items) |w, got| try std.testing.expectEqualSlices(u8, w, got);
+        try std.testing.expect(n.waitExternalized(.{ .timeout_ms = 50 }) == null);
+        try std.testing.expect(hook.failed_with == null);
+        try std.testing.expectEqual(@as(u64, 8), n.next_deliver);
+    }
+
+    // Queue path: the same dir yields 3, 5, 7 exactly once each.
+    {
+        const n = try Node.create(gpa, io, base);
+        defer n.deinit();
+        for (want_slots, want_values) |s, w| {
+            const e = n.waitExternalized(.{ .timeout_ms = 1000 }) orelse return error.TailNotReplayed;
+            defer gpa.free(e.value);
+            try std.testing.expectEqual(s, e.slot);
+            try std.testing.expectEqualSlices(u8, w, e.value);
+        }
+        try std.testing.expect(n.waitExternalized(.{ .timeout_ms = 50 }) == null);
+    }
+
+    // A hook that refuses a journaled value refuses the whole start.
+    {
+        var hook = RecordingHook{ .gpa = gpa, .refuse = 5 };
+        defer hook.deinit();
+        var o = base;
+        o.delivery = hook.hook();
+        try std.testing.expectError(error.EngineFailed, Node.create(gpa, io, o));
+        try std.testing.expect(std.mem.indexOf(u8, diag.message(), "HookRefused") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag.message(), "slot 5") != null);
+        try std.testing.expectEqualSlices(u64, &[_]u64{3}, hook.slots.items); // stopped at the refusal
+        try std.testing.expect(hook.failed_with == null); // create failed; no latch, no on_failed
+    }
 }
