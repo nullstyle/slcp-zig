@@ -66,6 +66,13 @@ example-build:
 # ===== M6:docs =====
 # M6 stage anchor (docs): docs-smoke recipe goes here.
 
+# The docs gate (part of `zig build test`): README/docs snippets byte-equal
+# to the sources they quote, recipe outputs byte-equal to the real CLI,
+# every documented `zig build X` / `just X` / `slcp <verb>` exists, enum arms
+# and version pins match the code. Evidence line: `[docs-smoke] checks=N failures=M`.
+docs-smoke:
+    zig build docs-smoke --summary all
+
 # ===== M6:apisnap_ci =====
 # M6 stage anchor (apisnap_ci): fmt / fmt-check / ci-lint / api-snapshot / check-api go here.
 

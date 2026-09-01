@@ -647,6 +647,54 @@ pub fn build(b: *std.Build) void {
     // compile, the docs-smoke step. Insert under this anchor only.
     // Keep the blank line between anchors so parallel stages merge cleanly.
 
+    // docs-smoke: the documentation gate (design §13.7). README / docs
+    // snippets byte-equal to the files they quote, recipe outputs byte-equal
+    // to the real CLI, every documented step / recipe / verb exists, enum
+    // arms and pinned versions match the source. The tool reads the docs,
+    // src/ and the manifests (none declared) and spawns the CLI: cwd pinned
+    // + side effects. Prints `[docs-smoke] checks=N failures=M`.
+    const docs_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("tools/docs_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+    });
+    const docs_smoke = b.addExecutable(.{ .name = "docs-smoke", .root_module = docs_smoke_mod });
+    const run_docs_smoke = b.addRunArtifact(docs_smoke);
+    run_docs_smoke.addArtifactArg(cli_exe);
+    run_docs_smoke.setCwd(b.path("."));
+    run_docs_smoke.has_side_effects = true;
+
+    // bytes-node-example: the README's bytes-level quickstart
+    // (examples/bytes_node.zig), compiled against the in-tree `slcp` module,
+    // never installed or run (it would dial example.com).
+    const bytes_node_example = b.addExecutable(.{
+        .name = "bytes-node-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/bytes_node.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+        }),
+    });
+
+    // The tool's unit tests (marker grammar, token scanners, the enum parser
+    // over the REAL src/engine files, the version scanners over the real
+    // manifests): undeclared file reads, hence cwd + side effects.
+    const docs_smoke_tests = b.addTest(.{ .name = "slcp-docs-smoke-tests", .root_module = docs_smoke_mod });
+    const run_docs_smoke_tests = b.addRunArtifact(docs_smoke_tests);
+    run_docs_smoke_tests.setCwd(b.path("."));
+    run_docs_smoke_tests.has_side_effects = true;
+    const docs_smoke_tests_step = b.step("docs-smoke-tests", "Run the docs-smoke tool's unit tests (part of `test`)");
+    docs_smoke_tests_step.dependOn(&run_docs_smoke_tests.step);
+
+    const docs_smoke_step = b.step("docs-smoke", "Docs gate: README/docs snippets byte-equal to sources, recipe outputs byte-equal to the CLI, documented steps/verbs/enum arms/pins exist (part of `test`)");
+    docs_smoke_step.dependOn(&run_docs_smoke.step);
+    docs_smoke_step.dependOn(&bytes_node_example.step);
+    docs_smoke_step.dependOn(&counter_intree.step);
+    docs_smoke_step.dependOn(&run_docs_smoke_tests.step);
+    test_step.dependOn(docs_smoke_step);
+
     // ===== M6:apisnap_ci =====
     // M6 stage anchor (apisnap_ci): api-snapshot / check-api / api-closure
     // steps and the tool's tests. Insert under this anchor only.
