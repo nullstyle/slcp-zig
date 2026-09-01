@@ -1623,12 +1623,16 @@ fn buildSignedExternalize(gpa: std.mem.Allocator, seed: [32]u8, network_id: [32]
     return @constCast(try emb.toBytes());
 }
 
-// Non-vacuity: moving the journal-tail replay back BEFORE the frontier set
-// (the M5 order) or replaying it through `ext_queue.append` instead of
-// `deliverSlot` leaves the hook with zero slots inside create (the
-// `{3,5,7}` assertion goes red); dropping the `else` branch of `deliverSlot`
-// makes the hookless reopen see nothing; ignoring the hook's error in the
-// replay loop turns the `EngineFailed` expectation into a successful create.
+// Non-vacuity: skipping the journal-tail replay, or replaying it through
+// `ext_queue.append` instead of `deliverSlot`, leaves the hook with zero
+// slots inside create (the `{3,5,7}` assertion goes red); moving the own.log
+// restore loop back BEFORE the frontier set + tail replay (the M5 order)
+// goes red on the refusing-hook arm — the restored slot-5 externalize is
+// dispatched before the replay can fail, and create's unwind does not free
+// what that dispatch buffered (the testing allocator reports the leak);
+// dropping the `else` branch of `deliverSlot` makes the hookless reopen see
+// nothing; ignoring the hook's error in the replay loop turns the
+// `EngineFailed` expectation into a successful create.
 test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascending inside create; the queue path sees each once; a refusing hook fails create" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
