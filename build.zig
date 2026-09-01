@@ -535,6 +535,20 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(appnode_errors_step);
 
+    // Codec fuzz target (§8.5 strict-canonical + order-preserving auto-codec):
+    // one std.testing.fuzz target + a 5000-iteration deterministic smoke,
+    // under both `fuzz-smoke` (part of `test`) and `fuzz`.
+    const fuzz_codec_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/codec_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+    });
+    const fuzz_codec_tests = b.addTest(.{ .name = "slcp-fuzz-codec", .root_module = fuzz_codec_mod });
+    const run_fuzz_codec_smoke = b.addRunArtifact(fuzz_codec_tests);
+    fuzz_smoke_step.dependOn(&run_fuzz_codec_smoke.step);
+    const run_fuzz_codec = b.addRunArtifact(fuzz_codec_tests);
+    fuzz_step.dependOn(&run_fuzz_codec.step);
 
     // ===== M6:example =====
     // M6 stage anchor (example): counter-intree compile, example_smoke tool
