@@ -6,6 +6,10 @@
 # a contract.
 slcp.AppNode: fn (comptime type) type
 slcp.Codec: fn (comptime type) type
+slcp.DeliveryHook.ctx: field *anyopaque
+slcp.DeliveryHook.on_externalized: field *const fn (*anyopaque, u64, []const u8) anyerror!void
+slcp.DeliveryHook.on_failed: field *const fn (*anyopaque, anyerror) void
+slcp.DeliveryHook: struct
 slcp.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
 slcp.Driver.ctx: field *anyopaque
 slcp.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
@@ -14,6 +18,7 @@ slcp.Driver: struct
 slcp.DriverError: type = error{DriverFault,OutOfMemory}
 slcp.Node.cur_source: field ?usize = null
 slcp.Node.current_slot: field u64
+slcp.Node.delivery: field ?node.node.DeliveryHook
 slcp.Node.eng: field engine.engine.Engine
 slcp.Node.engine_thread: field ?Thread = null
 slcp.Node.ext_closed: field bool = false
@@ -50,6 +55,7 @@ slcp.Node.wheel: field node.timers.Wheel
 slcp.NodeId: type = [32]u8
 slcp.NodeOptions.allow_unsafe_quorum: field bool = false
 slcp.NodeOptions.data_dir: field []const u8
+slcp.NodeOptions.delivery: field ?node.node.DeliveryHook = null
 slcp.NodeOptions.diagnostic: field ?*node.node.Diagnostic = null
 slcp.NodeOptions.driver: field ?driver.Driver = null
 slcp.NodeOptions.include_self: field bool = true
@@ -1013,13 +1019,19 @@ slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding) error{Wr
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
 slcp.node.CreateError: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
+slcp.node.DeliveryHook.ctx: field *anyopaque
+slcp.node.DeliveryHook.on_externalized: field *const fn (*anyopaque, u64, []const u8) anyerror!void
+slcp.node.DeliveryHook.on_failed: field *const fn (*anyopaque, anyerror) void
+slcp.node.DeliveryHook: struct
 slcp.node.Diagnostic.buf: field [1024]u8 = <default>
 slcp.node.Diagnostic.len: field usize = 0
 slcp.node.Diagnostic.message: fn (*const node.node.Diagnostic) []const u8
+slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
 slcp.node.Diagnostic: struct
 slcp.node.Error: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
+slcp.node.Node.delivery: field ?node.node.DeliveryHook
 slcp.node.Node.eng: field engine.engine.Engine
 slcp.node.Node.engine_thread: field ?Thread = null
 slcp.node.Node.explain: fn (error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}) []const u8

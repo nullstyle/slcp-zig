@@ -181,6 +181,7 @@ slcp.node.Node.waitExternalized: fn (*node.node.Node, node.node.Node.WaitOptions
 slcp.node.Node: struct
 slcp.node.Options.allow_unsafe_quorum: field bool = false
 slcp.node.Options.data_dir: field []const u8
+slcp.node.Options.delivery: field ?node.node.DeliveryHook = null
 slcp.node.Options.diagnostic: field ?*node.node.Diagnostic = null
 slcp.node.Options.driver: field ?driver.Driver = null
 slcp.node.Options.include_self: field bool = true
