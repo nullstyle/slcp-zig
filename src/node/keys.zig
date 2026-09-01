@@ -43,13 +43,41 @@ const core = @import("slcp-core");
 
 pub const Error = error{ BadKeyFile, EntropyUnavailable, KeyFileExists } || std.mem.Allocator.Error;
 
+// Explicit error sets (M6 S6 API freeze). These are signature-only
+// annotations: each is the union of what the body's callees declare, so the
+// behaviour is unchanged — but the snapshot gate now pins a NAMED contract a
+// consumer can `switch` on, instead of an inferred set that silently follows
+// std's file-system error vocabulary.
+/// `error.IdentityElement` from deriving the public key of a seed.
+pub const DeriveError = error{IdentityElement};
+/// Reading an existing key file: open + positional read + derive, plus
+/// `BadKeyFile` for a wrong-length file.
+pub const LoadError = error{BadKeyFile} ||
+    std.Io.File.OpenError ||
+    std.Io.File.ReadPositionalError ||
+    DeriveError;
+/// The first-run mint ceremony: entropy, atomic 0600 create, write, fsync,
+/// link into place.
+pub const MintError = std.Io.RandomSecureError ||
+    std.Io.Dir.CreateFileAtomicError ||
+    std.Io.File.Writer.Error ||
+    std.Io.File.SyncError ||
+    std.Io.File.Atomic.LinkError;
+/// `loadOrCreate`: a load, or (on `FileNotFound`) a mint.
+pub const LoadOrCreateError = LoadError || MintError;
+/// `createNew`: the existence probe (open), a mint, `KeyFileExists`, derive.
+pub const CreateNewError = error{KeyFileExists} ||
+    std.Io.File.OpenError ||
+    MintError ||
+    DeriveError;
+
 pub const KeyPair = struct {
     seed: [32]u8,
     public_key: [32]u8,
 };
 
 /// Load the seed at `path`, or create a fresh 0600 key file there.
-pub fn loadOrCreate(io: std.Io, path: []const u8) !KeyPair {
+pub fn loadOrCreate(io: std.Io, path: []const u8) LoadOrCreateError!KeyPair {
     const cwd = std.Io.Dir.cwd();
     var seed: [32]u8 = undefined;
 
@@ -83,7 +111,7 @@ pub fn loadOrCreate(io: std.Io, path: []const u8) !KeyPair {
 /// `error.FileNotFound` (and no file appears); a wrong-length file is
 /// `error.BadKeyFile`. The `Node.create` path uses this so a typo in
 /// `.key_file` cannot silently mint a second identity.
-pub fn load(io: std.Io, path: []const u8) !KeyPair {
+pub fn load(io: std.Io, path: []const u8) LoadError!KeyPair {
     const cwd = std.Io.Dir.cwd();
     var file = try cwd.openFile(io, path, .{});
     defer file.close(io);
@@ -97,7 +125,7 @@ pub fn load(io: std.Io, path: []const u8) !KeyPair {
 /// Mint a fresh key file at `path` (0600, atomic + durable — the same
 /// ceremony as `loadOrCreate`'s first run). `error.KeyFileExists` if any
 /// file already sits there — a key file is never overwritten.
-pub fn createNew(io: std.Io, path: []const u8) !KeyPair {
+pub fn createNew(io: std.Io, path: []const u8) CreateNewError!KeyPair {
     const cwd = std.Io.Dir.cwd();
     if (cwd.openFile(io, path, .{})) |opened| {
         var file = opened;
@@ -123,7 +151,7 @@ pub fn createNew(io: std.Io, path: []const u8) !KeyPair {
 /// into place. `link` fails with PathAlreadyExists rather than replacing, so
 /// a concurrently created key is never clobbered. A missing parent dir
 /// surfaces here as the underlying fs error (FileNotFound).
-fn mint(io: std.Io, cwd: std.Io.Dir, path: []const u8, seed: *[32]u8) !void {
+fn mint(io: std.Io, cwd: std.Io.Dir, path: []const u8, seed: *[32]u8) MintError!void {
     try io.randomSecure(seed);
     var af = try cwd.createFileAtomic(io, path, .{
         .permissions = std.Io.File.Permissions.fromMode(0o600),
