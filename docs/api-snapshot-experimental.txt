@@ -4,6 +4,14 @@
 # -Dstrict-experimental=true so the committed copy cannot go stale). Do not
 # rely on any symbol below across releases; only docs/api-snapshot.txt is
 # a contract.
+slcp.AppNode: fn (comptime type) type
+slcp.Codec: fn (comptime type) type
+slcp.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
+slcp.Driver.ctx: field *anyopaque
+slcp.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
+slcp.Driver.validate_value: field *const fn (*anyopaque, u64, []const u8, bool) driver.Validity
+slcp.Driver: struct
+slcp.DriverError: type = error{DriverFault,OutOfMemory}
 slcp.Node.cur_source: field ?usize = null
 slcp.Node.current_slot: field u64
 slcp.Node.eng: field engine.engine.Engine
@@ -51,6 +59,24 @@ slcp.NodeOptions.secret_seed: field ?[32]u8 = null
 slcp.NodeOptions.start_slot: field u64 = 1
 slcp.NodeOptions.strict_canonical: field bool = true
 slcp.NodeOptions.watcher: field bool = false
+slcp.Validity.invalid: enumerant = 0
+slcp.Validity.maybe_valid: enumerant = 1
+slcp.Validity.valid: enumerant = 2
+slcp.Validity: enum
+slcp.app_node.AppNode: fn (comptime type) type
+slcp.app_node.Codec: fn (comptime type) type
+slcp.app_node.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
+slcp.app_node.Driver.ctx: field *anyopaque
+slcp.app_node.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
+slcp.app_node.Driver.validate_value: field *const fn (*anyopaque, u64, []const u8, bool) driver.Validity
+slcp.app_node.Driver: struct
+slcp.app_node.DriverError: type = error{DriverFault,OutOfMemory}
+slcp.app_node.Validity.invalid: enumerant = 0
+slcp.app_node.Validity.maybe_valid: enumerant = 1
+slcp.app_node.Validity.valid: enumerant = 2
+slcp.app_node.Validity: enum
+slcp.app_node.max_encoded_bytes: const usize = 65536
+slcp.app_node: struct
 slcp.core.ballot.Error: type = error{AlreadyStarted,EffectBudgetExceeded,EngineFailed,InvalidValue,OutOfMemory,WrongProtocol}
 slcp.core.ballot.Phase.confirm: enumerant = 1
 slcp.core.ballot.Phase.externalize: enumerant = 2
@@ -370,6 +396,7 @@ slcp.core.gen.host.LintFinding.Builder.init: fn (*serialization.message.MessageB
 slcp.core.gen.host.LintFinding.Builder.setCode: fn (*gen.host.LintFinding.Builder, u16) error{}!void
 slcp.core.gen.host.LintFinding.Builder.setLevel: fn (*gen.host.LintFinding.Builder, u8) error{}!void
 slcp.core.gen.host.LintFinding.Builder.setMembers: fn (*gen.host.LintFinding.Builder, u32) error{}!void
+slcp.core.gen.host.LintFinding.Builder.setNode: fn (*gen.host.LintFinding.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.host.LintFinding.Builder.setThreshold: fn (*gen.host.LintFinding.Builder, u32) error{}!void
 slcp.core.gen.host.LintFinding.Builder.wrap: fn (serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder) gen.host.LintFinding.Builder
 slcp.core.gen.host.LintFinding.Builder: struct
@@ -377,6 +404,7 @@ slcp.core.gen.host.LintFinding.Reader._reader: field serialization.message.Struc
 slcp.core.gen.host.LintFinding.Reader.getCode: fn (gen.host.LintFinding.Reader) error{}!u16
 slcp.core.gen.host.LintFinding.Reader.getLevel: fn (gen.host.LintFinding.Reader) error{}!u8
 slcp.core.gen.host.LintFinding.Reader.getMembers: fn (gen.host.LintFinding.Reader) error{}!u32
+slcp.core.gen.host.LintFinding.Reader.getNode: fn (gen.host.LintFinding.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.host.LintFinding.Reader.getThreshold: fn (gen.host.LintFinding.Reader) error{}!u32
 slcp.core.gen.host.LintFinding.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.LintFinding.Reader
 slcp.core.gen.host.LintFinding.Reader.wrap: fn (serialization.message.StructReader) gen.host.LintFinding.Reader
@@ -771,20 +799,26 @@ slcp.core.pending.Pending: struct
 slcp.core.pending: struct
 slcp.core.qset.LintCode.all_members_critical: enumerant = 2
 slcp.core.qset.LintCode.below_two_thirds: enumerant = 1
+slcp.core.qset.LintCode.critical_node: enumerant = 3
 slcp.core.qset.LintCode.sub_majority_threshold: enumerant = 0
 slcp.core.qset.LintCode: enum
 slcp.core.qset.LintFinding.code: field engine.qset.LintCode
 slcp.core.qset.LintFinding.level: field engine.qset.LintLevel
 slcp.core.qset.LintFinding.members: field u32
+slcp.core.qset.LintFinding.node: field ?[32]u8 = null
 slcp.core.qset.LintFinding.threshold: field u32
 slcp.core.qset.LintFinding: struct
 slcp.core.qset.LintLevel.err: enumerant = 0
 slcp.core.qset.LintLevel.warning: enumerant = 1
 slcp.core.qset.LintLevel: enum
 slcp.core.qset.clone: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!engine.qset.QuorumSetOwned
+slcp.core.qset.containsNode: fn (*const engine.qset.QuorumSetOwned, [32]u8) bool
+slcp.core.qset.criticalNodes: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}![][32]u8
 slcp.core.qset.exciseNode: fn (mem.Allocator, *const engine.qset.QuorumSetOwned, [32]u8) error{OutOfMemory}!?engine.qset.QuorumSetOwned
 slcp.core.qset.fromReader: fn (mem.Allocator, gen.slcp.QuorumSet.Reader) anyerror!engine.qset.QuorumSetOwned
+slcp.core.qset.isSatisfiableWithout: fn (*const engine.qset.QuorumSetOwned, [32]u8) bool
 slcp.core.qset.lint: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}![]engine.qset.LintFinding
+slcp.core.qset.minBlockingSize: fn (*const engine.qset.QuorumSetOwned) u32
 slcp.core.qset: struct
 slcp.core.qset_store.Store.addToGraph: fn (*engine.qset_store.Store, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!void
 slcp.core.qset_store.Store.advertised: field hash_map.Custom([32]u8,[32]u8,hash_map.AutoContext([32]u8),80) = <default>
@@ -803,6 +837,27 @@ slcp.core.qset_store.Store.order: field array_list.Aligned([32]u8,null) = <defau
 slcp.core.qset_store.Store.setAdvertised: fn (*engine.qset_store.Store, [32]u8, [32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store: struct
 slcp.core.qset_store: struct
+slcp.core.quorum.NodeId: type = [32]u8
+slcp.core.quorum.ParseNodeIdError: type = error{BadNodeIdHex,BadNodeIdLength}
+slcp.core.quorum.Quorum.JsonError: type = error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}
+slcp.core.quorum.Quorum.containsNode: fn (quorum.Quorum, [32]u8) bool
+slcp.core.quorum.Quorum.fromJson: fn (mem.Allocator, []const u8) error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}!quorum.Quorum
+slcp.core.quorum.Quorum.inner_sets: field []const quorum.Quorum = <default>
+slcp.core.quorum.Quorum.majorityOf: fn ([]const [32]u8) quorum.Quorum
+slcp.core.quorum.Quorum.memberCount: fn (quorum.Quorum) usize
+slcp.core.quorum.Quorum.of: fn (u32, []const [32]u8) quorum.Quorum
+slcp.core.quorum.Quorum.ofSets: fn (u32, []const quorum.Quorum) quorum.Quorum
+slcp.core.quorum.Quorum.threshold: field u32
+slcp.core.quorum.Quorum.toOwned: fn (quorum.Quorum, mem.Allocator) error{OutOfMemory}!engine.qset.QuorumSetOwned
+slcp.core.quorum.Quorum.twoThirdsOf: fn ([]const [32]u8) quorum.Quorum
+slcp.core.quorum.Quorum.twoThirdsOfSets: fn ([]const quorum.Quorum) quorum.Quorum
+slcp.core.quorum.Quorum.validators: field []const [32]u8 = <default>
+slcp.core.quorum.Quorum.writeJson: fn (*Io.Writer, *const engine.qset.QuorumSetOwned) error{WriteFailed}!void
+slcp.core.quorum.Quorum: struct
+slcp.core.quorum.nodeId: fn (comptime *const [64]u8) [32]u8
+slcp.core.quorum.nodeIdHex: fn ([32]u8) [64]u8
+slcp.core.quorum.parseNodeId: fn ([]const u8) error{BadNodeIdHex,BadNodeIdLength}![32]u8
+slcp.core.quorum: struct
 slcp.core.slot.NodeId: type = [32]u8
 slcp.core.slot.Slot.ballot: field engine.ballot.State = <default>
 slcp.core.slot.Slot.deinit: fn (*engine.slot.Slot, mem.Allocator) void
