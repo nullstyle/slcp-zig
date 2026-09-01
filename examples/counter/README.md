@@ -157,15 +157,19 @@ every box.
    - `pk_a`, `pk_b`, `pk_c` := the three public keys, the **same three on
      every machine, in the same order**. The quorum
      `twoThirdsOf(&.{ pk_a, pk_b, pk_c })` is then 2-of-3 and lists yourself,
-     which is what you want: the node lints its own quorum at startup and
-     refuses sub-majority shapes (`twoThirdsOf` over only the *other* two
-     plus the auto-added self would be 2-of-4 — refused as unsafe).
+     which is what you want: every machine lints the same shape at startup.
+     (A node absent from its own quorum is auto-added; with three machines
+     `twoThirdsOf` over only the *other* two still comes out 2-of-3, but on
+     a four-machine network the same mistake — 2-of-3 over the others, plus
+     self — is 2-of-4, a sub-majority the node refuses as `UnsafeQuorum`.)
    - `.listen_port` := `7311` on every machine (or any port ≥ 1024 you open
      in the firewall).
    - `.peers` := the **other two** machines as `"host:port"` — hostnames or
      IP literals; IPv6 in brackets (`"[2001:db8::2]:7311"`). On **a** that is
      `&.{ "b.example.com:7311", "c.example.com:7311" }`, on **b** it is a and
-     c, and so on. Listing your own address is a startup error (`PeerIsSelf`).
+     c, and so on. A loopback literal with your own port (`127.0.0.1:7311`)
+     is refused at startup (`PeerIsSelf`); your own public hostname is not
+     detected — leave yourself out.
 
    Leave `.network` identical everywhere: the passphrase is hashed into the
    32-byte network id that keeps unrelated slcp networks from talking to each
@@ -221,7 +225,7 @@ every box.
 | `slot` lines stop; `… consensus needs a quorum; waiting` every 60 s | Only one of three nodes is up. 2-of-3 halts by design. | Start a second node. |
 | `peer 'b.example.com:7311' unreachable (ConnectionRefused)` forever | Firewall, or the other node is not running / listens on another port. | Open TCP 7311 on all three; check `ss -ltnp` on the peer. |
 | `unreachable (UnknownHostName)` | DNS. | Use the IP literal in `.peers`, or fix `/etc/hosts`. |
-| Startup error `UnsafeQuorum` / `QuorumThresholdOutOfRange` | The quorum shape is a fork machine (e.g. 1-of-3, or `twoThirdsOf` over the other two only). | List all three keys, yourself included; keep `twoThirdsOf`. Lint a JSON spec any time with `./zig-out/bin/slcp lint-quorum quorum.json` (see `docs/recipes/`). |
+| Startup error `UnsafeQuorum` / `QuorumThresholdOutOfRange` | The quorum shape is a fork machine (e.g. 1-of-3, or `twoThirdsOf` over the other nodes only — 2-of-4 once self is auto-added on a four-machine network). | List all three keys, yourself included; keep `twoThirdsOf`. Lint a JSON spec any time with `./zig-out/bin/slcp lint-quorum quorum.json` (see `docs/recipes/`). |
 | Startup error `DataDirOtherNetwork` / `DataDirOtherNode` | `slcp-data/` was written by a different `.network` or a different key. | Use a fresh `.data_dir` — never reuse one across identities. (A data dir binds to network + key on the very first start attempt, even one that fails later.) |
 | Startup error `KeyFileBad` / `KeyFileAccessDenied` / `KeyFileDirMissing` | `slcp.key` is not a raw 32-byte seed, is unreadable, or its directory does not exist. | `slcp key new slcp.key` in the directory you run from; check permissions (0600). |
 | `externalized gap: slots A..B unrecoverable; resuming delivery at C` | A node was down for more than 16 slots; the others have already compacted those slots and cannot answer for them. | Expected: the node skips the gap and continues from the live frontier. The log is loud on purpose. |
