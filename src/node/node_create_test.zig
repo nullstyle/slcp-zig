@@ -185,8 +185,8 @@ test "key_file: 31-byte file, missing parent dir, read-only dir, and first-run m
         try g.tmp.dir.createDirPath(io, "ro");
         var ro = try g.tmp.dir.openDir(io, "ro", .{});
         defer ro.close(io);
-        try ro.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
-        defer ro.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+        try g.tmp.dir.setFilePermissions(io, "ro", std.Io.File.Permissions.fromMode(0o500), .{});
+        defer g.tmp.dir.setFilePermissions(io, "ro", std.Io.File.Permissions.fromMode(0o700), .{}) catch {};
         var b3: [std.fs.max_path_bytes]u8 = undefined;
         const ro_path = try g.sub(&b3, "ro/slcp.key");
         var denied = g.options();
@@ -422,8 +422,8 @@ test "data_dir: empty, regular file, read-only parent, other network, other node
         try g.tmp.dir.createDirPath(io, "locked");
         var locked = try g.tmp.dir.openDir(io, "locked", .{});
         defer locked.close(io);
-        try locked.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
-        defer locked.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+        try g.tmp.dir.setFilePermissions(io, "locked", std.Io.File.Permissions.fromMode(0o500), .{});
+        defer g.tmp.dir.setFilePermissions(io, "locked", std.Io.File.Permissions.fromMode(0o700), .{}) catch {};
         var b2: [std.fs.max_path_bytes]u8 = undefined;
         var denied = g.options();
         denied.data_dir = try g.sub(&b2, "locked/sub");
