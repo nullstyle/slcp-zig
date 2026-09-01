@@ -41,7 +41,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("slcp-core");
 
-pub const Error = error{ BadKeyFile, EntropyUnavailable } || std.mem.Allocator.Error;
+pub const Error = error{ BadKeyFile, EntropyUnavailable, KeyFileExists } || std.mem.Allocator.Error;
 
 pub const KeyPair = struct {
     seed: [32]u8,
@@ -72,34 +72,80 @@ pub fn loadOrCreate(io: std.Io, path: []const u8) !KeyPair {
         // PathAlreadyExists rather than replacing, so a concurrently created
         // key is never clobbered. A missing parent dir surfaces here as the
         // underlying fs error.
-        error.FileNotFound => {
-            try io.randomSecure(&seed);
-            var af = try cwd.createFileAtomic(io, path, .{
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
-            });
-            // Cleans up the temp file on any failure below; a no-op on the
-            // handles that `link` already consumed on success.
-            defer af.deinit(io);
-            try af.file.writeStreamingAll(io, &seed);
-            // Make the seed bytes durable BEFORE the name appears: a power
-            // loss after link-but-before-flush would otherwise leave a named
-            // key file whose content evaporates, so the next boot silently
-            // mints a different identity.
-            try af.file.sync(io);
-            if (comptime builtin.os.tag == .macos) {
-                // fsync(2) on macOS does not flush the drive's own cache;
-                // F_FULLFSYNC asks for a true flush to media. Filesystems
-                // that lack it (e.g. SMB) fail the fcntl — the plain fsync
-                // above is then the best available, so this is deliberately
-                // non-fatal (the same fallback SQLite uses).
-                _ = std.c.fcntl(af.file.handle, std.posix.F.FULLFSYNC);
-            }
-            try af.link(io);
-        },
+        error.FileNotFound => try mint(io, cwd, path, &seed),
         else => return err,
     }
 
     return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
+}
+
+/// Load the seed at `path`; NEVER mints. An absent file is
+/// `error.FileNotFound` (and no file appears); a wrong-length file is
+/// `error.BadKeyFile`. The `Node.create` path uses this so a typo in
+/// `.key_file` cannot silently mint a second identity.
+pub fn load(io: std.Io, path: []const u8) !KeyPair {
+    const cwd = std.Io.Dir.cwd();
+    var file = try cwd.openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [33]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buf, 0);
+    if (n != 32) return error.BadKeyFile;
+    const seed = buf[0..32].*;
+    return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
+}
+
+/// Mint a fresh key file at `path` (0600, atomic + durable — the same
+/// ceremony as `loadOrCreate`'s first run). `error.KeyFileExists` if any
+/// file already sits there — a key file is never overwritten.
+pub fn createNew(io: std.Io, path: []const u8) !KeyPair {
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.openFile(io, path, .{})) |opened| {
+        var file = opened;
+        file.close(io);
+        return error.KeyFileExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    var seed: [32]u8 = undefined;
+    mint(io, cwd, path, &seed) catch |err| switch (err) {
+        // Lost a race with a concurrent creator: `link` refuses to replace.
+        error.PathAlreadyExists => return error.KeyFileExists,
+        else => return err,
+    };
+    return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
+}
+
+/// First-run ceremony: fresh OS entropy committed atomically + durably with
+/// owner-only perms set at creation, so the seed never exists on disk
+/// world-readable and the final name never refers to a partial or volatile
+/// file. Temp file (0600) → write → fsync (and F_FULLFSYNC on macOS) → link
+/// into place. `link` fails with PathAlreadyExists rather than replacing, so
+/// a concurrently created key is never clobbered. A missing parent dir
+/// surfaces here as the underlying fs error (FileNotFound).
+fn mint(io: std.Io, cwd: std.Io.Dir, path: []const u8, seed: *[32]u8) !void {
+    try io.randomSecure(seed);
+    var af = try cwd.createFileAtomic(io, path, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    // Cleans up the temp file on any failure below; a no-op on the
+    // handles that `link` already consumed on success.
+    defer af.deinit(io);
+    try af.file.writeStreamingAll(io, seed);
+    // Make the seed bytes durable BEFORE the name appears: a power
+    // loss after link-but-before-flush would otherwise leave a named
+    // key file whose content evaporates, so the next boot silently
+    // mints a different identity.
+    try af.file.sync(io);
+    if (comptime builtin.os.tag == .macos) {
+        // fsync(2) on macOS does not flush the drive's own cache;
+        // F_FULLFSYNC asks for a true flush to media. Filesystems
+        // that lack it (e.g. SMB) fail the fcntl — the plain fsync
+        // above is then the best available, so this is deliberately
+        // non-fatal (the same fallback SQLite uses).
+        _ = std.c.fcntl(af.file.handle, std.posix.F.FULLFSYNC);
+    }
+    try af.link(io);
 }
 
 /// A random, non-signing identity for watcher mode.
@@ -207,6 +253,45 @@ test "loadOrCreate: a freshly created key file is complete (32 bytes) and mode 0
     while (try it.next(io)) |entry| {
         entries += 1;
         try testing.expectEqualStrings("perms.seed", entry.name);
+    }
+    try testing.expectEqual(@as(usize, 1), entries);
+}
+
+// Non-vacuity: dropping the pre-check AND the PathAlreadyExists mapping in
+// `createNew` lets the second call mint over the first (the bytes-unchanged
+// assertion goes red); making `load` fall through to `mint` on FileNotFound
+// makes the "no file appears" assertion red.
+test "createNew twice is KeyFileExists (bytes unchanged); load on an absent path is FileNotFound and mints nothing" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "new.seed");
+
+    // load never mints.
+    try testing.expectError(error.FileNotFound, load(io, path));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "new.seed", .{}));
+
+    const first = try createNew(io, path);
+    try testing.expectError(error.KeyFileExists, createNew(io, path));
+    const st = try tmp.dir.statFile(io, "new.seed", .{});
+    try testing.expectEqual(@as(u64, 32), st.size);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+
+    // The bytes are the first mint's, and load agrees with loadOrCreate.
+    const loaded = try load(io, path);
+    try testing.expectEqualSlices(u8, &first.seed, &loaded.seed);
+    try testing.expectEqualSlices(u8, &first.public_key, &loaded.public_key);
+    const via_loc = try loadOrCreate(io, path);
+    try testing.expectEqualSlices(u8, &first.seed, &via_loc.seed);
+
+    // No temp-file debris.
+    var it = tmp.dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(io)) |entry| {
+        entries += 1;
+        try testing.expectEqualStrings("new.seed", entry.name);
     }
     try testing.expectEqual(@as(usize, 1), entries);
 }
