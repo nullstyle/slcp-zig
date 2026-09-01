@@ -43,18 +43,6 @@ fn pubFor(i: usize) [32]u8 {
     return crypto.publicKeyFromSeed(seedFor(i)) catch unreachable;
 }
 
-/// Build a fresh flat {threshold, validators} quorum set (each Node consumes
-/// its own copy).
-fn buildFlatQset(gpa: std.mem.Allocator, pubkeys: []const [32]u8, threshold: u32) !qset.QuorumSetOwned {
-    const validators = try gpa.alloc(qset.NodeId, pubkeys.len);
-    for (pubkeys, 0..) |pk, i| validators[i] = pk;
-    return .{
-        .threshold = threshold,
-        .validators = validators,
-        .inner_sets = &.{},
-    };
-}
-
 fn addrList(gpa: std.mem.Allocator, base_port: u16, count: usize, skip: usize) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -159,7 +147,6 @@ const Cluster = struct {
         const gpa = self.gpa;
         var pubs: [N + 1][32]u8 = undefined;
         for (0..self.n_validators) |k| pubs[k] = pubFor(k);
-        const qs = try buildFlatQset(gpa, pubs[0..self.n_validators], self.threshold);
         const peers = try addrList(gpa, self.base_port, N, i);
         defer freeAddrList(gpa, peers);
         const dir = try self.dataDir(gpa, i);
@@ -169,7 +156,8 @@ const Cluster = struct {
             .network = NETWORK,
             .node_id = pubFor(i),
             .secret_seed = seedFor(i),
-            .quorum_set = qs,
+            // The spec borrows `pubs`; Node.create deep-copies it (toOwned).
+            .quorum = slcp.Quorum.of(self.threshold, pubs[0..self.n_validators]),
             .listen_port = self.base_port + @as(u16, @intCast(i)),
             .peers = peers,
             .data_dir = dir,
@@ -716,7 +704,7 @@ const gen_slcp = core.gen.slcp;
 fn sharedQsetHash(gpa: std.mem.Allocator, n_validators: usize, threshold: u32) ![32]u8 {
     var pubs: [N + 1][32]u8 = undefined;
     for (0..n_validators) |k| pubs[k] = pubFor(k);
-    var qs = try buildFlatQset(gpa, pubs[0..n_validators], threshold);
+    var qs = try slcp.Quorum.of(threshold, pubs[0..n_validators]).toOwned(gpa);
     defer qs.deinit(gpa);
     try qset.validateAndNormalize(gpa, &qs);
     const flat = try qset.canonicalBytes(gpa, &qs);

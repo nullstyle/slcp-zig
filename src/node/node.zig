@@ -27,6 +27,7 @@ const overlay_mod = @import("overlay.zig");
 const timers_mod = @import("timers.zig");
 const store_mod = @import("store.zig");
 const keys_mod = @import("keys.zig");
+const lint_report = @import("lint_report.zig");
 
 const engine = core.engine;
 const crypto = core.crypto;
@@ -44,14 +45,137 @@ const purge_window: u64 = 16;
 const resync_interval_ms: u64 = 3_000;
 
 /// A relative-duration Io.Timeout in milliseconds (this Zig's condvar API).
-fn msTimeout(ms: u64) std.Io.Timeout {
+/// Public: `AppNode.waitApplied` reuses it.
+pub fn msTimeout(ms: u64) std.Io.Timeout {
     return .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)), .clock = .awake } };
 }
 
-pub const Error = error{
+/// Every way `create` can refuse to start, one member per misconfiguration
+/// (design §11.2 / plan R18). Each site writes a one-paragraph message that
+/// names the offending value and says what to do into `Options.diagnostic`
+/// (or `std.log.scoped(.slcp_create).err` when none is given); `explain`
+/// is the static, value-free fallback text.
+pub const CreateError = error{
+    NetworkPassphraseEmpty,
     NoIdentity,
+    ConflictingIdentity,
+    WatcherHasIdentity,
+    IdentityMismatch,
+    KeyFileBad,
+    KeyFileDirMissing,
+    KeyFileAccessDenied,
+    KeyFileIoFailed,
+    MaxValueBytesOutOfRange,
+    StartSlotZero,
+    StartSlotBehindJournal,
+    BadPeerSpec,
+    DuplicatePeer,
+    PeerIsSelf,
+    QuorumEmpty,
+    QuorumThresholdOutOfRange,
+    QuorumDuplicateNode,
+    QuorumTooDeep,
+    QuorumTooManyValidators,
+    UnsafeQuorum,
+    DataDirEmpty,
+    DataDirNotADirectory,
+    DataDirAccessDenied,
+    DataDirUnusable,
+    DataDirOtherNetwork,
+    DataDirOtherNode,
+    ListenPortInUse,
+    ListenPortPrivileged,
+    ListenFailed,
+    ThreadSpawnFailed,
     EngineFailed,
 } || std.mem.Allocator.Error;
+
+/// Alias kept for one release (M5 spelling).
+pub const Error = CreateError;
+
+pub const ProposeError = error{ WatcherCannotPropose, ValueEmpty, ValueTooLarge } || std.mem.Allocator.Error;
+
+/// Static, value-free explanation of a `CreateError` — the fallback when the
+/// caller did not pass a `Diagnostic`. Non-empty and unique per member (the
+/// exhaustive switch keeps it covering every member).
+pub fn explain(err: CreateError) []const u8 {
+    return explainCreateError(err);
+}
+
+fn explainCreateError(err: CreateError) []const u8 {
+    return switch (err) {
+        error.NetworkPassphraseEmpty => ".network is empty; set it to a passphrase unique to your application (it becomes the networkId).",
+        error.NoIdentity => "no identity: set .key_file (created on first run) or .secret_seed, or .watcher = true for a node that only follows.",
+        error.ConflictingIdentity => ".key_file and .secret_seed are both set; provide one identity source.",
+        error.WatcherHasIdentity => ".watcher = true but a signing identity (.secret_seed / .key_file) is set; a watcher never signs.",
+        error.IdentityMismatch => ".node_id is not the public key of the given seed / key file; drop .node_id (it is derived) or fix the seed.",
+        error.KeyFileBad => ".key_file is not a 32-byte raw seed; restore the original file or move it aside to mint a new identity.",
+        error.KeyFileDirMissing => ".key_file's directory does not exist; create the directory first (slcp creates the file, not its parent).",
+        error.KeyFileAccessDenied => ".key_file cannot be read or created (permission denied); fix the permissions or choose another path.",
+        error.KeyFileIoFailed => ".key_file could not be read or created (I/O error); check the path and the filesystem.",
+        error.MaxValueBytesOutOfRange => ".max_value_bytes is outside [1, 65536]; pick the largest value your app will ever propose.",
+        error.StartSlotZero => ".start_slot is 0 but slots start at 1; drop it (default 1).",
+        error.StartSlotBehindJournal => ".start_slot is at or below the journal high-water mark in .data_dir; drop it (the node resumes after the journal) or use a fresh data_dir.",
+        error.BadPeerSpec => "a .peers entry is not host:port (IPv4/IPv6 literal or hostname, port 1..65535).",
+        error.DuplicatePeer => "a .peers entry is listed twice; list each peer once.",
+        error.PeerIsSelf => "a .peers entry is this node's own listen address; list only the OTHER nodes.",
+        error.QuorumEmpty => ".quorum has no members; list the validators (slcp.Quorum.twoThirdsOf is the blessed default).",
+        error.QuorumThresholdOutOfRange => "a .quorum level's threshold is outside [1, member count].",
+        error.QuorumDuplicateNode => ".quorum lists the same validator more than once.",
+        error.QuorumTooDeep => ".quorum nests deeper than the wire limit (4 levels); flatten it.",
+        error.QuorumTooManyValidators => ".quorum names more than 255 validators; trim or group them.",
+        error.UnsafeQuorum => ".quorum is below a majority (a fork machine); raise the threshold or set .allow_unsafe_quorum = true to start anyway.",
+        error.DataDirEmpty => ".data_dir is empty; set it to a directory this node owns (created on first run).",
+        error.DataDirNotADirectory => ".data_dir exists but is not a directory.",
+        error.DataDirAccessDenied => ".data_dir cannot be created or opened (permission denied).",
+        error.DataDirUnusable => ".data_dir cannot be used (I/O error); check the path, the filesystem and free space.",
+        error.DataDirOtherNetwork => ".data_dir was created for a different network; use a fresh data_dir per network, or fix .network.",
+        error.DataDirOtherNode => ".data_dir belongs to another node's key; restore the original key file or start a fresh data_dir.",
+        error.ListenPortInUse => ".listen_port is already in use on this machine; stop the other process or pick another port.",
+        error.ListenPortPrivileged => ".listen_port is a privileged port (< 1024) this process may not bind; use a port >= 1024.",
+        error.ListenFailed => "the listener could not be bound (socket error); check the port and the network stack.",
+        error.ThreadSpawnFailed => "cannot start the engine/overlay threads; the process is out of threads or memory.",
+        error.EngineFailed => "the consensus engine could not be initialized; please report this with your options.",
+        error.OutOfMemory => "out of memory while creating the node.",
+    };
+}
+
+/// Where `create` writes its one-paragraph failure message. Stack-sized;
+/// a message longer than the buffer is truncated and ends with "…".
+pub const Diagnostic = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const Diagnostic) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+        var w: std.Io.Writer = .fixed(&self.buf);
+        w.print(fmt, args) catch {
+            const ellipsis = "…";
+            var keep = @min(w.end, self.buf.len - ellipsis.len);
+            // Do not split a UTF-8 sequence.
+            while (keep > 0 and (self.buf[keep] & 0xC0) == 0x80) keep -= 1;
+            @memcpy(self.buf[keep..][0..ellipsis.len], ellipsis);
+            self.len = keep + ellipsis.len;
+            return;
+        };
+        self.len = w.end;
+    }
+};
+
+const create_log = std.log.scoped(.slcp_create);
+
+/// Record the failure message (into `diag`, else the create log) and hand
+/// back the error for `return`.
+fn fail(diag: ?*Diagnostic, err: CreateError, comptime fmt: []const u8, args: anytype) CreateError {
+    var local: Diagnostic = .{};
+    const d = diag orelse &local;
+    d.set(fmt, args);
+    if (diag == null) create_log.err("{s}", .{d.message()});
+    return err;
+}
 
 /// One externalized slot, delivered to the app. `value` is owned by the
 /// caller after `waitExternalized` returns — free it with `node.allocator()`.
@@ -60,29 +184,46 @@ pub const Externalized = struct {
     value: []u8,
 };
 
+pub const Quorum = core.quorum.Quorum;
+
 pub const Options = struct {
-    /// Passphrase → networkId (domain separation).
+    /// Passphrase → networkId (domain separation). Must be non-empty.
     network: []const u8,
-    /// Explicit identity (bytes-level). Provide EITHER (node_id + secret_seed)
-    /// OR key_path, unless watcher.
+    /// Identity: EITHER `.key_file` (loaded, or minted on first run) OR
+    /// `.secret_seed`; `.node_id` is optional and, when given, must be the
+    /// public key of that seed. A `.watcher` has no signing identity.
     node_id: ?[32]u8 = null,
     secret_seed: ?[32]u8 = null,
-    key_path: ?[]const u8 = null,
-    /// Pre-built quorum set; the Node validates/normalizes then takes
-    /// ownership (freed by deinit via the engine).
-    quorum_set: qset.QuorumSetOwned,
+    key_file: ?[]const u8 = null,
+    /// The quorum spec (§12). Borrowed; deep-copied, validated, normalized
+    /// and linted at `create`. The local node is added to the top level when
+    /// absent (see `include_self`).
+    quorum: Quorum,
+    /// Auto-add this node to the top-level validators when it is absent
+    /// from the whole tree (info log). `false` opts out (warning log).
+    include_self: bool = true,
+    /// Start even when the lint reports ERRORs (sub-majority threshold).
+    /// The errors are still logged.
+    allow_unsafe_quorum: bool = false,
+    /// TCP port to listen on; 0 = ephemeral (see `boundPort`).
     listen_port: u16,
-    /// "host:port" strings to dial.
+    /// "host:port" strings to dial: IPv4/IPv6 literal (`[v6]:port`) or hostname.
     peers: []const []const u8 = &.{},
+    /// Directory for the write-ahead logs and the identity marker; created
+    /// on first run, then bound to this network + key.
     data_dir: []const u8,
     /// No key, ephemeral nodeId, never signs, never proposes (§11).
     watcher: bool = false,
     strict_canonical: bool = true,
+    /// Largest value `propose` accepts; [1, 65536].
     max_value_bytes: u32 = 4096,
-    /// First slot to nominate proposals for (default 1).
+    /// First slot to nominate proposals for (default 1). Must be above the
+    /// journal high-water mark of an existing data_dir.
     start_slot: u64 = 1,
     /// Application driver; null → the omakase default (§8.4).
     driver: ?core.driver.Driver = null,
+    /// Receives the failure message when `create` errors.
+    diagnostic: ?*Diagnostic = null,
 };
 
 const SlotOwn = struct {
@@ -227,6 +368,10 @@ pub const Node = struct {
     /// WAS one — an e2e dialer crashed parsing a freed string).
     peer_specs: [][]u8 = &.{},
 
+    /// `Options.max_value_bytes`: `propose` rejects larger values up front
+    /// (`ValueTooLarge`) instead of letting the engine drop them silently.
+    max_value_bytes: u32,
+
     /// Anti-entropy thread (§9.2 host policy): every `resync_interval_ms` it
     /// re-floods our latest own envelopes for live slots + getSlotState(0).
     /// The engine (faithfully to stellar-core) only emits when its state
@@ -245,44 +390,194 @@ pub const Node = struct {
     // Lifecycle
     // -------------------------------------------------------------------
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Node {
-        var opts = options;
+    /// Build and start a node. Fail-fast: every misconfiguration is checked
+    /// in a fixed order (passphrase → identity → limits → peers → quorum →
+    /// data_dir → engine → store/recovery → listener → threads) and reported
+    /// as ONE `CreateError` member with a message in `options.diagnostic`.
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
+        const opts = options;
+        const diag = opts.diagnostic;
 
-        // Resolve identity.
+        // ---- passphrase ----
+        if (opts.network.len == 0) {
+            return fail(diag, error.NetworkPassphraseEmpty, ".network is empty; set it to a passphrase unique to your application, e.g. \"my-counter-app v1\" (it becomes the networkId, which partitions your network from every other slcp network).", .{});
+        }
+        const network_id = crypto.networkIdFromPassphrase(opts.network);
+
+        // ---- identity ----
         var node_id: [32]u8 = undefined;
         var secret_seed: ?[32]u8 = null;
         if (opts.watcher) {
-            const kp = try keys_mod.ephemeral(io);
-            node_id = if (opts.node_id) |n| n else kp.public_key;
-            secret_seed = null;
+            if (opts.secret_seed != null) {
+                return fail(diag, error.WatcherHasIdentity, ".watcher = true but .secret_seed is set; a watcher never signs — drop .secret_seed (and .key_file), or set .watcher = false to validate with that identity.", .{});
+            }
+            if (opts.key_file) |path| {
+                return fail(diag, error.WatcherHasIdentity, ".watcher = true but .key_file = \"{s}\" is set; a watcher never signs — drop .key_file (and .secret_seed), or set .watcher = false to validate with that key.", .{path});
+            }
+            if (opts.node_id) |n| {
+                node_id = n;
+            } else {
+                const kp = keys_mod.ephemeral(io) catch |e| {
+                    return fail(diag, error.EngineFailed, "cannot draw OS entropy for the watcher's ephemeral node id: {t}; the system's secure random source is unavailable.", .{e});
+                };
+                node_id = kp.public_key;
+            }
+        } else if (opts.secret_seed != null and opts.key_file != null) {
+            return fail(diag, error.ConflictingIdentity, ".key_file = \"{s}\" and .secret_seed are both set; provide ONE identity source (drop .secret_seed to use the key file, or drop .key_file to use the seed).", .{opts.key_file.?});
         } else if (opts.secret_seed) |seed| {
+            const derived = crypto.publicKeyFromSeed(seed) catch |e| {
+                return fail(diag, error.EngineFailed, ".secret_seed is not a usable Ed25519 seed ({t}); use 32 random bytes (slcp key new <file> mints one).", .{e});
+            };
+            if (opts.node_id) |n| {
+                if (!std.mem.eql(u8, &n, &derived)) {
+                    return fail(diag, error.IdentityMismatch, ".node_id {s} is not the public key of .secret_seed (which derives {s}); drop .node_id (it is derived from the seed) or fix the seed.", .{ &std.fmt.bytesToHex(n, .lower), &std.fmt.bytesToHex(derived, .lower) });
+                }
+            }
+            node_id = derived;
             secret_seed = seed;
-            node_id = if (opts.node_id) |n| n else try crypto.publicKeyFromSeed(seed);
-        } else if (opts.key_path) |path| {
-            const kp = try keys_mod.loadOrCreate(io, path);
+        } else if (opts.key_file) |path| {
+            const kp = try loadKeyFile(io, path, diag);
+            if (opts.node_id) |n| {
+                if (!std.mem.eql(u8, &n, &kp.public_key)) {
+                    return fail(diag, error.IdentityMismatch, ".node_id {s} is not the public key of .key_file \"{s}\" (which holds {s}); drop .node_id (it is derived from the key file) or point .key_file at the right file.", .{ &std.fmt.bytesToHex(n, .lower), path, &std.fmt.bytesToHex(kp.public_key, .lower) });
+                }
+            }
             node_id = kp.public_key;
             secret_seed = kp.seed;
+        } else if (opts.node_id) |n| {
+            return fail(diag, error.NoIdentity, ".node_id {s} alone cannot sign; add the matching .secret_seed or .key_file, or set .watcher = true for a node that only follows.", .{&std.fmt.bytesToHex(n, .lower)});
         } else {
-            return error.NoIdentity;
+            return fail(diag, error.NoIdentity, "no identity: set .key_file (e.g. \"slcp.key\" — created on first run, then reused) or .secret_seed, or set .watcher = true for a node that only follows.", .{});
+        }
+        const node_hex = std.fmt.bytesToHex(node_id, .lower);
+
+        // ---- limits ----
+        if (opts.max_value_bytes < 1 or opts.max_value_bytes > 65536) {
+            return fail(diag, error.MaxValueBytesOutOfRange, ".max_value_bytes {d} is outside [1, 65536]; pick the largest value your app will ever propose (the default is 4096).", .{opts.max_value_bytes});
+        }
+        if (opts.start_slot == 0) {
+            return fail(diag, error.StartSlotZero, ".start_slot is 0 but slots start at 1; drop .start_slot (default 1) or set it to the first slot this node should nominate.", .{});
         }
 
-        // Validate + normalize the quorum set, then derive its hash + framed
-        // form (for getQset answering) BEFORE the engine takes ownership.
-        try qset.validateAndNormalize(gpa, &opts.quorum_set);
-        const flat = try qset.canonicalBytes(gpa, &opts.quorum_set);
-        const local_hash = crypto.qsetHash(flat);
-        gpa.free(flat);
-        const framed_local = try ownedQsetToFramed(gpa, &opts.quorum_set);
+        // ---- peer specs ----
+        for (opts.peers, 0..) |spec, i| {
+            overlay_mod.validatePeerSpec(spec) catch |e| {
+                const why: []const u8 = switch (e) {
+                    error.MissingPort => "no port",
+                    error.EmptyHost => "empty host",
+                    error.BadPort => "port must be 1..65535",
+                    error.BadHost => "host is neither an IP literal nor a valid hostname",
+                };
+                return fail(diag, error.BadPeerSpec, ".peers[{d}] = \"{s}\" is not host:port ({s}); use \"a.example.com:7311\", \"10.0.0.2:7311\" or \"[2001:db8::2]:7311\".", .{ i, spec, why });
+            };
+            for (opts.peers[0..i], 0..) |prev, j| {
+                if (std.mem.eql(u8, prev, spec)) {
+                    return fail(diag, error.DuplicatePeer, ".peers[{d}] = \"{s}\" repeats .peers[{d}]; list each peer once.", .{ i, spec, j });
+                }
+            }
+            if (opts.listen_port != 0) {
+                const hp = overlay_mod.parseHostPort(spec) catch unreachable; // validated above
+                if (hp.port == opts.listen_port and isLoopbackHost(hp.host)) {
+                    return fail(diag, error.PeerIsSelf, ".peers[{d}] = \"{s}\" is this node's own listen address; list only the OTHER nodes.", .{ i, spec });
+                }
+            }
+        }
+
+        // ---- quorum ----
+        if (opts.quorum.memberCount() == 0) {
+            return fail(diag, error.QuorumEmpty, ".quorum has no members (threshold {d} of 0); list the validators, e.g. slcp.Quorum.twoThirdsOf(&.{{ pk_a, pk_b, pk_c }}).", .{opts.quorum.threshold});
+        }
+        var owned = try opts.quorum.toOwned(gpa);
+        var owned_live = true;
+        errdefer if (owned_live) owned.deinit(gpa);
+        if (!opts.watcher and !opts.quorum.containsNode(node_id)) {
+            if (opts.include_self) {
+                const grown = try gpa.realloc(owned.validators, owned.validators.len + 1);
+                grown[grown.len - 1] = node_id;
+                owned.validators = grown;
+                create_log.info("added self {s} to the top-level quorum", .{&node_hex});
+            } else {
+                var wbuf: [512]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&wbuf);
+                lint_report.writeSelfAbsent(&w, node_id) catch {};
+                create_log.warn("{s}", .{std.mem.trimEnd(u8, w.buffered(), "\n")});
+            }
+        }
+        // Structural checks on the owned tree, in the order the messages
+        // are most useful; `validateAndNormalize` is the authority and its
+        // errors map 1:1 to the same members as a fallback.
+        if (lint_report.firstBadThreshold(&owned)) |bad| {
+            return fail(diag, error.QuorumThresholdOutOfRange, ".quorum threshold {d} is outside [1, {d}] for a level with {d} members; use slcp.Quorum.twoThirdsOf (the blessed default) or a threshold within range.", .{ bad.threshold, bad.members, bad.members });
+        }
+        if (try lint_report.firstDuplicate(gpa, &owned)) |dup| {
+            return fail(diag, error.QuorumDuplicateNode, ".quorum lists validator {s} more than once; each node appears once in the whole tree.", .{&std.fmt.bytesToHex(dup, .lower)});
+        }
+        if (lint_report.depth(&owned) > qset.max_depth) {
+            return fail(diag, error.QuorumTooDeep, ".quorum nests {d} levels deep but the wire limit is {d}; flatten the inner sets (orgs one level down is the usual shape).", .{ lint_report.depth(&owned), qset.max_depth });
+        }
+        if (lint_report.totalValidators(&owned) > qset.max_total_validators) {
+            return fail(diag, error.QuorumTooManyValidators, ".quorum names {d} validators but the wire limit is {d}; group them into inner sets or trim the list.", .{ lint_report.totalValidators(&owned), qset.max_total_validators });
+        }
+        qset.validateAndNormalize(gpa, &owned) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EmptyQuorumSet => return fail(diag, error.QuorumEmpty, ".quorum has a level with no members; every level needs at least one validator or inner set.", .{}),
+            error.ThresholdOutOfRange => return fail(diag, error.QuorumThresholdOutOfRange, ".quorum has a level whose threshold is outside [1, member count]; use slcp.Quorum.twoThirdsOf (the blessed default).", .{}),
+            error.DuplicateNode => return fail(diag, error.QuorumDuplicateNode, ".quorum lists a validator more than once; each node appears once in the whole tree.", .{}),
+            error.DepthExceeded => return fail(diag, error.QuorumTooDeep, ".quorum nests deeper than the wire limit of {d} levels; flatten the inner sets.", .{qset.max_depth}),
+            error.TooManyValidators => return fail(diag, error.QuorumTooManyValidators, ".quorum names more than {d} validators; group them into inner sets or trim the list.", .{qset.max_total_validators}),
+            else => return fail(diag, error.EngineFailed, ".quorum could not be normalized: {t}; please report this with your quorum spec.", .{e}),
+        };
+        const findings = try qset.lint(gpa, &owned); // OOM only
+        defer gpa.free(findings);
+        for (findings) |f| {
+            if (f.level != .err) continue;
+            if (!opts.allow_unsafe_quorum) {
+                const n = f.members;
+                const t = f.threshold;
+                const two_thirds = std.math.divCeil(u32, 2 * n, 3) catch unreachable;
+                return fail(diag, error.UnsafeQuorum, ".quorum is unsafe: {d}-of-{d} is below a majority, so two disjoint \"quorums\" can form inside your own slice (a fork machine); use a threshold of at least {d} (slcp.Quorum.twoThirdsOf gives {d}), or set .allow_unsafe_quorum = true to start anyway.", .{ t, n, n / 2 + 1, two_thirds });
+            }
+        }
+        for (findings) |f| {
+            var wbuf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&wbuf);
+            lint_report.writeFinding(&w, f) catch {};
+            const line = std.mem.trimEnd(u8, w.buffered(), "\n");
+            // Both at warn: an ERROR finding only reaches this loop when
+            // the operator set `.allow_unsafe_quorum = true`, i.e. accepted
+            // it knowingly (and the test runner fails any test that logs at
+            // err level).
+            switch (f.level) {
+                .err => create_log.warn("{s} (.allow_unsafe_quorum = true: starting anyway)", .{line}),
+                .warning => create_log.warn("{s}", .{line}),
+            }
+        }
+        // Hash + framed form (for getQset answering) BEFORE the engine takes
+        // ownership of the tree.
+        const local_hash = qset.hashNormalized(gpa, &owned) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return fail(diag, error.EngineFailed, ".quorum could not be hashed: {t}; please report this with your quorum spec.", .{e}),
+        };
+        const framed_local = ownedQsetToFramed(gpa, &owned) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return fail(diag, error.EngineFailed, ".quorum could not be encoded: {t}; please report this with your quorum spec.", .{e}),
+        };
         defer gpa.free(framed_local);
 
-        // Engine config (takes ownership of quorum_set on success).
+        // ---- data_dir ----
+        if (opts.data_dir.len == 0) {
+            return fail(diag, error.DataDirEmpty, ".data_dir is empty; set it to a directory this node owns, e.g. \"slcp-data\" (created on first run).", .{});
+        }
+        try checkDataDir(io, opts.data_dir, network_id, node_id, opts.watcher, diag);
+
+        // ---- engine ----
         var limits = core.limits.Limits{};
         limits.max_value_bytes = opts.max_value_bytes;
         const cfg = engine.Config{
-            .network_id = crypto.networkIdFromPassphrase(opts.network),
+            .network_id = network_id,
             .node_id = node_id,
             .secret_seed = secret_seed,
-            .quorum_set = opts.quorum_set,
+            .quorum_set = owned,
             .strict_canonical = opts.strict_canonical,
             .limits = limits,
         };
@@ -306,12 +601,23 @@ pub const Node = struct {
             .current_slot = opts.start_slot,
             .next_deliver = opts.start_slot,
             .last_ext_value = &.{},
+            .max_value_bytes = opts.max_value_bytes,
         };
 
-        self.eng = try engine.Engine.init(gpa, cfg, drv);
+        // Engine.init does NOT free cfg.quorum_set on failure; we still own
+        // it until this succeeds.
+        self.eng = engine.Engine.init(gpa, cfg, drv) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return fail(diag, error.EngineFailed, "the consensus engine could not be initialized: {t}; this is a bug in slcp or an exotic limit — please report it with your options.", .{e}),
+        };
+        owned_live = false;
         errdefer self.eng.deinit();
 
-        self.store = try store_mod.Store.open(gpa, io, opts.data_dir);
+        // ---- store + recovery ----
+        self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the logs could not be opened ({t}); check the path, the filesystem and free space.", .{ opts.data_dir, e }),
+        };
         errdefer self.store.deinit();
 
         // Cache our own qset on disk so getQset can answer it after restart.
@@ -344,11 +650,24 @@ pub const Node = struct {
         });
 
         // ---- Restart recovery (§10), synchronous, pre-threads ----
-        try self.wheel.start(); // arms during restore are honored
-        errdefer self.wheel.stop();
-
-        var rec = try self.store.recover(gpa);
+        var rec = self.store.recover(gpa) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the logs could not be read back ({t}); check the filesystem, or move the directory aside to start fresh.", .{ opts.data_dir, e }),
+        };
         defer store_mod.Store.deinitRecovery(gpa, &rec);
+
+        if (opts.start_slot > 1) {
+            if (rec.externalized_hwm) |hwm| {
+                if (opts.start_slot <= hwm) {
+                    return fail(diag, error.StartSlotBehindJournal, ".start_slot {d} is at or below the journal high-water mark {d} in {s}; drop .start_slot (the node resumes at {d}) or use a fresh data_dir.", .{ opts.start_slot, hwm, opts.data_dir, hwm + 1 });
+                }
+            }
+        }
+
+        self.wheel.start() catch |e| { // arms during restore are honored
+            return fail(diag, error.ThreadSpawnFailed, "cannot start the engine/overlay thread: {t}.", .{e});
+        };
+        errdefer self.wheel.stop();
 
         if (rec.torn_tail_repaired) {
             // The ROUTINE crash artifact (power loss mid-append): the store
@@ -370,7 +689,10 @@ pub const Node = struct {
             var wcfg = cfg;
             wcfg.secret_seed = null;
             wcfg.quorum_set = qs_clone;
-            self.eng = try engine.Engine.init(gpa, wcfg, drv);
+            self.eng = engine.Engine.init(gpa, wcfg, drv) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return fail(diag, error.EngineFailed, "the consensus engine could not be re-initialized in watcher mode: {t}; please report this.", .{e}),
+            };
             self.watcher = true;
         }
 
@@ -402,11 +724,24 @@ pub const Node = struct {
         }
 
         // ---- Go live ----
-        try self.ov.start();
+        self.ov.start() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AddressInUse => return fail(diag, error.ListenPortInUse, ".listen_port {d} is already in use on this machine (another slcp node, or a stale process); stop it or pick a different port.", .{opts.listen_port}),
+            error.AccessDenied => {
+                if (opts.listen_port < 1024) {
+                    return fail(diag, error.ListenPortPrivileged, ".listen_port {d} is a privileged port (< 1024) and this process may not bind it; use a port >= 1024 (7311 is the docs' default).", .{opts.listen_port});
+                }
+                return fail(diag, error.ListenFailed, "cannot listen on .listen_port {d}: AccessDenied; a sandbox or firewall policy refuses the bind.", .{opts.listen_port});
+            },
+            error.ThreadSpawnFailed => return fail(diag, error.ThreadSpawnFailed, "cannot start the engine/overlay thread: {t}.", .{e}),
+            else => return fail(diag, error.ListenFailed, "cannot listen on .listen_port {d}: {t}; check the port and the network stack.", .{ opts.listen_port, e }),
+        };
         errdefer self.ov.stop();
 
         self.live = true; // dispatch may now emit to the network
-        self.engine_thread = try std.Thread.spawn(.{}, engineLoop, .{self});
+        self.engine_thread = std.Thread.spawn(.{}, engineLoop, .{self}) catch |e| {
+            return fail(diag, error.ThreadSpawnFailed, "cannot start the engine/overlay thread: {t}.", .{e});
+        };
         // If the SECOND spawn fails, the unwind must join the engine thread
         // BEFORE the earlier errdefers tear down the store/engine/overlay it
         // is actively using (and before gpa.destroy frees the queue it is
@@ -415,8 +750,116 @@ pub const Node = struct {
             self.q.close();
             if (self.engine_thread) |t| t.join();
         }
-        self.resync_thread = try std.Thread.spawn(.{}, resyncLoop, .{self});
+        self.resync_thread = std.Thread.spawn(.{}, resyncLoop, .{self}) catch |e| {
+            return fail(diag, error.ThreadSpawnFailed, "cannot start the engine/overlay thread: {t}.", .{e});
+        };
         return self;
+    }
+
+    /// Static explanation of a `CreateError` (the module-level `explain`).
+    pub const explain = explainCreateError;
+
+    /// Resolve `.key_file`: load it, or mint it on first run — never both
+    /// silently. Every failure is mapped to a specific `KeyFile*` member.
+    fn loadKeyFile(io: std.Io, path: []const u8, diag: ?*Diagnostic) CreateError!keys_mod.KeyPair {
+        if (keys_mod.load(io, path)) |kp| {
+            return kp;
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                const kp = keys_mod.createNew(io, path) catch |cerr| switch (cerr) {
+                    error.FileNotFound => return fail(diag, error.KeyFileDirMissing, ".key_file \"{s}\": its directory does not exist; create the directory first (slcp creates the key file, not its parent).", .{path}),
+                    error.AccessDenied, error.PermissionDenied => return fail(diag, error.KeyFileAccessDenied, ".key_file \"{s}\" cannot be created (permission denied); fix the directory permissions or point .key_file somewhere this user can write.", .{path}),
+                    error.KeyFileExists => {
+                        // Raced with another creator: the file is there now.
+                        return keys_mod.load(io, path) catch |e2| {
+                            return fail(diag, error.KeyFileIoFailed, ".key_file \"{s}\" appeared while being created but could not be read: {t}.", .{ path, e2 });
+                        };
+                    },
+                    else => return fail(diag, error.KeyFileIoFailed, ".key_file \"{s}\" could not be created: {t}; check the path and the filesystem.", .{ path, cerr }),
+                };
+                create_log.info("created new key file {s} (public key {s})", .{ path, &std.fmt.bytesToHex(kp.public_key, .lower) });
+                return kp;
+            },
+            error.BadKeyFile => {
+                const size: u64 = if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| st.size else |_| 0;
+                return fail(diag, error.KeyFileBad, ".key_file \"{s}\" holds {d} bytes, not the 32-byte raw seed slcp writes; restore the original file, or move it aside to mint a new identity on the next start.", .{ path, size });
+            },
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.KeyFileAccessDenied, ".key_file \"{s}\" cannot be read (permission denied); fix the file permissions or point .key_file somewhere this user can read.", .{path}),
+            error.IsDir => return fail(diag, error.KeyFileBad, ".key_file \"{s}\" is a directory, not a 32-byte raw seed file; point .key_file at the key file itself.", .{path}),
+            else => return fail(diag, error.KeyFileIoFailed, ".key_file \"{s}\" could not be read: {t}; check the path and the filesystem.", .{ path, err }),
+        }
+    }
+
+    /// The identity-marker line format (§10 data_dir layout, M6):
+    /// `slcp-identity-v1\n<hex16 of networkId[0..8]>\n<hex64 node_id>\n`.
+    const identity_header = "slcp-identity-v1";
+    const identity_file = "identity";
+
+    /// Create/open `data_dir` and bind it to this network + key through the
+    /// `identity` marker: written on first create, compared afterwards. A
+    /// watcher skips the node comparison (its id is ephemeral).
+    fn checkDataDir(io: std.Io, data_dir: []const u8, network_id: [32]u8, node_id: [32]u8, watcher: bool, diag: ?*Diagnostic) CreateError!void {
+        var dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |e| switch (e) {
+            error.NotDir => return fail(diag, error.DataDirNotADirectory, ".data_dir \"{s}\" exists but is not a directory (the path or one of its components is a regular file); point .data_dir at a directory or remove the file.", .{data_dir}),
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\" cannot be created or opened (permission denied); fix the permissions or pick a directory this user can write.", .{data_dir}),
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: {t}; check the path, the filesystem and free space.", .{ data_dir, e }),
+        };
+        defer dir.close(io);
+
+        const net_hex = std.fmt.bytesToHex(network_id[0..8].*, .lower);
+        const node_hex = std.fmt.bytesToHex(node_id, .lower);
+        var expect_buf: [128]u8 = undefined;
+        const expected = std.fmt.bufPrint(&expect_buf, identity_header ++ "\n{s}\n{s}\n", .{ &net_hex, &node_hex }) catch unreachable;
+
+        var have_buf: [256]u8 = undefined;
+        if (dir.openFile(io, identity_file, .{})) |opened| {
+            var f = opened;
+            defer f.close(io);
+            const n = f.readPositionalAll(io, &have_buf, 0) catch |e| {
+                return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\": the identity marker could not be read ({t}); check the filesystem.", .{ data_dir, e });
+            };
+            var lines = std.mem.splitScalar(u8, have_buf[0..n], '\n');
+            const header = lines.next() orelse "";
+            const have_net = lines.next() orelse "";
+            const have_node = lines.next() orelse "";
+            if (!std.mem.eql(u8, header, identity_header) or have_net.len != 16 or have_node.len != 64) {
+                return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\": the identity marker ({s}/{s}) is malformed; if this data_dir really belongs to this node, delete that file and it will be rewritten.", .{ data_dir, data_dir, identity_file });
+            }
+            if (!std.mem.eql(u8, have_net, &net_hex)) {
+                return fail(diag, error.DataDirOtherNetwork, ".data_dir {s} was created for a different network (id prefix {s}, this node's is {s}); use a fresh data_dir per network, or fix .network.", .{ data_dir, have_net, &net_hex });
+            }
+            if (!watcher and !std.mem.eql(u8, have_node, &node_hex)) {
+                return fail(diag, error.DataDirOtherNode, ".data_dir {s} belongs to node {s} but this node is {s}; a data_dir is bound to one key — restore the original key file or start a fresh data_dir.", .{ data_dir, have_node, &node_hex });
+            }
+        } else |e| switch (e) {
+            error.FileNotFound => {
+                var f = dir.createFile(io, identity_file, .{}) catch |ce| switch (ce) {
+                    error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\" is not writable (permission denied); fix the permissions or pick a directory this user can write.", .{data_dir}),
+                    else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the identity marker could not be created ({t}); check the filesystem and free space.", .{ data_dir, ce }),
+                };
+                defer f.close(io);
+                f.writeStreamingAll(io, expected) catch |we| {
+                    return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the identity marker could not be written ({t}); check the filesystem and free space.", .{ data_dir, we });
+                };
+                f.sync(io) catch {};
+            },
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\" is not readable (permission denied); fix the permissions or pick a directory this user can use.", .{data_dir}),
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the identity marker could not be opened ({t}); check the filesystem.", .{ data_dir, e }),
+        }
+    }
+
+    /// `PeerIsSelf` host test: 127.0.0.0/8, `::1`, or `localhost`.
+    fn isLoopbackHost(host: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+        const addr = std.Io.net.IpAddress.parse(host, 1) catch return false;
+        return switch (addr) {
+            .ip4 => |a| a.bytes[0] == 127,
+            .ip6 => |a| blk: {
+                var v6_loopback: [16]u8 = @splat(0);
+                v6_loopback[15] = 1;
+                break :blk std.mem.eql(u8, &a.bytes, &v6_loopback);
+            },
+        };
     }
 
     pub fn deinit(self: *Node) void {
@@ -478,10 +921,13 @@ pub const Node = struct {
     // App surface
     // -------------------------------------------------------------------
 
-    /// Queue `value` to be nominated for the next available slot (§11). Error
-    /// in watcher mode.
-    pub fn propose(self: *Node, value: []const u8) !void {
-        if (self.watcher) return error.EngineFailed; // watchers never propose
+    /// Queue `value` to be nominated for the next available slot (§11).
+    /// Watchers cannot propose; empty and oversized (> `max_value_bytes`)
+    /// values are rejected up front rather than dropped by the engine.
+    pub fn propose(self: *Node, value: []const u8) ProposeError!void {
+        if (self.watcher) return error.WatcherCannotPropose;
+        if (value.len == 0) return error.ValueEmpty;
+        if (value.len > self.max_value_bytes) return error.ValueTooLarge;
         const copy = try self.gpa.dupe(u8, value);
         self.prop_mu.lockUncancelable(self.io);
         self.proposal_queue.append(self.gpa, copy) catch |e| {

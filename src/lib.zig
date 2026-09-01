@@ -32,6 +32,19 @@ pub const NodeOptions = node.Options;
 
 // ===== M6:quorum exports =====
 // Quorum spec, nodeId helpers, lint_report (M6 quorum stage; insert here only).
+/// The user-facing quorum spec (§12): `Quorum.twoThirdsOf(&.{ pk_a, pk_b, pk_c })`.
+pub const Quorum = core.quorum.Quorum;
+pub const NodeId = core.qset.NodeId;
+/// Comptime public key from its 64-hex spelling (the output of `slcp key show`).
+pub const nodeId = core.quorum.nodeId;
+/// Runtime public key from 64 hex chars.
+pub const parseNodeId = core.quorum.parseNodeId;
+/// Human-readable quorum lint report (what `slcp lint-quorum` prints).
+pub const lint_report = @import("node/lint_report.zig");
+
+test {
+    _ = @import("node/node_create_test.zig");
+}
 
 // ===== M6:appnode exports =====
 // AppNode, Codec, Validity, Driver, DeliveryHook (M6 appnode stage; insert here only).
