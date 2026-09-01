@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Rapid pushes to a branch (or PR) supersede in-flight runs: cancel the older
+# run so the two-platform matrix does not pile up and starve runners.
+# (capnp-zig's ci.yml documents a cancelled run saving a PARTIAL .zig-cache
+# that poisoned later runs; nothing here caches .zig-cache across runs, so
+# that failure class is structurally absent — keep it that way.)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A hung test binary must fail the job, not burn a runner for the 6-hour
+    # default. Local cold measurements (plan §4): `test` 23 s, `wasm` 3 s,
+    # `wasm-diff` 11 s — plus a cold dependency fetch and compile on the
+    # runner; 30 minutes bounds a hang with headroom.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      # mise.toml is the single Zig version specifier (and provides `just`).
+      # mise-action MUST pin its own version: only recent mise resolves the
+      # explicit dev-build tarball URL the pin needs (see setup-zig).
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      # The wasm differential harness (tests/wasm/host.mjs) drives
+      # slcp_core.wasm through Node. Assert the runner has one before the
+      # gate would otherwise report a skip or a confusing spawn error.
+      - name: Node runtime for the wasm differential harness
+        run: node --version
+
+      - name: Unit + vector + framing + ABI + sim + fuzz-smoke (+ api-snapshot tests)
+        run: zig build test --summary all
+
+      - name: Build slcp_core.wasm
+        run: zig build wasm --summary all
+
+      # The M4 gate: depends on the wasm artifact, so it can never pass by
+      # skipping (unlike the soft twin inside `test`).
+      - name: Differential native-vs-wasm replay
+        run: zig build wasm-diff --summary all
+
+  e2e:
+    name: End-to-end cluster (ubuntu)
+    runs-on: ubuntu-latest
+    # Measured 2m11s locally (plan §4); real loopback sockets + clocks, so
+    # bound the hang case generously but well under the default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: 4-node loopback cluster (200 slots, kill/restart, partition/heal, equivocator)
+        run: zig build e2e --summary all
+
+  fmt-check:
+    name: Format check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      # The recipe lists the hand-written trees explicitly; src/gen is NOT
+      # covered because capnpc-zig's output is not fmt-clean (R10; see
+      # docs/upstream/06-check-api-cache-and-fmt-clean-gen.md).
+      - name: Check formatting
+        run: just fmt-check

@@ -1,0 +1,37 @@
+name: Install the Cap'n Proto compiler
+description: >
+  Put `capnp` on PATH for Linux and macOS runners and assert it is actually
+  there.
+
+  Copied from capnp-zig (Linux + macOS branches; the Windows branch is dropped
+  because slcp-zig's CI matrix has no Windows leg). Only the generated-code
+  drift check (`gen-check`: regenerate src/gen from schema/*.capnp with the
+  capnpc-zig plugin and `git diff --exit-code`) needs the C++ compiler — plain
+  `zig build test` does not, so the `test` matrix does not use this action.
+
+  Turn a missing tool into a hard job failure instead of a gate that quietly
+  degrades: the final step is the assertion.
+runs:
+  using: composite
+  steps:
+    - name: Install Cap'n Proto compiler (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if command -v sudo >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
+        else
+          apt-get update
+          apt-get install -y capnproto libcapnp-dev
+        fi
+
+    - name: Install Cap'n Proto compiler (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install capnp
+
+    # This step is the assertion.
+    - name: Verify the toolchain the gate depends on is present
+      shell: bash
+      run: capnp --version
