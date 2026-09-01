@@ -25,9 +25,17 @@ pub const EngineConfig = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasNetworkId(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getNetworkId(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasNodeId(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getNodeId(self: Reader) ![]const u8 {
@@ -35,15 +43,27 @@ pub const EngineConfig = struct {
             return try self._reader.readData(1);
         }
 
+        pub fn hasSecretSeed(self: Reader) bool {
+            return !self._reader.isPointerNull(2);
+        }
+
         pub fn getSecretSeed(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(2)) return &[_]u8{};
             return try self._reader.readData(2);
+        }
+
+        pub fn hasQuorumSet(self: Reader) bool {
+            return !self._reader.isPointerNull(3);
         }
 
         pub fn getQuorumSet(self: Reader) !slcp.QuorumSet.Reader {
             if (self._reader.isPointerNull(3)) return slcp.QuorumSet.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(3);
             return slcp.QuorumSet.Reader{ ._reader = value };
+        }
+
+        pub fn hasLimits(self: Reader) bool {
+            return !self._reader.isPointerNull(4);
         }
 
         pub fn getLimits(self: Reader) !Limits.Reader {
@@ -70,21 +90,41 @@ pub const EngineConfig = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasNetworkId(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setNetworkId(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasNodeId(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn setNodeId(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(1, value);
         }
 
+        pub fn hasSecretSeed(self: Builder) bool {
+            return !self._builder.isPointerNull(2);
+        }
+
         pub fn setSecretSeed(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(2, value);
+        }
+
+        pub fn hasQuorumSet(self: Builder) bool {
+            return !self._builder.isPointerNull(3);
         }
 
         pub fn initQuorumSet(self: *Builder) !slcp.QuorumSet.Builder {
             const builder = try self._builder.initStruct(3, 1, 2);
             return slcp.QuorumSet.Builder{ ._builder = builder };
+        }
+
+        pub fn hasLimits(self: Builder) bool {
+            return !self._builder.isPointerNull(4);
         }
 
         pub fn initLimits(self: *Builder) !Limits.Builder {
@@ -216,8 +256,12 @@ pub const Input = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn whichOrdinal(self: Reader) u16 {
+            return self._reader.readUnionDiscriminant(0);
+        }
+
         pub fn which(self: Reader) error{InvalidEnumValue}!WhichTag {
-            return std.enums.fromInt(WhichTag, self._reader.readU16(0)) orelse return error.InvalidEnumValue;
+            return std.enums.fromInt(WhichTag, self.whichOrdinal()) orelse return error.InvalidEnumValue;
         }
 
         pub fn getUnset(self: Reader) !void {
@@ -225,10 +269,20 @@ pub const Input = struct {
             return {};
         }
 
+        pub fn hasEnvelopeReceived(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 1) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getEnvelopeReceived(self: Reader) ![]const u8 {
             if ((try self.which()) != .envelopeReceived) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasTimerFired(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 2) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getTimerFired(self: Reader) !TimerKey.Reader {
@@ -238,6 +292,11 @@ pub const Input = struct {
             return TimerKey.Reader{ ._reader = value };
         }
 
+        pub fn hasNominate(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 3) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getNominate(self: Reader) !Nominate.Reader {
             if ((try self.which()) != .nominate) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return Nominate.Reader{ ._reader = self._reader.emptyStruct() };
@@ -245,10 +304,20 @@ pub const Input = struct {
             return Nominate.Reader{ ._reader = value };
         }
 
+        pub fn hasQsetReceived(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 4) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getQsetReceived(self: Reader) ![]const u8 {
             if ((try self.which()) != .qsetReceived) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasRestoreOwnEnvelope(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 5) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getRestoreOwnEnvelope(self: Reader) ![]const u8 {
@@ -281,9 +350,19 @@ pub const Input = struct {
             _ = value;
         }
 
+        pub fn hasEnvelopeReceived(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 1) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setEnvelopeReceived(self: *Builder, value: []const u8) !void {
             self._builder.writeU16(0, 1);
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasTimerFired(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 2) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initTimerFired(self: *Builder) !TimerKey.Builder {
@@ -292,15 +371,30 @@ pub const Input = struct {
             return TimerKey.Builder{ ._builder = builder };
         }
 
+        pub fn hasNominate(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 3) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initNominate(self: *Builder) !Nominate.Builder {
             self._builder.writeU16(0, 3);
             const builder = try self._builder.initStruct(0, 1, 2);
             return Nominate.Builder{ ._builder = builder };
         }
 
+        pub fn hasQsetReceived(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 4) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setQsetReceived(self: *Builder, value: []const u8) !void {
             self._builder.writeU16(0, 4);
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasRestoreOwnEnvelope(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 5) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn setRestoreOwnEnvelope(self: *Builder, value: []const u8) !void {
@@ -342,13 +436,22 @@ pub const Effect = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn whichOrdinal(self: Reader) u16 {
+            return self._reader.readUnionDiscriminant(0);
+        }
+
         pub fn which(self: Reader) error{InvalidEnumValue}!WhichTag {
-            return std.enums.fromInt(WhichTag, self._reader.readU16(0)) orelse return error.InvalidEnumValue;
+            return std.enums.fromInt(WhichTag, self.whichOrdinal()) orelse return error.InvalidEnumValue;
         }
 
         pub fn getUnset(self: Reader) !void {
             if ((try self.which()) != .unset) return error.WrongUnionMember;
             return {};
+        }
+
+        pub fn hasPersistOwnEnvelope(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 1) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getPersistOwnEnvelope(self: Reader) !SlotBytes.Reader {
@@ -358,11 +461,21 @@ pub const Effect = struct {
             return SlotBytes.Reader{ ._reader = value };
         }
 
+        pub fn hasBroadcastEnvelope(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 2) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getBroadcastEnvelope(self: Reader) !SlotBytes.Reader {
             if ((try self.which()) != .broadcastEnvelope) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return SlotBytes.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(0);
             return SlotBytes.Reader{ ._reader = value };
+        }
+
+        pub fn hasForwardEnvelope(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 3) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getForwardEnvelope(self: Reader) !SlotBytes.Reader {
@@ -372,11 +485,21 @@ pub const Effect = struct {
             return SlotBytes.Reader{ ._reader = value };
         }
 
+        pub fn hasArmTimer(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 4) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getArmTimer(self: Reader) !ArmTimer.Reader {
             if ((try self.which()) != .armTimer) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return ArmTimer.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(0);
             return ArmTimer.Reader{ ._reader = value };
+        }
+
+        pub fn hasCancelTimer(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 5) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getCancelTimer(self: Reader) !TimerKey.Reader {
@@ -386,10 +509,20 @@ pub const Effect = struct {
             return TimerKey.Reader{ ._reader = value };
         }
 
+        pub fn hasRequestQset(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 6) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getRequestQset(self: Reader) ![]const u8 {
             if ((try self.which()) != .requestQset) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasExternalized(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 7) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getExternalized(self: Reader) !SlotBytes.Reader {
@@ -402,6 +535,11 @@ pub const Effect = struct {
         pub fn getInputStatus(self: Reader) !u16 {
             if ((try self.which()) != .inputStatus) return error.WrongUnionMember;
             return self._reader.readU16(2);
+        }
+
+        pub fn hasPhaseEvent(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 9) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getPhaseEvent(self: Reader) !PhaseEvent.Reader {
@@ -430,10 +568,20 @@ pub const Effect = struct {
             _ = value;
         }
 
+        pub fn hasPersistOwnEnvelope(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 1) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initPersistOwnEnvelope(self: *Builder) !SlotBytes.Builder {
             self._builder.writeU16(0, 1);
             const builder = try self._builder.initStruct(0, 1, 1);
             return SlotBytes.Builder{ ._builder = builder };
+        }
+
+        pub fn hasBroadcastEnvelope(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 2) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initBroadcastEnvelope(self: *Builder) !SlotBytes.Builder {
@@ -442,10 +590,20 @@ pub const Effect = struct {
             return SlotBytes.Builder{ ._builder = builder };
         }
 
+        pub fn hasForwardEnvelope(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 3) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initForwardEnvelope(self: *Builder) !SlotBytes.Builder {
             self._builder.writeU16(0, 3);
             const builder = try self._builder.initStruct(0, 1, 1);
             return SlotBytes.Builder{ ._builder = builder };
+        }
+
+        pub fn hasArmTimer(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 4) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initArmTimer(self: *Builder) !ArmTimer.Builder {
@@ -454,15 +612,30 @@ pub const Effect = struct {
             return ArmTimer.Builder{ ._builder = builder };
         }
 
+        pub fn hasCancelTimer(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 5) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initCancelTimer(self: *Builder) !TimerKey.Builder {
             self._builder.writeU16(0, 5);
             const builder = try self._builder.initStruct(0, 2, 0);
             return TimerKey.Builder{ ._builder = builder };
         }
 
+        pub fn hasRequestQset(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 6) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setRequestQset(self: *Builder, value: []const u8) !void {
             self._builder.writeU16(0, 6);
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasExternalized(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 7) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initExternalized(self: *Builder) !SlotBytes.Builder {
@@ -474,6 +647,11 @@ pub const Effect = struct {
         pub fn setInputStatus(self: *Builder, value: u16) !void {
             self._builder.writeU16(0, 8);
             self._builder.writeU16(2, @bitCast(value));
+        }
+
+        pub fn hasPhaseEvent(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 9) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initPhaseEvent(self: *Builder) !PhaseEvent.Builder {
@@ -548,6 +726,10 @@ pub const SlotBytes = struct {
             return self._reader.readU64(0);
         }
 
+        pub fn hasBytes(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getBytes(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
@@ -569,6 +751,10 @@ pub const SlotBytes = struct {
 
         pub fn setSlot(self: *Builder, value: u64) !void {
             self._builder.writeU64(0, @bitCast(value));
+        }
+
+        pub fn hasBytes(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn setBytes(self: *Builder, value: []const u8) !void {
@@ -649,9 +835,17 @@ pub const Nominate = struct {
             return self._reader.readU64(0);
         }
 
+        pub fn hasValue(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getValue(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasPrevValue(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getPrevValue(self: Reader) ![]const u8 {
@@ -677,8 +871,16 @@ pub const Nominate = struct {
             self._builder.writeU64(0, @bitCast(value));
         }
 
+        pub fn hasValue(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setValue(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasPrevValue(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn setPrevValue(self: *Builder, value: []const u8) !void {
@@ -758,6 +960,10 @@ pub const ValueList = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasValues(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getValues(self: Reader) !DataListReader {
             if (self._reader.isPointerNull(0)) return DataListReader{ ._list = self._reader.emptyList(message.PointerListReader) };
             const raw = try self._reader.readPointerList(0);
@@ -776,6 +982,10 @@ pub const ValueList = struct {
 
         pub fn wrap(builder: message.StructBuilder) Builder {
             return .{ ._builder = builder };
+        }
+
+        pub fn hasValues(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initValues(self: *Builder, element_count: u32) !DataListBuilder {
@@ -815,6 +1025,10 @@ pub const LintFinding = struct {
             return self._reader.readU32(8);
         }
 
+        pub fn hasNode(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getNode(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
@@ -850,6 +1064,10 @@ pub const LintFinding = struct {
             self._builder.writeU32(8, @bitCast(value));
         }
 
+        pub fn hasNode(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setNode(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
         }
@@ -873,6 +1091,10 @@ pub const LintDiagnostics = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasFindings(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getFindings(self: Reader) !StructListReader(LintFinding) {
             if (self._reader.isPointerNull(0)) return StructListReader(LintFinding){ ._list = self._reader.emptyStructList() };
             const raw = try self._reader.readStructList(0);
@@ -891,6 +1113,10 @@ pub const LintDiagnostics = struct {
 
         pub fn wrap(builder: message.StructBuilder) Builder {
             return .{ ._builder = builder };
+        }
+
+        pub fn hasFindings(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initFindings(self: *Builder, element_count: u32) !StructListBuilder(LintFinding) {

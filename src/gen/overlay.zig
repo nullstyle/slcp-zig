@@ -38,13 +38,22 @@ pub const Frame = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn whichOrdinal(self: Reader) u16 {
+            return self._reader.readUnionDiscriminant(0);
+        }
+
         pub fn which(self: Reader) error{InvalidEnumValue}!WhichTag {
-            return std.enums.fromInt(WhichTag, self._reader.readU16(0)) orelse return error.InvalidEnumValue;
+            return std.enums.fromInt(WhichTag, self.whichOrdinal()) orelse return error.InvalidEnumValue;
         }
 
         pub fn getUnset(self: Reader) !void {
             if ((try self.which()) != .unset) return error.WrongUnionMember;
             return {};
+        }
+
+        pub fn hasHello(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 1) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getHello(self: Reader) !Hello.Reader {
@@ -54,11 +63,21 @@ pub const Frame = struct {
             return Hello.Reader{ ._reader = value };
         }
 
+        pub fn hasEnvelope(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 2) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getEnvelope(self: Reader) !slcp.Envelope.Reader {
             if ((try self.which()) != .envelope) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return slcp.Envelope.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(0);
             return slcp.Envelope.Reader{ ._reader = value };
+        }
+
+        pub fn hasGetQset(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 3) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getGetQset(self: Reader) ![]const u8 {
@@ -67,11 +86,21 @@ pub const Frame = struct {
             return try self._reader.readData(0);
         }
 
+        pub fn hasQset(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 4) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getQset(self: Reader) !slcp.QuorumSet.Reader {
             if ((try self.which()) != .qset) return error.WrongUnionMember;
             if (self._reader.isPointerNull(0)) return slcp.QuorumSet.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(0);
             return slcp.QuorumSet.Reader{ ._reader = value };
+        }
+
+        pub fn hasDontHave(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 5) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getDontHave(self: Reader) !DontHave.Reader {
@@ -84,6 +113,11 @@ pub const Frame = struct {
         pub fn getGetSlotState(self: Reader) !u64 {
             if ((try self.which()) != .getSlotState) return error.WrongUnionMember;
             return self._reader.readU64(8);
+        }
+
+        pub fn hasSlotState(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 7) return false;
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getSlotState(self: Reader) !SlotState.Reader {
@@ -122,10 +156,20 @@ pub const Frame = struct {
             _ = value;
         }
 
+        pub fn hasHello(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 1) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initHello(self: *Builder) !Hello.Builder {
             self._builder.writeU16(0, 1);
             const builder = try self._builder.initStruct(0, 2, 2);
             return Hello.Builder{ ._builder = builder };
+        }
+
+        pub fn hasEnvelope(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 2) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initEnvelope(self: *Builder) !slcp.Envelope.Builder {
@@ -134,15 +178,30 @@ pub const Frame = struct {
             return slcp.Envelope.Builder{ ._builder = builder };
         }
 
+        pub fn hasGetQset(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 3) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setGetQset(self: *Builder, value: []const u8) !void {
             self._builder.writeU16(0, 3);
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasQset(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 4) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initQset(self: *Builder) !slcp.QuorumSet.Builder {
             self._builder.writeU16(0, 4);
             const builder = try self._builder.initStruct(0, 1, 2);
             return slcp.QuorumSet.Builder{ ._builder = builder };
+        }
+
+        pub fn hasDontHave(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 5) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initDontHave(self: *Builder) !DontHave.Builder {
@@ -154,6 +213,11 @@ pub const Frame = struct {
         pub fn setGetSlotState(self: *Builder, value: u64) !void {
             self._builder.writeU16(0, 6);
             self._builder.writeU64(8, @bitCast(value));
+        }
+
+        pub fn hasSlotState(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 7) return false;
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initSlotState(self: *Builder) !SlotState.Builder {
@@ -192,9 +256,17 @@ pub const Hello = struct {
             return self._reader.readU32(0);
         }
 
+        pub fn hasNetworkIdPrefix(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getNetworkIdPrefix(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasNodeId(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getNodeId(self: Reader) ![]const u8 {
@@ -228,8 +300,16 @@ pub const Hello = struct {
             self._builder.writeU32(0, @bitCast(value));
         }
 
+        pub fn hasNetworkIdPrefix(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setNetworkIdPrefix(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasNodeId(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn setNodeId(self: *Builder, value: []const u8) !void {
@@ -264,6 +344,10 @@ pub const DontHave = struct {
             return self._reader.readU8(0);
         }
 
+        pub fn hasId(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getId(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
@@ -285,6 +369,10 @@ pub const DontHave = struct {
 
         pub fn setKind(self: *Builder, value: u8) !void {
             self._builder.writeU8(0, @bitCast(value));
+        }
+
+        pub fn hasId(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn setId(self: *Builder, value: []const u8) !void {
@@ -314,6 +402,10 @@ pub const SlotState = struct {
             return self._reader.readU64(0);
         }
 
+        pub fn hasEnvelopes(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getEnvelopes(self: Reader) !StructListReader(slcp.Envelope) {
             if (self._reader.isPointerNull(0)) return StructListReader(slcp.Envelope){ ._list = self._reader.emptyStructList() };
             const raw = try self._reader.readStructList(0);
@@ -336,6 +428,10 @@ pub const SlotState = struct {
 
         pub fn setSlot(self: *Builder, value: u64) !void {
             self._builder.writeU64(0, @bitCast(value));
+        }
+
+        pub fn hasEnvelopes(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn initEnvelopes(self: *Builder, element_count: u32) !StructListBuilder(slcp.Envelope) {

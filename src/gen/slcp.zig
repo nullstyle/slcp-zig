@@ -28,6 +28,10 @@ pub const Ballot = struct {
             return self._reader.readU32(0);
         }
 
+        pub fn hasValue(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getValue(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
@@ -49,6 +53,10 @@ pub const Ballot = struct {
 
         pub fn setCounter(self: *Builder, value: u32) !void {
             self._builder.writeU32(0, @bitCast(value));
+        }
+
+        pub fn hasValue(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn setValue(self: *Builder, value: []const u8) !void {
@@ -80,10 +88,18 @@ pub const QuorumSet = struct {
             return self._reader.readU32(0);
         }
 
+        pub fn hasValidators(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getValidators(self: Reader) !DataListReader {
             if (self._reader.isPointerNull(0)) return DataListReader{ ._list = self._reader.emptyList(message.PointerListReader) };
             const raw = try self._reader.readPointerList(0);
             return DataListReader{ ._list = raw };
+        }
+
+        pub fn hasInnerSets(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getInnerSets(self: Reader) !StructListReader(QuorumSet) {
@@ -110,9 +126,17 @@ pub const QuorumSet = struct {
             self._builder.writeU32(0, @bitCast(value));
         }
 
+        pub fn hasValidators(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initValidators(self: *Builder, element_count: u32) !DataListBuilder {
             const raw = try self._builder.writePointerList(0, element_count);
             return DataListBuilder{ ._list = raw };
+        }
+
+        pub fn hasInnerSets(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn initInnerSets(self: *Builder, element_count: u32) !StructListBuilder(QuorumSet) {
@@ -139,15 +163,27 @@ pub const Nomination = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasQuorumSetHash(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getQuorumSetHash(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasVotes(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getVotes(self: Reader) !DataListReader {
             if (self._reader.isPointerNull(1)) return DataListReader{ ._list = self._reader.emptyList(message.PointerListReader) };
             const raw = try self._reader.readPointerList(1);
             return DataListReader{ ._list = raw };
+        }
+
+        pub fn hasAccepted(self: Reader) bool {
+            return !self._reader.isPointerNull(2);
         }
 
         pub fn getAccepted(self: Reader) !DataListReader {
@@ -170,13 +206,25 @@ pub const Nomination = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasQuorumSetHash(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setQuorumSetHash(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasVotes(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn initVotes(self: *Builder, element_count: u32) !DataListBuilder {
             const raw = try self._builder.writePointerList(1, element_count);
             return DataListBuilder{ ._list = raw };
+        }
+
+        pub fn hasAccepted(self: Builder) bool {
+            return !self._builder.isPointerNull(2);
         }
 
         pub fn initAccepted(self: *Builder, element_count: u32) !DataListBuilder {
@@ -200,9 +248,17 @@ pub const Prepare = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasQuorumSetHash(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getQuorumSetHash(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasBallot(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getBallot(self: Reader) !Ballot.Reader {
@@ -211,10 +267,18 @@ pub const Prepare = struct {
             return Ballot.Reader{ ._reader = value };
         }
 
+        pub fn hasPrepared(self: Reader) bool {
+            return !self._reader.isPointerNull(2);
+        }
+
         pub fn getPrepared(self: Reader) !Ballot.Reader {
             if (self._reader.isPointerNull(2)) return Ballot.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(2);
             return Ballot.Reader{ ._reader = value };
+        }
+
+        pub fn hasPreparedPrime(self: Reader) bool {
+            return !self._reader.isPointerNull(3);
         }
 
         pub fn getPreparedPrime(self: Reader) !Ballot.Reader {
@@ -245,8 +309,16 @@ pub const Prepare = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasQuorumSetHash(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setQuorumSetHash(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasBallot(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn initBallot(self: *Builder) !Ballot.Builder {
@@ -254,9 +326,17 @@ pub const Prepare = struct {
             return Ballot.Builder{ ._builder = builder };
         }
 
+        pub fn hasPrepared(self: Builder) bool {
+            return !self._builder.isPointerNull(2);
+        }
+
         pub fn initPrepared(self: *Builder) !Ballot.Builder {
             const builder = try self._builder.initStruct(2, 1, 1);
             return Ballot.Builder{ ._builder = builder };
+        }
+
+        pub fn hasPreparedPrime(self: Builder) bool {
+            return !self._builder.isPointerNull(3);
         }
 
         pub fn initPreparedPrime(self: *Builder) !Ballot.Builder {
@@ -288,9 +368,17 @@ pub const Confirm = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasQuorumSetHash(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getQuorumSetHash(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasBallot(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getBallot(self: Reader) !Ballot.Reader {
@@ -325,8 +413,16 @@ pub const Confirm = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasQuorumSetHash(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setQuorumSetHash(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasBallot(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn initBallot(self: *Builder) !Ballot.Builder {
@@ -362,6 +458,10 @@ pub const Externalize = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasCommit(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getCommit(self: Reader) !Ballot.Reader {
             if (self._reader.isPointerNull(0)) return Ballot.Reader{ ._reader = self._reader.emptyStruct() };
             const value = try self._reader.readStruct(0);
@@ -370,6 +470,10 @@ pub const Externalize = struct {
 
         pub fn getNH(self: Reader) !u32 {
             return self._reader.readU32(0);
+        }
+
+        pub fn hasCommitQuorumSetHash(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getCommitQuorumSetHash(self: Reader) ![]const u8 {
@@ -391,6 +495,10 @@ pub const Externalize = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasCommit(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn initCommit(self: *Builder) !Ballot.Builder {
             const builder = try self._builder.initStruct(0, 1, 1);
             return Ballot.Builder{ ._builder = builder };
@@ -398,6 +506,10 @@ pub const Externalize = struct {
 
         pub fn setNH(self: *Builder, value: u32) !void {
             self._builder.writeU32(0, @bitCast(value));
+        }
+
+        pub fn hasCommitQuorumSetHash(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn setCommitQuorumSetHash(self: *Builder, value: []const u8) !void {
@@ -424,13 +536,22 @@ pub const Statement = struct {
                 return .{ ._reader = reader };
             }
 
-            pub fn which(self: @This()) error{InvalidEnumValue}!WhichTag {
-                return std.enums.fromInt(WhichTag, self._reader.readU16(8)) orelse return error.InvalidEnumValue;
+            pub fn whichOrdinal(self: @This()) u16 {
+                return self._reader.readUnionDiscriminant(8);
+            }
+
+            pub fn which(self: @This()) error{InvalidEnumValue}!Statement.Pledges.WhichTag {
+                return std.enums.fromInt(Statement.Pledges.WhichTag, self.whichOrdinal()) orelse return error.InvalidEnumValue;
             }
 
             pub fn getUnset(self: @This()) !void {
                 if ((try self.which()) != .unset) return error.WrongUnionMember;
                 return {};
+            }
+
+            pub fn hasNominate(self: @This()) bool {
+                if (self._reader.readUnionDiscriminant(8) != 1) return false;
+                return !self._reader.isPointerNull(1);
             }
 
             pub fn getNominate(self: @This()) !Nomination.Reader {
@@ -439,16 +560,31 @@ pub const Statement = struct {
                 return Nomination.Reader{ ._reader = value };
             }
 
+            pub fn hasPrepare(self: @This()) bool {
+                if (self._reader.readUnionDiscriminant(8) != 2) return false;
+                return !self._reader.isPointerNull(1);
+            }
+
             pub fn getPrepare(self: @This()) !Prepare.Reader {
                 if ((try self.which()) != .prepare) return error.WrongUnionMember;
                 const value = try self._reader.readStruct(1);
                 return Prepare.Reader{ ._reader = value };
             }
 
+            pub fn hasConfirm(self: @This()) bool {
+                if (self._reader.readUnionDiscriminant(8) != 3) return false;
+                return !self._reader.isPointerNull(1);
+            }
+
             pub fn getConfirm(self: @This()) !Confirm.Reader {
                 if ((try self.which()) != .confirm) return error.WrongUnionMember;
                 const value = try self._reader.readStruct(1);
                 return Confirm.Reader{ ._reader = value };
+            }
+
+            pub fn hasExternalize(self: @This()) bool {
+                if (self._reader.readUnionDiscriminant(8) != 4) return false;
+                return !self._reader.isPointerNull(1);
             }
 
             pub fn getExternalize(self: @This()) !Externalize.Reader {
@@ -471,10 +607,20 @@ pub const Statement = struct {
                 _ = value;
             }
 
+            pub fn hasNominate(self: @This()) bool {
+                if (self._builder.readUnionDiscriminant(8) != 1) return false;
+                return !self._builder.isPointerNull(1);
+            }
+
             pub fn initNominate(self: *@This()) !Nomination.Builder {
             self._builder.writeU16(8, 1);
                 const builder = try self._builder.initStruct(1, 0, 3);
                 return Nomination.Builder{ ._builder = builder };
+            }
+
+            pub fn hasPrepare(self: @This()) bool {
+                if (self._builder.readUnionDiscriminant(8) != 2) return false;
+                return !self._builder.isPointerNull(1);
             }
 
             pub fn initPrepare(self: *@This()) !Prepare.Builder {
@@ -483,10 +629,20 @@ pub const Statement = struct {
                 return Prepare.Builder{ ._builder = builder };
             }
 
+            pub fn hasConfirm(self: @This()) bool {
+                if (self._builder.readUnionDiscriminant(8) != 3) return false;
+                return !self._builder.isPointerNull(1);
+            }
+
             pub fn initConfirm(self: *@This()) !Confirm.Builder {
             self._builder.writeU16(8, 3);
                 const builder = try self._builder.initStruct(1, 2, 2);
                 return Confirm.Builder{ ._builder = builder };
+            }
+
+            pub fn hasExternalize(self: @This()) bool {
+                if (self._builder.readUnionDiscriminant(8) != 4) return false;
+                return !self._builder.isPointerNull(1);
             }
 
             pub fn initExternalize(self: *@This()) !Externalize.Builder {
@@ -508,6 +664,10 @@ pub const Statement = struct {
 
         pub fn wrap(reader: message.StructReader) Reader {
             return .{ ._reader = reader };
+        }
+
+        pub fn hasNodeId(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
         }
 
         pub fn getNodeId(self: Reader) ![]const u8 {
@@ -535,6 +695,10 @@ pub const Statement = struct {
 
         pub fn wrap(builder: message.StructBuilder) Builder {
             return .{ ._builder = builder };
+        }
+
+        pub fn hasNodeId(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
         }
 
         pub fn setNodeId(self: *Builder, value: []const u8) !void {
@@ -565,9 +729,17 @@ pub const Envelope = struct {
             return .{ ._reader = reader };
         }
 
+        pub fn hasStatementBytes(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
         pub fn getStatementBytes(self: Reader) ![]const u8 {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
+        }
+
+        pub fn hasSignature(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
         }
 
         pub fn getSignature(self: Reader) ![]const u8 {
@@ -589,8 +761,16 @@ pub const Envelope = struct {
             return .{ ._builder = builder };
         }
 
+        pub fn hasStatementBytes(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
         pub fn setStatementBytes(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
+        }
+
+        pub fn hasSignature(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
         }
 
         pub fn setSignature(self: *Builder, value: []const u8) !void {
