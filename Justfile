@@ -30,6 +30,11 @@ vectors-sweep:
 # ===== M6:appnode =====
 # M6 stage anchor (appnode).
 
+# Expected-fail compile of every AppNode / auto-codec teaching error
+# (tests/appnode_errors/, 20 cases; also part of `zig build test`).
+appnode-errors:
+    zig build appnode-errors --summary all
+
 # ===== M6:example =====
 # M6 stage anchor (example): example-smoke / example-build recipes go here.
 
