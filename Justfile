@@ -97,7 +97,7 @@ api-snapshot:
     zig build api-snapshot
 
 # docs/stability.md is the review reference. Add -Dstrict-experimental=true to
-# also gate the experimental file, as CI's ubuntu job does.
+# also gate the experimental file, as both CI test legs do (since fc351a5).
 # Fail when the STABLE public API drifts from docs/api-snapshot.txt.
 check-api:
     zig build check-api

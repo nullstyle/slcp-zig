@@ -723,12 +723,12 @@ pub fn build(b: *std.Build) void {
     // `test` (design §13.8): a Stable drift or an unclosed Stable signature
     // is red at the gate, on every OS. Locally that means `zig build test`
     // refreshes docs/api-snapshot-experimental.txt in place when it drifted
-    // (commit it); CI's ubuntu leg passes -Dstrict-experimental=true so a
+    // (commit it); both CI test legs pass -Dstrict-experimental=true so a
     // stale committed copy is red there.
     const strict_experimental = b.option(
         bool,
         "strict-experimental",
-        "check-api: also fail when docs/api-snapshot-experimental.txt is stale (CI ubuntu job; default false)",
+        "check-api: also fail when docs/api-snapshot-experimental.txt is stale (both CI test legs; default false)",
     ) orelse false;
     const api_snapshot_mod = b.createModule(.{
         .root_source_file = b.path("tools/api_snapshot.zig"),
