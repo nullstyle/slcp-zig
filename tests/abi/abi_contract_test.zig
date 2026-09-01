@@ -510,13 +510,13 @@ test "§7.2 freeInput releases every owned slice on all six Input arms" {
 /// docs). Kept byte-for-byte structurally identical; the wasm differential
 /// harness is what pins the real export's bytes against this shape.
 ///
-/// BUG FOUND (reported, fixed here only): the real `encodeLint` does
-///     const framed = try mb.toBytes();
-///     return alloc.dupe(u8, framed);
-/// but `MessageBuilder.toBytes` returns an ALLOCATOR-OWNED slice ("the caller
-/// must free the returned slice"), and `mb.deinit()` does not reclaim it — so
-/// every `slcp_lint_qset` call leaks one frame in the wasm heap. The
-/// `defer alloc.free(framed)` below is the missing line.
+/// `node @4` (M6) is written only when the finding carries one — the wire
+/// contract is "ABSENT pointer otherwise", so a mirror that wrote an empty
+/// Data would still decode as 0 bytes but produce different frame bytes.
+///
+/// (M4 finding, fixed in M6: `MessageBuilder.toBytes` returns an
+/// ALLOCATOR-OWNED slice that `mb.deinit()` does not reclaim; the real
+/// `encodeLint` now carries the same `defer alloc.free(framed)`.)
 fn encodeLintMirror(gpa: std.mem.Allocator, findings: []const qset.LintFinding) ![]u8 {
     var mb = MessageBuilder.init(gpa);
     defer mb.deinit();
@@ -529,10 +529,11 @@ fn encodeLintMirror(gpa: std.mem.Allocator, findings: []const qset.LintFinding) 
             try b.setCode(@backingInt(f.code));
             try b.setMembers(f.members);
             try b.setThreshold(f.threshold);
+            if (f.node) |*n| try b.setNode(n);
         }
     }
     const framed = try mb.toBytes();
-    defer gpa.free(framed); // the line slcp_host_abi.encodeLint is missing
+    defer gpa.free(framed);
     return gpa.dupe(u8, framed);
 }
 
@@ -545,11 +546,20 @@ fn decodeLint(gpa: std.mem.Allocator, frame: []const u8) ![]qset.LintFinding {
     errdefer gpa.free(out);
     for (out, 0..) |*slot, i| {
         const f = try list.get(@intCast(i));
+        // ABSENT pointer ⇒ null; present ⇒ exactly 32 bytes. Checked on the
+        // raw pointer, not on `getNode().len`, so a present-but-empty Data
+        // (a different frame) can never masquerade as "absent".
+        const node: ?qset.NodeId = if (f._reader.isPointerNull(0)) null else blk: {
+            const raw = try f.getNode();
+            if (raw.len != 32) return error.BadNodeLength;
+            break :blk raw[0..32].*;
+        };
         slot.* = .{
             .level = std.enums.fromInt(qset.LintLevel, try f.getLevel()) orelse return error.InvalidEnumValue,
             .code = std.enums.fromInt(qset.LintCode, try f.getCode()) orelse return error.InvalidEnumValue,
             .members = try f.getMembers(),
             .threshold = try f.getThreshold(),
+            .node = node,
         };
     }
     return out;
@@ -568,19 +578,26 @@ fn expectLintRoundTrip(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned) !
         try testing.expectEqual(a.code, b.code);
         try testing.expectEqual(a.members, b.members);
         try testing.expectEqual(a.threshold, b.threshold);
+        try testing.expectEqual(a.node == null, b.node == null);
+        if (a.node) |an| try testing.expectEqualSlices(u8, &an, &b.node.?);
     }
     return decoded;
 }
 
-test "§7.2/§12 slcp_lint_qset: LintDiagnostics frame round-trips the four lint shapes" {
+// Non-vacuity: dropping `setNode` from the mirror → the 3-of-3 / 1-of-1
+// decoded `critical_node` findings come back with `node == null` (red);
+// writing `setNode` unconditionally → the clean/sub-majority findings
+// come back non-null (red on `want_node`).
+test "§7.2/§12 slcp_lint_qset: LintDiagnostics frame round-trips the lint shapes incl. node @4" {
     const gpa = testing.allocator;
 
-    const Shape = struct { threshold: u32, members: []const u8, want: usize };
+    const Shape = struct { threshold: u32, members: []const u8, want: usize, want_node: usize };
     const shapes = [_]Shape{
-        .{ .threshold = 2, .members = &.{ 1, 2, 3 }, .want = 0 }, // clean 2-of-3
-        .{ .threshold = 1, .members = &.{ 1, 2, 3 }, .want = 2 }, // sub-majority 1-of-3
-        .{ .threshold = 3, .members = &.{ 1, 2, 3 }, .want = 1 }, // all-critical 3-of-3
-        .{ .threshold = 3, .members = &.{ 1, 2, 3, 4, 5 }, .want = 1 }, // below-two-thirds 3-of-5
+        .{ .threshold = 2, .members = &.{ 1, 2, 3 }, .want = 0, .want_node = 0 }, // clean 2-of-3
+        .{ .threshold = 1, .members = &.{ 1, 2, 3 }, .want = 2, .want_node = 0 }, // sub-majority 1-of-3
+        .{ .threshold = 3, .members = &.{ 1, 2, 3 }, .want = 4, .want_node = 3 }, // all-critical 3-of-3 (+3 critical_node)
+        .{ .threshold = 3, .members = &.{ 1, 2, 3, 4, 5 }, .want = 1, .want_node = 0 }, // below-two-thirds 3-of-5
+        .{ .threshold = 1, .members = &.{9}, .want = 1, .want_node = 1 }, // singleton 1-of-1 (critical_node only)
     };
     for (shapes) |sh| {
         var qs = try flatQset(gpa, sh.threshold, sh.members);
@@ -588,10 +605,18 @@ test "§7.2/§12 slcp_lint_qset: LintDiagnostics frame round-trips the four lint
         const decoded = try expectLintRoundTrip(gpa, &qs);
         defer gpa.free(decoded);
         try testing.expectEqual(sh.want, decoded.len);
+        var with_node: usize = 0;
         for (decoded) |f| {
             try testing.expectEqual(@as(u32, @intCast(sh.members.len)), f.members);
             try testing.expectEqual(sh.threshold, f.threshold);
+            // present ⇔ critical_node; present ⇒ 32 bytes (NodeId), absent ⇒ null
+            try testing.expectEqual(f.code == .critical_node, f.node != null);
+            if (f.node) |n| {
+                with_node += 1;
+                try testing.expect(qset.containsNode(&qs, n));
+            }
         }
+        try testing.expectEqual(sh.want_node, with_node);
     }
 }
 
@@ -606,26 +631,24 @@ test "§7.2/§12 lint frame and vectors/lint.json agree" {
         return error.SkipZigTest;
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
     const cases = root.object.get("cases").?.array;
-    try testing.expectEqual(@as(usize, 4), cases.items.len);
+    // M6 lint v2: the four M0 shapes plus nested-clean, nested-critical,
+    // singleton and clean 4-of-5. A regenerated file that lost cases is red.
+    try testing.expect(cases.items.len >= 8);
 
+    var critical_cases: usize = 0;
     for (cases.items) |case| {
-        const input = case.object.get("input").?.object;
-        const validators = input.get("validators").?.array;
-        const threshold: u32 = @intCast(input.get("threshold").?.integer);
-
-        const vals = try gpa.alloc(qset.NodeId, validators.items.len);
-        for (validators.items, 0..) |v, i| {
-            const hex = v.string;
-            try testing.expectEqual(@as(usize, 64), hex.len);
-            _ = try std.fmt.hexToBytes(&vals[i], hex);
-        }
-        var qs = qset.QuorumSetOwned{
-            .threshold = threshold,
-            .validators = vals,
-            .inner_sets = try gpa.alloc(qset.QuorumSetOwned, 0),
-        };
+        // The vector's input goes through THE quorum JSON parser (nested
+        // inputs included) — the same code path the CLI takes.
+        const input_bytes = try std.json.Stringify.valueAlloc(arena, case.object.get("input").?, .{});
+        const spec = try slcp.quorum.Quorum.fromJson(arena, input_bytes);
+        var qs = try spec.toOwned(gpa);
         defer qs.deinit(gpa);
         try qset.validateAndNormalize(gpa, &qs);
+
+        try testing.expectEqual(
+            @as(u32, @intCast(case.object.get("minBlocking").?.integer)),
+            qset.minBlockingSize(&qs),
+        );
 
         // The findings that came back through the ABI frame — not the raw
         // qset.lint slice — are what gets compared to the vector.
@@ -642,8 +665,15 @@ test "§7.2/§12 lint frame and vectors/lint.json agree" {
             try testing.expectEqual(want_code, got.code);
             try testing.expectEqual(@as(u32, @intCast(wo.get("members").?.integer)), got.members);
             try testing.expectEqual(@as(u32, @intCast(wo.get("threshold").?.integer)), got.threshold);
+            if (wo.get("node")) |wn| {
+                try testing.expectEqualStrings(wn.string, &slcp.quorum.nodeIdHex(got.node.?));
+                critical_cases += 1;
+            } else {
+                try testing.expect(got.node == null);
+            }
         }
     }
+    try testing.expect(critical_cases > 0); // the node hex comparison ran
 }
 
 // ---------------------------------------------------------------------------

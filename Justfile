@@ -22,6 +22,11 @@ e2e:
 # ===== M6:quorum =====
 # M6 stage anchor (quorum): cli / lint-quorum / vectors-sweep recipes go here.
 
+# The stale-wasm red guard: regenerate the vectors, rebuild the wasm, then run
+# every gate that pins qset/lint bytes (native mirrors AND the wasm export).
+vectors-sweep:
+    zig build vectors && zig build wasm && zig build test && zig build wasm-diff
+
 # ===== M6:appnode =====
 # M6 stage anchor (appnode).
 

@@ -18,6 +18,7 @@ pub const crypto = @import("crypto.zig");
 pub const driver = @import("driver.zig");
 pub const limits = @import("engine/limits.zig");
 pub const qset = @import("engine/qset.zig");
+pub const quorum = @import("quorum.zig");
 pub const statement = @import("engine/statement.zig");
 pub const stored = @import("engine/stored.zig");
 pub const values = @import("engine/values.zig");

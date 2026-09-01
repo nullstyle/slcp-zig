@@ -401,9 +401,13 @@ pub fn encodeLint(alloc: std.mem.Allocator, findings: []const qset.LintFinding) 
             try b.setCode(@backingInt(f.code));
             try b.setMembers(f.members);
             try b.setThreshold(f.threshold);
+            // `node @4` is an ABSENT pointer unless the finding carries one
+            // (critical_node) — the §7.1 layout every mirror must match.
+            if (f.node) |*n| try b.setNode(n);
         }
     }
     const framed = try mb.toBytes();
+    defer alloc.free(framed); // toBytes hands out an allocator-owned slice; mb.deinit does not reclaim it
     return alloc.dupe(u8, framed);
 }
 

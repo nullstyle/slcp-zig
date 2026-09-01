@@ -560,3 +560,66 @@ test "property: depth-3 chain never increases weight" {
         try testing.expectEqual(w_leaf / 2, nodeWeight(&wide, nid(0)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// qset.isSatisfiableWithout vs isVBlocking — the M6 lint's criticality
+// predicate must agree with the oracle-transcribed v-blocking predicate.
+// ---------------------------------------------------------------------------
+
+/// Random tree over a fresh-id counter (unique validators, like a validated
+/// tree): depth <= 3, 0..3 validators and 0..2 inner sets per level (at least
+/// one member), threshold in [1, members]. Caller deinits.
+fn randomTree(gpa: std.mem.Allocator, rng: std.Random, next_id: *u8, depth: u32) !qset.QuorumSetOwned {
+    var nv: u8 = rng.intRangeAtMost(u8, 0, 3);
+    const ni: u8 = if (depth < 3) rng.intRangeAtMost(u8, 0, 2) else 0;
+    if (nv + ni == 0) nv = 1;
+
+    const vals = try gpa.alloc(NodeId, nv);
+    errdefer gpa.free(vals);
+    for (vals) |*v| {
+        v.* = nid(next_id.*);
+        next_id.* += 1;
+    }
+    const inners = try gpa.alloc(qset.QuorumSetOwned, ni);
+    var built: usize = 0;
+    errdefer {
+        for (inners[0..built]) |*inner| inner.deinit(gpa);
+        gpa.free(inners);
+    }
+    for (inners) |*inner| {
+        inner.* = try randomTree(gpa, rng, next_id, depth + 1);
+        built += 1;
+    }
+    const members: u32 = @as(u32, nv) + @as(u32, ni);
+    return .{ .threshold = rng.intRangeAtMost(u32, 1, members), .validators = vals, .inner_sets = inners };
+}
+
+// Non-vacuity: making `qset.isSatisfiableWithout` count the excluded node
+// (drop the `!eql` guard) → every node reads "satisfiable" while
+// `isVBlocking` still blocks 3-of-3 members → red on the first such tree.
+test "property: qset.isSatisfiableWithout(qs, v) == !isVBlocking(qs, {v}) on 500 random trees" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5ca1ab1e);
+    const rng = prng.random();
+
+    var trees: usize = 0;
+    var checks: usize = 0;
+    var critical_seen: usize = 0;
+    while (trees < 500) : (trees += 1) {
+        var next_id: u8 = 0;
+        var qs = try randomTree(gpa, rng, &next_id, 1);
+        defer qs.deinit(gpa);
+        // every validator in the tree plus one id that is NOT in it
+        var i: u8 = 0;
+        while (i <= next_id) : (i += 1) {
+            const v = nid(i);
+            const one = [_]NodeId{v};
+            const blocked = isVBlocking(&qs, &one);
+            try testing.expectEqual(!blocked, qset.isSatisfiableWithout(&qs, v));
+            if (blocked) critical_seen += 1;
+            checks += 1;
+        }
+    }
+    try testing.expect(checks > 500);
+    try testing.expect(critical_seen > 0); // the property was exercised on both sides
+}

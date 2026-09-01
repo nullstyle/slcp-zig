@@ -990,6 +990,7 @@ fn encodeLintNative(gpa: std.mem.Allocator, findings: []const qset.LintFinding) 
             try b.setCode(@backingInt(f.code));
             try b.setMembers(f.members);
             try b.setThreshold(f.threshold);
+            if (f.node) |*n| try b.setNode(n); // present only for critical_node
         }
     }
     return gpa.dupe(u8, try mb.toBytes());
