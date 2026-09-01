@@ -411,7 +411,11 @@ pub const Overlay = struct {
 
         try self.dialer_threads.ensureTotalCapacity(self.gpa, self.cfg.peers.len);
 
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        // Thread-spawn failures are reported as ONE named error so the Node
+        // can tell "cannot start a thread" (`CreateError.ThreadSpawnFailed`)
+        // apart from "cannot bind the port" (the ListenError members above).
+        self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch
+            return error.ThreadSpawnFailed;
         // From here, any failure must join everything already spawned.
         errdefer {
             self.stopping.store(true, .release);
@@ -419,7 +423,8 @@ pub const Overlay = struct {
         }
 
         for (self.cfg.peers, 0..) |_, i| {
-            const t = try std.Thread.spawn(.{}, dialerLoop, .{ self, i });
+            const t = std.Thread.spawn(.{}, dialerLoop, .{ self, i }) catch
+                return error.ThreadSpawnFailed;
             self.dialer_threads.appendAssumeCapacity(t);
         }
 
@@ -611,13 +616,19 @@ pub const Overlay = struct {
     fn dialerLoop(self: *Overlay, peer_index: usize) void {
         const spec = self.cfg.peers[peer_index];
         var attempt: u32 = 0;
+        // Consecutive dial failures since the last success; drives the
+        // rate-limited "unreachable" warning (attempt saturates at 30 for the
+        // backoff table, so it cannot serve as the warn counter).
+        var failures: u64 = 0;
         while (!self.stopping.load(.acquire)) {
-            const conn = self.dialOne(spec) orelse {
+            const conn = self.dialOne(spec, failures) orelse {
+                failures +|= 1;
                 self.waitInterruptible(backoffNs(peer_index, attempt));
                 if (attempt < 30) attempt += 1;
                 continue;
             };
             attempt = 0; // TCP connect succeeded — reset backoff growth.
+            failures = 0;
             self.runConnection(conn);
             if (self.stopping.load(.acquire)) break;
             // Reconnect after a base (attempt 0 ≈ 1s) delay + jitter.
@@ -625,20 +636,43 @@ pub const Overlay = struct {
         }
     }
 
-    fn dialOne(self: *Overlay, spec: []const u8) ?*Conn {
+    /// One dial attempt. An IP literal connects directly; anything else is a
+    /// hostname resolved through `std.Io.net.HostName.connect` (the Io's
+    /// resolver: /etc/hosts + DNS under Threaded), so `a.example.com:7311`
+    /// and `localhost:7311` both work (§9 peer specs). `failures` is the
+    /// consecutive-failure count: the unreachable warning fires on the first
+    /// failure and every 8th thereafter, not on every 1..60 s retry.
+    fn dialOne(self: *Overlay, spec: []const u8, failures: u64) ?*Conn {
         const hp = parseHostPort(spec) catch {
             log.warn("overlay: bad peer spec '{s}'", .{spec});
             return null;
         };
-        var addr = net.IpAddress.parse(hp.host, hp.port) catch {
-            log.warn("overlay: cannot parse peer address '{s}'", .{spec});
-            return null;
-        };
-        const stream = net.IpAddress.connect(&addr, self.io, .{ .mode = .stream }) catch {
-            return null;
+        const stream = blk: {
+            if (net.IpAddress.parse(hp.host, hp.port)) |parsed| {
+                var addr = parsed;
+                break :blk net.IpAddress.connect(&addr, self.io, .{ .mode = .stream }) catch |err| {
+                    warnUnreachable(spec, failures, err);
+                    return null;
+                };
+            } else |_| {
+                const hn = net.HostName.init(hp.host) catch {
+                    log.warn("overlay: cannot parse peer address '{s}'", .{spec});
+                    return null;
+                };
+                break :blk hn.connect(self.io, hp.port, .{ .mode = .stream }) catch |err| {
+                    warnUnreachable(spec, failures, err);
+                    return null;
+                };
+            }
         };
         setTcpNoDelay(stream.socket.handle);
         return self.makeConn(stream, true);
+    }
+
+    fn warnUnreachable(spec: []const u8, failures: u64, err: anyerror) void {
+        if (failures == 0 or failures % 8 == 0) {
+            log.warn("overlay: peer '{s}' unreachable ({t}); retrying with backoff (1s..60s)", .{ spec, err });
+        }
     }
 
     /// Wrap `stream` in a heap Conn. Closes `stream` and returns null on
@@ -1019,15 +1053,40 @@ fn isRequestFrame(frame: wire.OverlayFrame) bool {
     };
 }
 
-const HostPort = struct { host: []const u8, port: u16 };
+pub const HostPort = struct { host: []const u8, port: u16 };
 
-fn parseHostPort(spec: []const u8) !HostPort {
+/// Split a peer spec on its LAST ':' into host and port. One leading '[' and
+/// trailing ']' are stripped from the host, so `[::1]:7311` yields host
+/// `::1`. Port 0 is rejected (nothing listens on port 0). The host is NOT
+/// validated here — see `validatePeerSpec`.
+pub fn parseHostPort(spec: []const u8) error{BadPeerSpec}!HostPort {
     const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.BadPeerSpec;
     if (idx == 0 or idx + 1 >= spec.len) return error.BadPeerSpec;
-    return .{
-        .host = spec[0..idx],
-        .port = try std.fmt.parseInt(u16, spec[idx + 1 ..], 10),
-    };
+    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPeerSpec;
+    if (port == 0) return error.BadPeerSpec;
+    var host = spec[0..idx];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    if (host.len == 0) return error.BadPeerSpec;
+    return .{ .host = host, .port = port };
+}
+
+pub const PeerSpecError = error{ MissingPort, EmptyHost, BadPort, BadHost };
+
+/// Is `spec` something `dialOne` can act on? `host:port` where host is an
+/// IPv4/IPv6 literal (`[v6]:port` accepted) or an RFC 1123 hostname, and
+/// port is 1..65535. `Node.create` maps a failure to `BadPeerSpec` naming
+/// the index, the spec and which part is wrong.
+pub fn validatePeerSpec(spec: []const u8) PeerSpecError!void {
+    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.MissingPort;
+    if (idx + 1 >= spec.len) return error.MissingPort;
+    if (idx == 0) return error.EmptyHost;
+    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPort;
+    if (port == 0) return error.BadPort;
+    var host = spec[0..idx];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    if (host.len == 0) return error.EmptyHost;
+    if (net.IpAddress.parse(host, port)) |_| return else |_| {}
+    net.HostName.validate(host) catch return error.BadHost;
 }
 
 /// Exponential backoff 1s→60s plus deterministic per-peer jitter (Wyhash over
@@ -1591,4 +1650,70 @@ test "write queue caps: overflow fails the enqueue and shuts the conn down" {
         try testing.expectError(error.WriteQueueFull, conn.enqueue("y"));
         try testing.expectError(error.WriteClosed, conn.enqueue("y"));
     }
+}
+
+// Non-vacuity: dropping the bracket strip makes `[::1]` the host (red);
+// removing the `port == 0` rejection makes `a.example.com:0` validate;
+// replacing `HostName.validate` with "accept anything" lets `bad_host!`
+// through; skipping `IpAddress.parse` first rejects `[::1]:7311` as a bad
+// hostname.
+test "validatePeerSpec / parseHostPort: literals, bracket-v6, hostnames, and each rejection" {
+    try validatePeerSpec("127.0.0.1:7311");
+    try validatePeerSpec("[::1]:7311");
+    try validatePeerSpec("a.example.com:7311");
+    try validatePeerSpec("localhost:7311");
+    try validatePeerSpec("localhost:65535");
+    try testing.expectError(error.MissingPort, validatePeerSpec("nohost"));
+    try testing.expectError(error.MissingPort, validatePeerSpec("host:"));
+    try testing.expectError(error.EmptyHost, validatePeerSpec(":7311"));
+    try testing.expectError(error.EmptyHost, validatePeerSpec("[]:7311"));
+    try testing.expectError(error.BadPort, validatePeerSpec("a.example.com:0"));
+    try testing.expectError(error.BadPort, validatePeerSpec("a.example.com:70000"));
+    try testing.expectError(error.BadPort, validatePeerSpec("a.example.com:seven"));
+    try testing.expectError(error.BadHost, validatePeerSpec("bad_host!:7311"));
+    try testing.expectError(error.BadHost, validatePeerSpec("-leading.example.com:7311"));
+
+    const v6 = try parseHostPort("[::1]:7311");
+    try testing.expectEqualStrings("::1", v6.host);
+    try testing.expectEqual(@as(u16, 7311), v6.port);
+    const host = try parseHostPort("a.example.com:7311");
+    try testing.expectEqualStrings("a.example.com", host.host);
+    try testing.expectError(error.BadPeerSpec, parseHostPort("a.example.com:0"));
+    try testing.expectError(error.BadPeerSpec, parseHostPort("[]:7311"));
+}
+
+// Non-vacuity: this is the M6 hostname path. Reverting `dialOne` to the
+// IP-literal-only branch makes `localhost:<port>` unparseable and the peer
+// never comes up (PeerCountTimeout). The first assertion pins that
+// `IpAddress.parse` really rejects "localhost", so the old branch cannot
+// pass this test by accident.
+test "dialer resolves a hostname peer spec" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    try testing.expect(std.meta.isError(net.IpAddress.parse("localhost", 1)));
+
+    var b_rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer b_rec.deinit();
+    var a_rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer a_rec.deinit();
+
+    var ov_b = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xBB), b_rec.callbacks());
+    b_rec.ov = &ov_b;
+    try ov_b.start();
+    defer ov_b.deinit();
+    defer ov_b.stop();
+
+    var buf: [64]u8 = undefined;
+    const b_spec = try std.fmt.bufPrint(&buf, "localhost:{d}", .{ov_b.boundPort()});
+    var ov_a = try Overlay.init(gpa, io, testConfig(0, &.{b_spec}, test_prefix, 0xAA), a_rec.callbacks());
+    a_rec.ov = &ov_a;
+    try ov_a.start();
+    defer ov_a.deinit();
+    defer ov_a.stop();
+
+    // on_peer_up within the (generous, ~8 s) poll bound; the plan asks for 5 s.
+    try waitPeerCount(io, &ov_a, 1);
+    try waitPeerCount(io, &ov_b, 1);
+    try testing.expectEqual(@as(usize, 1), a_rec.peerUpCount());
+    try testing.expectEqual(@as(usize, 1), b_rec.peerUpCount());
 }
