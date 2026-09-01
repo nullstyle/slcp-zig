@@ -1,7 +1,7 @@
 //! slcp — the native omakase layer (design §11.2). Wraps the sans-io engine
 //! (slcp-core) in a real node: TCP flood overlay, a real-clock timer wheel,
 //! crash-safe persistence, and a key file. The typed `AppNode(App)` layer
-//! (§8.5) lands at M6 on top of this.
+//! (§8.5) landed M6 on top of this.
 //!
 //! Escape hatches stay public: `core` is the whole sans-io engine, so a power
 //! user can drive `core.engine.Engine` with their own I/O and skip everything
@@ -48,14 +48,17 @@ test {
 
 // ===== M6:appnode exports =====
 // AppNode, Codec, Validity, Driver, DeliveryHook (M6 appnode stage; insert here only).
-/// Typed app layer (§8.5): `Codec(T)` auto-codec + the `AppNode(App)` comptime
-/// contract. `create` / `propose` / `waitApplied` land in M6 S3.
+/// Typed app layer (§8.5): `Codec(T)` auto-codec + the `AppNode(App)` typed
+/// node (`create` / `propose` / `waitApplied` over the bytes-level Node).
 pub const app_node = @import("node/app_node.zig");
 pub const AppNode = app_node.AppNode;
 pub const Codec = app_node.Codec;
 pub const Validity = core.driver.Validity;
 pub const Driver = core.driver.Driver;
 pub const DriverError = core.driver.DriverError;
+/// Engine-thread delivery hook for bytes-level apps (`Options.delivery`);
+/// what `AppNode` installs for itself.
+pub const DeliveryHook = node.DeliveryHook;
 
 test {
     // Discover every node-layer module's tests under `zig build node-tests`.

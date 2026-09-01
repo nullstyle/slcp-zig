@@ -24,8 +24,13 @@
 //! bool ∈ {0,1}, enum tag must name a variant) so the codec cannot become a
 //! value-malleability source.
 //!
-//! This stage (M6 S1b) ships the codec and the contract checks; `create` /
-//! `propose` / `waitApplied` and the Driver compilation land in S3.
+//! **The node** (`AppNode(App)`, M6 S3): `create` forwards every bytes-level
+//! option except `driver` / `delivery` (the R8 mirror `Options`), compiles
+//! `validate` / `combine` into the driver, and installs a `DeliveryHook` so
+//! `apply` runs on the engine thread at the externalize effect — the same
+//! thread that runs `validate`, so the typed state needs no lock. The user
+//! thread sees value copies through `waitApplied`, which never hangs: null on
+//! timeout / deinit, `error.NodeHalted` once the node latched inert.
 
 const std = @import("std");
 const core = @import("slcp-core");
@@ -385,12 +390,117 @@ fn CustomCodec(comptime App: type) type {
     };
 }
 
-/// The typed node (§8.5, §11.2). This stage returns the contract-checked
-/// type with its `State`, `Command`, `codec` and `Options`; `create` /
-/// `propose` / `waitApplied` and the Driver compilation land in S3.
+// ---------------------------------------------------------------------------
+// Options mirror (plan R8)
+// ---------------------------------------------------------------------------
+
+/// The two `node.Options` fields `AppNode` owns itself: it compiles the
+/// app into the driver and installs its own delivery hook.
+const owned_option_fields = [_][]const u8{ "driver", "delivery" };
+
+fn isOwnedOptionField(comptime name: []const u8) bool {
+    inline for (owned_option_fields) |o| if (std.mem.eql(u8, name, o)) return true;
+    return false;
+}
+
+/// `AppNode.Options`: every `node.Options` field except `driver` and
+/// `delivery`, with the SAME types and defaults — reified from
+/// `node.Options` itself, so a field added to the bytes-level node appears
+/// here automatically. `checkOptionsParity` is the comptime guard that the
+/// mirror really is field-for-field the bytes-level set minus the two.
+fn MirrorOptions() type {
+    const info = @typeInfo(node.Options).@"struct";
+    comptime var names: []const [:0]const u8 = &.{};
+    comptime var types: []const type = &.{};
+    comptime var attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attr| {
+        if (isOwnedOptionField(name)) continue;
+        names = names ++ [_][:0]const u8{name};
+        types = types ++ [_]type{FT};
+        attrs = attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{attr};
+    }
+    const Mirror = @Struct(.auto, null, names, types, attrs);
+    comptime checkOptionsParity(Mirror);
+    return Mirror;
+}
+
+/// Comptime parity: (a) every non-owned `node.Options` field exists in the
+/// mirror with an identical type and an identical default (or identically
+/// none); (b) the mirror has no other fields; (c) the two owned fields are
+/// really absent. A drift in either direction is a compile error naming
+/// the field.
+fn checkOptionsParity(comptime Mirror: type) void {
+    const src = @typeInfo(node.Options).@"struct";
+    const dst = @typeInfo(Mirror).@"struct";
+    comptime var expected: usize = 0;
+    inline for (src.field_names, src.field_types, src.field_attrs) |name, FT, attr| {
+        if (isOwnedOptionField(name)) {
+            if (@hasField(Mirror, name))
+                @compileError("AppNode.Options must not carry `" ++ name ++ "` (AppNode supplies it).");
+            continue;
+        }
+        expected += 1;
+        if (!@hasField(Mirror, name))
+            @compileError("AppNode.Options is missing node.Options field `" ++ name ++ "`.");
+        const idx = std.meta.fieldIndex(Mirror, name).?;
+        if (dst.field_types[idx] != FT)
+            @compileError("AppNode.Options field `" ++ name ++ "` has type " ++ @typeName(dst.field_types[idx]) ++ ", node.Options has " ++ @typeName(FT) ++ ".");
+        const have_default = dst.field_attrs[idx].default_value_ptr != null;
+        const want_default = attr.default_value_ptr != null;
+        if (have_default != want_default)
+            @compileError("AppNode.Options field `" ++ name ++ "` default presence differs from node.Options.");
+        if (want_default) {
+            const a = attr.defaultValue(FT).?;
+            const b = dst.field_attrs[idx].defaultValue(FT).?;
+            if (!std.meta.eql(a, b))
+                @compileError("AppNode.Options field `" ++ name ++ "` default differs from node.Options.");
+        }
+    }
+    if (dst.field_names.len != expected)
+        @compileError("AppNode.Options carries a field node.Options does not have.");
+}
+
+const OptionsMirror = MirrorOptions();
+
+const create_log = std.log.scoped(.slcp_create);
+const log = std.log.scoped(.slcp_app_node);
+
+/// `AppNode.create`'s failure reporter: same contract as the Node's — the
+/// paragraph goes into `diagnostic` when given, else to the create log at
+/// err level. Generic over the error so each `AppNode(App).CreateError`
+/// member coerces at the `return`.
+fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
+    var local: node.Diagnostic = .{};
+    const d = diag orelse &local;
+    d.set(fmt, args);
+    if (diag == null) create_log.err("{s}", .{d.message()});
+    return err;
+}
+
+/// The teaching text for a journaled value the current `Command` cannot
+/// decode (design §8.5: command evolution is consensus surface).
+const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
+
+/// The typed node (§8.5, §11.2): a comptime adapter that compiles `App` into
+/// the frozen §8.2 `Driver` and a §8.5 delivery hook over the bytes-level
+/// `node.Node`.
+///
+/// Threading: `validate` (driver) and `apply` (hook) both run on the engine
+/// thread and read/write the one `state` — no lock, no tearing. The user
+/// thread only ever sees value copies via `waitApplied`.
+///
+/// Restart (v1 limitation, plan R17): `State` is NOT persisted. After
+/// `create`, `state` = `initialState()` + `apply` over the replayed journal
+/// tail (compaction-bounded: the last ≥16 slots), so commands must be full
+/// VALUES ("count becomes 3"), never deltas; apps with delta semantics
+/// persist State themselves. Consequently the first proposal after a
+/// restart is usually STALE (computed from `initialState()`): the network
+/// rejects it and the §0 loop catches up from the applied stream.
 pub fn AppNode(comptime App: type) type {
     comptime validateAppContract(App);
     return struct {
+        const Self = @This();
+
         pub const State = App.State;
         pub const Command = App.Command;
         /// `Codec(Command)` (auto, order-preserving) or the app's own
@@ -398,10 +508,272 @@ pub fn AppNode(comptime App: type) type {
         pub const codec = if (hasCustomCodec(App)) CustomCodec(App) else Codec(App.Command);
         /// true when `apply` uses the large-state shape `fn (*State, Command) void`.
         pub const apply_in_place = @TypeOf(App.apply) == fn (*State, Command) void;
-        /// S1b placeholder: the bytes-level option set. S3 replaces this with
-        /// the R8 mirror (every `node.Options` field except `driver` and
-        /// `delivery`, enforced by a comptime parity check).
-        pub const Options = node.Options;
+        /// Every `node.Options` field except `driver` and `delivery`
+        /// (same types, same defaults; comptime parity-checked).
+        pub const Options = OptionsMirror;
+        pub const WaitOptions = node.Node.WaitOptions;
+        /// One applied slot: the value copy of `State` taken on the engine
+        /// thread right after `apply`.
+        pub const Applied = struct { slot: u64, state: State };
+        pub const CreateError = error{ CommandExceedsMaxValueBytes, UndecodableExternalizedValue } || node.CreateError;
+        pub const ProposeError = node.ProposeError;
+        pub const WaitError = error{NodeHalted};
+
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        /// The bytes-level node; null only for a detached (test) instance.
+        n: ?*node.Node = null,
+        /// Engine-thread-only (and the creating thread during the journal
+        /// replay): the replicated state.
+        state: State,
+        /// Engine-thread-only: highest slot applied. A slot at or below it
+        /// is a re-delivery (journal overlap) and is a no-op.
+        applied_hwm: u64 = 0,
+        max_value_bytes: u32,
+        /// Set once `create` has returned; the hook logs a decode failure
+        /// loudly only then (inside `create` it becomes the diagnostic).
+        created: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// Recorded by the hook for `create`'s codec-mismatch diagnostic.
+        undecodable: ?struct { slot: u64, len: usize } = null,
+
+        // waitApplied queue (same shape as Node's externalized queue).
+        mu: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        queue: std.ArrayList(Applied) = .empty,
+        head: usize = 0,
+        closed: bool = false,
+        halt_err: ?anyerror = null,
+
+        fn initialState() State {
+            if (@hasDecl(App, "initialState")) return App.initialState();
+            return State{};
+        }
+
+        /// Allocate the adapter without a Node (the driver / hook can be
+        /// exercised directly). `deinit` handles both shapes.
+        fn createDetached(gpa: std.mem.Allocator, io: std.Io, max_value_bytes: u32) std.mem.Allocator.Error!*Self {
+            const self = try gpa.create(Self);
+            self.* = .{ .gpa = gpa, .io = io, .state = initialState(), .max_value_bytes = max_value_bytes };
+            return self;
+        }
+
+        /// Start the typed node: forwards `opts` to `node.Node.create` with
+        /// the compiled driver and the delivery hook, replaying the journal
+        /// tail through `apply` before returning. `*Self` is the driver and
+        /// hook ctx (stable address). Adds two members to the bytes-level
+        /// `CreateError`: an auto-encoded Command larger than
+        /// `max_value_bytes`, and a journaled value the Command cannot decode.
+        pub fn create(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
+            const diag = opts.diagnostic;
+            if (comptime !codec.is_custom) {
+                // Only once the range itself is sane: an out-of-range value
+                // is the Node's MaxValueBytesOutOfRange, not ours.
+                if (opts.max_value_bytes >= 1 and opts.max_value_bytes <= 65536 and codec.size > opts.max_value_bytes) {
+                    return fail(diag, error.CommandExceedsMaxValueBytes, "Command encodes to {d} bytes but max_value_bytes is {d}; raise max_value_bytes (<= 65536) or shrink Command.", .{ codec.size, opts.max_value_bytes });
+                }
+            }
+
+            const self = try createDetached(gpa, io, opts.max_value_bytes);
+            errdefer {
+                self.queue.deinit(gpa);
+                gpa.destroy(self);
+            }
+
+            var nopts: node.Options = .{
+                .network = opts.network,
+                .quorum = opts.quorum,
+                .listen_port = opts.listen_port,
+                .data_dir = opts.data_dir,
+                .driver = self.driver(),
+                .delivery = self.hook(),
+            };
+            inline for (@typeInfo(Options).@"struct".field_names) |name| {
+                @field(nopts, name) = @field(opts, name);
+            }
+
+            self.n = node.Node.create(gpa, io, nopts) catch |e| {
+                if (self.undecodable) |u| {
+                    // The hook refused a journaled value during the tail
+                    // replay: report OUR member with the teaching text
+                    // (the Node's generic "hook refused" paragraph is
+                    // superseded).
+                    return fail(diag, error.UndecodableExternalizedValue, undecodable_fmt, .{ u.slot, u.len, @typeName(Command) });
+                }
+                return e;
+            };
+            self.created.store(true, .release);
+            return self;
+        }
+
+        /// Stop the node (joins the engine thread — no hook call can be in
+        /// flight afterwards), wake `waitApplied` callers with null, free.
+        pub fn deinit(self: *Self) void {
+            if (self.n) |n| n.deinit();
+            self.mu.lockUncancelable(self.io);
+            self.closed = true;
+            self.cond.broadcast(self.io);
+            self.mu.unlock(self.io);
+            const gpa = self.gpa;
+            self.queue.deinit(gpa);
+            self.* = undefined;
+            gpa.destroy(self);
+        }
+
+        /// Encode `cmd` with the codec and queue it for nomination. A custom
+        /// codec returning zero bytes is `ValueEmpty`; one returning more
+        /// than `max_value_bytes` is `ValueTooLarge`.
+        pub fn propose(self: *Self, cmd: Command) ProposeError!void {
+            const n = self.n orelse return error.WatcherCannotPropose;
+            if (comptime codec.is_custom) {
+                // Sized to the frozen cap so an oversize custom encoding is
+                // reported (ValueTooLarge), not a buffer overrun.
+                const buf = try self.gpa.alloc(u8, max_encoded_bytes);
+                defer self.gpa.free(buf);
+                return n.propose(codec.encode(cmd, buf));
+            } else {
+                var buf: [codec.size]u8 = undefined;
+                return n.propose(codec.encode(cmd, &buf));
+            }
+        }
+
+        /// Block for the next applied slot in order. Returns null on timeout
+        /// or after `deinit`; after the node has halted (`on_failed`), the
+        /// already-applied items are still drained first, then
+        /// `error.NodeHalted` — immediately, even with `timeout_ms = null`.
+        pub fn waitApplied(self: *Self, wopts: WaitOptions) WaitError!?Applied {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            while (self.head >= self.queue.items.len and !self.closed) {
+                if (wopts.timeout_ms) |ms| {
+                    self.cond.waitTimeout(self.io, &self.mu, node.msTimeout(ms)) catch return null;
+                } else {
+                    self.cond.waitUncancelable(self.io, &self.mu);
+                }
+            }
+            if (self.head < self.queue.items.len) {
+                const item = self.queue.items[self.head];
+                self.head += 1;
+                if (self.head == self.queue.items.len) {
+                    self.queue.clearRetainingCapacity();
+                    self.head = 0;
+                }
+                return item;
+            }
+            if (self.halt_err != null) return error.NodeHalted;
+            return null;
+        }
+
+        /// The error the node halted with (after `on_failed`), else null.
+        pub fn haltError(self: *Self) ?anyerror {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            return self.halt_err;
+        }
+
+        /// The compiled §8.2 driver (ctx = this adapter).
+        pub fn driver(self: *Self) Driver {
+            return .{
+                .ctx = @ptrCast(self),
+                .validate_value = driverValidate,
+                .combine_candidates = driverCombine,
+            };
+        }
+
+        /// The bytes-level node underneath (stats, boundPort, …).
+        pub fn raw(self: *Self) *node.Node {
+            return self.n.?;
+        }
+
+        fn hook(self: *Self) node.DeliveryHook {
+            return .{
+                .ctx = @ptrCast(self),
+                .on_externalized = hookExternalized,
+                .on_failed = hookFailed,
+            };
+        }
+
+        // ---- driver vtable (engine thread) ----
+
+        fn driverValidate(ctx: *anyopaque, slot: u64, value: []const u8, is_nomination: bool) Validity {
+            _ = slot;
+            _ = is_nomination;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const cmd = codec.decode(value) orelse return .invalid;
+            return App.validate(self.state, cmd);
+        }
+
+        fn driverCombine(ctx: *anyopaque, slot: u64, candidates: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) DriverError!void {
+            _ = slot;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (candidates.len == 0) return error.DriverFault;
+            if (comptime @hasDecl(App, "combine")) {
+                // Sized by the candidate slice (never a fixed array).
+                const cmds = try gpa.alloc(Command, candidates.len);
+                defer gpa.free(cmds);
+                var n: usize = 0;
+                for (candidates) |c| {
+                    if (codec.decode(c)) |cmd| {
+                        cmds[n] = cmd;
+                        n += 1;
+                    }
+                }
+                if (n == 0) return error.DriverFault;
+                const best = App.combine(self.state, cmds[0..n]);
+                if (comptime codec.is_custom) {
+                    try out.resize(gpa, max_encoded_bytes);
+                    const written = codec.encode(best, out.items);
+                    out.shrinkRetainingCapacity(written.len);
+                } else {
+                    try out.resize(gpa, codec.size);
+                    const written = codec.encode(best, out.items);
+                    std.debug.assert(written.len == codec.size);
+                }
+            } else {
+                // §8.4 default: lexicographic max — numerically the largest
+                // under the order-preserving auto-codec ("highest wins").
+                var best = candidates[0];
+                for (candidates[1..]) |c| {
+                    if (std.mem.order(u8, c, best) == .gt) best = c;
+                }
+                try out.appendSlice(gpa, best);
+            }
+        }
+
+        // ---- delivery hook (engine thread; creating thread during replay) ----
+
+        fn hookExternalized(ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const cmd = codec.decode(value) orelse {
+                // §8.5's one fatal rule: bytes the network agreed on must
+                // decode. Inside create this becomes the diagnostic; at
+                // runtime the node halts loudly (the Node logs + latches).
+                self.undecodable = .{ .slot = slot, .len = value.len };
+                if (self.created.load(.acquire)) log.err(undecodable_fmt, .{ slot, value.len, @typeName(Command) });
+                return error.UndecodableExternalizedValue;
+            };
+            if (slot <= self.applied_hwm) return; // re-delivery: no-op
+            if (comptime apply_in_place) {
+                App.apply(&self.state, cmd);
+            } else {
+                self.state = App.apply(self.state, cmd);
+            }
+            self.applied_hwm = slot;
+
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            if (self.closed) return;
+            try self.queue.append(self.gpa, .{ .slot = slot, .state = self.state });
+            self.cond.signal(self.io);
+        }
+
+        fn hookFailed(ctx: *anyopaque, err: anyerror) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            if (self.halt_err == null) self.halt_err = err;
+            self.closed = true;
+            self.cond.broadcast(self.io);
+        }
     };
 }
 
@@ -679,13 +1051,13 @@ const Memo = struct {
 // `AppNode(Explicit)`; routing custom-codec apps through `Codec(Command)`
 // would still compile Memo (fixed-size Command) but `is_custom` flips.
 test "contract acceptance: Counter, pointer-apply, initialState + defaultless State, custom codec + combine" {
-    const CounterNode = AppNode(Counter);
-    try std.testing.expectEqual(Counter.State, CounterNode.State);
-    try std.testing.expectEqual(Counter.Command, CounterNode.Command);
-    try std.testing.expectEqual(@as(usize, 8), CounterNode.codec.size);
-    try std.testing.expect(!CounterNode.codec.is_custom);
-    try std.testing.expect(!CounterNode.apply_in_place);
-    try std.testing.expect(@hasField(CounterNode.Options, "network"));
+    const CN = AppNode(Counter);
+    try std.testing.expectEqual(Counter.State, CN.State);
+    try std.testing.expectEqual(Counter.Command, CN.Command);
+    try std.testing.expectEqual(@as(usize, 8), CN.codec.size);
+    try std.testing.expect(!CN.codec.is_custom);
+    try std.testing.expect(!CN.apply_in_place);
+    try std.testing.expect(@hasField(CN.Options, "network"));
 
     const PtrNode = AppNode(PtrApply);
     try std.testing.expect(PtrNode.apply_in_place);
@@ -702,4 +1074,471 @@ test "contract acceptance: Counter, pointer-apply, initialState + defaultless St
     try std.testing.expectEqualSlices(u8, "hello", wire);
     try std.testing.expectEqual(@as(u8, 5), MemoNode.codec.decode(wire).?.len);
     try std.testing.expect(MemoNode.codec.decode("") == null);
+}
+
+// -- AppNode over the Node (M6 S3) ---------------------------------------------
+
+const Quorum = core.quorum.Quorum;
+const crypto = core.crypto;
+const testing = std.testing;
+
+/// Highest bid wins; ties break toward the LOWER bidder id (the default
+/// byte-max would pick the higher id — that is what makes the custom
+/// combine observable).
+const Auction = struct {
+    pub const State = struct { bid: u32 = 0, bidder: u8 = 0 };
+    pub const Command = struct { bid: u32, bidder: u8 };
+    pub fn validate(state: State, cmd: Command) Validity {
+        return if (cmd.bid > state.bid) .valid else .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        _ = state;
+        return .{ .bid = cmd.bid, .bidder = cmd.bidder };
+    }
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        var best = cmds[0];
+        for (cmds[1..]) |c| {
+            if (c.bid > best.bid or (c.bid == best.bid and c.bidder < best.bidder)) best = c;
+        }
+        return best;
+    }
+};
+
+const CounterNode = AppNode(Counter);
+
+fn encodeCounter(buf: *[8]u8, next: u64) []u8 {
+    return CounterNode.codec.encode(.{ .next = next }, buf);
+}
+
+/// A tmpDir-backed data_dir path (absolute) for one test.
+const TestDir = struct {
+    tmp: testing.TmpDir,
+    buf: [std.fs.max_path_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn init() !TestDir {
+        var d: TestDir = .{ .tmp = testing.tmpDir(.{}) };
+        d.len = try d.tmp.dir.realPath(testing.io, &d.buf);
+        return d;
+    }
+    fn path(self: *TestDir) []const u8 {
+        return self.buf[0..self.len];
+    }
+    /// `<tmp>/<name>` into `out`.
+    fn sub(self: *TestDir, out: []u8, name: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(out, "{s}/{s}", .{ self.path(), name });
+    }
+    fn deinit(self: *TestDir) void {
+        self.tmp.cleanup();
+    }
+};
+
+fn seedOf(byte: u8) [32]u8 {
+    return @splat(byte);
+}
+
+// Non-vacuity: removing the `slot <= applied_hwm` guard makes the
+// re-deliveries queue a third and fourth Applied (the two-item drain then
+// sees slot 2 twice); decoding AFTER the guard, or applying before decoding,
+// changes `state` on the junk delivery; dropping the `halt_err` check in
+// `waitApplied` returns null instead of NodeHalted after the drain.
+test "hook semantics without a Node: ascending applies, re-deliveries are no-ops, junk is UndecodableExternalizedValue, drain then NodeHalted" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const n = try CounterNode.createDetached(gpa, io, 4096);
+    defer n.deinit();
+    const ctx: *anyopaque = @ptrCast(n);
+    var buf: [8]u8 = undefined;
+
+    try CounterNode.hookExternalized(ctx, 1, encodeCounter(&buf, 1));
+    try CounterNode.hookExternalized(ctx, 2, encodeCounter(&buf, 2));
+    try testing.expectEqual(@as(u64, 2), n.state.count);
+    // Re-delivery (journal overlap) of 2 and of 1: no-ops.
+    try CounterNode.hookExternalized(ctx, 2, encodeCounter(&buf, 2));
+    try CounterNode.hookExternalized(ctx, 1, encodeCounter(&buf, 1));
+    try testing.expectEqual(@as(u64, 2), n.state.count);
+    // Junk on the agreed stream: the one fatal rule, state untouched.
+    try testing.expectError(error.UndecodableExternalizedValue, CounterNode.hookExternalized(ctx, 3, "junk"));
+    try testing.expectEqual(@as(u64, 2), n.state.count);
+    try testing.expectEqual(@as(u64, 3), n.undecodable.?.slot);
+    try testing.expect(n.haltError() == null);
+
+    CounterNode.hookFailed(ctx, error.DiskFull);
+    try testing.expectEqual(@as(?anyerror, error.DiskFull), n.haltError());
+    // Drain the two applied items first, then NodeHalted — immediately,
+    // with no timeout.
+    const a1 = (try n.waitApplied(.{ .timeout_ms = null })).?;
+    try testing.expectEqual(@as(u64, 1), a1.slot);
+    try testing.expectEqual(@as(u64, 1), a1.state.count);
+    const a2 = (try n.waitApplied(.{ .timeout_ms = null })).?;
+    try testing.expectEqual(@as(u64, 2), a2.slot);
+    try testing.expectEqual(@as(u64, 2), a2.state.count);
+    try testing.expectError(error.NodeHalted, n.waitApplied(.{ .timeout_ms = null }));
+    try testing.expectError(error.NodeHalted, n.waitApplied(.{ .timeout_ms = 10 }));
+}
+
+// Non-vacuity: a driver that skips `App.validate` (returns .valid for any
+// decodable value) fails the .invalid / .maybe_valid arms; feeding
+// candidates in a fixed array capped below 64 (or a combine that ignores
+// `App.combine`) fails the Auction tie-break; returning an empty `out` on
+// zero candidates instead of DriverFault fails the last arm.
+test "driver vtable: validate reaches all three verdicts, junk is invalid, default combine is numeric max, custom combine breaks ties, 64 candidates, zero is DriverFault" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const n = try CounterNode.createDetached(gpa, io, 4096);
+    defer n.deinit();
+    const d = n.driver();
+    var buf: [8]u8 = undefined;
+
+    try testing.expectEqual(Validity.valid, d.validate_value(d.ctx, 1, encodeCounter(&buf, 1), true));
+    try testing.expectEqual(Validity.maybe_valid, d.validate_value(d.ctx, 1, encodeCounter(&buf, 2), false));
+    try testing.expectEqual(Validity.invalid, d.validate_value(d.ctx, 1, encodeCounter(&buf, 0), true));
+    try testing.expectEqual(Validity.invalid, d.validate_value(d.ctx, 1, "junk", true));
+
+    // Default combine: numerically the largest, over 64 candidates whose
+    // byte order is deliberately not their insertion order.
+    var cands: [64][8]u8 = undefined;
+    var cand_slices: [64][]const u8 = undefined;
+    for (&cands, 0..) |*c, i| {
+        const v: u64 = @intCast((i * 37) % 64 + 1); // a permutation of 1..64
+        _ = CounterNode.codec.encode(.{ .next = v }, c);
+        cand_slices[i] = c;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try d.combine_candidates(d.ctx, 1, &cand_slices, gpa, &out);
+    try testing.expectEqual(@as(usize, CounterNode.codec.size), out.items.len);
+    try testing.expectEqual(@as(u64, 64), CounterNode.codec.decode(out.items).?.next);
+
+    out.clearRetainingCapacity();
+    try testing.expectError(error.DriverFault, d.combine_candidates(d.ctx, 1, &.{}, gpa, &out));
+
+    // Custom combine (Auction): equal bids, the LOWER bidder wins — the
+    // byte-max default would have picked bidder 9.
+    const AuctionNode = AppNode(Auction);
+    const a = try AuctionNode.createDetached(gpa, io, 4096);
+    defer a.deinit();
+    const ad = a.driver();
+    var b1: [5]u8 = undefined;
+    var b2: [5]u8 = undefined;
+    var b3: [5]u8 = undefined;
+    const acands = [_][]const u8{
+        AuctionNode.codec.encode(.{ .bid = 100, .bidder = 9 }, &b1),
+        AuctionNode.codec.encode(.{ .bid = 100, .bidder = 2 }, &b2),
+        AuctionNode.codec.encode(.{ .bid = 50, .bidder = 1 }, &b3),
+    };
+    out.clearRetainingCapacity();
+    try ad.combine_candidates(ad.ctx, 1, &acands, gpa, &out);
+    const won = AuctionNode.codec.decode(out.items).?;
+    try testing.expectEqual(@as(u32, 100), won.bid);
+    try testing.expectEqual(@as(u8, 2), won.bidder);
+    out.clearRetainingCapacity();
+    try testing.expectError(error.DriverFault, ad.combine_candidates(ad.ctx, 1, &.{}, gpa, &out));
+}
+
+// Non-vacuity: adding `driver` or `delivery` to the mirror (or dropping
+// `diagnostic` / `allow_unsafe_quorum` from it), changing a field's type,
+// or changing a default (e.g. `max_value_bytes = 4095`) fails the
+// field-by-field comparison; the count check catches an extra field.
+test "Options parity: AppNode.Options is node.Options minus driver/delivery, same types and defaults" {
+    const src = @typeInfo(node.Options).@"struct";
+    const dst = @typeInfo(CounterNode.Options).@"struct";
+    var expected: usize = 0;
+    inline for (src.field_names, src.field_types, src.field_attrs) |name, FT, attr| {
+        if (comptime std.mem.eql(u8, name, "driver") or std.mem.eql(u8, name, "delivery")) {
+            try testing.expect(!@hasField(CounterNode.Options, name));
+        } else {
+            expected += 1;
+            try testing.expect(@hasField(CounterNode.Options, name));
+            const idx = comptime std.meta.fieldIndex(CounterNode.Options, name).?;
+            try testing.expect(dst.field_types[idx] == FT);
+            const want = comptime attr.defaultValue(FT);
+            const have = comptime dst.field_attrs[idx].defaultValue(FT);
+            try testing.expect((want == null) == (have == null));
+            if (want) |w| try testing.expect(std.meta.eql(w, have.?));
+        }
+    }
+    try testing.expectEqual(expected, dst.field_names.len);
+    try testing.expectEqual(src.field_names.len - 2, dst.field_names.len);
+    try testing.expect(@hasField(CounterNode.Options, "diagnostic"));
+    try testing.expect(@hasField(CounterNode.Options, "allow_unsafe_quorum"));
+}
+
+// Non-vacuity: dropping the `codec.size > max_value_bytes` pre-check lets
+// the 8-byte Command start under max_value_bytes = 4 (and every propose then
+// fails with ValueTooLarge); forwarding a watcher's propose to the Node
+// without the `n == null` guard is unchanged here, but removing the Node's
+// own watcher check makes the first arm succeed; an encode-to-empty that is
+// not passed through Node.propose fails the ValueEmpty arm.
+test "propose errors: watcher, custom codec encoding to empty, Command wider than max_value_bytes at create" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var diag: node.Diagnostic = .{};
+    const seed = seedOf(0x51);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const other = seedOf(0x52);
+
+    // max_value_bytes = 4 for an 8-byte Command: refused at create, with
+    // the sizes in the message.
+    try testing.expectError(error.CommandExceedsMaxValueBytes, CounterNode.create(gpa, io, .{
+        .network = "propose-errors v1",
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, other, seedOf(0x53) }),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .max_value_bytes = 4,
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "encodes to 8 bytes but max_value_bytes is 4") != null);
+
+    // A watcher never proposes.
+    var wbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const w = try CounterNode.create(gpa, io, .{
+        .network = "propose-errors v1",
+        .watcher = true,
+        .quorum = Quorum.twoThirdsOf(&.{ me, other, seedOf(0x53) }),
+        .listen_port = 0,
+        .data_dir = try td.sub(&wbuf, "watcher"),
+        .diagnostic = &diag,
+    });
+    defer w.deinit();
+    try testing.expectError(error.WatcherCannotPropose, w.propose(.{ .next = 1 }));
+    try testing.expect(w.raw().watcher);
+
+    // A custom codec that encodes to zero bytes is ValueEmpty; a normal one
+    // is accepted.
+    var mbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const MemoNode = AppNode(Memo);
+    const m = try MemoNode.create(gpa, io, .{
+        .network = "propose-errors v1",
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, other, seedOf(0x53) }),
+        .listen_port = 0,
+        .data_dir = try td.sub(&mbuf, "memo"),
+        .diagnostic = &diag,
+    });
+    defer m.deinit();
+    try testing.expectError(error.ValueEmpty, m.propose(.{ .len = 0, .text = @splat(' ') }));
+    try m.propose(Memo.decode("hello").?);
+}
+
+/// Wait until `pred(state)` holds on `n`, driving the §0 loop (propose
+/// count + 1 after every applied slot) on every node in `peers` meanwhile.
+/// Returns the last applied state on `n`, or error.Timeout.
+fn driveUntil(io: std.Io, n: *CounterNode, peers: []const *CounterNode, deadline_ms: u64, target: u64) !Counter.State {
+    var waited: u64 = 0;
+    var last: ?Counter.State = null;
+    while (waited < deadline_ms) {
+        if (try n.waitApplied(.{ .timeout_ms = 50 })) |ext| {
+            last = ext.state;
+            if (ext.state.count >= target) return ext.state;
+            try n.propose(.{ .next = ext.state.count + 1 });
+        }
+        for (peers) |p| {
+            if (try p.waitApplied(.{ .timeout_ms = 1 })) |ext| {
+                try p.propose(.{ .next = ext.state.count + 1 });
+            }
+        }
+        waited += 50;
+        _ = io;
+    }
+    if (last) |l| std.debug.print("\ndriveUntil: timed out at count {d} (target {d})\n", .{ l.count, target });
+    return error.Timeout;
+}
+
+// Non-vacuity: a driver that never reaches `App.validate` (or a hook that
+// never `apply`s) leaves count at 0 — the 10 s wait returns null; encoding
+// through anything but `codec` (e.g. little-endian) makes the singleton
+// externalize a value that decodes to a different count.
+test "AppNode over the real Node (1-of-1 self quorum): propose {next=1} applies count 1, then 2" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var diag: node.Diagnostic = .{};
+    const seed = seedOf(0x61);
+    const me = try crypto.publicKeyFromSeed(seed);
+
+    const n = try CounterNode.create(gpa, io, .{
+        .network = "appnode-singleton v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+    try testing.expect(n.raw().boundPort() != 0);
+
+    try n.propose(.{ .next = 1 });
+    const a1 = (try n.waitApplied(.{ .timeout_ms = 10_000 })) orelse return error.SingletonNeverExternalized;
+    try testing.expectEqual(@as(u64, 1), a1.slot);
+    try testing.expectEqual(@as(u64, 1), a1.state.count);
+    try n.propose(.{ .next = 2 });
+    const a2 = (try n.waitApplied(.{ .timeout_ms = 10_000 })) orelse return error.SingletonNeverExternalized;
+    try testing.expectEqual(@as(u64, 2), a2.slot);
+    try testing.expectEqual(@as(u64, 2), a2.state.count);
+    try testing.expect(n.haltError() == null);
+}
+
+/// Two typed nodes on loopback, 2-of-2: `a` listens on an ephemeral port
+/// with no peers, `b` dials it. `create` order matters (b needs a's port).
+const Pair = struct {
+    seed_a: [32]u8,
+    seed_b: [32]u8,
+    ids: [2][32]u8,
+    dir_a: [std.fs.max_path_bytes]u8 = undefined,
+    dir_b: [std.fs.max_path_bytes]u8 = undefined,
+    dir_a_len: usize = 0,
+    dir_b_len: usize = 0,
+    diag: node.Diagnostic = .{},
+
+    const network = "appnode-restart v1";
+
+    fn init(td: *TestDir) !Pair {
+        var p: Pair = .{ .seed_a = seedOf(0x71), .seed_b = seedOf(0x72), .ids = undefined };
+        p.ids[0] = try crypto.publicKeyFromSeed(p.seed_a);
+        p.ids[1] = try crypto.publicKeyFromSeed(p.seed_b);
+        p.dir_a_len = (try td.sub(&p.dir_a, "a")).len;
+        p.dir_b_len = (try td.sub(&p.dir_b, "b")).len;
+        return p;
+    }
+
+    fn createA(self: *Pair, gpa: std.mem.Allocator, io: std.Io, peers: []const []const u8) !*CounterNode {
+        return CounterNode.create(gpa, io, .{
+            .network = network,
+            .secret_seed = self.seed_a,
+            .quorum = Quorum.of(2, &self.ids),
+            .listen_port = 0,
+            .peers = peers,
+            .data_dir = self.dir_a[0..self.dir_a_len],
+            .diagnostic = &self.diag,
+        });
+    }
+
+    fn createB(self: *Pair, gpa: std.mem.Allocator, io: std.Io, peers: []const []const u8) !*CounterNode {
+        return CounterNode.create(gpa, io, .{
+            .network = network,
+            .secret_seed = self.seed_b,
+            .quorum = Quorum.of(2, &self.ids),
+            .listen_port = 0,
+            .peers = peers,
+            .data_dir = self.dir_b[0..self.dir_b_len],
+            .diagnostic = &self.diag,
+        });
+    }
+};
+
+fn loopbackSpec(buf: []u8, port: u16) ![]const u8 {
+    return std.fmt.bufPrint(buf, "127.0.0.1:{d}", .{port});
+}
+
+// Non-vacuity: skipping the journal-tail replay in `Node.create` (the M6 S3
+// reorder's second step) leaves the restarted node at count 0 with nothing
+// on `waitApplied` — the "tail ends at count 2" assertions go red and, with
+// only stale proposals, the convergence wait times out; replaying the tail
+// through `ext_queue` instead of the hook does the same (the hook never
+// applies). Exactly the §0 program's restart: stale `{next=1}` FIRST.
+test "restart replay (2-of-2 loopback): deinit, create on the same data_dir, stale propose first, tail replays to count 2, converges to 3" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var pair = try Pair.init(&td);
+    var spec_buf: [32]u8 = undefined;
+
+    const b = blk: {
+        const a = try pair.createA(gpa, io, &.{});
+        defer a.deinit();
+        const b = try pair.createB(gpa, io, &.{try loopbackSpec(&spec_buf, a.raw().boundPort())});
+        errdefer b.deinit();
+
+        // Phase 1 — the §0 program on both nodes until a has applied count 2.
+        try a.propose(.{ .next = 1 });
+        try b.propose(.{ .next = 1 });
+        const s = try driveUntil(io, a, &.{b}, 60_000, 2);
+        try testing.expectEqual(@as(u64, 2), s.count);
+        break :blk b;
+        // `a` goes down here (deinit joins its threads; its data_dir stays).
+    };
+    defer b.deinit();
+
+    // Phase 2 — restart a on the same data_dir (dialing b: a's port changed).
+    const a2 = try pair.createA(gpa, io, &.{try loopbackSpec(&spec_buf, b.raw().boundPort())});
+    defer a2.deinit();
+    // State is initialState() + the replayed tail (R17): the first proposal
+    // is computed from a fresh State and is STALE — the network rejects it.
+    try a2.propose(.{ .next = 1 });
+    // The replayed tail arrives through waitApplied, ending at count 2 …
+    const r1 = (try a2.waitApplied(.{ .timeout_ms = 1000 })) orelse return error.TailNotReplayed;
+    try testing.expectEqual(@as(u64, 1), r1.slot);
+    try testing.expectEqual(@as(u64, 1), r1.state.count);
+    try a2.propose(.{ .next = r1.state.count + 1 });
+    const r2 = (try a2.waitApplied(.{ .timeout_ms = 1000 })) orelse return error.TailNotReplayed;
+    try testing.expectEqual(@as(u64, 2), r2.slot);
+    try testing.expectEqual(@as(u64, 2), r2.state.count);
+    try a2.propose(.{ .next = r2.state.count + 1 });
+    // … and the loop converges to count 3 (slot 3 carries {next=3}).
+    const s3 = try driveUntil(io, a2, &.{b}, 90_000, 3);
+    try testing.expectEqual(@as(u64, 3), s3.count);
+    try testing.expect(a2.haltError() == null);
+    try testing.expect(b.haltError() == null);
+}
+
+// Non-vacuity: a hook that treats an undecodable journaled value as a no-op
+// (or maps it to any other error) lets AppNode.create succeed on the "abc"
+// dir; dropping the `undecodable` rewrite in `create` reports the Node's
+// generic EngineFailed instead of UndecodableExternalizedValue.
+test "codec mismatch at create: a bytes-level Node journals \"abc\"; AppNode(Counter).create refuses with UndecodableExternalizedValue; the bytes-level Node reopens fine" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var diag: node.Diagnostic = .{};
+    const seed = seedOf(0x81);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const opts = node.Options{
+        .network = "codec-mismatch v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .diagnostic = &diag,
+    };
+
+    // A bytes-level singleton agrees on "abc" (3 bytes: never a Counter command).
+    {
+        const n = try node.Node.create(gpa, io, opts);
+        defer n.deinit();
+        try n.propose("abc");
+        const e = n.waitExternalized(.{ .timeout_ms = 10_000 }) orelse return error.SingletonNeverExternalized;
+        defer gpa.free(e.value);
+        try testing.expectEqual(@as(u64, 1), e.slot);
+        try testing.expectEqualSlices(u8, "abc", e.value);
+    }
+
+    // The typed node cannot decode what the network agreed on: refuse to start.
+    try testing.expectError(error.UndecodableExternalizedValue, CounterNode.create(gpa, io, .{
+        .network = "codec-mismatch v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "slot 1: journaled value (3 bytes) does not decode as") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "command evolution is consensus surface") != null);
+
+    // The bytes-level node still reopens the dir and replays the tail.
+    {
+        const n = try node.Node.create(gpa, io, opts);
+        defer n.deinit();
+        const e = n.waitExternalized(.{ .timeout_ms = 1000 }) orelse return error.TailNotReplayed;
+        defer gpa.free(e.value);
+        try testing.expectEqual(@as(u64, 1), e.slot);
+        try testing.expectEqualSlices(u8, "abc", e.value);
+    }
 }
