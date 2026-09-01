@@ -43,16 +43,18 @@
 //! something new" a non-event: a brand-new symbol lands in the Experimental
 //! file until someone deliberately adds a Stable rule for it.
 //!
-//! The S1c rule list is INTERIM (today's surface only): `slcp.Quorum`,
-//! `slcp.nodeId`, `slcp.AppNode`, `slcp.Codec`, ... are promoted in S6 (the
-//! API freeze), which also finalizes docs/stability.md.
+//! The rule list below is the v0.1.0 freeze (M6 stage S6). Generic entry
+//! points (`AppNode`, `Codec`) are pinned through REFERENCE INSTANTIATIONS
+//! over the §0 `Counter` app (`reference_instantiations`), so the surface a
+//! consumer actually calls — `AppNode(Counter).create/propose/waitApplied`,
+//! `Codec(Counter.Command).encode/decode` — is walked like any declaration.
 
 const std = @import("std");
 const slcp = @import("slcp");
 
 /// Depth of the whole-tree walk from the `slcp` root. The deepest frozen
 /// declaration today is 5 segments (`slcp.core.engine.Effect.SlotBytes.slot`);
-/// 8 keeps headroom for the S6 promotions (`slcp.AppNode(Counter).State.*`).
+/// 8 keeps headroom (`slcp.AppNode(Counter).Applied.state`).
 const max_depth = 8;
 
 // ---------------------------------------------------------------------------
@@ -67,7 +69,7 @@ const max_depth = 8;
 //             dragging in its siblings, its fields, or an enclosing
 //             container's other members.
 //
-// The list below is the FULL Stable contract as of S1c.
+// The list below is the FULL Stable contract as of v0.1.0 (S6 freeze).
 // ---------------------------------------------------------------------------
 
 const MatchKind = enum { prefix, exact };
@@ -88,21 +90,59 @@ const skip_paths = [_][]const u8{
     "slcp.core.capnpc",
 };
 
-/// Exclusion overrides: paths a `stable_rules` prefix would otherwise sweep
-/// in, but which docs/stability.md explicitly names as Experimental. Checked
-/// FIRST and force Experimental regardless of any Stable prefix. Empty at
-/// S1c; kept so the S6 promotions have somewhere to hold out e.g.
-/// `driver.Checked` (R16) without narrowing a prefix rule.
-const experimental_overrides = [_]Rule{};
+/// Exclusion overrides: paths docs/stability.md explicitly names as
+/// Experimental. Checked FIRST and force Experimental regardless of any
+/// Stable rule. Two uses: holding one member out of a `p()` subtree
+/// (`Diagnostic.set`), and recording a deliberate NON-promotion of an entry
+/// point whose rendered line would pin nothing — a function whose error set
+/// is `anyerror` today. `qset.canonicalBytes` inherits capnp-zig's builder
+/// errors (`initValidators` resolves to `anyerror`), and `hashNormalized`,
+/// `validateAndNormalize` (inner-set ordering hashes) and `Engine.init`
+/// (local qset hash) all run through it, so none can carry an explicit set
+/// without a behaviour-changing error mapping. Freezing `anyerror!T` would
+/// document a contract nobody can `switch` on; these stay Experimental until
+/// they have real sets. Rule-liveness applies here too.
+const experimental_overrides = [_]Rule{
+    // Node-internal writer of the create() failure message (S3: the buffer
+    // and `message()` are the consumer's side; `set` is ours).
+    e("slcp.node.Diagnostic.set"),
+    // `anyerror!` today (see above).
+    e("slcp.core.qset.validateAndNormalize"),
+    e("slcp.core.qset.hashNormalized"),
+    e("slcp.core.qset.canonicalBytes"),
+    e("slcp.core.engine.Engine.init"),
+};
+
+/// The reference application for the generic entry points: the §0 program's
+/// `Counter` (examples/counter/src/main.zig), kept byte-identical so the
+/// instantiation pinned here is the one the README's quickstart compiles.
+const Counter = struct {
+    pub const State = struct { count: u64 = 0 };
+    pub const Command = struct { next: u64 };
+
+    pub fn validate(state: State, cmd: Command) slcp.Validity {
+        if (cmd.next == state.count + 1) return .valid;
+        if (cmd.next > state.count + 1) return .maybe_valid; // this node may be behind
+        return .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        _ = state;
+        return .{ .count = cmd.next };
+    }
+};
 
 /// Generic entry points (`fn (type) type`) render as one opaque line — the
 /// INSTANTIATED surface a consumer actually calls is invisible to the walk.
 /// Each reference instantiation is walked as a synthetic root under the path
-/// given here, so its members are pinned like any other declaration. Empty at
-/// S1c: S6 adds `slcp.Codec(Counter.Command)` and `slcp.AppNode(Counter)`
-/// once the appnode stage has landed on the merged tree.
+/// given here, so its members are pinned like any other declaration.
+/// ORDER MATTERS: the walk's `seen` set is shared, and `AppNode(Counter).codec`
+/// IS `Codec(Counter.Command)` — listing the codec first puts its members
+/// under their own root instead of under `slcp.AppNode(Counter).codec`.
 const RefInst = struct { path: []const u8, ty: type };
-const reference_instantiations = [_]RefInst{};
+const reference_instantiations = [_]RefInst{
+    .{ .path = "slcp.Codec(Counter.Command)", .ty = slcp.Codec(Counter.Command) },
+    .{ .path = "slcp.AppNode(Counter)", .ty = slcp.AppNode(Counter) },
+};
 
 const stable_rules = [_]Rule{
     // --- slcp: the omakase bytes-level node (§11.2). `Node` is frozen EXACTLY
@@ -126,12 +166,76 @@ const stable_rules = [_]Rule{
     p("slcp.node.Node.WaitOptions"),
     p("slcp.node.Options"),
     p("slcp.node.Externalized"),
+    // The error taxonomy consumers `switch` on, and the two ways to read a
+    // create() failure: the `Diagnostic` buffer (`Options.diagnostic`; its
+    // `set` is held out above) and the static `explain`. Everything an
+    // `Options` field reaches is Stable (docs/stability.md): `Diagnostic`,
+    // `DeliveryHook` (a vtable shape is a contract like `Driver`'s), `Quorum`.
+    e("slcp.node.CreateError"),
+    e("slcp.node.Error"),
+    e("slcp.node.ProposeError"),
+    p("slcp.node.Diagnostic"),
+    e("slcp.node.explain"),
+    e("slcp.node.Node.explain"),
+    p("slcp.node.DeliveryHook"),
+    e("slcp.DeliveryHook"),
 
-    // --- keys UX (§11): the key-file entry points and the pair they yield. ---
+    // --- Quorum UX (§12): the spec type and its constructors (whole module —
+    //     `twoThirdsOf`, `majorityOf`, `of`, `ofSets`, JSON in/out, `toOwned`),
+    //     the node-id helpers, and the top-level aliases. `lint_report` (the
+    //     CLI's rendering) stays Experimental. ---
+    p("slcp.core.quorum"),
+    p("slcp.Quorum"),
+    e("slcp.NodeId"),
+    e("slcp.nodeId"),
+    e("slcp.parseNodeId"),
+
+    // --- keys UX (§11): the key-file entry points, the pair they yield, and
+    //     the named error sets (explicit since S6 — an inferred set that
+    //     follows std's fs vocabulary is not a contract). ---
     p("slcp.keys.KeyPair"),
     e("slcp.keys.loadOrCreate"),
+    e("slcp.keys.load"),
+    e("slcp.keys.createNew"),
     e("slcp.keys.ephemeral"),
     e("slcp.keys.Error"),
+    e("slcp.keys.DeriveError"),
+    e("slcp.keys.LoadError"),
+    e("slcp.keys.MintError"),
+    e("slcp.keys.LoadOrCreateError"),
+    e("slcp.keys.CreateNewError"),
+
+    // --- The typed layer (§8.5): the two generic entry points as lines, and
+    //     their reference instantiations over `Counter`. `AppNode(Counter)`
+    //     is exact (its fields are engine-thread state) with the lifecycle +
+    //     I/O methods one by one; `Options` / `Applied` are prefix (a
+    //     consumer constructs / reads them); `State` / `Command` pin the
+    //     aliases the methods are typed against (closure). `codec` and
+    //     `apply_in_place` stay Experimental. ---
+    e("slcp.AppNode"),
+    e("slcp.Codec"),
+    e("slcp.AppNode(Counter)"),
+    e("slcp.AppNode(Counter).create"),
+    e("slcp.AppNode(Counter).deinit"),
+    e("slcp.AppNode(Counter).propose"),
+    e("slcp.AppNode(Counter).waitApplied"),
+    e("slcp.AppNode(Counter).haltError"),
+    e("slcp.AppNode(Counter).driver"),
+    e("slcp.AppNode(Counter).raw"),
+    e("slcp.AppNode(Counter).State"),
+    e("slcp.AppNode(Counter).Command"),
+    e("slcp.AppNode(Counter).WaitOptions"),
+    p("slcp.AppNode(Counter).Options"),
+    p("slcp.AppNode(Counter).Applied"),
+    e("slcp.AppNode(Counter).CreateError"),
+    e("slcp.AppNode(Counter).ProposeError"),
+    e("slcp.AppNode(Counter).WaitError"),
+    p("slcp.Codec(Counter.Command)"),
+    // Top-level aliases of the driver vocabulary (same types as
+    // `slcp.core.driver.*`; the alias lines pin the spelling).
+    e("slcp.Validity"),
+    e("slcp.Driver"),
+    e("slcp.DriverError"),
 
     // --- Driver vtable (§8.2): the frozen host-language contract. PREFIX on
     //     `Driver` pins the vtable field shapes + `default()`; R16 keeps a
@@ -141,11 +245,11 @@ const stable_rules = [_]Rule{
     e("slcp.core.driver.DriverError"),
 
     // --- Sans-io engine (§5): the power-user escape hatch. `Engine` exact
-    //     (internal fields out), its six entry points, and the input/effect
+    //     (internal fields out), five of its six entry points (`init` is
+    //     `anyerror!` — see `experimental_overrides`), and the input/effect
     //     vocabulary as whole subtrees (union variants + payload fields are
     //     the contract). ---
     e("slcp.core.engine.Engine"),
-    e("slcp.core.engine.Engine.init"),
     e("slcp.core.engine.Engine.deinit"),
     e("slcp.core.engine.Engine.pushInput"),
     e("slcp.core.engine.Engine.popEffect"),
@@ -164,15 +268,15 @@ const stable_rules = [_]Rule{
     // The frozen wire limits (§4.5) and the tunable `Limits` struct.
     p("slcp.core.limits"),
 
-    // --- Quorum set value type (§4.3/§12): what `Options.quorum_set` and
-    //     `Config.quorum_set` are built from. PREFIX on the owned tree (its
-    //     three fields are the shape a consumer constructs), the validate /
-    //     hash / canonical-bytes functions, and the frozen constants. Lint
-    //     (`lint`, `LintFinding`, ...) stays Experimental until S6. ---
+    // --- Quorum set value type (§4.3/§12): what `Config.quorum_set` is
+    //     built from (`Quorum.toOwned`). PREFIX on the owned tree (its three
+    //     fields are the shape a consumer constructs), the error set and the
+    //     frozen constants. `validateAndNormalize` / `hashNormalized` /
+    //     `canonicalBytes` are `anyerror!` today (see
+    //     `experimental_overrides`); the lint surface (`lint`, `LintFinding`,
+    //     `LintCode`, ...) is Experimental — its wire form is frozen by
+    //     host.capnp and vectors/lint.json, not by the Zig names. ---
     p("slcp.core.qset.QuorumSetOwned"),
-    e("slcp.core.qset.validateAndNormalize"),
-    e("slcp.core.qset.hashNormalized"),
-    e("slcp.core.qset.canonicalBytes"),
     e("slcp.core.qset.Error"),
     e("slcp.core.qset.NodeId"),
     e("slcp.core.qset.max_depth"),
@@ -188,6 +292,23 @@ const stable_rules = [_]Rule{
 /// exist at comptime.
 const abi_prefix = "slcp-abi";
 const abi_source_path = "src/wasm/slcp_host_abi.zig";
+
+/// The §7.2 negotiation constants pinned from the ABI module's text, by VALUE
+/// (`pub const <name>: <type> = <literal>;`). `abi_version` is mandatory (a
+/// source without it is `AbiVersionMissing`); the others render when present.
+/// Bumping `abi_max_version` or flipping a `feature_flags` bit is a contract
+/// change a host negotiates on — it must show in the Stable diff.
+const abi_pinned_consts = [_][]const u8{ "abi_version", "abi_min_version", "abi_max_version", "feature_flags" };
+
+/// `pub const <pinned name>: ...` → the text after `pub const `, else null.
+fn pinnedAbiConst(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "pub const ")) return null;
+    const body = line["pub const ".len..];
+    for (abi_pinned_consts) |name| {
+        if (std.mem.startsWith(u8, body, name) and body.len > name.len and body[name.len] == ':') return body;
+    }
+    return null;
+}
 
 fn matchesRule(path: []const u8, rules: []const Rule) bool {
     for (rules) |rule| {
@@ -720,8 +841,9 @@ const experimental_lines: []const []const u8 = blk: {
 //
 // One line per `export fn` (`slcp-abi.export.<name>: fn (...) <ret>`), one per
 // `extern "<module>" fn` driver import
-// (`slcp-abi.import.<module>.<name>: fn (...) <ret>`), plus the ABI version
-// constant (`slcp-abi.abi_version: const u32 = <n>`). The parser is
+// (`slcp-abi.import.<module>.<name>: fn (...) <ret>`), plus the negotiation
+// constants (`slcp-abi.abi_version: const u32 = <n>`, `abi_min_version`,
+// `abi_max_version`, `feature_flags` — `abi_pinned_consts`). The parser is
 // deliberately line-oriented and strict: an export or import whose signature
 // does not close on the line that opens it is an error, never a silently
 // truncated line — a truncated signature would freeze the wrong contract.
@@ -778,14 +900,15 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.import.{s}.{s}: fn {s}", .{
                 abi_prefix, module, sig[0..name_len], sig[name_len..],
             }));
-        } else if (std.mem.startsWith(u8, line, "pub const abi_version:")) {
+        } else if (pinnedAbiConst(line)) |raw_body| {
             // `pub const abi_version: u32 = 1;` → `slcp-abi.abi_version: const u32 = 1`
-            const body = std.mem.trim(u8, line["pub const ".len..], "; \t");
+            // (same shape for abi_min_version / abi_max_version / feature_flags).
+            const body = std.mem.trim(u8, raw_body, "; \t");
             const colon = std.mem.indexOf(u8, body, ": ") orelse return error.AbiSignatureSpansLines;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.{s}: const {s}", .{
                 abi_prefix, body[0..colon], body[colon + 2 ..],
             }));
-            saw_version = true;
+            if (std.mem.eql(u8, body[0..colon], "abi_version")) saw_version = true;
         }
     }
     if (!saw_version) return error.AbiVersionMissing;
@@ -1197,24 +1320,45 @@ const abi_fixture =
     \\
 ;
 
-// Non-vacuity: dropping the `extern "` arm loses the import line (3 ≠ 4);
-// rendering `abi_version` without the `const ` marker or with the `;` kept
-// fails the string compare.
-test "ABI text parser renders exports, driver imports and abi_version from an inline fixture" {
+// Non-vacuity: dropping the `extern "` arm loses the import line (4 ≠ 5);
+// dropping `abi_min_version` from `abi_pinned_consts` loses lines[1] (the
+// pre-S6 parser pinned only `abi_version`); rendering a const without the
+// `const ` marker or with the `;` kept fails the string compare.
+test "ABI text parser renders exports, driver imports and the negotiation consts from an inline fixture" {
     const gpa = std.testing.allocator;
     const lines = try renderAbiLines(gpa, abi_fixture);
     defer freeAbiLines(gpa, lines);
-    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqual(@as(usize, 5), lines.len);
     try std.testing.expectEqualStrings("slcp-abi.abi_version: const u32 = 7", lines[0]);
-    try std.testing.expectEqualStrings("slcp-abi.export.slcp_alloc: fn (len: u32) u32", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.abi_min_version: const u32 = 1", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.export.slcp_alloc: fn (len: u32) u32", lines[2]);
     try std.testing.expectEqualStrings(
         "slcp-abi.export.slcp_engine_pop_effect: fn (handle: u32, out_ptr_ptr: u32, out_len_ptr: u32) u32",
-        lines[2],
+        lines[3],
     );
     try std.testing.expectEqualStrings(
         "slcp-abi.import.slcp_driver.validate_value: fn (slot_lo: u32, slot_hi: u32, ptr: u32, len: u32, is_nomination: u32) u32",
-        lines[3],
+        lines[4],
     );
+}
+
+// Non-vacuity: a const outside `abi_pinned_consts` (`version_string`, or a
+// name that merely STARTS with a pinned one) must not render — treating the
+// list as a prefix match makes the length expect red.
+test "ABI text parser pins only the four negotiation consts" {
+    const gpa = std.testing.allocator;
+    const fixture =
+        \\pub const abi_version: u32 = 1;
+        \\pub const abi_version_string = "x";
+        \\pub const version_string = "slcp-core";
+        \\pub const feature_flags: u64 = 0b101;
+        \\
+    ;
+    const lines = try renderAbiLines(gpa, fixture);
+    defer freeAbiLines(gpa, lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings("slcp-abi.abi_version: const u32 = 1", lines[0]);
+    try std.testing.expectEqualStrings("slcp-abi.feature_flags: const u64 = 0b101", lines[1]);
 }
 
 // Non-vacuity: removing the terminator check in `oneLineSignature` makes the
@@ -1241,10 +1385,11 @@ test "ABI text parser requires abi_version" {
 }
 
 // Non-vacuity: the counts are the frozen §7 surface (design §14-M4);
-// deleting one `export fn` from src/wasm/slcp_host_abi.zig, or adding a fourth
-// driver import, turns this red. Reads the real file relative to the build
-// root (the run step pins cwd + has_side_effects).
-test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + abi_version" {
+// deleting one `export fn` from src/wasm/slcp_host_abi.zig, adding a fourth
+// driver import, or changing `feature_flags` from 0b101 turns this red. Reads
+// the real file relative to the build root (the run step pins cwd +
+// has_side_effects).
+test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + the 4 negotiation consts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const src = try std.Io.Dir.cwd().readFileAlloc(io, abi_source_path, gpa, .limited(4 * 1024 * 1024));
@@ -1255,15 +1400,20 @@ test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + abi_versi
     var exports: usize = 0;
     var imports: usize = 0;
     var versions: usize = 0;
+    var flags: usize = 0;
     for (lines) |line| {
         if (std.mem.startsWith(u8, line, "slcp-abi.export.")) exports += 1;
         if (std.mem.startsWith(u8, line, "slcp-abi.import.slcp_driver.")) imports += 1;
         if (std.mem.eql(u8, line, "slcp-abi.abi_version: const u32 = 1")) versions += 1;
+        if (std.mem.eql(u8, line, "slcp-abi.abi_min_version: const u32 = 1")) versions += 1;
+        if (std.mem.eql(u8, line, "slcp-abi.abi_max_version: const u32 = 1")) versions += 1;
+        if (std.mem.eql(u8, line, "slcp-abi.feature_flags: const u64 = 0b101")) flags += 1;
     }
     try std.testing.expectEqual(@as(usize, 23), exports);
     try std.testing.expectEqual(@as(usize, 3), imports);
-    try std.testing.expectEqual(@as(usize, 1), versions);
-    try std.testing.expectEqual(@as(usize, 27), lines.len);
+    try std.testing.expectEqual(@as(usize, 3), versions);
+    try std.testing.expectEqual(@as(usize, 1), flags);
+    try std.testing.expectEqual(@as(usize, 30), lines.len);
     // Every ABI line is Stable under `p("slcp-abi")`, and the rule is live.
     for (lines) |line| try std.testing.expect(tierIsStable(abiLinePath(line)));
     try checkAbiRuleLiveness(lines);
@@ -1276,8 +1426,6 @@ test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + abi_versi
 // `@typeInfo(...)` spelling) so a regression in `renderFnType` is caught
 // without a snapshot file. Ablation: return `@typeName(FnType)` from the
 // `.error_union` arm of `renderFnType` and the `@typeInfo` check fails.
-// (`Node.create` is NOT used here: its inferred set resolves to `anyerror`
-// because `qset.validateAndNormalize` recurses — an S6 finding.)
 test "the walked surface renders Node.propose with an expanded error set" {
     var found = false;
     for (stable_lines) |line| {
@@ -1288,4 +1436,58 @@ test "the walked surface renders Node.propose with an expanded error set" {
         }
     }
     try std.testing.expect(found);
+}
+
+fn stableLineWithPrefix(comptime prefix: []const u8) ?[]const u8 {
+    for (stable_lines) |line| {
+        if (std.mem.startsWith(u8, line, prefix)) return line;
+    }
+    return null;
+}
+
+// Non-vacuity (plan S6 test 1): removing either entry from
+// `reference_instantiations`, listing `AppNode(Counter)` BEFORE the codec
+// (its members then render under `slcp.AppNode(Counter).codec.*` and the
+// `Codec(Counter.Command).encode` prefix is absent), or dropping the
+// `e("slcp.AppNode(Counter).propose")` rule makes the matching `expect` red.
+// The error-set checks pin that the typed layer's explicit sets survive the
+// walk (an `anyerror!` here would freeze nothing).
+test "the Stable lines pin AppNode(Counter).create/propose/waitApplied and Codec(Counter.Command).encode/decode" {
+    const create = stableLineWithPrefix("slcp.AppNode(Counter).create: fn (") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, create, "CommandExceedsMaxValueBytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create, "UndecodableExternalizedValue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create, "anyerror") == null);
+    const propose = stableLineWithPrefix("slcp.AppNode(Counter).propose: fn (") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, propose, "error{OutOfMemory,ValueEmpty,ValueTooLarge,WatcherCannotPropose}!void") != null);
+    const wait = stableLineWithPrefix("slcp.AppNode(Counter).waitApplied: fn (") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, wait, "error{NodeHalted}!?") != null);
+    try std.testing.expect(stableLineWithPrefix("slcp.Codec(Counter.Command).encode: fn (") != null);
+    try std.testing.expect(stableLineWithPrefix("slcp.Codec(Counter.Command).decode: fn (") != null);
+    // The typed node's own fields are engine-thread state, never frozen.
+    try std.testing.expect(stableLineWithPrefix("slcp.AppNode(Counter).state: field") == null);
+    try std.testing.expect(!tierIsStable("slcp.AppNode(Counter).codec"));
+}
+
+// Non-vacuity: deleting `e("slcp.core.qset.canonicalBytes")` from
+// `experimental_overrides` while re-adding its old Stable rule makes the
+// first expect red; the `anyerror` scan is the reason those overrides exist —
+// if a Stable FUNCTION line ever renders `anyerror!`, the freeze is pinning a
+// contract nobody can `switch` on, and this test names the line. Callback
+// FIELDS are exempt on purpose: `DeliveryHook.on_externalized` is
+// `anyerror!void` because the app supplies the error (§8.5), and that is the
+// contract.
+test "no Stable function line renders an anyerror error set; the anyerror entry points are held out by override" {
+    try std.testing.expect(!tierIsStable("slcp.core.qset.canonicalBytes"));
+    try std.testing.expect(!tierIsStable("slcp.core.engine.Engine.init"));
+    try std.testing.expect(tierIsStable("slcp.core.engine.Engine.pushInput"));
+    try std.testing.expect(!tierIsStable("slcp.node.Diagnostic.set"));
+    try std.testing.expect(tierIsStable("slcp.node.Diagnostic.message"));
+    for (stable_lines) |line| {
+        const sep = std.mem.indexOf(u8, line, ": ") orelse continue;
+        if (!std.mem.startsWith(u8, line[sep + 2 ..], "fn (")) continue;
+        if (std.mem.indexOf(u8, line, " anyerror!") != null) {
+            std.debug.print("Stable function line with an anyerror set: {s}\n", .{line});
+            return error.TestUnexpectedResult;
+        }
+    }
 }

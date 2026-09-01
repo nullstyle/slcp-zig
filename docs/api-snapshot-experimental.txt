@@ -4,18 +4,32 @@
 # -Dstrict-experimental=true so the committed copy cannot go stale). Do not
 # rely on any symbol below across releases; only docs/api-snapshot.txt is
 # a contract.
-slcp.AppNode: fn (comptime type) type
-slcp.Codec: fn (comptime type) type
+slcp.AppNode(Counter).Command.next: field u64
+slcp.AppNode(Counter).State.count: field u64 = 0
+slcp.AppNode(Counter).WaitOptions.timeout_ms: field ?u64 = null
+slcp.AppNode(Counter).applied_hwm: field u64 = 0
+slcp.AppNode(Counter).apply_in_place: const bool = false
+slcp.AppNode(Counter).closed: field bool = false
+slcp.AppNode(Counter).codec: struct
+slcp.AppNode(Counter).cond: field Io.Condition = <default>
+slcp.AppNode(Counter).created: field atomic.Value(bool) = <default>
+slcp.AppNode(Counter).gpa: field mem.Allocator
+slcp.AppNode(Counter).halt_err: field ?anyerror = null
+slcp.AppNode(Counter).head: field usize = 0
+slcp.AppNode(Counter).io: field Io
+slcp.AppNode(Counter).max_value_bytes: field u32
+slcp.AppNode(Counter).mu: field Io.Mutex = <default>
+slcp.AppNode(Counter).n: field ?*node.node.Node = null
+slcp.AppNode(Counter).queue: field array_list.Aligned(node.app_node.AppNode(api_snapshot.Counter).Applied,null) = <default>
+slcp.AppNode(Counter).state: field api_snapshot.Counter.State
+slcp.AppNode(Counter).undecodable: field ?node.app_node.AppNode(api_snapshot.Counter)__struct_* = null
 slcp.DeliveryHook.ctx: field *anyopaque
 slcp.DeliveryHook.on_externalized: field *const fn (*anyopaque, u64, []const u8) anyerror!void
 slcp.DeliveryHook.on_failed: field *const fn (*anyopaque, anyerror) void
-slcp.DeliveryHook: struct
 slcp.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
 slcp.Driver.ctx: field *anyopaque
 slcp.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
 slcp.Driver.validate_value: field *const fn (*anyopaque, u64, []const u8, bool) driver.Validity
-slcp.Driver: struct
-slcp.DriverError: type = error{DriverFault,OutOfMemory}
 slcp.Node.cur_source: field ?usize = null
 slcp.Node.current_slot: field u64
 slcp.Node.delivery: field ?node.node.DeliveryHook
@@ -54,7 +68,6 @@ slcp.Node.resync_thread: field ?Thread = null
 slcp.Node.store: field node.store.Store
 slcp.Node.watcher: field bool
 slcp.Node.wheel: field node.timers.Wheel
-slcp.NodeId: type = [32]u8
 slcp.NodeOptions.allow_unsafe_quorum: field bool = false
 slcp.NodeOptions.data_dir: field []const u8
 slcp.NodeOptions.delivery: field ?node.node.DeliveryHook = null
@@ -72,14 +85,9 @@ slcp.NodeOptions.secret_seed: field ?[32]u8 = null
 slcp.NodeOptions.start_slot: field u64 = 1
 slcp.NodeOptions.strict_canonical: field bool = true
 slcp.NodeOptions.watcher: field bool = false
-slcp.Quorum.inner_sets: field []const quorum.Quorum = <default>
-slcp.Quorum.threshold: field u32
-slcp.Quorum.validators: field []const [32]u8 = <default>
-slcp.Quorum: struct
 slcp.Validity.invalid: enumerant = 0
 slcp.Validity.maybe_valid: enumerant = 1
 slcp.Validity.valid: enumerant = 2
-slcp.Validity: enum
 slcp.app_node.AppNode: fn (comptime type) type
 slcp.app_node.Codec: fn (comptime type) type
 slcp.app_node.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
@@ -264,6 +272,7 @@ slcp.core.engine.Engine.effects: field engine.engine.EffectQueue
 slcp.core.engine.Engine.excised: field ?engine.qset.QuorumSetOwned
 slcp.core.engine.Engine.failed: field bool = false
 slcp.core.engine.Engine.gpa: field mem.Allocator
+slcp.core.engine.Engine.init: fn (mem.Allocator, engine.engine.Config, driver.Driver) anyerror!engine.engine.Engine
 slcp.core.engine.Engine.pending: field engine.pending.Pending
 slcp.core.engine.Engine.qsets: field engine.qset_store.Store
 slcp.core.engine.Engine.slots: field array_hash_map.Custom(u64,*engine.slot.Slot,array_hash_map.AutoContext(u64),false) = <default>
@@ -286,6 +295,14 @@ slcp.core.gen.host.ArmTimer.Reader: struct
 slcp.core.gen.host.ArmTimer: struct
 slcp.core.gen.host.CAPNP_SCHEMA_MANIFEST_JSON: const []const u8
 slcp.core.gen.host.Effect.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.Effect.Builder.hasArmTimer: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasBroadcastEnvelope: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasCancelTimer: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasExternalized: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasForwardEnvelope: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasPersistOwnEnvelope: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasPhaseEvent: fn (gen.host.Effect.Builder) bool
+slcp.core.gen.host.Effect.Builder.hasRequestQset: fn (gen.host.Effect.Builder) bool
 slcp.core.gen.host.Effect.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.Effect.Builder
 slcp.core.gen.host.Effect.Builder.initArmTimer: fn (*gen.host.Effect.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.host.ArmTimer.Builder
 slcp.core.gen.host.Effect.Builder.initBroadcastEnvelope: fn (*gen.host.Effect.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.host.SlotBytes.Builder
@@ -310,8 +327,17 @@ slcp.core.gen.host.Effect.Reader.getPersistOwnEnvelope: fn (gen.host.Effect.Read
 slcp.core.gen.host.Effect.Reader.getPhaseEvent: fn (gen.host.Effect.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.host.PhaseEvent.Reader
 slcp.core.gen.host.Effect.Reader.getRequestQset: fn (gen.host.Effect.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,WrongUnionMember}![]const u8
 slcp.core.gen.host.Effect.Reader.getUnset: fn (gen.host.Effect.Reader) error{InvalidEnumValue,WrongUnionMember}!void
+slcp.core.gen.host.Effect.Reader.hasArmTimer: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasBroadcastEnvelope: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasCancelTimer: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasExternalized: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasForwardEnvelope: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasPersistOwnEnvelope: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasPhaseEvent: fn (gen.host.Effect.Reader) bool
+slcp.core.gen.host.Effect.Reader.hasRequestQset: fn (gen.host.Effect.Reader) bool
 slcp.core.gen.host.Effect.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.Effect.Reader
 slcp.core.gen.host.Effect.Reader.which: fn (gen.host.Effect.Reader) error{InvalidEnumValue}!gen.host.Effect.WhichTag
+slcp.core.gen.host.Effect.Reader.whichOrdinal: fn (gen.host.Effect.Reader) u16
 slcp.core.gen.host.Effect.Reader.wrap: fn (serialization.message.StructReader) gen.host.Effect.Reader
 slcp.core.gen.host.Effect.Reader: struct
 slcp.core.gen.host.Effect.WhichTag.armTimer: enumerant = 4
@@ -327,6 +353,11 @@ slcp.core.gen.host.Effect.WhichTag.unset: enumerant = 0
 slcp.core.gen.host.Effect.WhichTag: enum
 slcp.core.gen.host.Effect: struct
 slcp.core.gen.host.EngineConfig.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.EngineConfig.Builder.hasLimits: fn (gen.host.EngineConfig.Builder) bool
+slcp.core.gen.host.EngineConfig.Builder.hasNetworkId: fn (gen.host.EngineConfig.Builder) bool
+slcp.core.gen.host.EngineConfig.Builder.hasNodeId: fn (gen.host.EngineConfig.Builder) bool
+slcp.core.gen.host.EngineConfig.Builder.hasQuorumSet: fn (gen.host.EngineConfig.Builder) bool
+slcp.core.gen.host.EngineConfig.Builder.hasSecretSeed: fn (gen.host.EngineConfig.Builder) bool
 slcp.core.gen.host.EngineConfig.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.EngineConfig.Builder
 slcp.core.gen.host.EngineConfig.Builder.initLimits: fn (*gen.host.EngineConfig.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.host.Limits.Builder
 slcp.core.gen.host.EngineConfig.Builder.initQuorumSet: fn (*gen.host.EngineConfig.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.QuorumSet.Builder
@@ -343,11 +374,21 @@ slcp.core.gen.host.EngineConfig.Reader.getNodeId: fn (gen.host.EngineConfig.Read
 slcp.core.gen.host.EngineConfig.Reader.getQuorumSet: fn (gen.host.EngineConfig.Reader) error{InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.QuorumSet.Reader
 slcp.core.gen.host.EngineConfig.Reader.getSecretSeed: fn (gen.host.EngineConfig.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.host.EngineConfig.Reader.getStrictCanonical: fn (gen.host.EngineConfig.Reader) error{}!bool
+slcp.core.gen.host.EngineConfig.Reader.hasLimits: fn (gen.host.EngineConfig.Reader) bool
+slcp.core.gen.host.EngineConfig.Reader.hasNetworkId: fn (gen.host.EngineConfig.Reader) bool
+slcp.core.gen.host.EngineConfig.Reader.hasNodeId: fn (gen.host.EngineConfig.Reader) bool
+slcp.core.gen.host.EngineConfig.Reader.hasQuorumSet: fn (gen.host.EngineConfig.Reader) bool
+slcp.core.gen.host.EngineConfig.Reader.hasSecretSeed: fn (gen.host.EngineConfig.Reader) bool
 slcp.core.gen.host.EngineConfig.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.EngineConfig.Reader
 slcp.core.gen.host.EngineConfig.Reader.wrap: fn (serialization.message.StructReader) gen.host.EngineConfig.Reader
 slcp.core.gen.host.EngineConfig.Reader: struct
 slcp.core.gen.host.EngineConfig: struct
 slcp.core.gen.host.Input.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.Input.Builder.hasEnvelopeReceived: fn (gen.host.Input.Builder) bool
+slcp.core.gen.host.Input.Builder.hasNominate: fn (gen.host.Input.Builder) bool
+slcp.core.gen.host.Input.Builder.hasQsetReceived: fn (gen.host.Input.Builder) bool
+slcp.core.gen.host.Input.Builder.hasRestoreOwnEnvelope: fn (gen.host.Input.Builder) bool
+slcp.core.gen.host.Input.Builder.hasTimerFired: fn (gen.host.Input.Builder) bool
 slcp.core.gen.host.Input.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.Input.Builder
 slcp.core.gen.host.Input.Builder.initNominate: fn (*gen.host.Input.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.host.Nominate.Builder
 slcp.core.gen.host.Input.Builder.initTimerFired: fn (*gen.host.Input.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.host.TimerKey.Builder
@@ -366,8 +407,14 @@ slcp.core.gen.host.Input.Reader.getQsetReceived: fn (gen.host.Input.Reader) erro
 slcp.core.gen.host.Input.Reader.getRestoreOwnEnvelope: fn (gen.host.Input.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,WrongUnionMember}![]const u8
 slcp.core.gen.host.Input.Reader.getTimerFired: fn (gen.host.Input.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.host.TimerKey.Reader
 slcp.core.gen.host.Input.Reader.getUnset: fn (gen.host.Input.Reader) error{InvalidEnumValue,WrongUnionMember}!void
+slcp.core.gen.host.Input.Reader.hasEnvelopeReceived: fn (gen.host.Input.Reader) bool
+slcp.core.gen.host.Input.Reader.hasNominate: fn (gen.host.Input.Reader) bool
+slcp.core.gen.host.Input.Reader.hasQsetReceived: fn (gen.host.Input.Reader) bool
+slcp.core.gen.host.Input.Reader.hasRestoreOwnEnvelope: fn (gen.host.Input.Reader) bool
+slcp.core.gen.host.Input.Reader.hasTimerFired: fn (gen.host.Input.Reader) bool
 slcp.core.gen.host.Input.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.Input.Reader
 slcp.core.gen.host.Input.Reader.which: fn (gen.host.Input.Reader) error{InvalidEnumValue}!gen.host.Input.WhichTag
+slcp.core.gen.host.Input.Reader.whichOrdinal: fn (gen.host.Input.Reader) u16
 slcp.core.gen.host.Input.Reader.wrap: fn (serialization.message.StructReader) gen.host.Input.Reader
 slcp.core.gen.host.Input.Reader: struct
 slcp.core.gen.host.Input.WhichTag.envelopeReceived: enumerant = 1
@@ -405,17 +452,20 @@ slcp.core.gen.host.Limits.Reader.wrap: fn (serialization.message.StructReader) g
 slcp.core.gen.host.Limits.Reader: struct
 slcp.core.gen.host.Limits: struct
 slcp.core.gen.host.LintDiagnostics.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.LintDiagnostics.Builder.hasFindings: fn (gen.host.LintDiagnostics.Builder) bool
 slcp.core.gen.host.LintDiagnostics.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.LintDiagnostics.Builder
 slcp.core.gen.host.LintDiagnostics.Builder.initFindings: fn (*gen.host.LintDiagnostics.Builder, u32) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!serialization.message.typed_list_helpers.define(serialization.message).StructListBuilder(gen.host.LintFinding)
 slcp.core.gen.host.LintDiagnostics.Builder.wrap: fn (serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder) gen.host.LintDiagnostics.Builder
 slcp.core.gen.host.LintDiagnostics.Builder: struct
 slcp.core.gen.host.LintDiagnostics.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.host.LintDiagnostics.Reader.getFindings: fn (gen.host.LintDiagnostics.Reader) error{CannotUpgradeBitList,InvalidFarPointer,InvalidInlineCompositePointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).StructListReader(gen.host.LintFinding)
+slcp.core.gen.host.LintDiagnostics.Reader.hasFindings: fn (gen.host.LintDiagnostics.Reader) bool
 slcp.core.gen.host.LintDiagnostics.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.LintDiagnostics.Reader
 slcp.core.gen.host.LintDiagnostics.Reader.wrap: fn (serialization.message.StructReader) gen.host.LintDiagnostics.Reader
 slcp.core.gen.host.LintDiagnostics.Reader: struct
 slcp.core.gen.host.LintDiagnostics: struct
 slcp.core.gen.host.LintFinding.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.LintFinding.Builder.hasNode: fn (gen.host.LintFinding.Builder) bool
 slcp.core.gen.host.LintFinding.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.LintFinding.Builder
 slcp.core.gen.host.LintFinding.Builder.setCode: fn (*gen.host.LintFinding.Builder, u16) error{}!void
 slcp.core.gen.host.LintFinding.Builder.setLevel: fn (*gen.host.LintFinding.Builder, u8) error{}!void
@@ -430,11 +480,14 @@ slcp.core.gen.host.LintFinding.Reader.getLevel: fn (gen.host.LintFinding.Reader)
 slcp.core.gen.host.LintFinding.Reader.getMembers: fn (gen.host.LintFinding.Reader) error{}!u32
 slcp.core.gen.host.LintFinding.Reader.getNode: fn (gen.host.LintFinding.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.host.LintFinding.Reader.getThreshold: fn (gen.host.LintFinding.Reader) error{}!u32
+slcp.core.gen.host.LintFinding.Reader.hasNode: fn (gen.host.LintFinding.Reader) bool
 slcp.core.gen.host.LintFinding.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.LintFinding.Reader
 slcp.core.gen.host.LintFinding.Reader.wrap: fn (serialization.message.StructReader) gen.host.LintFinding.Reader
 slcp.core.gen.host.LintFinding.Reader: struct
 slcp.core.gen.host.LintFinding: struct
 slcp.core.gen.host.Nominate.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.Nominate.Builder.hasPrevValue: fn (gen.host.Nominate.Builder) bool
+slcp.core.gen.host.Nominate.Builder.hasValue: fn (gen.host.Nominate.Builder) bool
 slcp.core.gen.host.Nominate.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.Nominate.Builder
 slcp.core.gen.host.Nominate.Builder.setPrevValue: fn (*gen.host.Nominate.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.host.Nominate.Builder.setSlot: fn (*gen.host.Nominate.Builder, u64) error{}!void
@@ -445,6 +498,8 @@ slcp.core.gen.host.Nominate.Reader._reader: field serialization.message.StructRe
 slcp.core.gen.host.Nominate.Reader.getPrevValue: fn (gen.host.Nominate.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.host.Nominate.Reader.getSlot: fn (gen.host.Nominate.Reader) error{}!u64
 slcp.core.gen.host.Nominate.Reader.getValue: fn (gen.host.Nominate.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
+slcp.core.gen.host.Nominate.Reader.hasPrevValue: fn (gen.host.Nominate.Reader) bool
+slcp.core.gen.host.Nominate.Reader.hasValue: fn (gen.host.Nominate.Reader) bool
 slcp.core.gen.host.Nominate.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.Nominate.Reader
 slcp.core.gen.host.Nominate.Reader.wrap: fn (serialization.message.StructReader) gen.host.Nominate.Reader
 slcp.core.gen.host.Nominate.Reader: struct
@@ -465,6 +520,7 @@ slcp.core.gen.host.PhaseEvent.Reader.wrap: fn (serialization.message.StructReade
 slcp.core.gen.host.PhaseEvent.Reader: struct
 slcp.core.gen.host.PhaseEvent: struct
 slcp.core.gen.host.SlotBytes.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.SlotBytes.Builder.hasBytes: fn (gen.host.SlotBytes.Builder) bool
 slcp.core.gen.host.SlotBytes.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.SlotBytes.Builder
 slcp.core.gen.host.SlotBytes.Builder.setBytes: fn (*gen.host.SlotBytes.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.host.SlotBytes.Builder.setSlot: fn (*gen.host.SlotBytes.Builder, u64) error{}!void
@@ -473,6 +529,7 @@ slcp.core.gen.host.SlotBytes.Builder: struct
 slcp.core.gen.host.SlotBytes.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.host.SlotBytes.Reader.getBytes: fn (gen.host.SlotBytes.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.host.SlotBytes.Reader.getSlot: fn (gen.host.SlotBytes.Reader) error{}!u64
+slcp.core.gen.host.SlotBytes.Reader.hasBytes: fn (gen.host.SlotBytes.Reader) bool
 slcp.core.gen.host.SlotBytes.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.SlotBytes.Reader
 slcp.core.gen.host.SlotBytes.Reader.wrap: fn (serialization.message.StructReader) gen.host.SlotBytes.Reader
 slcp.core.gen.host.SlotBytes.Reader: struct
@@ -491,12 +548,14 @@ slcp.core.gen.host.TimerKey.Reader.wrap: fn (serialization.message.StructReader)
 slcp.core.gen.host.TimerKey.Reader: struct
 slcp.core.gen.host.TimerKey: struct
 slcp.core.gen.host.ValueList.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.host.ValueList.Builder.hasValues: fn (gen.host.ValueList.Builder) bool
 slcp.core.gen.host.ValueList.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.ValueList.Builder
 slcp.core.gen.host.ValueList.Builder.initValues: fn (*gen.host.ValueList.Builder, u32) anyerror!serialization.message.typed_list_helpers.define(serialization.message).DataListBuilder
 slcp.core.gen.host.ValueList.Builder.wrap: fn (serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder) gen.host.ValueList.Builder
 slcp.core.gen.host.ValueList.Builder: struct
 slcp.core.gen.host.ValueList.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.host.ValueList.Reader.getValues: fn (gen.host.ValueList.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).DataListReader
+slcp.core.gen.host.ValueList.Reader.hasValues: fn (gen.host.ValueList.Reader) bool
 slcp.core.gen.host.ValueList.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.host.ValueList.Reader
 slcp.core.gen.host.ValueList.Reader.wrap: fn (serialization.message.StructReader) gen.host.ValueList.Reader
 slcp.core.gen.host.ValueList.Reader: struct
@@ -506,6 +565,7 @@ slcp.core.gen.host.slcp: struct
 slcp.core.gen.host: struct
 slcp.core.gen.overlay.CAPNP_SCHEMA_MANIFEST_JSON: const []const u8
 slcp.core.gen.overlay.DontHave.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.overlay.DontHave.Builder.hasId: fn (gen.overlay.DontHave.Builder) bool
 slcp.core.gen.overlay.DontHave.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.overlay.DontHave.Builder
 slcp.core.gen.overlay.DontHave.Builder.setId: fn (*gen.overlay.DontHave.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.overlay.DontHave.Builder.setKind: fn (*gen.overlay.DontHave.Builder, u8) error{}!void
@@ -514,11 +574,18 @@ slcp.core.gen.overlay.DontHave.Builder: struct
 slcp.core.gen.overlay.DontHave.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.overlay.DontHave.Reader.getId: fn (gen.overlay.DontHave.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.overlay.DontHave.Reader.getKind: fn (gen.overlay.DontHave.Reader) error{}!u8
+slcp.core.gen.overlay.DontHave.Reader.hasId: fn (gen.overlay.DontHave.Reader) bool
 slcp.core.gen.overlay.DontHave.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.overlay.DontHave.Reader
 slcp.core.gen.overlay.DontHave.Reader.wrap: fn (serialization.message.StructReader) gen.overlay.DontHave.Reader
 slcp.core.gen.overlay.DontHave.Reader: struct
 slcp.core.gen.overlay.DontHave: struct
 slcp.core.gen.overlay.Frame.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.overlay.Frame.Builder.hasDontHave: fn (gen.overlay.Frame.Builder) bool
+slcp.core.gen.overlay.Frame.Builder.hasEnvelope: fn (gen.overlay.Frame.Builder) bool
+slcp.core.gen.overlay.Frame.Builder.hasGetQset: fn (gen.overlay.Frame.Builder) bool
+slcp.core.gen.overlay.Frame.Builder.hasHello: fn (gen.overlay.Frame.Builder) bool
+slcp.core.gen.overlay.Frame.Builder.hasQset: fn (gen.overlay.Frame.Builder) bool
+slcp.core.gen.overlay.Frame.Builder.hasSlotState: fn (gen.overlay.Frame.Builder) bool
 slcp.core.gen.overlay.Frame.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.overlay.Frame.Builder
 slcp.core.gen.overlay.Frame.Builder.initDontHave: fn (*gen.overlay.Frame.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.overlay.DontHave.Builder
 slcp.core.gen.overlay.Frame.Builder.initEnvelope: fn (*gen.overlay.Frame.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Envelope.Builder
@@ -543,8 +610,15 @@ slcp.core.gen.overlay.Frame.Reader.getPong: fn (gen.overlay.Frame.Reader) error{
 slcp.core.gen.overlay.Frame.Reader.getQset: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.slcp.QuorumSet.Reader
 slcp.core.gen.overlay.Frame.Reader.getSlotState: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.overlay.SlotState.Reader
 slcp.core.gen.overlay.Frame.Reader.getUnset: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,WrongUnionMember}!void
+slcp.core.gen.overlay.Frame.Reader.hasDontHave: fn (gen.overlay.Frame.Reader) bool
+slcp.core.gen.overlay.Frame.Reader.hasEnvelope: fn (gen.overlay.Frame.Reader) bool
+slcp.core.gen.overlay.Frame.Reader.hasGetQset: fn (gen.overlay.Frame.Reader) bool
+slcp.core.gen.overlay.Frame.Reader.hasHello: fn (gen.overlay.Frame.Reader) bool
+slcp.core.gen.overlay.Frame.Reader.hasQset: fn (gen.overlay.Frame.Reader) bool
+slcp.core.gen.overlay.Frame.Reader.hasSlotState: fn (gen.overlay.Frame.Reader) bool
 slcp.core.gen.overlay.Frame.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.overlay.Frame.Reader
 slcp.core.gen.overlay.Frame.Reader.which: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue}!gen.overlay.Frame.WhichTag
+slcp.core.gen.overlay.Frame.Reader.whichOrdinal: fn (gen.overlay.Frame.Reader) u16
 slcp.core.gen.overlay.Frame.Reader.wrap: fn (serialization.message.StructReader) gen.overlay.Frame.Reader
 slcp.core.gen.overlay.Frame.Reader: struct
 slcp.core.gen.overlay.Frame.WhichTag.dontHave: enumerant = 5
@@ -560,6 +634,8 @@ slcp.core.gen.overlay.Frame.WhichTag.unset: enumerant = 0
 slcp.core.gen.overlay.Frame.WhichTag: enum
 slcp.core.gen.overlay.Frame: struct
 slcp.core.gen.overlay.Hello.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.overlay.Hello.Builder.hasNetworkIdPrefix: fn (gen.overlay.Hello.Builder) bool
+slcp.core.gen.overlay.Hello.Builder.hasNodeId: fn (gen.overlay.Hello.Builder) bool
 slcp.core.gen.overlay.Hello.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.overlay.Hello.Builder
 slcp.core.gen.overlay.Hello.Builder.setCurrentSlot: fn (*gen.overlay.Hello.Builder, u64) error{}!void
 slcp.core.gen.overlay.Hello.Builder.setListenPort: fn (*gen.overlay.Hello.Builder, u16) error{}!void
@@ -574,11 +650,14 @@ slcp.core.gen.overlay.Hello.Reader.getListenPort: fn (gen.overlay.Hello.Reader) 
 slcp.core.gen.overlay.Hello.Reader.getNetworkIdPrefix: fn (gen.overlay.Hello.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.overlay.Hello.Reader.getNodeId: fn (gen.overlay.Hello.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.overlay.Hello.Reader.getProtocolVersion: fn (gen.overlay.Hello.Reader) error{}!u32
+slcp.core.gen.overlay.Hello.Reader.hasNetworkIdPrefix: fn (gen.overlay.Hello.Reader) bool
+slcp.core.gen.overlay.Hello.Reader.hasNodeId: fn (gen.overlay.Hello.Reader) bool
 slcp.core.gen.overlay.Hello.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.overlay.Hello.Reader
 slcp.core.gen.overlay.Hello.Reader.wrap: fn (serialization.message.StructReader) gen.overlay.Hello.Reader
 slcp.core.gen.overlay.Hello.Reader: struct
 slcp.core.gen.overlay.Hello: struct
 slcp.core.gen.overlay.SlotState.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.overlay.SlotState.Builder.hasEnvelopes: fn (gen.overlay.SlotState.Builder) bool
 slcp.core.gen.overlay.SlotState.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.overlay.SlotState.Builder
 slcp.core.gen.overlay.SlotState.Builder.initEnvelopes: fn (*gen.overlay.SlotState.Builder, u32) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!serialization.message.typed_list_helpers.define(serialization.message).StructListBuilder(gen.slcp.Envelope)
 slcp.core.gen.overlay.SlotState.Builder.setSlot: fn (*gen.overlay.SlotState.Builder, u64) error{}!void
@@ -587,6 +666,7 @@ slcp.core.gen.overlay.SlotState.Builder: struct
 slcp.core.gen.overlay.SlotState.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.overlay.SlotState.Reader.getEnvelopes: fn (gen.overlay.SlotState.Reader) error{CannotUpgradeBitList,InvalidFarPointer,InvalidInlineCompositePointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).StructListReader(gen.slcp.Envelope)
 slcp.core.gen.overlay.SlotState.Reader.getSlot: fn (gen.overlay.SlotState.Reader) error{}!u64
+slcp.core.gen.overlay.SlotState.Reader.hasEnvelopes: fn (gen.overlay.SlotState.Reader) bool
 slcp.core.gen.overlay.SlotState.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.overlay.SlotState.Reader
 slcp.core.gen.overlay.SlotState.Reader.wrap: fn (serialization.message.StructReader) gen.overlay.SlotState.Reader
 slcp.core.gen.overlay.SlotState.Reader: struct
@@ -595,6 +675,7 @@ slcp.core.gen.overlay.capnpSchemaManifestJson: fn () []const u8
 slcp.core.gen.overlay.slcp: struct
 slcp.core.gen.overlay: struct
 slcp.core.gen.slcp.Ballot.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Ballot.Builder.hasValue: fn (gen.slcp.Ballot.Builder) bool
 slcp.core.gen.slcp.Ballot.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Ballot.Builder
 slcp.core.gen.slcp.Ballot.Builder.setCounter: fn (*gen.slcp.Ballot.Builder, u32) error{}!void
 slcp.core.gen.slcp.Ballot.Builder.setValue: fn (*gen.slcp.Ballot.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
@@ -603,12 +684,15 @@ slcp.core.gen.slcp.Ballot.Builder: struct
 slcp.core.gen.slcp.Ballot.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.slcp.Ballot.Reader.getCounter: fn (gen.slcp.Ballot.Reader) error{}!u32
 slcp.core.gen.slcp.Ballot.Reader.getValue: fn (gen.slcp.Ballot.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
+slcp.core.gen.slcp.Ballot.Reader.hasValue: fn (gen.slcp.Ballot.Reader) bool
 slcp.core.gen.slcp.Ballot.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Ballot.Reader
 slcp.core.gen.slcp.Ballot.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Ballot.Reader
 slcp.core.gen.slcp.Ballot.Reader: struct
 slcp.core.gen.slcp.Ballot: struct
 slcp.core.gen.slcp.CAPNP_SCHEMA_MANIFEST_JSON: const []const u8
 slcp.core.gen.slcp.Confirm.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Confirm.Builder.hasBallot: fn (gen.slcp.Confirm.Builder) bool
+slcp.core.gen.slcp.Confirm.Builder.hasQuorumSetHash: fn (gen.slcp.Confirm.Builder) bool
 slcp.core.gen.slcp.Confirm.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Confirm.Builder
 slcp.core.gen.slcp.Confirm.Builder.initBallot: fn (*gen.slcp.Confirm.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Ballot.Builder
 slcp.core.gen.slcp.Confirm.Builder.setNCommit: fn (*gen.slcp.Confirm.Builder, u32) error{}!void
@@ -623,11 +707,15 @@ slcp.core.gen.slcp.Confirm.Reader.getNCommit: fn (gen.slcp.Confirm.Reader) error
 slcp.core.gen.slcp.Confirm.Reader.getNH: fn (gen.slcp.Confirm.Reader) error{}!u32
 slcp.core.gen.slcp.Confirm.Reader.getNPrepared: fn (gen.slcp.Confirm.Reader) error{}!u32
 slcp.core.gen.slcp.Confirm.Reader.getQuorumSetHash: fn (gen.slcp.Confirm.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
+slcp.core.gen.slcp.Confirm.Reader.hasBallot: fn (gen.slcp.Confirm.Reader) bool
+slcp.core.gen.slcp.Confirm.Reader.hasQuorumSetHash: fn (gen.slcp.Confirm.Reader) bool
 slcp.core.gen.slcp.Confirm.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Confirm.Reader
 slcp.core.gen.slcp.Confirm.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Confirm.Reader
 slcp.core.gen.slcp.Confirm.Reader: struct
 slcp.core.gen.slcp.Confirm: struct
 slcp.core.gen.slcp.Envelope.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Envelope.Builder.hasSignature: fn (gen.slcp.Envelope.Builder) bool
+slcp.core.gen.slcp.Envelope.Builder.hasStatementBytes: fn (gen.slcp.Envelope.Builder) bool
 slcp.core.gen.slcp.Envelope.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Envelope.Builder
 slcp.core.gen.slcp.Envelope.Builder.setSignature: fn (*gen.slcp.Envelope.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.slcp.Envelope.Builder.setStatementBytes: fn (*gen.slcp.Envelope.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
@@ -636,11 +724,15 @@ slcp.core.gen.slcp.Envelope.Builder: struct
 slcp.core.gen.slcp.Envelope.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.slcp.Envelope.Reader.getSignature: fn (gen.slcp.Envelope.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.slcp.Envelope.Reader.getStatementBytes: fn (gen.slcp.Envelope.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
+slcp.core.gen.slcp.Envelope.Reader.hasSignature: fn (gen.slcp.Envelope.Reader) bool
+slcp.core.gen.slcp.Envelope.Reader.hasStatementBytes: fn (gen.slcp.Envelope.Reader) bool
 slcp.core.gen.slcp.Envelope.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Envelope.Reader
 slcp.core.gen.slcp.Envelope.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Envelope.Reader
 slcp.core.gen.slcp.Envelope.Reader: struct
 slcp.core.gen.slcp.Envelope: struct
 slcp.core.gen.slcp.Externalize.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Externalize.Builder.hasCommit: fn (gen.slcp.Externalize.Builder) bool
+slcp.core.gen.slcp.Externalize.Builder.hasCommitQuorumSetHash: fn (gen.slcp.Externalize.Builder) bool
 slcp.core.gen.slcp.Externalize.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Externalize.Builder
 slcp.core.gen.slcp.Externalize.Builder.initCommit: fn (*gen.slcp.Externalize.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Ballot.Builder
 slcp.core.gen.slcp.Externalize.Builder.setCommitQuorumSetHash: fn (*gen.slcp.Externalize.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
@@ -651,11 +743,16 @@ slcp.core.gen.slcp.Externalize.Reader._reader: field serialization.message.Struc
 slcp.core.gen.slcp.Externalize.Reader.getCommit: fn (gen.slcp.Externalize.Reader) error{InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Ballot.Reader
 slcp.core.gen.slcp.Externalize.Reader.getCommitQuorumSetHash: fn (gen.slcp.Externalize.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.slcp.Externalize.Reader.getNH: fn (gen.slcp.Externalize.Reader) error{}!u32
+slcp.core.gen.slcp.Externalize.Reader.hasCommit: fn (gen.slcp.Externalize.Reader) bool
+slcp.core.gen.slcp.Externalize.Reader.hasCommitQuorumSetHash: fn (gen.slcp.Externalize.Reader) bool
 slcp.core.gen.slcp.Externalize.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Externalize.Reader
 slcp.core.gen.slcp.Externalize.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Externalize.Reader
 slcp.core.gen.slcp.Externalize.Reader: struct
 slcp.core.gen.slcp.Externalize: struct
 slcp.core.gen.slcp.Nomination.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Nomination.Builder.hasAccepted: fn (gen.slcp.Nomination.Builder) bool
+slcp.core.gen.slcp.Nomination.Builder.hasQuorumSetHash: fn (gen.slcp.Nomination.Builder) bool
+slcp.core.gen.slcp.Nomination.Builder.hasVotes: fn (gen.slcp.Nomination.Builder) bool
 slcp.core.gen.slcp.Nomination.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Nomination.Builder
 slcp.core.gen.slcp.Nomination.Builder.initAccepted: fn (*gen.slcp.Nomination.Builder, u32) anyerror!serialization.message.typed_list_helpers.define(serialization.message).DataListBuilder
 slcp.core.gen.slcp.Nomination.Builder.initVotes: fn (*gen.slcp.Nomination.Builder, u32) anyerror!serialization.message.typed_list_helpers.define(serialization.message).DataListBuilder
@@ -666,11 +763,18 @@ slcp.core.gen.slcp.Nomination.Reader._reader: field serialization.message.Struct
 slcp.core.gen.slcp.Nomination.Reader.getAccepted: fn (gen.slcp.Nomination.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).DataListReader
 slcp.core.gen.slcp.Nomination.Reader.getQuorumSetHash: fn (gen.slcp.Nomination.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.slcp.Nomination.Reader.getVotes: fn (gen.slcp.Nomination.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).DataListReader
+slcp.core.gen.slcp.Nomination.Reader.hasAccepted: fn (gen.slcp.Nomination.Reader) bool
+slcp.core.gen.slcp.Nomination.Reader.hasQuorumSetHash: fn (gen.slcp.Nomination.Reader) bool
+slcp.core.gen.slcp.Nomination.Reader.hasVotes: fn (gen.slcp.Nomination.Reader) bool
 slcp.core.gen.slcp.Nomination.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Nomination.Reader
 slcp.core.gen.slcp.Nomination.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Nomination.Reader
 slcp.core.gen.slcp.Nomination.Reader: struct
 slcp.core.gen.slcp.Nomination: struct
 slcp.core.gen.slcp.Prepare.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Prepare.Builder.hasBallot: fn (gen.slcp.Prepare.Builder) bool
+slcp.core.gen.slcp.Prepare.Builder.hasPrepared: fn (gen.slcp.Prepare.Builder) bool
+slcp.core.gen.slcp.Prepare.Builder.hasPreparedPrime: fn (gen.slcp.Prepare.Builder) bool
+slcp.core.gen.slcp.Prepare.Builder.hasQuorumSetHash: fn (gen.slcp.Prepare.Builder) bool
 slcp.core.gen.slcp.Prepare.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Prepare.Builder
 slcp.core.gen.slcp.Prepare.Builder.initBallot: fn (*gen.slcp.Prepare.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Ballot.Builder
 slcp.core.gen.slcp.Prepare.Builder.initPrepared: fn (*gen.slcp.Prepare.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Ballot.Builder
@@ -687,11 +791,17 @@ slcp.core.gen.slcp.Prepare.Reader.getNH: fn (gen.slcp.Prepare.Reader) error{}!u3
 slcp.core.gen.slcp.Prepare.Reader.getPrepared: fn (gen.slcp.Prepare.Reader) error{InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Ballot.Reader
 slcp.core.gen.slcp.Prepare.Reader.getPreparedPrime: fn (gen.slcp.Prepare.Reader) error{InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Ballot.Reader
 slcp.core.gen.slcp.Prepare.Reader.getQuorumSetHash: fn (gen.slcp.Prepare.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
+slcp.core.gen.slcp.Prepare.Reader.hasBallot: fn (gen.slcp.Prepare.Reader) bool
+slcp.core.gen.slcp.Prepare.Reader.hasPrepared: fn (gen.slcp.Prepare.Reader) bool
+slcp.core.gen.slcp.Prepare.Reader.hasPreparedPrime: fn (gen.slcp.Prepare.Reader) bool
+slcp.core.gen.slcp.Prepare.Reader.hasQuorumSetHash: fn (gen.slcp.Prepare.Reader) bool
 slcp.core.gen.slcp.Prepare.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Prepare.Reader
 slcp.core.gen.slcp.Prepare.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Prepare.Reader
 slcp.core.gen.slcp.Prepare.Reader: struct
 slcp.core.gen.slcp.Prepare: struct
 slcp.core.gen.slcp.QuorumSet.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.QuorumSet.Builder.hasInnerSets: fn (gen.slcp.QuorumSet.Builder) bool
+slcp.core.gen.slcp.QuorumSet.Builder.hasValidators: fn (gen.slcp.QuorumSet.Builder) bool
 slcp.core.gen.slcp.QuorumSet.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.QuorumSet.Builder
 slcp.core.gen.slcp.QuorumSet.Builder.initInnerSets: fn (*gen.slcp.QuorumSet.Builder, u32) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!serialization.message.typed_list_helpers.define(serialization.message).StructListBuilder(gen.slcp.QuorumSet)
 slcp.core.gen.slcp.QuorumSet.Builder.initValidators: fn (*gen.slcp.QuorumSet.Builder, u32) anyerror!serialization.message.typed_list_helpers.define(serialization.message).DataListBuilder
@@ -702,18 +812,25 @@ slcp.core.gen.slcp.QuorumSet.Reader._reader: field serialization.message.StructR
 slcp.core.gen.slcp.QuorumSet.Reader.getInnerSets: fn (gen.slcp.QuorumSet.Reader) error{CannotUpgradeBitList,InvalidFarPointer,InvalidInlineCompositePointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).StructListReader(gen.slcp.QuorumSet)
 slcp.core.gen.slcp.QuorumSet.Reader.getThreshold: fn (gen.slcp.QuorumSet.Reader) error{}!u32
 slcp.core.gen.slcp.QuorumSet.Reader.getValidators: fn (gen.slcp.QuorumSet.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}!serialization.message.typed_list_helpers.define(serialization.message).DataListReader
+slcp.core.gen.slcp.QuorumSet.Reader.hasInnerSets: fn (gen.slcp.QuorumSet.Reader) bool
+slcp.core.gen.slcp.QuorumSet.Reader.hasValidators: fn (gen.slcp.QuorumSet.Reader) bool
 slcp.core.gen.slcp.QuorumSet.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.QuorumSet.Reader
 slcp.core.gen.slcp.QuorumSet.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.QuorumSet.Reader
 slcp.core.gen.slcp.QuorumSet.Reader: struct
 slcp.core.gen.slcp.QuorumSet: struct
 slcp.core.gen.slcp.Statement.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
 slcp.core.gen.slcp.Statement.Builder.getPledges: fn (*gen.slcp.Statement.Builder) gen.slcp.Statement.Pledges.Builder
+slcp.core.gen.slcp.Statement.Builder.hasNodeId: fn (gen.slcp.Statement.Builder) bool
 slcp.core.gen.slcp.Statement.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.slcp.Statement.Builder
 slcp.core.gen.slcp.Statement.Builder.setNodeId: fn (*gen.slcp.Statement.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.slcp.Statement.Builder.setSlotIndex: fn (*gen.slcp.Statement.Builder, u64) error{}!void
 slcp.core.gen.slcp.Statement.Builder.wrap: fn (serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder) gen.slcp.Statement.Builder
 slcp.core.gen.slcp.Statement.Builder: struct
 slcp.core.gen.slcp.Statement.Pledges.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.slcp.Statement.Pledges.Builder.hasConfirm: fn (gen.slcp.Statement.Pledges.Builder) bool
+slcp.core.gen.slcp.Statement.Pledges.Builder.hasExternalize: fn (gen.slcp.Statement.Pledges.Builder) bool
+slcp.core.gen.slcp.Statement.Pledges.Builder.hasNominate: fn (gen.slcp.Statement.Pledges.Builder) bool
+slcp.core.gen.slcp.Statement.Pledges.Builder.hasPrepare: fn (gen.slcp.Statement.Pledges.Builder) bool
 slcp.core.gen.slcp.Statement.Pledges.Builder.initConfirm: fn (*gen.slcp.Statement.Pledges.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Confirm.Builder
 slcp.core.gen.slcp.Statement.Pledges.Builder.initExternalize: fn (*gen.slcp.Statement.Pledges.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Externalize.Builder
 slcp.core.gen.slcp.Statement.Pledges.Builder.initNominate: fn (*gen.slcp.Statement.Pledges.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.Nomination.Builder
@@ -727,7 +844,12 @@ slcp.core.gen.slcp.Statement.Pledges.Reader.getExternalize: fn (gen.slcp.Stateme
 slcp.core.gen.slcp.Statement.Pledges.Reader.getNominate: fn (gen.slcp.Statement.Pledges.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.slcp.Nomination.Reader
 slcp.core.gen.slcp.Statement.Pledges.Reader.getPrepare: fn (gen.slcp.Statement.Pledges.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.slcp.Prepare.Reader
 slcp.core.gen.slcp.Statement.Pledges.Reader.getUnset: fn (gen.slcp.Statement.Pledges.Reader) error{InvalidEnumValue,WrongUnionMember}!void
+slcp.core.gen.slcp.Statement.Pledges.Reader.hasConfirm: fn (gen.slcp.Statement.Pledges.Reader) bool
+slcp.core.gen.slcp.Statement.Pledges.Reader.hasExternalize: fn (gen.slcp.Statement.Pledges.Reader) bool
+slcp.core.gen.slcp.Statement.Pledges.Reader.hasNominate: fn (gen.slcp.Statement.Pledges.Reader) bool
+slcp.core.gen.slcp.Statement.Pledges.Reader.hasPrepare: fn (gen.slcp.Statement.Pledges.Reader) bool
 slcp.core.gen.slcp.Statement.Pledges.Reader.which: fn (gen.slcp.Statement.Pledges.Reader) error{InvalidEnumValue}!gen.slcp.Statement.Pledges.WhichTag
+slcp.core.gen.slcp.Statement.Pledges.Reader.whichOrdinal: fn (gen.slcp.Statement.Pledges.Reader) u16
 slcp.core.gen.slcp.Statement.Pledges.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Statement.Pledges.Reader
 slcp.core.gen.slcp.Statement.Pledges.Reader: struct
 slcp.core.gen.slcp.Statement.Pledges.WhichTag.confirm: enumerant = 3
@@ -741,6 +863,7 @@ slcp.core.gen.slcp.Statement.Reader._reader: field serialization.message.StructR
 slcp.core.gen.slcp.Statement.Reader.getNodeId: fn (gen.slcp.Statement.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.slcp.Statement.Reader.getPledges: fn (gen.slcp.Statement.Reader) gen.slcp.Statement.Pledges.Reader
 slcp.core.gen.slcp.Statement.Reader.getSlotIndex: fn (gen.slcp.Statement.Reader) error{}!u64
+slcp.core.gen.slcp.Statement.Reader.hasNodeId: fn (gen.slcp.Statement.Reader) bool
 slcp.core.gen.slcp.Statement.Reader.init: fn (*const serialization.message.Message) error{EmptyMessage,InvalidFarPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage}!gen.slcp.Statement.Reader
 slcp.core.gen.slcp.Statement.Reader.wrap: fn (serialization.message.StructReader) gen.slcp.Statement.Reader
 slcp.core.gen.slcp.Statement.Reader: struct
@@ -835,14 +958,17 @@ slcp.core.qset.LintFinding: struct
 slcp.core.qset.LintLevel.err: enumerant = 0
 slcp.core.qset.LintLevel.warning: enumerant = 1
 slcp.core.qset.LintLevel: enum
+slcp.core.qset.canonicalBytes: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) anyerror![]u8
 slcp.core.qset.clone: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!engine.qset.QuorumSetOwned
 slcp.core.qset.containsNode: fn (*const engine.qset.QuorumSetOwned, [32]u8) bool
 slcp.core.qset.criticalNodes: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}![][32]u8
 slcp.core.qset.exciseNode: fn (mem.Allocator, *const engine.qset.QuorumSetOwned, [32]u8) error{OutOfMemory}!?engine.qset.QuorumSetOwned
 slcp.core.qset.fromReader: fn (mem.Allocator, gen.slcp.QuorumSet.Reader) anyerror!engine.qset.QuorumSetOwned
+slcp.core.qset.hashNormalized: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) anyerror![32]u8
 slcp.core.qset.isSatisfiableWithout: fn (*const engine.qset.QuorumSetOwned, [32]u8) bool
 slcp.core.qset.lint: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}![]engine.qset.LintFinding
 slcp.core.qset.minBlockingSize: fn (*const engine.qset.QuorumSetOwned) u32
+slcp.core.qset.validateAndNormalize: fn (mem.Allocator, *engine.qset.QuorumSetOwned) anyerror!void
 slcp.core.qset: struct
 slcp.core.qset_store.Store.addToGraph: fn (*engine.qset_store.Store, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!void
 slcp.core.qset_store.Store.advertised: field hash_map.Custom([32]u8,[32]u8,hash_map.AutoContext([32]u8),80) = <default>
@@ -861,27 +987,6 @@ slcp.core.qset_store.Store.order: field array_list.Aligned([32]u8,null) = <defau
 slcp.core.qset_store.Store.setAdvertised: fn (*engine.qset_store.Store, [32]u8, [32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store: struct
 slcp.core.qset_store: struct
-slcp.core.quorum.NodeId: type = [32]u8
-slcp.core.quorum.ParseNodeIdError: type = error{BadNodeIdHex,BadNodeIdLength}
-slcp.core.quorum.Quorum.JsonError: type = error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}
-slcp.core.quorum.Quorum.containsNode: fn (quorum.Quorum, [32]u8) bool
-slcp.core.quorum.Quorum.fromJson: fn (mem.Allocator, []const u8) error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}!quorum.Quorum
-slcp.core.quorum.Quorum.inner_sets: field []const quorum.Quorum = <default>
-slcp.core.quorum.Quorum.majorityOf: fn ([]const [32]u8) quorum.Quorum
-slcp.core.quorum.Quorum.memberCount: fn (quorum.Quorum) usize
-slcp.core.quorum.Quorum.of: fn (u32, []const [32]u8) quorum.Quorum
-slcp.core.quorum.Quorum.ofSets: fn (u32, []const quorum.Quorum) quorum.Quorum
-slcp.core.quorum.Quorum.threshold: field u32
-slcp.core.quorum.Quorum.toOwned: fn (quorum.Quorum, mem.Allocator) error{OutOfMemory}!engine.qset.QuorumSetOwned
-slcp.core.quorum.Quorum.twoThirdsOf: fn ([]const [32]u8) quorum.Quorum
-slcp.core.quorum.Quorum.twoThirdsOfSets: fn ([]const quorum.Quorum) quorum.Quorum
-slcp.core.quorum.Quorum.validators: field []const [32]u8 = <default>
-slcp.core.quorum.Quorum.writeJson: fn (*Io.Writer, *const engine.qset.QuorumSetOwned) error{WriteFailed}!void
-slcp.core.quorum.Quorum: struct
-slcp.core.quorum.nodeId: fn (comptime *const [64]u8) [32]u8
-slcp.core.quorum.nodeIdHex: fn ([32]u8) [64]u8
-slcp.core.quorum.parseNodeId: fn ([]const u8) error{BadNodeIdHex,BadNodeIdLength}![32]u8
-slcp.core.quorum: struct
 slcp.core.slot.NodeId: type = [32]u8
 slcp.core.slot.Slot.ballot: field engine.ballot.State = <default>
 slcp.core.slot.Slot.deinit: fn (*engine.slot.Slot, mem.Allocator) void
@@ -1007,8 +1112,6 @@ slcp.core.values.dupe: fn (mem.Allocator, []const u8) error{OutOfMemory}![]u8
 slcp.core.values.order: fn ([]const u8, []const u8) math.Order
 slcp.core.values: struct
 slcp.core: struct
-slcp.keys.createNew: fn (Io, []const u8) error{AccessDenied,AntivirusInterference,BadPathName,BrokenPipe,Canceled,CrossDevice,DeviceBusy,DirNotEmpty,DiskQuota,EntropyUnavailable,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,HardwareFailure,IdentityElement,InputOutput,IsDir,KeyFileExists,LinkQuotaExceeded,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,OperationUnsupported,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.keys.KeyPair
-slcp.keys.load: fn (Io, []const u8) error{AccessDenied,AntivirusInterference,BadKeyFile,BadPathName,Canceled,DeviceBusy,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,IdentityElement,InputOutput,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForReading,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,Unseekable,WouldBlock}!node.keys.KeyPair
 slcp.keys: struct
 slcp.lint_report.Level.members: field u32
 slcp.lint_report.Level.threshold: field u32
@@ -1027,23 +1130,12 @@ slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFail
 slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding) error{WriteFailed}!void
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
-slcp.node.CreateError: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
-slcp.node.DeliveryHook.ctx: field *anyopaque
-slcp.node.DeliveryHook.on_externalized: field *const fn (*anyopaque, u64, []const u8) anyerror!void
-slcp.node.DeliveryHook.on_failed: field *const fn (*anyopaque, anyerror) void
-slcp.node.DeliveryHook: struct
-slcp.node.Diagnostic.buf: field [1024]u8 = <default>
-slcp.node.Diagnostic.len: field usize = 0
-slcp.node.Diagnostic.message: fn (*const node.node.Diagnostic) []const u8
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
-slcp.node.Diagnostic: struct
-slcp.node.Error: type = error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
 slcp.node.Node.delivery: field ?node.node.DeliveryHook
 slcp.node.Node.eng: field engine.engine.Engine
 slcp.node.Node.engine_thread: field ?Thread = null
-slcp.node.Node.explain: fn (error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}) []const u8
 slcp.node.Node.ext_closed: field bool = false
 slcp.node.Node.ext_cond: field Io.Condition = <default>
 slcp.node.Node.ext_mu: field Io.Mutex = <default>
@@ -1077,11 +1169,8 @@ slcp.node.Node.resync_thread: field ?Thread = null
 slcp.node.Node.store: field node.store.Store
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel
-slcp.node.ProposeError: type = error{OutOfMemory,ValueEmpty,ValueTooLarge,WatcherCannotPropose}
-slcp.node.explain: fn (error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}) []const u8
 slcp.node.msTimeout: fn (u64) Io.Timeout
 slcp.node: struct
-slcp.nodeId: fn (comptime *const [64]u8) [32]u8
 slcp.overlay.Callbacks.ctx: field ?*anyopaque = null
 slcp.overlay.Callbacks.on_peer_down: field ?*const fn (?*anyopaque, usize) void = null
 slcp.overlay.Callbacks.on_peer_up: field *const fn (?*anyopaque, usize) void
@@ -1139,7 +1228,6 @@ slcp.overlay.parseHostPort: fn ([]const u8) error{BadPeerSpec}!node.overlay.Host
 slcp.overlay.setTestLinkFilter: fn (?*const fn ([32]u8, [32]u8) bool) void
 slcp.overlay.validatePeerSpec: fn ([]const u8) error{BadHost,BadPort,EmptyHost,MissingPort}!void
 slcp.overlay: struct
-slcp.parseNodeId: fn ([]const u8) error{BadNodeIdHex,BadNodeIdLength}![32]u8
 slcp.store.Error: type = error{BadRecord,IoFailed,OutOfMemory}
 slcp.store.ExtRecord.slot: field u64
 slcp.store.ExtRecord.value: field []u8

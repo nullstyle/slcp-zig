@@ -719,9 +719,12 @@ pub fn build(b: *std.Build) void {
     // would then answer a hand-edited snapshot from the previous pass. See
     // docs/upstream/06-check-api-cache-and-fmt-clean-gen.md.
     //
-    // `check-api` / `api-closure` are deliberately NOT folded into `test`
-    // yet: the surface is still moving through M6. S6 (the API freeze) adds
-    // them; only the tool's unit tests run under `test` today.
+    // Since the S6 API freeze, `check-api` and `api-closure` are inside
+    // `test` (design §13.8): a Stable drift or an unclosed Stable signature
+    // is red at the gate, on every OS. Locally that means `zig build test`
+    // refreshes docs/api-snapshot-experimental.txt in place when it drifted
+    // (commit it); CI's ubuntu leg passes -Dstrict-experimental=true so a
+    // stale committed copy is red there.
     const strict_experimental = b.option(
         bool,
         "strict-experimental",
@@ -759,6 +762,10 @@ pub fn build(b: *std.Build) void {
     run_api_closure.has_side_effects = true;
     const api_closure_step = b.step("api-closure", "Fail when a Stable signature mentions an Experimental type");
     api_closure_step.dependOn(&run_api_closure.step);
+
+    // The API freeze gate (§13.8) is part of `test` from S6 on.
+    test_step.dependOn(check_api_step);
+    test_step.dependOn(api_closure_step);
 
     // The tool's own unit tests (error-set sort, line normalization, the ABI
     // text parser on fixtures AND on the real ABI source — hence cwd + side
