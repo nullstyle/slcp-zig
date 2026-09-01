@@ -35,6 +35,14 @@ pub const NodeOptions = node.Options;
 
 // ===== M6:appnode exports =====
 // AppNode, Codec, Validity, Driver, DeliveryHook (M6 appnode stage; insert here only).
+/// Typed app layer (§8.5): `Codec(T)` auto-codec + the `AppNode(App)` comptime
+/// contract. `create` / `propose` / `waitApplied` land in M6 S3.
+pub const app_node = @import("node/app_node.zig");
+pub const AppNode = app_node.AppNode;
+pub const Codec = app_node.Codec;
+pub const Validity = core.driver.Validity;
+pub const Driver = core.driver.Driver;
+pub const DriverError = core.driver.DriverError;
 
 test {
     // Discover every node-layer module's tests under `zig build node-tests`.
