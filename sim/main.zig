@@ -63,11 +63,11 @@ pub fn main(init: std.process.Init) !void {
         "scenario={s} seed={d} n={d}: {s} after {d} events (virtual t={d}ms)\n" ++
             "  inputs={d} effects={d} sent={d} delivered={d} dropped(rand)={d} dropped(part)={d} dup={d} timers={d}\n",
         .{
-            @tagName(name),                 seed,                        nodes,
-            if (result.stalled) "STALLED" else "all externalized",      result.events_processed,
-            result.virtual_now_ms,          result.counts.inputs,        result.counts.effects,
-            result.counts.sent,             result.counts.delivered,     result.counts.dropped_random,
-            result.counts.dropped_partition, result.counts.duplicated,   result.counts.timer_fires,
+            @tagName(name),                                        seed,                         nodes,
+            if (result.stalled) "STALLED" else "all externalized", result.events_processed,      result.virtual_now_ms,
+            result.counts.inputs,                                  result.counts.effects,        result.counts.sent,
+            result.counts.delivered,                               result.counts.dropped_random, result.counts.dropped_partition,
+            result.counts.duplicated,                              result.counts.timer_fires,
         },
     );
     for (0..nodes) |i| {

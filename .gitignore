@@ -3,3 +3,9 @@ zig-cache/
 zig-out/
 zig-pkg/
 .claude/worktrees/
+preflight.log
+examples/counter/zig-out/
+examples/counter/.zig-cache/
+examples/counter/slcp.key
+examples/counter/slcp-data/
+examples/counter/counter.json

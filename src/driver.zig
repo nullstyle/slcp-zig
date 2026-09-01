@@ -23,7 +23,7 @@ pub const Driver = struct {
     /// combine = lexicographic max ("highest proposal wins"), extract = none.
     pub fn default() Driver {
         return .{
-            .ctx = @constCast(@ptrCast(&default_ctx)),
+            .ctx = @ptrCast(@constCast(&default_ctx)),
             .validate_value = defaultValidate,
             .combine_candidates = defaultCombine,
         };

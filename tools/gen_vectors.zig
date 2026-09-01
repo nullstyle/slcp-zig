@@ -288,7 +288,7 @@ fn renderCrypto(gpa: std.mem.Allocator, statements: []const StatementVector) ![]
 
     try w.writeAll("  ],\n  \"gi\": [\n");
     for (gi_cases, 0..) |c, i| {
-        const tag: crypto.GiTag = @enumFromInt(c.tag);
+        const tag: crypto.GiTag = @fromBackingInt(@intCast(c.tag));
         const value = crypto.gi(tag, c.slot, c.prev, c.round, c.m);
         try w.print("    {{\"tag\": {d}, \"slot\": {d}, \"prevValue\": ", .{ c.tag, c.slot });
         try jsonHex(w, c.prev);
@@ -1236,7 +1236,7 @@ const TraceRun = struct {
     fn earlier(a: TraceTimer, b: TraceTimer) bool {
         if (a.deadline != b.deadline) return a.deadline < b.deadline;
         if (a.slot != b.slot) return a.slot < b.slot;
-        return @intFromEnum(a.timer) < @intFromEnum(b.timer);
+        return @backingInt(a.timer) < @backingInt(b.timer);
     }
 };
 

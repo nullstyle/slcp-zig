@@ -52,7 +52,7 @@ pub fn gi(tag: GiTag, slot: u64, prev_value: []const u8, round: u32, m: []const 
     h.update(&slot_be);
     h.update(prev_value);
     var tag_be: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tag_be, @intFromEnum(tag), .big);
+    std.mem.writeInt(u32, &tag_be, @backingInt(tag), .big);
     h.update(&tag_be);
     var round_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &round_be, round, .big);

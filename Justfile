@@ -18,3 +18,21 @@ gen-check: gen
 # partition/heal, one equivocator (design §13.6). Minutes-scale.
 e2e:
     zig build e2e
+
+# ===== M6:quorum =====
+# M6 stage anchor (quorum): cli / lint-quorum / vectors-sweep recipes go here.
+
+# ===== M6:appnode =====
+# M6 stage anchor (appnode).
+
+# ===== M6:example =====
+# M6 stage anchor (example): example-smoke / example-build recipes go here.
+
+# ===== M6:docs =====
+# M6 stage anchor (docs): docs-smoke recipe goes here.
+
+# ===== M6:apisnap_ci =====
+# M6 stage anchor (apisnap_ci): fmt / fmt-check / ci-lint / api-snapshot / check-api go here.
+
+# ===== M6:release =====
+# M6 stage anchor (release): preflight / package-preflight / release-hash / release-tag / verify-release-hash go here.

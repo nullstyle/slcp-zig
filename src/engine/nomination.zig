@@ -451,7 +451,6 @@ test "pickLeaderValue: max-Gi selection, single value, empty list" {
     try testing.expectEqual(@as(?usize, 1), pickLeaderValue(r, &dup));
 }
 
-
 // ---------------------------------------------------------------------------
 // M2: per-slot nomination protocol state (design §5.4 nomination.zig bullet).
 // The X/Y/Z sets, round tracking, and leader accumulation for one slot.

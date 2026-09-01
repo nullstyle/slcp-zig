@@ -527,7 +527,6 @@ pub const Node = struct {
     // Engine thread
     // -------------------------------------------------------------------
 
-
     const EmitTarget = union(enum) { all, one: usize, except: usize };
 
     /// Envelope-emit chokepoint. The engine's latest maps can hold ZERO-FRAME
@@ -648,10 +647,10 @@ pub const Node = struct {
                 }
             },
             .arm_timer => |a| {
-                self.wheel.arm(a.slot, @intFromEnum(a.timer), a.delay_ms) catch |e|
+                self.wheel.arm(a.slot, @backingInt(a.timer), a.delay_ms) catch |e|
                     log.err("timer arm failed: {s}", .{@errorName(e)});
             },
-            .cancel_timer => |c| self.wheel.cancel(c.slot, @intFromEnum(c.timer)),
+            .cancel_timer => |c| self.wheel.cancel(c.slot, @backingInt(c.timer)),
             .request_qset => |r| {
                 if (!self.live) return;
                 self.noteQsetRequested(r.hash);
@@ -953,7 +952,7 @@ pub const Node = struct {
         // Drop stale fires for purged slots (a cancel can race an in-flight
         // fire; feeding a purged slot back would resurrect its state).
         if (slot < self.purge_floor.load(.acquire)) return;
-        const timer: engine.TimerId = @enumFromInt(@as(u8, @intCast(timer_id)));
+        const timer: engine.TimerId = @fromBackingInt(@intCast(@as(u8, @intCast(timer_id))));
         self.q.push(.{ .input = .{ .timer_fired = .{ .slot = slot, .timer = timer } }, .source_peer = null });
     }
 };
@@ -1020,14 +1019,14 @@ test "node: every method compiles (forces body analysis without instantiation)" 
     // check for the Node spine, which the socket-driven e2e exercises at
     // runtime.
     const fns = .{
-        Node.create,      Node.deinit,         Node.propose,
-        Node.waitExternalized, Node.stats,     Node.boundPort,
-        Node.engineLoop,  Node.applyInput,     Node.markFailed,
-        Node.dispatch,    Node.onExternalized, Node.maybeStartNomination,
-        Node.recordOwnLatest, Node.pruneOwnLatest, Node.onRecv,
-        Node.onPeerUp,    Node.enqueueEnvelope, Node.onQsetFrame,
-        Node.answerGetQset, Node.answerGetSlotState, Node.onTimerFire,
-        Node.drainDeliverable, Node.noteQsetRequested, Node.consumeQsetRequested,
+        Node.create,           Node.deinit,             Node.propose,
+        Node.waitExternalized, Node.stats,              Node.boundPort,
+        Node.engineLoop,       Node.applyInput,         Node.markFailed,
+        Node.dispatch,         Node.onExternalized,     Node.maybeStartNomination,
+        Node.recordOwnLatest,  Node.pruneOwnLatest,     Node.onRecv,
+        Node.onPeerUp,         Node.enqueueEnvelope,    Node.onQsetFrame,
+        Node.answerGetQset,    Node.answerGetSlotState, Node.onTimerFire,
+        Node.drainDeliverable, Node.noteQsetRequested,  Node.consumeQsetRequested,
         Node.resyncLoop,
     };
     inline for (fns) |f| {

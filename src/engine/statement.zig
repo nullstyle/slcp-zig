@@ -253,7 +253,7 @@ pub fn isNewerStatement(old: gen_slcp.Statement.Reader, new: gen_slcp.Statement.
 
     // Ballot protocol: statement type PREPARE < CONFIRM < EXTERNALIZE
     // (WhichTag ints preserve this order).
-    if (old_tag != new_tag) return @intFromEnum(old_tag) < @intFromEnum(new_tag);
+    if (old_tag != new_tag) return @backingInt(old_tag) < @backingInt(new_tag);
     switch (new_tag) {
         // can't have duplicate EXTERNALIZE statements
         .externalize => return false,

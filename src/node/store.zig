@@ -344,7 +344,7 @@ pub const Store = struct {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lessThan(_: void, a: Entry, b: Entry) bool {
                 if (a.slot != b.slot) return a.slot < b.slot;
-                return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+                return @backingInt(a.kind) < @backingInt(b.kind);
             }
         }.lessThan);
 

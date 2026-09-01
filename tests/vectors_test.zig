@@ -301,7 +301,7 @@ test "sanity vectors: statement sanity replay" {
             .string => |expected| {
                 try std.testing.expect(result != null);
                 try std.testing.expectEqualStrings(expected, @tagName(result.?));
-                arm_seen[@intFromEnum(result.?)] = true;
+                arm_seen[@backingInt(result.?)] = true;
             },
             else => return error.MalformedVector,
         }
@@ -310,7 +310,7 @@ test "sanity vectors: statement sanity replay" {
     // encoding is pinned by the third)
     try std.testing.expect(sane_seen >= 3);
     for (std.enums.values(statement.InsaneReason)) |arm| {
-        if (!arm_seen[@intFromEnum(arm)]) {
+        if (!arm_seen[@backingInt(arm)]) {
             std.debug.print("no sanity vector for InsaneReason.{s}\n", .{@tagName(arm)});
             return error.MissingInsaneReasonArm;
         }

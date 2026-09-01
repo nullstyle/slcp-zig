@@ -1,13 +1,13 @@
 .{
     .name = .slcp,
-    .version = "0.0.0",
-    .minimum_zig_version = "0.17.0-dev.1683",
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0-dev.1786",
     .dependencies = .{
         .capnpc_zig = .{
             .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.16.0.tar.gz",
             .hash = "capnpc_zig-0.16.0-nUduFXLZNgAmDvsQZOn7lNOEtNbRBYquaALRB24zUAvS",
         },
     },
-    .paths = .{""},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "schema" },
     .fingerprint = 0x7d6ab72da9f52a7,
 }

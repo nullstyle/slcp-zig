@@ -213,7 +213,7 @@ pub fn checkEngine(eng: *const engine.Engine, tracker: *Tracker, gpa: std.mem.Al
             }
             t.max_b_counter = b.counter;
         }
-        if (@intFromEnum(bs.phase) < @intFromEnum(t.phase)) {
+        if (@backingInt(bs.phase) < @backingInt(t.phase)) {
             return .{ .slot = slot_index, .msg = "phase moved backwards" };
         }
         t.phase = bs.phase;

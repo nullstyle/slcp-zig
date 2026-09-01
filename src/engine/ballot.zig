@@ -377,7 +377,7 @@ fn cachedValidate(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, value: []const u8) !d
 }
 
 fn minValidity(a: driver_mod.Validity, b: driver_mod.Validity) driver_mod.Validity {
-    return @enumFromInt(@min(@intFromEnum(a), @intFromEnum(b)));
+    return @fromBackingInt(@intCast(@min(@backingInt(a), @backingInt(b))));
 }
 
 /// Minimum validation level over all values referenced by `st` (oracle:

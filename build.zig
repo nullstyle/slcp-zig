@@ -478,4 +478,34 @@ pub fn build(b: *std.Build) void {
     run_e2e.has_side_effects = true; // real sockets/files: never answer from cache
     const e2e_step = b.step("e2e", "Run the 4-node end-to-end cluster (200 slots, kill/restart, partition/heal, equivocator)");
     e2e_step.dependOn(&run_e2e.step);
+
+    // ===== M6:quorum =====
+    // M6 stage anchor (quorum): cli exe + cli tests + node_create tests land
+    // here and only here. The six M6 anchors stay in this order — later
+    // anchors may reference symbols declared under earlier ones.
+
+    // ===== M6:appnode =====
+    // M6 stage anchor (appnode): appnode-errors expected-fail compile step,
+    // codec fuzz target. Insert under this anchor only; never above it.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // ===== M6:example =====
+    // M6 stage anchor (example): counter-intree compile, example_smoke tool
+    // and its run steps. Insert under this anchor only; never above it.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // ===== M6:docs =====
+    // M6 stage anchor (docs): docs_smoke tool + run step, bytes_node example
+    // compile, the docs-smoke step. Insert under this anchor only.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // ===== M6:apisnap_ci =====
+    // M6 stage anchor (apisnap_ci): api-snapshot / check-api / api-closure
+    // steps and the tool's tests. Insert under this anchor only.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // ===== M6:release =====
+    // M6 stage anchor (release): the preflight aggregate step. Insert under
+    // this anchor only; it may reference every step declared above.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
 }

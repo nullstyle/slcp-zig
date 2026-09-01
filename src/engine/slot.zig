@@ -106,7 +106,7 @@ const TestLookup = struct {
     entries: []const Entry,
 
     fn get(ctx: *const anyopaque, node: NodeId) ?*const qset.QuorumSetOwned {
-        const self: *const TestLookup = @alignCast(@ptrCast(ctx));
+        const self: *const TestLookup = @ptrCast(@alignCast(ctx));
         for (self.entries) |e| {
             if (std.mem.eql(u8, &e.id, &node)) return e.qs;
         }

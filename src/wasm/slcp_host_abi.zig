@@ -80,7 +80,7 @@ var last_error_code: u32 = 0;
 var last_error_msg: []const u8 = "";
 
 fn setError(code: ErrorCode, msg: []const u8) void {
-    last_error_code = @intFromEnum(code);
+    last_error_code = @backingInt(code);
     last_error_msg = msg; // static strings only — never freed
 }
 
@@ -397,8 +397,8 @@ pub fn encodeLint(alloc: std.mem.Allocator, findings: []const qset.LintFinding) 
         const list = try root.initFindings(@intCast(findings.len));
         for (findings, 0..) |f, i| {
             var b = try list.get(@intCast(i));
-            try b.setLevel(@intFromEnum(f.level));
-            try b.setCode(@intFromEnum(f.code));
+            try b.setLevel(@backingInt(f.level));
+            try b.setCode(@backingInt(f.code));
             try b.setMembers(f.members);
             try b.setThreshold(f.threshold);
         }

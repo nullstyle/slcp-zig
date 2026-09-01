@@ -66,7 +66,7 @@ pub fn encodeInput(gpa: std.mem.Allocator, input: engine.Input) ![]u8 {
         .timer_fired => |a| {
             var tk = try b.initTimerFired();
             try tk.setSlot(a.slot);
-            try tk.setTimer(@intFromEnum(a.timer));
+            try tk.setTimer(@backingInt(a.timer));
         },
         .nominate => |a| {
             var n = try b.initNominate();
@@ -190,24 +190,24 @@ pub fn encodeEffect(gpa: std.mem.Allocator, effect: *const engine.Effect) ![]u8 
         .arm_timer => |t| {
             var a = try b.initArmTimer();
             try a.setSlot(t.slot);
-            try a.setTimer(@intFromEnum(t.timer));
+            try a.setTimer(@backingInt(t.timer));
             try a.setDelayMs(t.delay_ms);
         },
         .cancel_timer => |t| {
             var tk = try b.initCancelTimer();
             try tk.setSlot(t.slot);
-            try tk.setTimer(@intFromEnum(t.timer));
+            try tk.setTimer(@backingInt(t.timer));
         },
         .request_qset => |rq| try b.setRequestQset(&rq.hash),
         .externalized => |sb| {
             var s = try b.initExternalized();
             try setSlotBytes(&s, sb);
         },
-        .input_status => |st| try b.setInputStatus(@intFromEnum(st.code)),
+        .input_status => |st| try b.setInputStatus(@backingInt(st.code)),
         .phase_event => |p| {
             var pe = try b.initPhaseEvent();
             try pe.setSlot(p.slot);
-            try pe.setKind(@intFromEnum(p.kind));
+            try pe.setKind(@backingInt(p.kind));
             try pe.setDetail(p.detail);
         },
     }

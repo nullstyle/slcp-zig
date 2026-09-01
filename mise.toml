@@ -1,6 +1,8 @@
 [tools]
 just = "latest"
-capnp = "latest"
+# capnp (the C++ compiler) is installed out of band — `brew install capnp` /
+# `apt-get install capnproto` — and is needed only for `just gen`. It is not
+# in mise's tool registry (`mise install` exits 1 with it listed).
 
 # THE single Zig version specifier for this repo (capnp-zig's convention):
 # build.zig.zon holds only a FLOOR (minimum_zig_version), never a second pin.

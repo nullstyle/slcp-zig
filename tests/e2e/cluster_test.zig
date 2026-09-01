@@ -269,7 +269,6 @@ const Cluster = struct {
     }
 };
 
-
 /// Bounded progress wait (a stalled cluster must FAIL the test with a
 /// timeout, never hang the runner — review finding).
 fn waitFor(io: std.Io, deadline_ms: u64, cl: *Cluster, pred: *const fn (*Cluster) bool) !void {

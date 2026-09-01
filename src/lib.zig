@@ -30,6 +30,12 @@ pub const node = @import("node/node.zig");
 pub const Node = node.Node;
 pub const NodeOptions = node.Options;
 
+// ===== M6:quorum exports =====
+// Quorum spec, nodeId helpers, lint_report (M6 quorum stage; insert here only).
+
+// ===== M6:appnode exports =====
+// AppNode, Codec, Validity, Driver, DeliveryHook (M6 appnode stage; insert here only).
+
 test {
     // Discover every node-layer module's tests under `zig build node-tests`.
     std.testing.refAllDecls(@This());
