@@ -815,13 +815,18 @@ pub const LintFinding = struct {
             return self._reader.readU32(8);
         }
 
+        pub fn getNode(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(0)) return &[_]u8{};
+            return try self._reader.readData(0);
+        }
+
     };
 
     pub const Builder = struct {
         _builder: message.StructBuilder,
 
         pub fn init(msg: *message.MessageBuilder) !Builder {
-            const builder = try msg.allocateStruct(2, 0);
+            const builder = try msg.allocateStruct(2, 1);
             return .{ ._builder = builder };
         }
 
@@ -843,6 +848,10 @@ pub const LintFinding = struct {
 
         pub fn setThreshold(self: *Builder, value: u32) !void {
             self._builder.writeU32(8, @bitCast(value));
+        }
+
+        pub fn setNode(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(0, value);
         }
 
     };
@@ -885,7 +894,7 @@ pub const LintDiagnostics = struct {
         }
 
         pub fn initFindings(self: *Builder, element_count: u32) !StructListBuilder(LintFinding) {
-            const raw = try self._builder.writeStructList(0, element_count, 2, 0);
+            const raw = try self._builder.writeStructList(0, element_count, 2, 1);
             return StructListBuilder(LintFinding){ ._list = raw };
         }
 

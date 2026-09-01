@@ -58,5 +58,6 @@ struct LintFinding {
   code      @1 :UInt16;   # qset.LintCode ordinal
   members   @2 :UInt32;   # top-level member count n
   threshold @3 :UInt32;
+  node      @4 :Data;     # 32 bytes, present only for code == critical_node (3); ABSENT pointer otherwise
 }
 struct LintDiagnostics { findings @0 :List(LintFinding); }

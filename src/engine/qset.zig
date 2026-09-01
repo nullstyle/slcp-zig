@@ -268,17 +268,21 @@ pub fn hashNormalized(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) ![32]u8
 }
 
 // ---------------------------------------------------------------------------
-// Lint (§12) — first cut, M0 scope. Judges the LOCAL top-level configuration;
-// deeper slice analysis is M6 polish. Findings are emitted in a fixed order
-// so lint output is byte-stable for the lint.json vectors.
+// Lint (§12) — v2 (M6). The top-level threshold checks judge the LOCAL
+// configuration; `critical_node` is tree-wide (a validator present in every
+// slice). Lint never reasons about OTHER nodes' qsets (no cross-node
+// intersection analysis — see threat-model §4). Findings are emitted in a
+// fixed order so lint output is byte-stable for the lint.json vectors.
 // ---------------------------------------------------------------------------
 
 pub const LintLevel = enum { err, warning };
 
+/// Ordinals are the wire `LintFinding.code` (host.capnp) — append-only.
 pub const LintCode = enum {
     sub_majority_threshold, // error: two disjoint "quorums" can exist in your own slice
     below_two_thirds, // warning: threshold < ceil(2n/3) — weak Byzantine margin
     all_members_critical, // warning: threshold == n — any single member offline halts you
+    critical_node, // warning: THIS validator is in every slice — it alone offline halts you
 };
 
 pub const LintFinding = struct {
@@ -286,9 +290,14 @@ pub const LintFinding = struct {
     code: LintCode,
     members: u32, // top-level member count n
     threshold: u32,
+    /// Set only for `critical_node` (the validator in question); null otherwise.
+    /// On the wire this is `LintFinding.node @4` — an ABSENT pointer when null.
+    node: ?NodeId = null,
 };
 
 /// Lint a NORMALIZED local quorum set. Caller frees the returned slice.
+/// Order: the three top-level findings (each at most once, in enum order),
+/// then one `critical_node` per critical validator, ascending by bytes.
 pub fn lint(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) ![]LintFinding {
     var findings: std.ArrayList(LintFinding) = .empty;
     defer findings.deinit(gpa);
@@ -308,7 +317,86 @@ pub fn lint(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) ![]LintFinding {
         try findings.append(gpa, .{ .level = .warning, .code = .all_members_critical, .members = n, .threshold = t });
     }
 
+    const critical = try criticalNodes(gpa, qs);
+    defer gpa.free(critical);
+    for (critical) |id| {
+        try findings.append(gpa, .{ .level = .warning, .code = .critical_node, .members = n, .threshold = t, .node = id });
+    }
+
     return findings.toOwnedSlice(gpa);
+}
+
+/// Size of the smallest set of validators whose simultaneous outage makes
+/// `qs` unsatisfiable (the §12 "halts if any K of these are offline" K).
+/// Validator → 1; set → sum of the (n − t + 1) smallest member values. Exact
+/// for validated trees (members are disjoint, so the cheapest way to knock
+/// out n − t + 1 members is the n − t + 1 cheapest ones).
+pub fn minBlockingSize(qs: *const QuorumSetOwned) u32 {
+    var costs: [max_total_validators + 1]u32 = undefined;
+    var len: usize = 0;
+    for (qs.validators) |_| {
+        if (len < costs.len) {
+            costs[len] = 1;
+            len += 1;
+        }
+    }
+    for (qs.inner_sets) |*inner| {
+        if (len < costs.len) {
+            costs[len] = minBlockingSize(inner);
+            len += 1;
+        }
+    }
+    const members = costs[0..len];
+    std.mem.sort(u32, members, {}, std.sort.asc(u32));
+    const n: u32 = @intCast(members.len);
+    if (qs.threshold == 0 or qs.threshold > n) return 0; // unvalidated shapes: nothing to block / already blocked
+    const need: usize = n - qs.threshold + 1;
+    var sum: u32 = 0;
+    for (members[0..need]) |c| sum += c;
+    return sum;
+}
+
+/// Does `qs` still have a satisfiable slice when `node` is offline? Direct
+/// counting definition over the tree: a validator counts unless it IS `node`;
+/// an inner set counts if it is itself satisfiable without `node`. Equals
+/// `!local_node.isVBlocking(qs, &.{node})` (property-tested there).
+pub fn isSatisfiableWithout(qs: *const QuorumSetOwned, node: NodeId) bool {
+    var sat: u32 = 0;
+    for (qs.validators) |*v| {
+        if (!std.mem.eql(u8, v, &node)) sat += 1;
+    }
+    for (qs.inner_sets) |*inner| {
+        if (isSatisfiableWithout(inner, node)) sat += 1;
+    }
+    return sat >= qs.threshold;
+}
+
+/// Every validator in the tree whose outage alone makes `qs` unsatisfiable,
+/// ascending by bytes. Caller frees.
+pub fn criticalNodes(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) ![]NodeId {
+    var all: std.ArrayList(NodeId) = .empty;
+    defer all.deinit(gpa);
+    try collectValidators(gpa, qs, &all);
+    std.mem.sort(NodeId, all.items, {}, nodeIdLessThan);
+
+    var out: std.ArrayList(NodeId) = .empty;
+    defer out.deinit(gpa);
+    for (all.items, 0..) |id, i| {
+        if (i > 0 and std.mem.eql(u8, &all.items[i - 1], &id)) continue; // unvalidated duplicate
+        if (!isSatisfiableWithout(qs, id)) try out.append(gpa, id);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Is `node` a validator anywhere in the tree?
+pub fn containsNode(qs: *const QuorumSetOwned, node: NodeId) bool {
+    for (qs.validators) |*v| {
+        if (std.mem.eql(u8, v, &node)) return true;
+    }
+    for (qs.inner_sets) |*inner| {
+        if (containsNode(inner, node)) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +641,9 @@ test "exciseNode: re-normalization flattens an inner set reduced to 1-of-1" {
     try std.testing.expectEqualSlices(u8, &nodeId(2), &out.validators[1]);
 }
 
+// Non-vacuity: dropping the `critical_node` loop in `lint` → the 3-of-3 case
+// has 1 finding, not 4, and 1-of-1 has 0; setting `node` on every finding →
+// the `node == null` checks on the first findings go red.
 test "lint: 2-of-3 warns below-two-thirds is absent, 1-of-3 is sub-majority, 3-of-3 critical" {
     const gpa = std.testing.allocator;
 
@@ -571,14 +662,197 @@ test "lint: 2-of-3 warns below-two-thirds is absent, 1-of-3 is sub-majority, 3-o
     try std.testing.expectEqual(@as(usize, 2), f2.len);
     try std.testing.expectEqual(LintLevel.err, f2[0].level);
     try std.testing.expectEqual(LintCode.sub_majority_threshold, f2[0].code);
+    try std.testing.expectEqual(LintCode.below_two_thirds, f2[1].code);
+    try std.testing.expect(f2[0].node == null and f2[1].node == null);
 
-    var all_of_three = try ownedFlat(gpa, 3, &.{ 1, 2, 3 });
+    // 3-of-3: the top-level finding first, then one critical_node per
+    // validator in ascending byte order, `node` set only on those.
+    var all_of_three = try ownedFlat(gpa, 3, &.{ 3, 1, 2 });
     defer all_of_three.deinit(gpa);
     try validateAndNormalize(gpa, &all_of_three);
     const f3 = try lint(gpa, &all_of_three);
     defer gpa.free(f3);
-    try std.testing.expectEqual(@as(usize, 1), f3.len);
+    try std.testing.expectEqual(@as(usize, 4), f3.len);
     try std.testing.expectEqual(LintCode.all_members_critical, f3[0].code);
+    try std.testing.expect(f3[0].node == null);
+    for (f3[1..], 1..) |f, i| {
+        try std.testing.expectEqual(LintLevel.warning, f.level);
+        try std.testing.expectEqual(LintCode.critical_node, f.code);
+        try std.testing.expectEqual(@as(u32, 3), f.members);
+        try std.testing.expectEqual(@as(u32, 3), f.threshold);
+        try std.testing.expectEqualSlices(u8, &nodeId(@intCast(i)), &f.node.?);
+    }
+
+    // 1-of-1: no top-level finding, exactly one critical_node.
+    var single = try ownedFlat(gpa, 1, &.{7});
+    defer single.deinit(gpa);
+    try validateAndNormalize(gpa, &single);
+    const f4 = try lint(gpa, &single);
+    defer gpa.free(f4);
+    try std.testing.expectEqual(@as(usize, 1), f4.len);
+    try std.testing.expectEqual(LintCode.critical_node, f4[0].code);
+    try std.testing.expectEqualSlices(u8, &nodeId(7), &f4[0].node.?);
+
+    // 3-of-5: unchanged first finding, no critical nodes.
+    var three_of_five = try ownedFlat(gpa, 3, &.{ 1, 2, 3, 4, 5 });
+    defer three_of_five.deinit(gpa);
+    try validateAndNormalize(gpa, &three_of_five);
+    const f5 = try lint(gpa, &three_of_five);
+    defer gpa.free(f5);
+    try std.testing.expectEqual(@as(usize, 1), f5.len);
+    try std.testing.expectEqual(LintCode.below_two_thirds, f5[0].code);
+}
+
+/// Test-only nested builder: `threshold`-of-{validators..., inner sets...}.
+fn ownedNested(gpa: std.mem.Allocator, threshold: u32, validator_bytes: []const u8, inners: []const QuorumSetOwned) !QuorumSetOwned {
+    const vals = try gpa.alloc(NodeId, validator_bytes.len);
+    for (validator_bytes, 0..) |b, i| vals[i] = nodeId(b);
+    return .{ .threshold = threshold, .validators = vals, .inner_sets = try gpa.dupe(QuorumSetOwned, inners) };
+}
+
+/// Reference for `minBlockingSize`: the smallest |S| over ALL subsets S of the
+/// tree's validators such that the tree is unsatisfiable with S offline
+/// (direct counting over the complement). n <= 9 validators → 512 subsets.
+fn bruteMinBlocking(gpa: std.mem.Allocator, qs: *const QuorumSetOwned) !u32 {
+    var all: std.ArrayList(NodeId) = .empty;
+    defer all.deinit(gpa);
+    try collectValidators(gpa, qs, &all);
+    std.debug.assert(all.items.len <= 9);
+    var best: u32 = std.math.maxInt(u32);
+    var mask: u32 = 0;
+    while (mask < (@as(u32, 1) << @intCast(all.items.len))) : (mask += 1) {
+        var offline: [9]NodeId = undefined;
+        var k: usize = 0;
+        for (all.items, 0..) |id, i| {
+            if ((mask >> @intCast(i)) & 1 == 1) {
+                offline[k] = id;
+                k += 1;
+            }
+        }
+        if (k < best and !satisfiableWithoutSet(qs, offline[0..k])) best = @intCast(k);
+    }
+    return best;
+}
+
+fn satisfiableWithoutSet(qs: *const QuorumSetOwned, offline: []const NodeId) bool {
+    var sat: u32 = 0;
+    for (qs.validators) |*v| {
+        var off = false;
+        for (offline) |*o| {
+            if (std.mem.eql(u8, v, o)) off = true;
+        }
+        if (!off) sat += 1;
+    }
+    for (qs.inner_sets) |*inner| {
+        if (satisfiableWithoutSet(inner, offline)) sat += 1;
+    }
+    return sat >= qs.threshold;
+}
+
+// Non-vacuity: changing `need` to n − t (dropping the +1) makes 2-of-3 → 1
+// and 3-of-3 → 0; summing the LARGEST members instead of the smallest makes
+// 3-of-{A, org, org} → 2. Both diverge from the brute-force reference.
+test "minBlockingSize: hand table and brute-force subset reference agree" {
+    const gpa = std.testing.allocator;
+
+    const Flat = struct { t: u32, vals: []const u8, want: u32 };
+    const flats = [_]Flat{
+        .{ .t = 2, .vals = &.{ 1, 2, 3 }, .want = 2 },
+        .{ .t = 4, .vals = &.{ 1, 2, 3, 4, 5 }, .want = 2 },
+        .{ .t = 3, .vals = &.{ 1, 2, 3 }, .want = 1 },
+        .{ .t = 1, .vals = &.{1}, .want = 1 },
+        .{ .t = 1, .vals = &.{ 1, 2, 3 }, .want = 3 },
+    };
+    for (flats) |c| {
+        var qs = try ownedFlat(gpa, c.t, c.vals);
+        defer qs.deinit(gpa);
+        try validateAndNormalize(gpa, &qs);
+        try std.testing.expectEqual(c.want, minBlockingSize(&qs));
+        try std.testing.expectEqual(c.want, try bruteMinBlocking(gpa, &qs));
+    }
+
+    // 2-of-{org(2-of-3) × 3} → 2 + 2 = 4
+    var orgs = try ownedNested(gpa, 2, &.{}, &.{
+        try ownedFlat(gpa, 2, &.{ 0x10, 0x11, 0x12 }),
+        try ownedFlat(gpa, 2, &.{ 0x20, 0x21, 0x22 }),
+        try ownedFlat(gpa, 2, &.{ 0x30, 0x31, 0x32 }),
+    });
+    defer orgs.deinit(gpa);
+    try validateAndNormalize(gpa, &orgs);
+    try std.testing.expectEqual(@as(u32, 4), minBlockingSize(&orgs));
+    try std.testing.expectEqual(@as(u32, 4), try bruteMinBlocking(gpa, &orgs));
+
+    // 3-of-{A, org1(2-of-3), org2(2-of-3)} → smallest single member = A → 1
+    var mixed = try ownedNested(gpa, 3, &.{1}, &.{
+        try ownedFlat(gpa, 2, &.{ 0x10, 0x11, 0x12 }),
+        try ownedFlat(gpa, 2, &.{ 0x20, 0x21, 0x22 }),
+    });
+    defer mixed.deinit(gpa);
+    try validateAndNormalize(gpa, &mixed);
+    try std.testing.expectEqual(@as(u32, 1), minBlockingSize(&mixed));
+    try std.testing.expectEqual(@as(u32, 1), try bruteMinBlocking(gpa, &mixed));
+
+    // 2-of-{A, org1(2-of-3), org2(2-of-3)} → two smallest = 1 + 2 = 3
+    var mixed2 = try ownedNested(gpa, 2, &.{1}, &.{
+        try ownedFlat(gpa, 2, &.{ 0x10, 0x11, 0x12 }),
+        try ownedFlat(gpa, 2, &.{ 0x20, 0x21, 0x22 }),
+    });
+    defer mixed2.deinit(gpa);
+    try validateAndNormalize(gpa, &mixed2);
+    try std.testing.expectEqual(@as(u32, 3), minBlockingSize(&mixed2));
+    try std.testing.expectEqual(@as(u32, 3), try bruteMinBlocking(gpa, &mixed2));
+}
+
+// Non-vacuity: making `isSatisfiableWithout` ignore `node` (count every
+// validator) → no node is ever critical → the 3-of-3 and 2-of-{2-of-2 × 2}
+// expectations go red; dropping the sort → the ascending check on 3-of-3
+// built from {3,1,2} input still passes only because normalization sorted
+// the validators, but 2-of-{2-of-2 × 2} interleaves orgs and goes red.
+test "criticalNodes: none / all ascending / lone validator / every org member" {
+    const gpa = std.testing.allocator;
+
+    var two_of_three = try ownedFlat(gpa, 2, &.{ 1, 2, 3 });
+    defer two_of_three.deinit(gpa);
+    try validateAndNormalize(gpa, &two_of_three);
+    const c1 = try criticalNodes(gpa, &two_of_three);
+    defer gpa.free(c1);
+    try std.testing.expectEqual(@as(usize, 0), c1.len);
+
+    var all_of_three = try ownedFlat(gpa, 3, &.{ 3, 1, 2 });
+    defer all_of_three.deinit(gpa);
+    try validateAndNormalize(gpa, &all_of_three);
+    const c2 = try criticalNodes(gpa, &all_of_three);
+    defer gpa.free(c2);
+    try std.testing.expectEqual(@as(usize, 3), c2.len);
+    for (c2, 1..) |id, i| try std.testing.expectEqualSlices(u8, &nodeId(@intCast(i)), &id);
+
+    var mixed = try ownedNested(gpa, 3, &.{1}, &.{
+        try ownedFlat(gpa, 2, &.{ 0x10, 0x11, 0x12 }),
+        try ownedFlat(gpa, 2, &.{ 0x20, 0x21, 0x22 }),
+    });
+    defer mixed.deinit(gpa);
+    try validateAndNormalize(gpa, &mixed);
+    const c3 = try criticalNodes(gpa, &mixed);
+    defer gpa.free(c3);
+    try std.testing.expectEqual(@as(usize, 1), c3.len);
+    try std.testing.expectEqualSlices(u8, &nodeId(1), &c3[0]);
+    try std.testing.expect(containsNode(&mixed, nodeId(0x21)));
+    try std.testing.expect(!containsNode(&mixed, nodeId(0x99)));
+
+    // 2-of-{org(2-of-2) × 2}: every org member is critical (orgs are 2-of-2
+    // and both orgs are needed). Input orgs deliberately hold interleaved
+    // byte values so the ascending-by-bytes order is observable.
+    var pairs = try ownedNested(gpa, 2, &.{}, &.{
+        try ownedFlat(gpa, 2, &.{ 0x10, 0x30 }),
+        try ownedFlat(gpa, 2, &.{ 0x20, 0x40 }),
+    });
+    defer pairs.deinit(gpa);
+    try validateAndNormalize(gpa, &pairs);
+    const c4 = try criticalNodes(gpa, &pairs);
+    defer gpa.free(c4);
+    try std.testing.expectEqual(@as(usize, 4), c4.len);
+    const want4 = [_]u8{ 0x10, 0x20, 0x30, 0x40 };
+    for (c4, want4) |id, b| try std.testing.expectEqualSlices(u8, &nodeId(b), &id);
 }
 
 /// Deep copy; an already-normalized set stays normalized.

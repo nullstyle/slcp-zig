@@ -15,6 +15,7 @@ const canonical = slcp.canonical;
 const crypto = slcp.crypto;
 const nomination = slcp.nomination;
 const qset = slcp.qset;
+const quorum = slcp.quorum;
 const statement = slcp.statement;
 const gen_slcp = slcp.gen.slcp;
 
@@ -77,11 +78,8 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
 // Quorum-set specs → wire messages → normalize/hash outcomes
 // ---------------------------------------------------------------------------
 
-const QSpec = struct {
-    threshold: u32,
-    validators: []const qset.NodeId,
-    inners: []const QSpec = &.{},
-};
+/// Specs are the user-facing `slcp.Quorum` (borrowed slices, un-normalized).
+const QSpec = quorum.Quorum;
 
 fn writeSpecInto(b: *gen_slcp.QuorumSet.Builder, spec: QSpec) !void {
     try b.setThreshold(spec.threshold);
@@ -89,9 +87,9 @@ fn writeSpecInto(b: *gen_slcp.QuorumSet.Builder, spec: QSpec) !void {
         const vl = try b.initValidators(@intCast(spec.validators.len));
         for (spec.validators, 0..) |*v, i| try vl.set(@intCast(i), v);
     }
-    if (spec.inners.len > 0) {
-        const il = try b.initInnerSets(@intCast(spec.inners.len));
-        for (spec.inners, 0..) |inner, i| {
+    if (spec.inner_sets.len > 0) {
+        const il = try b.initInnerSets(@intCast(spec.inner_sets.len));
+        for (spec.inner_sets, 0..) |inner, i| {
             var ib = try il.get(@intCast(i));
             try writeSpecInto(&ib, inner);
         }
@@ -122,32 +120,15 @@ fn processSpec(gpa: std.mem.Allocator, spec: QSpec) !QsetOutcome {
     return .{ .ok = .{ .owned = owned, .hash = h } };
 }
 
-fn writeSpecJson(w: *std.Io.Writer, spec: QSpec) !void {
-    try w.print("{{\"threshold\":{d},\"validators\":[", .{spec.threshold});
-    for (spec.validators, 0..) |*v, i| {
-        if (i > 0) try w.writeByte(',');
-        try jsonHex(w, v);
-    }
-    try w.writeAll("],\"innerSets\":[");
-    for (spec.inners, 0..) |inner, i| {
-        if (i > 0) try w.writeByte(',');
-        try writeSpecJson(w, inner);
-    }
-    try w.writeAll("]}");
+/// The un-normalized INPUT spelling: a deep copy of the spec (never
+/// normalized) through the one quorum JSON writer.
+fn writeSpecJson(gpa: std.mem.Allocator, w: *std.Io.Writer, spec: QSpec) !void {
+    const owned = try spec.toOwned(gpa);
+    try quorum.Quorum.writeJson(w, &owned);
 }
 
 fn writeOwnedJson(w: *std.Io.Writer, owned: *const qset.QuorumSetOwned) !void {
-    try w.print("{{\"threshold\":{d},\"validators\":[", .{owned.threshold});
-    for (owned.validators, 0..) |*v, i| {
-        if (i > 0) try w.writeByte(',');
-        try jsonHex(w, v);
-    }
-    try w.writeAll("],\"innerSets\":[");
-    for (owned.inner_sets, 0..) |*inner, i| {
-        if (i > 0) try w.writeByte(',');
-        try writeOwnedJson(w, inner);
-    }
-    try w.writeAll("]}");
+    try quorum.Quorum.writeJson(w, owned);
 }
 
 fn ids(comptime bytes: []const u8) [bytes.len]qset.NodeId {
@@ -357,17 +338,17 @@ fn renderQset(gpa: std.mem.Allocator) ![]const u8 {
         .{ .name = "singleton inner set flattened into parent", .spec = .{
             .threshold = 2,
             .validators = &single_parent,
-            .inners = &.{.{ .threshold = 1, .validators = &single_inner }},
+            .inner_sets = &.{.{ .threshold = 1, .validators = &single_inner }},
         } },
         .{ .name = "nested 3 orgs, 2-of-3 orgs, majority within each", .spec = .{
             .threshold = 2,
             .validators = &.{},
-            .inners = &.{ org1, org2, org3 },
+            .inner_sets = &.{ org1, org2, org3 },
         } },
         .{ .name = "inner sets sorted by qsetHash", .spec = .{
             .threshold = 2,
             .validators = &.{},
-            .inners = &ord_desc,
+            .inner_sets = &ord_desc,
         } },
     };
 
@@ -377,7 +358,7 @@ fn renderQset(gpa: std.mem.Allocator) ![]const u8 {
         try w.writeAll("    {\"name\": ");
         try jsonString(w, c.name);
         try w.writeAll(",\n     \"input\": ");
-        try writeSpecJson(w, c.spec);
+        try writeSpecJson(gpa, w, c.spec);
         try w.writeAll(",\n     \"normalized\": ");
         try writeOwnedJson(w, &outcome.ok.owned);
         try w.writeAll(",\n     \"hash\": ");
@@ -394,10 +375,10 @@ fn renderQset(gpa: std.mem.Allocator) ![]const u8 {
 
     // Depth-5 chain: each wrapper is {threshold 1, no validators, one inner}.
     const level5: QSpec = .{ .threshold = 1, .validators = &deep_leaf };
-    const level4: QSpec = .{ .threshold = 1, .validators = &.{}, .inners = &.{level5} };
-    const level3: QSpec = .{ .threshold = 1, .validators = &.{}, .inners = &.{level4} };
-    const level2: QSpec = .{ .threshold = 1, .validators = &.{}, .inners = &.{level3} };
-    const level1: QSpec = .{ .threshold = 1, .validators = &.{}, .inners = &.{level2} };
+    const level4: QSpec = .{ .threshold = 1, .validators = &.{}, .inner_sets = &.{level5} };
+    const level3: QSpec = .{ .threshold = 1, .validators = &.{}, .inner_sets = &.{level4} };
+    const level2: QSpec = .{ .threshold = 1, .validators = &.{}, .inner_sets = &.{level3} };
+    const level1: QSpec = .{ .threshold = 1, .validators = &.{}, .inner_sets = &.{level2} };
 
     // 256 distinct validators (one splat byte each) breaches the 255 cap.
     const big_vals = try gpa.alloc(qset.NodeId, 256);
@@ -411,7 +392,7 @@ fn renderQset(gpa: std.mem.Allocator) ![]const u8 {
         .{ .name = "duplicate node across tree", .spec = .{
             .threshold = 2,
             .validators = &dup_top,
-            .inners = &.{.{ .threshold = 1, .validators = &dup_inner }},
+            .inner_sets = &.{.{ .threshold = 1, .validators = &dup_inner }},
         } },
         .{ .name = "depth five", .spec = level1 },
         .{ .name = "256 validators", .spec = .{ .threshold = 200, .validators = big_vals } },
@@ -423,7 +404,7 @@ fn renderQset(gpa: std.mem.Allocator) ![]const u8 {
         try w.writeAll("    {\"name\": ");
         try jsonString(w, r.name);
         try w.writeAll(",\n     \"input\": ");
-        try writeSpecJson(w, r.spec);
+        try writeSpecJson(gpa, w, r.spec);
         try w.writeAll(",\n     \"error\": ");
         try jsonString(w, @errorName(outcome.err));
         try w.writeAll(if (i + 1 < rejections.len) "},\n" else "}\n");
@@ -443,6 +424,13 @@ fn renderLint(gpa: std.mem.Allocator) ![]const u8 {
 
     const three = ids(&.{ 0x01, 0x02, 0x03 });
     const five = ids(&.{ 0x01, 0x02, 0x03, 0x04, 0x05 });
+    const one = ids(&.{0x01});
+    const org1_vals = ids(&.{ 0x10, 0x11, 0x12 });
+    const org2_vals = ids(&.{ 0x20, 0x21, 0x22 });
+    const org3_vals = ids(&.{ 0x30, 0x31, 0x32 });
+    const org1: QSpec = .{ .threshold = 2, .validators = &org1_vals };
+    const org2: QSpec = .{ .threshold = 2, .validators = &org2_vals };
+    const org3: QSpec = .{ .threshold = 2, .validators = &org3_vals };
 
     const Case = struct { name: []const u8, spec: QSpec };
     const cases = [_]Case{
@@ -450,6 +438,19 @@ fn renderLint(gpa: std.mem.Allocator) ![]const u8 {
         .{ .name = "sub-majority 1-of-3", .spec = .{ .threshold = 1, .validators = &three } },
         .{ .name = "all-critical 3-of-3", .spec = .{ .threshold = 3, .validators = &three } },
         .{ .name = "below-two-thirds 3-of-5", .spec = .{ .threshold = 3, .validators = &five } },
+        // M6 lint v2: nested shapes, the singleton, and the recipe 4-of-5.
+        .{ .name = "nested 3 orgs 2-of-3 majority within (clean)", .spec = .{
+            .threshold = 2,
+            .validators = &.{},
+            .inner_sets = &.{ org1, org2, org3 },
+        } },
+        .{ .name = "nested critical validator 3-of-{A, org1(2-of-3), org2(2-of-3)}", .spec = .{
+            .threshold = 3,
+            .validators = &one,
+            .inner_sets = &.{ org1, org2 },
+        } },
+        .{ .name = "singleton 1-of-1", .spec = .{ .threshold = 1, .validators = &one } },
+        .{ .name = "clean 4-of-5", .spec = .{ .threshold = 4, .validators = &five } },
     };
 
     try w.writeAll("{\n  \"version\": 1,\n  \"cases\": [\n");
@@ -460,7 +461,8 @@ fn renderLint(gpa: std.mem.Allocator) ![]const u8 {
         try w.writeAll("    {\"name\": ");
         try jsonString(w, c.name);
         try w.writeAll(",\n     \"input\": ");
-        try writeSpecJson(w, c.spec);
+        try writeSpecJson(gpa, w, c.spec);
+        try w.print(",\n     \"minBlocking\": {d}", .{qset.minBlockingSize(&owned)});
         try w.writeAll(",\n     \"findings\": [");
         for (findings, 0..) |f, j| {
             if (j > 0) try w.writeByte(',');
@@ -468,7 +470,12 @@ fn renderLint(gpa: std.mem.Allocator) ![]const u8 {
             try jsonString(w, @tagName(f.level));
             try w.writeAll(", \"code\": ");
             try jsonString(w, @tagName(f.code));
-            try w.print(", \"members\": {d}, \"threshold\": {d}}}", .{ f.members, f.threshold });
+            try w.print(", \"members\": {d}, \"threshold\": {d}", .{ f.members, f.threshold });
+            if (f.node) |n| {
+                try w.writeAll(", \"node\": ");
+                try jsonHex(w, &n);
+            }
+            try w.writeByte('}');
         }
         try w.writeAll("]");
         try w.writeAll(if (i + 1 < cases.len) "},\n" else "}\n");
@@ -916,7 +923,7 @@ fn renderLeaderCase(
     try w.print(", \"round\": {d}, \"localNode\": ", .{c.round});
     try jsonHex(w, &c.local);
     try w.writeAll(",\n     \"qset\": ");
-    try writeSpecJson(w, c.spec);
+    try writeSpecJson(gpa, w, c.spec);
 
     try w.writeAll(",\n     \"weights\": [");
     for (members, 0..) |node, i| {
@@ -979,7 +986,7 @@ fn renderLeader(gpa: std.mem.Allocator) ![]const u8 {
     const org1_vals = ids(&.{ 0x10, 0x11, 0x12 });
     const org2_vals = ids(&.{ 0x20, 0x21, 0x22 });
     const org3_vals = ids(&.{ 0x30, 0x31, 0x32 });
-    const nested: QSpec = .{ .threshold = 2, .validators = &.{}, .inners = &.{
+    const nested: QSpec = .{ .threshold = 2, .validators = &.{}, .inner_sets = &.{
         .{ .threshold = 2, .validators = &org1_vals },
         .{ .threshold = 2, .validators = &org2_vals },
         .{ .threshold = 2, .validators = &org3_vals },
