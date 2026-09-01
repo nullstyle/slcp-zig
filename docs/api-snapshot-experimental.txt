@@ -39,7 +39,9 @@ slcp.Node.nominating: field bool = false
 slcp.Node.ov: field node.overlay.Overlay
 slcp.Node.own_latest: field hash_map.Custom(u64,node.node.SlotOwn,hash_map.AutoContext(u64),80) = <default>
 slcp.Node.own_mu: field Io.Mutex = <default>
+slcp.Node.peer_downs: field atomic.Value(u64) = <default>
 slcp.Node.peer_specs: field [][]u8 = <default>
+slcp.Node.peers_live: field atomic.Value(usize) = <default>
 slcp.Node.pending_ext: field hash_map.Custom(u64,[]u8,hash_map.AutoContext(u64),80) = <default>
 slcp.Node.prop_mu: field Io.Mutex = <default>
 slcp.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
@@ -1060,7 +1062,9 @@ slcp.node.Node.nominating: field bool = false
 slcp.node.Node.ov: field node.overlay.Overlay
 slcp.node.Node.own_latest: field hash_map.Custom(u64,node.node.SlotOwn,hash_map.AutoContext(u64),80) = <default>
 slcp.node.Node.own_mu: field Io.Mutex = <default>
+slcp.node.Node.peer_downs: field atomic.Value(u64) = <default>
 slcp.node.Node.peer_specs: field [][]u8 = <default>
+slcp.node.Node.peers_live: field atomic.Value(usize) = <default>
 slcp.node.Node.pending_ext: field hash_map.Custom(u64,[]u8,hash_map.AutoContext(u64),80) = <default>
 slcp.node.Node.prop_mu: field Io.Mutex = <default>
 slcp.node.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
