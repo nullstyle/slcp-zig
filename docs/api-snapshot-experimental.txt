@@ -191,6 +191,13 @@ slcp.core.crypto.tag_qset: const *const [12]u8
 slcp.core.crypto.tag_statement: const *const [12]u8
 slcp.core.crypto.verify: fn ([32]u8, [32]u8, [64]u8) bool
 slcp.core.crypto: struct
+slcp.core.driver.Checked.combine_divergence_msg: const *const [97:0]u8
+slcp.core.driver.Checked.divergences: field u32 = 0
+slcp.core.driver.Checked.driver: fn (*driver.Checked) driver.Driver
+slcp.core.driver.Checked.inner: field driver.Driver
+slcp.core.driver.Checked.panic_on_divergence: field bool = true
+slcp.core.driver.Checked.validate_divergence_msg: const *const [95:0]u8
+slcp.core.driver.Checked: struct
 slcp.core.driver: struct
 slcp.core.emit.BV.counter: field u32
 slcp.core.emit.BV.value: field []const u8
