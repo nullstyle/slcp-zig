@@ -484,6 +484,33 @@ pub fn build(b: *std.Build) void {
     // here and only here. The six M6 anchors stay in this order — later
     // anchors may reference symbols declared under earlier ones.
 
+    // The `slcp` CLI (`slcp lint-quorum` / `slcp key new|show`, plan R5).
+    // Installed by the DEFAULT install step so a consumer's
+    // `Dependency.artifact("slcp")` finds it (R19 — `artifact` only searches
+    // the top-level install step); `zig build cli` is the same install for
+    // humans. node_create tests ride on `node-tests` via src/lib.zig.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "slcp", .module = slcp_mod },
+        },
+    });
+    const cli_exe = b.addExecutable(.{ .name = "slcp", .root_module = cli_mod });
+    const install_cli = b.addInstallArtifact(cli_exe, .{});
+    b.getInstallStep().dependOn(&install_cli.step);
+    const cli_step = b.step("cli", "Build the slcp CLI into zig-out/bin/slcp");
+    cli_step.dependOn(&install_cli.step);
+    // cli-tests: in-process `cli.run` over inline JSON + tmpDir only — no
+    // undeclared file reads, so no setCwd / has_side_effects needed.
+    const cli_tests = b.addTest(.{ .name = "slcp-cli-tests", .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const cli_tests_step = b.step("cli-tests", "Run the slcp CLI unit tests");
+    cli_tests_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&cli_exe.step);
+
     // ===== M6:appnode =====
     // M6 stage anchor (appnode): appnode-errors expected-fail compile step,
     // codec fuzz target. Insert under this anchor only; never above it.

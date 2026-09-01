@@ -27,6 +27,14 @@ e2e:
 # ===== M6:quorum =====
 # M6 stage anchor (quorum): cli / lint-quorum / vectors-sweep recipes go here.
 
+# Build the `slcp` CLI (lint-quorum, key new, key show) into zig-out/bin/slcp.
+cli:
+    zig build cli
+
+# Lint a quorum spec JSON file (docs/recipes/*.json are the copy-paste examples).
+lint-quorum FILE:
+    zig build cli && ./zig-out/bin/slcp lint-quorum {{FILE}}
+
 # The stale-wasm red guard: regenerate the vectors, rebuild the wasm, then run
 # every gate that pins qset/lint bytes (native mirrors AND the wasm export).
 vectors-sweep:
