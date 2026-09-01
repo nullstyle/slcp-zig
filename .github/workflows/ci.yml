@@ -27,7 +27,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          # R20: the STABLE snapshot (docs/api-snapshot.txt) is strict on
+          # every OS — it is the frozen contract. The EXPERIMENTAL file is
+          # strict on Linux only: `@typeName` can spell std types per-OS
+          # (capnp-zig hit the `sockaddr` family), and a platform rendering
+          # difference there is noise, not a contract change. macOS runs the
+          # non-strict form, which refreshes the file in place and only
+          # WARNS on drift; flip it to strict after one green run shows the
+          # two renderings agree (`platform_type_aliases` is where a
+          # disagreement gets canonicalized).
+          - os: ubuntu-latest
+            strict_experimental: -Dstrict-experimental=true
+          - os: macos-latest
+            strict_experimental: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -46,8 +59,13 @@ jobs:
       - name: Node runtime for the wasm differential harness
         run: node --version
 
-      - name: Unit + vector + framing + ABI + sim + fuzz-smoke (+ api-snapshot tests)
-        run: zig build test --summary all
+      # `test` is the gate: engine unit tests, conformance vectors, framing,
+      # ABI, sim smoke, fuzz smoke, node-layer tests, CLI tests, the AppNode
+      # expected-fail compiles, the example's in-tree compile, docs-smoke,
+      # and — since the S6 API freeze — check-api + api-closure + the
+      # snapshot tool's own tests (design §13.7 / §13.8).
+      - name: Unit + vectors + node + docs-smoke + check-api + api-closure
+        run: zig build test ${{ matrix.strict_experimental }} --summary all
 
       - name: Build slcp_core.wasm
         run: zig build wasm --summary all
@@ -75,6 +93,44 @@ jobs:
       - name: 4-node loopback cluster (200 slots, kill/restart, partition/heal, equivocator)
         run: zig build e2e --summary all
 
+  example-smoke:
+    name: Example smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Three nested `zig build -Doptimize=ReleaseSafe` consumer builds of
+    # examples/counter (sequential, sharing this workspace's .zig-cache) plus
+    # a loopback run of the three counters with a SIGKILL + restart; ~45 s
+    # warm locally, minutes cold on a runner. 20 minutes bounds a hang
+    # (the tool's own run deadline is 180 s; the builds are the unknown).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      # What the nested consumer builds fetch and cache: NOTHING new. Their
+      # only dependency is `slcp` as a PATH dependency (`.path = "../../.."`
+      # from the scratch copies under .zig-cache/example-smoke/), whose own
+      # dependency tree (capnp-zig and its transitive packages) the root
+      # build of the smoke tool has already fetched into <workspace>/zig-pkg
+      # — this Zig fetches into `<build root>/zig-pkg`, and the tool exports
+      # ZIG_LOCAL_PKG_DIR=<workspace>/zig-pkg to the nested builds (S4) so
+      # they read that directory instead of fetching under their own build
+      # root. Compilation output shares the workspace .zig-cache
+      # (`--cache-dir`; setup-zig also points ZIG_LOCAL_CACHE_DIR /
+      # ZIG_GLOBAL_CACHE_DIR there). No git, no prompts: every fetch is a
+      # tarball URL pinned by hash in build.zig.zon, and `zig build` never
+      # asks a question.
+      - name: Three consumer builds + loopback run with SIGKILL/restart
+        run: zig build example-smoke --summary all
+
   fmt-check:
     name: Format check
     runs-on: ubuntu-latest
@@ -88,8 +144,98 @@ jobs:
 
       - uses: ./.github/actions/setup-zig
 
-      # The recipe lists the hand-written trees explicitly; src/gen is NOT
-      # covered because capnpc-zig's output is not fmt-clean (R10; see
+      # The recipe lists the hand-written trees explicitly (build.zig, src/*,
+      # sim, tests, tools, examples); src/gen is NOT covered because
+      # capnpc-zig's output is not fmt-clean (R10; see
       # docs/upstream/06-check-api-cache-and-fmt-clean-gen.md).
       - name: Check formatting
         run: just fmt-check
+
+  gen-check:
+    name: Generated code drift (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The fallback step clones a public repo over https; a misconfigured
+      # runner must fail fast, never sit on a credential prompt.
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      # apt capnproto: the C++ `capnp compile` driver that loads the plugin.
+      - uses: ./.github/actions/setup-capnp
+
+      # The plugin must be the capnpc-zig this tree PINS, not whatever a
+      # developer has on PATH: src/gen was regenerated in S6 with the plugin
+      # built from the pinned package after the hand-installed binary turned
+      # out to be a pre-v0.16.0 build that emitted less code. `--fetch=all`
+      # also pulls capnp-zig's LAZY dependencies (quic) so the plugin build
+      # below needs no network of its own. This Zig fetches into
+      # <build root>/zig-pkg (older layouts used $ZIG_GLOBAL_CACHE_DIR/p);
+      # both are searched, by the exact hash from build.zig.zon.
+      - name: Fetch the dependency tree (capnp-zig and its lazy deps)
+        run: zig build --fetch=all
+
+      - name: Build the capnpc-zig plugin from the fetched package
+        id: plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          hash="$(sed -n 's/.*\.hash = "\(capnpc_zig-[^"]*\)".*/\1/p' build.zig.zon | head -n 1)"
+          if [ -z "$hash" ]; then
+            echo "::error::build.zig.zon has no capnpc_zig hash line"
+            exit 1
+          fi
+          echo "pinned package: $hash"
+          pkg=""
+          for cand in "$GITHUB_WORKSPACE/zig-pkg/$hash" "$ZIG_GLOBAL_CACHE_DIR/p/$hash"; do
+            if [ -d "$cand" ]; then
+              pkg="$cand"
+              break
+            fi
+          done
+          if [ -z "$pkg" ]; then
+            echo "::warning::fetched package $hash not found under zig-pkg/ or the global cache; using the git-clone fallback"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "building capnpc-zig in $pkg"
+          if (cd "$pkg" && ZIG_LOCAL_PKG_DIR="$GITHUB_WORKSPACE/zig-pkg" zig build -p "$GITHUB_WORKSPACE/.capnpc" --summary all); then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::the plugin build inside the fetched package failed; using the git-clone fallback"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Explicit fallback (plan S6): the same tag the manifest pins, cloned
+      # shallowly. Only runs when the package route did not produce a plugin.
+      - name: Fallback — build the plugin from a clone of the pinned tag
+        if: steps.plugin.outputs.built != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(sed -n 's#.*capnp-zig/archive/refs/tags/\(v[^/"]*\)\.tar\.gz.*#\1#p' build.zig.zon | head -n 1)"
+          if [ -z "$tag" ]; then
+            echo "::error::build.zig.zon has no capnp-zig tag URL"
+            exit 1
+          fi
+          echo "cloning capnp-zig $tag"
+          git clone --depth 1 --branch "$tag" https://github.com/nullstyle/capnp-zig "$RUNNER_TEMP/capnp-zig"
+          (cd "$RUNNER_TEMP/capnp-zig" && zig build -p "$GITHUB_WORKSPACE/.capnpc" --summary all)
+
+      # This step is the assertion: whichever route ran, the plugin exists.
+      - name: Verify the plugin binary
+        shell: bash
+        run: test -x "$GITHUB_WORKSPACE/.capnpc/bin/capnpc-zig"
+
+      # `just gen` writes src/gen from schema/*.capnp with THAT plugin;
+      # `git diff --exit-code src/gen` is the drift check.
+      - name: Regenerate src/gen and fail on drift
+        shell: bash
+        run: CAPNPC_ZIG="$GITHUB_WORKSPACE/.capnpc/bin/capnpc-zig" just gen-check

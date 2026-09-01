@@ -335,6 +335,28 @@ wasm or for a host that brings its own I/O. The package ships `build.zig`,
 `build.zig.zon`, `src/` and `schema/` only; capnp-zig is its one dependency
 and is fetched the same way.
 
+## API stability
+
+The public surface is split into two tiers, and a gate inside `zig build
+test` keeps the split honest:
+
+- **Stable** — `docs/api-snapshot.txt`, the frozen contract for the `0.1.x`
+  line: the typed `AppNode` / `Codec` layer (pinned through a reference
+  instantiation over the counter above), `Node` and its `Options` with every
+  default, the `Quorum` spec and node-id helpers, the key-file entry points
+  with explicit error sets, the `Driver` vtable, the sans-io engine's
+  input/effect vocabulary, and the wasm host ABI. `zig build check-api` is
+  red on any drift, on every OS.
+- **Experimental** — `docs/api-snapshot-experimental.txt`, everything else
+  that is `pub` (overlay, store, timers, wire, lint report, generated code,
+  engine internals). It may change at any `0.x` bump; the file is refreshed
+  by `check-api` and checked for staleness on Linux CI.
+
+`zig build api-closure` (also inside `test`) refuses a Stable function whose
+signature mentions an Experimental type. The tiers, the held-out entry points
+(those whose error set is still `anyerror`), and the promotion procedure are
+in [`docs/stability.md`](docs/stability.md).
+
 ## Documentation
 
 - `docs/protocol.md` — the normative byte-level definition of SLCP v1 as a
