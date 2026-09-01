@@ -620,6 +620,10 @@ test "§7.2/§12 slcp_lint_qset: LintDiagnostics frame round-trips the lint shap
     }
 }
 
+// Non-vacuity: a stale lint.json (4 cases, no `minBlocking`/`node`) is red on
+// `cases.len >= 8`; a wrong `minBlockingSize` is red on the `minBlocking` pin;
+// a mirror without `setNode` is red on the `node` hex comparison (which is
+// asserted to have run via `critical_cases > 0`).
 test "§7.2/§12 lint frame and vectors/lint.json agree" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
