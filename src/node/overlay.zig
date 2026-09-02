@@ -832,7 +832,11 @@ pub const Overlay = struct {
                 continue;
             };
             defer frame.deinit(gpa);
-            if (isRequestFrame(frame) and !self.chargeRequest(conn)) continue;
+            if (isRequestFrame(frame)) switch (self.chargeRequest(conn)) {
+                .accept => {},
+                .drop => continue,
+                .disconnect => return,
+            };
             self.cb.on_recv(self.cb.ctx, conn.id, &frame);
         }
     }
@@ -894,16 +898,26 @@ pub const Overlay = struct {
         return true;
     }
 
-    /// Charge one inbound request; returns false to drop (drop-and-log) it.
-    fn chargeRequest(self: *Overlay, conn: *Conn) bool {
+    const RequestVerdict = enum { accept, drop, disconnect };
+
+    /// Charge one inbound request. Over budget is a strike and the request
+    /// is dropped (drop-and-log); the strike that reaches
+    /// `max_budget_strikes` disconnects the peer — the same ladder as
+    /// `chargeBytes`, which is what protocol.md §12 / threat-model.md §3
+    /// promise ("32 breaches ⇒ disconnect").
+    fn chargeRequest(self: *Overlay, conn: *Conn) RequestVerdict {
         self.rollWindow(conn);
         conn.win_reqs += 1;
         if (conn.win_reqs > max_outstanding_requests) {
             conn.strikes += 1;
-            log.warn("overlay: peer {d} request-rate breach ({d} in window); dropping request", .{ conn.id, conn.win_reqs });
-            return false;
+            if (conn.strikes >= max_budget_strikes) {
+                log.warn("overlay: peer {d} request-rate breach ({d} in window), strike {d}; exceeded budget strikes, disconnecting", .{ conn.id, conn.win_reqs, conn.strikes });
+                return .disconnect;
+            }
+            log.warn("overlay: peer {d} request-rate breach ({d} in window), strike {d}; dropping request", .{ conn.id, conn.win_reqs, conn.strikes });
+            return .drop;
         }
-        return true;
+        return .accept;
     }
 
     fn monoNs(self: *Overlay) i96 {
@@ -1740,4 +1754,77 @@ test "dialer resolves a hostname peer spec" {
     try waitPeerCount(io, &ov_b, 1);
     try testing.expectEqual(@as(usize, 1), a_rec.peerUpCount());
     try testing.expectEqual(@as(usize, 1), b_rec.peerUpCount());
+}
+
+// Non-vacuity: the S8 pin for "request-rate strikes are counted but never
+// enforced". Reverting `chargeRequest` to a per-frame drop (no
+// `max_budget_strikes` comparison) or making `readLoop` `continue` on a
+// disconnect verdict leaves the flooder connected: `peerCount()` stays 1
+// and the trailing ping is still answered with a pong.
+test "request budget: a getQset flood is disconnected at max_budget_strikes, not merely dropped" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var b_rec: Recorder = .{ .io = io, .gpa = gpa };
+    b_rec.reply_pong = true;
+    defer b_rec.deinit();
+    var ov_b = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xBB), b_rec.callbacks());
+    b_rec.ov = &ov_b;
+    try ov_b.start();
+    defer ov_b.deinit();
+    defer ov_b.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov_b.boundPort());
+    const c = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c.close(io);
+
+    // Complete a valid Hello so the conn is published and request-charged.
+    const hello = try wire.encode(gpa, .{ .hello = .{
+        .protocol_version = wire.protocol_version,
+        .network_id_prefix = test_prefix,
+        .node_id = @as([32]u8, @splat(0x01)),
+        .current_slot = 0,
+        .listen_port = 0,
+    } });
+    defer gpa.free(hello);
+    try writeAll(io, c.socket.handle, hello);
+    try waitPeerCount(io, &ov_b, 1);
+
+    // One burst of tiny getQset frames: ~12 KiB, far under the 256 KiB/s
+    // byte cap, so the ONLY budget breached is the request budget. Two full
+    // windows plus the strikes are sent so a window roll mid-burst cannot
+    // leave the count short. Writes may fail once B has hung up — that is
+    // the point.
+    const req = try wire.encode(gpa, .{ .get_qset = @as([32]u8, @splat(0xAB)) });
+    defer gpa.free(req);
+    const n_frames = 2 * max_outstanding_requests + max_budget_strikes + 8;
+    var i: usize = 0;
+    while (i < n_frames) : (i += 1) writeAll(io, c.socket.handle, req) catch break;
+
+    // The flooder must be torn down.
+    var tries: usize = 0;
+    while (tries < 500 and ov_b.peerCount() != 0) : (tries += 1) sleepMs(io, 10);
+    try testing.expectEqual(@as(usize, 0), ov_b.peerCount());
+
+    // And the wire is dead: a ping gets EOF/error, never a pong.
+    const ping = try wire.encode(gpa, .{ .ping = 0xFEED });
+    defer gpa.free(ping);
+    writeAll(io, c.socket.handle, ping) catch {};
+    var framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer framer.deinit();
+    var got_pong = false;
+    tries = 0;
+    while (tries < 20 and !got_pong) : (tries += 1) {
+        var rb: [4096]u8 = undefined;
+        const n = readBounded(io, c.socket.handle, &rb, 500) catch break;
+        if (n == 0) break;
+        framer.push(rb[0..n]) catch break;
+        while (framer.popFrame() catch null) |raw| {
+            defer gpa.free(raw);
+            var fr = wire.decode(gpa, raw) catch continue;
+            defer fr.deinit(gpa);
+            if (fr == .pong and fr.pong == 0xFEED) got_pong = true;
+        }
+    }
+    try testing.expect(!got_pong);
 }
