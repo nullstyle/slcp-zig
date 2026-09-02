@@ -112,6 +112,14 @@ pub const threat_model_needles = [_][]const u8{
     "quorum intersection",
     "Top-level threshold sanity",
 };
+/// Source strings the docs quote verbatim. Each needle must occur in BOTH
+/// the source file and the doc (whitespace-folded, so a quotation wrapped
+/// across doc lines still matches) — a misquote in the doc or a reworded
+/// source string goes red either way.
+pub const SourceQuote = struct { doc: []const u8, source: []const u8, needle: []const u8 };
+pub const source_quotes = [_]SourceQuote{
+    .{ .doc = "docs/determinism.md", .source = "src/node/app_node.zig", .needle = "floats are NONDETERMINISTIC across nodes (NaN payloads, ±0, platform math differences)" },
+};
 /// Spellings that must appear in NO active doc (stale designs, wrong verbs,
 /// wrong failure modes). `double-appl` (S8 D2-restart): AppNode re-applies
 /// the journal tail exactly once onto `initialState()` (`applied_hwm`), so
@@ -660,6 +668,33 @@ pub fn findWrappedPhrase(text: []const u8, phrase: []const u8) ?usize {
     return null;
 }
 
+/// `text` with every run of whitespace (spaces, tabs, newlines) folded to
+/// one space, so prose wrapped across lines compares as one line.
+pub fn foldWhitespace(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var in_ws = false;
+    for (text) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            in_ws = true;
+        } else {
+            if (in_ws and out.items.len > 0) try out.append(gpa, ' ');
+            in_ws = false;
+            try out.append(gpa, c);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Whitespace-folded substring search (see foldWhitespace).
+pub fn containsFolded(gpa: std.mem.Allocator, text: []const u8, needle: []const u8) !bool {
+    const t = try foldWhitespace(gpa, text);
+    defer gpa.free(t);
+    const n = try foldWhitespace(gpa, needle);
+    defer gpa.free(n);
+    return std.mem.indexOf(u8, t, n) != null;
+}
+
 fn containsBackticked(text: []const u8, name: []const u8) bool {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "`{s}`", .{name}) catch return false;
@@ -836,6 +871,12 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
     // ---- (9) fixed needles ----
     for (protocol_needles) |n| rep.checkFmt(std.mem.indexOf(u8, protocol, n) != null, "docs/protocol.md", 0, "contains `{s}`", .{n}, "copied literal missing", .{});
     for (threat_model_needles) |n| rep.checkFmt(std.mem.indexOf(u8, docs[2].text, n) != null, "docs/threat-model.md", 0, "contains `{s}`", .{n}, "required statement missing", .{});
+    for (source_quotes) |q| {
+        const src = readFile(arena, io, q.source) catch "";
+        rep.checkFmt(try containsFolded(arena, src, q.needle), q.source, 0, "contains `{s}`", .{q.needle}, "the source string docs quote was reworded — update the doc and this needle together", .{});
+        const text = for (docs) |d| (if (std.mem.eql(u8, d.path, q.doc)) break d.text) else "";
+        rep.checkFmt(try containsFolded(arena, text, q.needle), q.doc, 0, "quotes `{s}` verbatim", .{q.needle}, "misquotes {s}", .{q.source});
+    }
     for (docs) |doc| {
         for (forbidden_needles) |n| {
             const at = std.mem.indexOf(u8, doc.text, n);
@@ -1162,6 +1203,21 @@ test "forbidden needles: no active doc calls the replay failure mode double-appl
 // Non-vacuity: the evidence line is what `just preflight` greps and the
 // `[FAIL] file:line: what (why)` shape is what a human greps; change either
 // format string and this fails.
+// Non-vacuity: dropping the fold (plain indexOf) fails the wrapped case;
+// the em-dash variant is the exact misquote docs/determinism.md carried.
+test "source quotes: a wrapped quotation matches folded; an em-dash for the parenthesis does not" {
+    const gpa = testing.allocator;
+    const needle = "floats are NONDETERMINISTIC across nodes (NaN payloads, ±0, platform math differences)";
+    const wrapped = "   (`src/node/app_node.zig`: \"floats are NONDETERMINISTIC across nodes (NaN\n   payloads, ±0, platform math differences)\"). Do not compute with them\n";
+    try testing.expect(try containsFolded(gpa, wrapped, needle));
+    try testing.expect(std.mem.indexOf(u8, wrapped, needle) == null);
+    const misquoted = "   (`src/node/app_node.zig`: \"floats are NONDETERMINISTIC across nodes —\n   NaN payloads, ±0, platform math differences\"). Do not compute with them\n";
+    try testing.expect(!try containsFolded(gpa, misquoted, needle));
+    const folded = try foldWhitespace(gpa, "  a \t b\n\n  c ");
+    defer gpa.free(folded);
+    try testing.expectEqualStrings("a b c", folded);
+}
+
 test "report: failure line shape and the evidence line" {
     const gpa = testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(gpa);
