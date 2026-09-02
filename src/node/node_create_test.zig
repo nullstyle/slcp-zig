@@ -604,7 +604,7 @@ test "explain covers every CreateError member with a non-empty, unique message" 
     for (msgs, 0..) |a, i| {
         for (msgs[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
     }
-    try testing.expect(names.len >= 33); // 32 named members + OutOfMemory
+    try testing.expect(names.len >= 35); // 34 named members + OutOfMemory
     try testing.expectEqualStrings(node.explain(error.NoIdentity), Node.explain(error.NoIdentity));
 }
 
@@ -655,31 +655,57 @@ test "propose: watcher, empty, oversized, and a 1-byte value" {
     try testing.expectError(error.WatcherCannotPropose, w.propose("x"));
 }
 
-// Policy pin for the S8 finding "A world-readable key file (mode 0644) is
-// accepted silently despite the documented 0600 contract": the chosen fix is
-// a `slcp_create` WARNING (`keys.modeTooOpen`, pinned in keys.zig), not a
-// new CreateError — a seed an operator copied in with umask 022 is still
-// this node's identity, and an existing deployment must keep starting. This
-// test pins the "keep starting" half: 0644 and 0666 files create with the
-// key's own id and an empty diagnostic. If the policy ever flips to a
-// refusal, this test is the one to invert (and CreateError, a Stable line,
-// grows a member).
-test "key_file: a 0644 / 0666 seed still creates (warned, not refused) with an empty diagnostic" {
+// Pins the S8 finding "A world-readable key file (mode 0644) is accepted
+// silently despite the documented 0600 contract" under the user decision
+// (2026-09-01): a seed any other account can read is REFUSED at create,
+// ssh-style, with a specific member and an actionable message — not merely
+// warned about. Red before the fix: `loadKeyFile` only logged a warning, so
+// every mode below created a node (`UnexpectedSuccess`). Ablations: masking
+// with 0o007 instead of 0o077 lets the 0640 case start (red on the
+// member); dropping the mode / path / `chmod 600` from the message fails
+// the needles; refusing 0600 too breaks the accepted arm.
+test "key_file: a 0640 / 0644 / 0666 seed is KeyFileTooPermissive (the message names the mode and the chmod); 0600 and 0400 are accepted" {
     const io = testing.io;
     var g = try Golden.init();
     defer g.deinit();
 
-    for ([_]std.posix.mode_t{ 0o644, 0o666 }, [_][]const u8{ "world644.key", "world666.key" }) |mode, name| {
-        try g.tmp.dir.writeFile(io, .{ .sub_path = name, .data = &g.seeds[0] });
-        try g.tmp.dir.setFilePermissions(io, name, std.Io.File.Permissions.fromMode(mode), .{});
+    const loose = [_]struct { mode: u32, name: []const u8, needle: []const u8 }{
+        .{ .mode = 0o640, .name = "group640.key", .needle = "mode 0640" },
+        .{ .mode = 0o644, .name = "world644.key", .needle = "mode 0644" },
+        .{ .mode = 0o666, .name = "world666.key", .needle = "mode 0666" },
+    };
+    for (loose) |case| {
+        try g.tmp.dir.writeFile(io, .{ .sub_path = case.name, .data = &g.seeds[0] });
+        try g.tmp.dir.setFilePermissions(io, case.name, std.Io.File.Permissions.fromMode(@intCast(case.mode)), .{});
         var b: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try g.sub(&b, name);
-        try testing.expectEqual(mode, try keys.modeOf(io, path));
-        try testing.expect(keys.modeTooOpen(mode));
+        const path = try g.sub(&b, case.name);
+        try testing.expectEqual(case.mode, try keys.modeOf(io, path));
+        try testing.expect(keys.modeTooOpen(case.mode));
 
         var opts = g.options();
         opts.secret_seed = null;
         opts.key_file = path;
+        try g.expectFail(opts, error.KeyFileTooPermissive, case.needle);
+        try expectContains(g.diag.message(), path);
+        var chmod_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+        try expectContains(g.diag.message(), try std.fmt.bufPrint(&chmod_buf, "chmod 600 {s}", .{path}));
+        // The seed itself is intact and still loads through the keys layer:
+        // the refusal is the node's policy, not a damaged file.
+        const kp = try keys.load(io, path);
+        try testing.expectEqualSlices(u8, &g.ids[0], &kp.public_key);
+    }
+
+    // Owner-only modes start: 0600 (what the mint writes) and a read-only 0400.
+    for ([_]u32{ 0o600, 0o400 }, [_][]const u8{ "own600.key", "own400.key" }, [_][]const u8{ "d600", "d400" }) |mode, name, sub| {
+        try g.tmp.dir.writeFile(io, .{ .sub_path = name, .data = &g.seeds[0] });
+        try g.tmp.dir.setFilePermissions(io, name, std.Io.File.Permissions.fromMode(@intCast(mode)), .{});
+        var b: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try g.sub(&b, name);
+        var d: [std.fs.max_path_bytes]u8 = undefined;
+        var opts = g.options();
+        opts.secret_seed = null;
+        opts.key_file = path;
+        opts.data_dir = try g.sub(&d, sub);
         g.diag.len = 0;
         const n = try Node.create(testing.allocator, io, opts);
         defer n.deinit();

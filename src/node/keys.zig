@@ -344,7 +344,7 @@ test "createNew twice is KeyFileExists (bytes unchanged); load on an absent path
 // Pins the S8 finding "A world-readable key file (mode 0644) is accepted
 // silently despite the documented 0600 contract": the load side can now SEE
 // the mode, and group/other bits (0o077) are exactly what `Node.create`
-// warns about. Red before the fix: neither `modeOf` nor `modeTooOpen`
+// refuses with `KeyFileTooPermissive` (S8b) and `slcp key show` warns about. Red before the fix: neither `modeOf` nor `modeTooOpen`
 // existed — nothing on the load path looked at the mode at all. Ablations:
 // masking with 0o007 instead of 0o077 lets the 0640 case through (red);
 // returning the raw mode without `& 0o777` breaks the equality on file
@@ -367,7 +367,9 @@ test "modeOf/modeTooOpen: a minted key file is owner-only; 0640, 0644 and 0666 a
         try tmp.dir.setFilePermissions(io, "mode.seed", std.Io.File.Permissions.fromMode(@intCast(mode)), .{});
         try testing.expectEqual(mode, try modeOf(io, path));
         try testing.expect(modeTooOpen(mode));
-        // The seed itself still loads: the mode is a warning, not a refusal.
+        // The keys layer itself still loads it: the refusal is Node.create's
+        // policy (and `key show` must still be able to print the public key
+        // of a loose file while telling the operator to tighten it).
         _ = try load(io, path);
     }
 

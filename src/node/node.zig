@@ -68,6 +68,7 @@ pub const CreateError = error{
     KeyFileDirMissing,
     KeyFileAccessDenied,
     KeyFileIoFailed,
+    KeyFileTooPermissive,
     MaxValueBytesOutOfRange,
     StartSlotZero,
     StartSlotBehindJournal,
@@ -117,6 +118,7 @@ fn explainCreateError(err: CreateError) []const u8 {
         error.KeyFileDirMissing => ".key_file's directory does not exist; create the directory first (slcp creates the file, not its parent).",
         error.KeyFileAccessDenied => ".key_file cannot be read or created (permission denied); fix the permissions or choose another path.",
         error.KeyFileIoFailed => ".key_file could not be read or created (I/O error); check the path and the filesystem.",
+        error.KeyFileTooPermissive => ".key_file is readable by group or other (mode 0644, say) but the seed must be owner-only like ssh keys; run `chmod 600 <file>` and start again.",
         error.MaxValueBytesOutOfRange => ".max_value_bytes is outside [1, 65536]; pick the largest value your app will ever propose.",
         error.StartSlotZero => ".start_slot is 0 but slots start at 1; drop it (default 1).",
         error.StartSlotBehindJournal => ".start_slot is at or below the journal high-water mark in .data_dir; drop it (the node resumes after the journal) or use a fresh data_dir.",
@@ -901,13 +903,15 @@ pub const Node = struct {
     fn loadKeyFile(io: std.Io, path: []const u8, diag: ?*Diagnostic) CreateError!keys_mod.KeyPair {
         if (keys_mod.load(io, path)) |kp| {
             // The mint ceremony writes 0600; a file copied in by cp/scp or
-            // restored under umask 022 arrives 0644 and would otherwise be
-            // accepted in silence (S8 finding). Warn, do not refuse: the
-            // seed is still this node's identity and a running deployment
-            // must keep starting — the operator fixes the mode.
+            // restored under umask 022 arrives 0644 (S8 finding: it was
+            // accepted in silence, then only warned about). User decision
+            // (S8b): REFUSE, ssh-style — a seed every account in the group
+            // or on the machine can read is not this node's identity alone,
+            // and the fix is one command the message spells out. A stat
+            // failure is not a verdict (the seed did load): start.
             if (keys_mod.modeOf(io, path)) |mode| {
                 if (keys_mod.modeTooOpen(mode)) {
-                    create_log.warn(".key_file \"{s}\" is mode 0{o}: readable by group/other, not the 0600 slcp mints; run `chmod 600 {s}`", .{ path, mode, path });
+                    return fail(diag, error.KeyFileTooPermissive, ".key_file \"{s}\" is mode 0{o}: readable by group/other, but the seed must be owner-only (slcp mints 0600 and, like ssh, refuses a key other accounts can read); run `chmod 600 {s}` and start again.", .{ path, mode, path });
                 }
             } else |_| {}
             return kp;

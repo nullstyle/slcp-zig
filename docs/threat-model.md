@@ -218,11 +218,14 @@ after the next crash (it could re-emit an older, conflicting statement).
 - On disk: `key_file` is exactly 32 raw seed bytes, mode `0600`, created
   atomically and durably (`src/node/keys.zig`). `Node.create` refuses a
   file of any other length (`KeyFileBad`) so a typo cannot mint a second
-  identity, and `slcp key new` never overwrites. The mode is enforced only
-  at mint time: a seed copied in by `cp`/`scp` or restored under umask 022
-  arrives `0644` and still loads, with a `slcp_create` warning naming the
-  mode and `chmod 600 <path>` — a warning, not a refusal, so a running
-  deployment keeps starting while the operator tightens the file.
+  identity, and `slcp key new` never overwrites. The mode is enforced at
+  mint time AND at load time (S8b, user decision): a seed copied in by
+  `cp`/`scp` or restored under umask 022 arrives `0644`, and `Node.create`
+  / `AppNode.create` then **refuse to start** with `KeyFileTooPermissive`,
+  ssh-style — the diagnostic names the mode, the path and the
+  `chmod 600 <path>` that fixes it, because a seed every account in the
+  group or on the machine can read is not one node's identity. `slcp key
+  show` still prints the public key of such a file, with the same warning.
 - The `identity` marker binds a `data_dir` to one (network, key) pair on
   the first create attempt (protocol §13): moving a data_dir under another
   key is `DataDirOtherNode`. The marker does **not** stop the *same* key

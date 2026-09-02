@@ -377,6 +377,14 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
             return 1;
         },
     };
+    // A loose mode is printed, not refused: `key show` is how an operator
+    // reads a public key back, and the warning tells them why `Node.create`
+    // will refuse this file (KeyFileTooPermissive) until it is 0600.
+    if (keys.modeOf(io, path)) |mode| {
+        if (keys.modeTooOpen(mode)) {
+            try err_out.print("slcp key show: warning: {s} is mode 0{o}: readable by group/other; a node refuses to start with it (KeyFileTooPermissive) — run: chmod 600 {s}\n", .{ path, mode, path });
+        }
+    } else |_| {}
     try out.print("public key: {s}\n", .{&std.fmt.bytesToHex(kp.public_key, .lower)});
     return 0;
 }
@@ -574,7 +582,9 @@ test "cli lint-quorum: a mistyped `innersets` key is exit 2 naming the key, not 
 
 // Non-vacuity: letting `key new` overwrite makes the bytes-unchanged check
 // red; printing the wrong key (e.g. the seed) breaks the `keys.load`
-// equality; dropping the `slcp key new` hint from `key show` is red.
+// equality; dropping the `slcp key new` hint from `key show` is red; dropping
+// the loose-mode warning from `key show` (S8b) leaves stderr empty on the
+// 0644 file (red on the `mode 0644` needle).
 test "cli key new / key show: mint once, refuse to overwrite, show, missing file hint, --help" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -605,6 +615,18 @@ test "cli key new / key show: mint once, refuse to overwrite, show, missing file
     c.exec(gpa, io, &.{ "key", "show", key_path });
     try testing.expectEqual(@as(u8, 0), c.code);
     try testing.expectEqualStrings(&want_hex, std.mem.trimEnd(u8, c.stdout()[12..], "\n"));
+    try testing.expectEqualStrings("", c.stderr()); // 0600: nothing to warn about
+
+    // S8b: a loose mode still shows the key (exit 0) but warns on stderr
+    // with the mode and the chmod — the same file Node.create refuses.
+    try tmp.dir.setFilePermissions(io, "node.key", std.Io.File.Permissions.fromMode(0o644), .{});
+    c.exec(gpa, io, &.{ "key", "show", key_path });
+    try testing.expectEqual(@as(u8, 0), c.code);
+    try testing.expectEqualStrings(&want_hex, std.mem.trimEnd(u8, c.stdout()[12..], "\n"));
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "mode 0644") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "chmod 600 ") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "KeyFileTooPermissive") != null);
+    try tmp.dir.setFilePermissions(io, "node.key", std.Io.File.Permissions.fromMode(0o600), .{});
 
     var b2: [std.fs.max_path_bytes]u8 = undefined;
     const missing = try tmpPath(io, &tmp, &b2, "nope.key");

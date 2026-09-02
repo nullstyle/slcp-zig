@@ -852,7 +852,11 @@ node requested.
 mode `0600`, created atomically and durably (temp file → fsync, plus
 `F_FULLFSYNC` on macOS → link into place). Any other length is
 `error.BadKeyFile`; `createNew` never overwrites (`KeyFileExists`). The
-public key (node id) is derived from the seed.
+public key (node id) is derived from the seed. `Node.create` (M6 S8b)
+refuses a key file whose mode grants group or other any access
+(`keys.modeTooOpen`: `mode & 0o077 != 0`) with `KeyFileTooPermissive`; the
+diagnostic names the mode, the path and the `chmod 600 <path>` that fixes
+it. `slcp key show` prints the public key of such a file but warns.
 
 ## 14. WASM host ABI summary
 
