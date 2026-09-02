@@ -497,6 +497,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "slcp", .module = slcp_mod },
         },
     });
+    // `slcp --version` reports the package version straight from
+    // build.zig.zon (embedded when this build script compiles), so the CLI
+    // can never disagree with the manifest.
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "version", comptime manifestVersion());
+    cli_mod.addOptions("build_options", cli_options);
     const cli_exe = b.addExecutable(.{ .name = "slcp", .root_module = cli_mod });
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
@@ -786,4 +792,14 @@ pub fn build(b: *std.Build) void {
     // M6 stage anchor (release): the preflight aggregate step. Insert under
     // this anchor only; it may reference every step declared above.
     // Keep the blank line between anchors so parallel stages merge cleanly.
+}
+
+/// `.version = "<v>"` of build.zig.zon, the one place the version lives.
+fn manifestVersion() []const u8 {
+    const zon = @embedFile("build.zig.zon");
+    const key = ".version = \"";
+    const at = std.mem.indexOf(u8, zon, key) orelse @compileError("build.zig.zon has no .version");
+    const start = at + key.len;
+    const end = std.mem.indexOfScalarPos(u8, zon, start, '"') orelse @compileError("build.zig.zon: unterminated .version");
+    return zon[start..end];
 }

@@ -13,6 +13,8 @@ const qset = core.qset;
 const Quorum = slcp.Quorum;
 const keys = slcp.keys;
 const lint_report = slcp.lint_report;
+/// `version` = build.zig.zon's `.version`, injected by build.zig.
+const build_options = @import("build_options");
 
 pub const usage =
     \\usage: slcp <command> [args]
@@ -28,8 +30,33 @@ pub const usage =
     \\  slcp key show <file>
     \\      Print the public key (node id) of an existing key file.
     \\  slcp --help
+    \\      This text (also `slcp <command> --help`). `--` ends the options: what follows is a path.
+    \\  slcp --version
+    \\      Print the package version.
     \\
 ;
+
+/// `--help` / `-h` anywhere before a `--` separator: every verb prints the
+/// usage to stdout and exits 0 before it touches the filesystem.
+fn wantsHelp(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--")) return false;
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
+}
+
+/// An argument that looks like an option (`-x`, `--x`); never a path unless
+/// it follows `--`. A lone `-` is a path.
+fn looksLikeOption(a: []const u8) bool {
+    return a.len > 1 and a[0] == '-';
+}
+
+fn unknownOption(err_out: *std.Io.Writer, verb: []const u8, arg: []const u8) RunError!u8 {
+    try err_out.print("slcp{s}{s}: unknown option \"{s}\" (use `--` before a path that starts with `-`)\n\n", .{ if (verb.len == 0) "" else " ", verb, arg });
+    try err_out.writeAll(usage);
+    return 2;
+}
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) u8 {
     return runInner(gpa, io, args, out, err_out) catch |err| switch (err) {
@@ -53,35 +80,50 @@ fn runInner(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *
         try out.writeAll(usage);
         return 0;
     }
+    if (std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
+        try out.writeAll("slcp " ++ build_options.version ++ "\n");
+        return 0;
+    }
     if (std.mem.eql(u8, verb, "lint-quorum")) return lintQuorum(gpa, io, args[1..], out, err_out);
     if (std.mem.eql(u8, verb, "key")) return keyCommand(io, args[1..], out, err_out);
+    if (looksLikeOption(verb)) return unknownOption(err_out, "", verb);
     try err_out.print("slcp: unknown command \"{s}\"\n\n", .{verb});
     try err_out.writeAll(usage);
     return 2;
 }
 
 fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) RunError!u8 {
-    if (args.len == 0) {
+    if (wantsHelp(args)) {
+        try out.writeAll(usage);
+        return 0;
+    }
+    // A leading `--` makes the next argument a path however it looks.
+    const literal = args.len > 0 and std.mem.eql(u8, args[0], "--");
+    const rest = if (literal) args[1..] else args;
+    if (rest.len == 0) {
         try err_out.writeAll("slcp lint-quorum: missing <quorum.json>\n\n");
         try err_out.writeAll(usage);
         return 2;
     }
-    const path = args[0];
+    const path = rest[0];
+    if (!literal and looksLikeOption(path)) return unknownOption(err_out, "lint-quorum", path);
     var self_id: ?qset.NodeId = null;
     var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--self")) {
-            if (i + 1 >= args.len) {
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--self")) {
+            if (i + 1 >= rest.len) {
                 try err_out.writeAll("slcp lint-quorum: --self needs a <hex64> node id\n");
                 return 2;
             }
             i += 1;
-            self_id = slcp.parseNodeId(args[i]) catch {
-                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{args[i]});
+            self_id = slcp.parseNodeId(rest[i]) catch {
+                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{rest[i]});
                 return 2;
             };
+        } else if (looksLikeOption(rest[i])) {
+            return unknownOption(err_out, "lint-quorum", rest[i]);
         } else {
-            try err_out.print("slcp lint-quorum: unknown argument \"{s}\"\n", .{args[i]});
+            try err_out.print("slcp lint-quorum: unknown argument \"{s}\"\n", .{rest[i]});
             return 2;
         }
     }
@@ -162,12 +204,21 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
 }
 
 fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) RunError!u8 {
-    if (args.len != 2 or !(std.mem.eql(u8, args[0], "new") or std.mem.eql(u8, args[0], "show"))) {
+    if (wantsHelp(args)) {
+        try out.writeAll(usage);
+        return 0;
+    }
+    const known_verb = args.len >= 1 and (std.mem.eql(u8, args[0], "new") or std.mem.eql(u8, args[0], "show"));
+    // `key new -- <file>`: the path is taken verbatim however it looks.
+    const literal = args.len >= 2 and std.mem.eql(u8, args[1], "--");
+    const rest = if (known_verb) args[@as(usize, if (literal) 2 else 1)..] else args;
+    if (!known_verb or rest.len != 1) {
         try err_out.writeAll("slcp key: expected `key new <file>` or `key show <file>`\n\n");
         try err_out.writeAll(usage);
         return 2;
     }
-    const path = args[1];
+    const path = rest[0];
+    if (!literal and looksLikeOption(path)) return unknownOption(err_out, if (std.mem.eql(u8, args[0], "new")) "key new" else "key show", path);
     if (std.mem.eql(u8, args[0], "new")) {
         const kp = keys.createNew(io, path) catch |err| switch (err) {
             error.KeyFileExists => {
@@ -419,4 +470,68 @@ test "cli lint-quorum: an allocation failure anywhere is `slcp: out of memory`, 
     try testing.expect(fail_index >= 3);
     try testing.expectEqual(@as(u8, 0), c.code);
     try testing.expect(std.mem.indexOf(u8, c.stdout(), two_of_three_hash) != null);
+}
+
+// Non-vacuity: treating `--help` as a file name mints a key literally named
+// `--help` (exit 0 with a `public key:` line) and makes `lint-quorum --help`
+// a FileNotFound (exit 2); dropping the option check lets `--bogus` through
+// as a path; `--version` was "unknown command" (exit 2).
+test "cli per-verb --help/-h prints usage (exit 0, no file touched); option-looking paths are refused; --version" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var c = Captured.init(gpa);
+    defer c.deinit();
+    // On a red run `key new --help` mints a file literally named `--help`
+    // in the cwd; remove it so a failure does not litter the tree.
+    defer std.Io.Dir.cwd().deleteFile(io, "--help") catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, "-h") catch {};
+
+    const help_forms = [_][]const []const u8{
+        &.{ "key", "new", "--help" },
+        &.{ "key", "new", "-h" },
+        &.{ "key", "show", "--help" },
+        &.{ "key", "--help" },
+        &.{ "lint-quorum", "--help" },
+        &.{ "lint-quorum", "-h" },
+        &.{ "lint-quorum", "spec.json", "--help" },
+        &.{ "help", "key" },
+    };
+    for (help_forms) |args| {
+        c.exec(gpa, io, args);
+        try testing.expectEqual(@as(u8, 0), c.code);
+        try testing.expectEqualStrings(usage, c.stdout());
+        try testing.expectEqualStrings("", c.stderr());
+    }
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "--help", .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "-h", .{}));
+
+    // An option-looking positional is refused before the filesystem is
+    // touched (exit 2, names the option, shows the usage).
+    const option_paths = [_][]const []const u8{
+        &.{ "key", "new", "--bogus" },
+        &.{ "key", "show", "-x" },
+        &.{ "lint-quorum", "--bogus" },
+        &.{ "lint-quorum", "-x.json" },
+        &.{"--bogus"},
+    };
+    for (option_paths) |args| {
+        c.exec(gpa, io, args);
+        try testing.expectEqual(@as(u8, 2), c.code);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), "unknown option") != null);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), args[args.len - 1]) != null);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), "usage: slcp") != null);
+        try testing.expectEqualStrings("", c.stdout());
+    }
+    // `--` ends option parsing: what follows is a path, however it looks.
+    c.exec(gpa, io, &.{ "lint-quorum", "--", "-x.json" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "cannot read -x.json") != null);
+
+    // `--version` / `-V` print the manifest version on stdout.
+    for ([_][]const u8{ "--version", "-V" }) |flag| {
+        c.exec(gpa, io, &.{flag});
+        try testing.expectEqual(@as(u8, 0), c.code);
+        try testing.expectEqualStrings("slcp " ++ build_options.version ++ "\n", c.stdout());
+        try testing.expect(std.ascii.isDigit(build_options.version[0]));
+    }
 }
