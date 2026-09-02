@@ -281,8 +281,9 @@ same binary through `slcp_dep.artifact("slcp")`, as the example's
   quorum spec (`{"threshold":T,"validators":[<hex64>…],"innerSets":[…]}`):
   prints the normalized tree, its hash, the minimum blocking-set size, the
   critical nodes and every finding. Exit 0 clean or warnings, 1 lint errors,
-  2 bad input. `docs/quorum-recipes.md` holds three copy-paste specs with the
-  exact output each one produces.
+  2 bad input (or a report that could not be written to stdout).
+  `docs/quorum-recipes.md` holds three copy-paste specs with the exact output
+  each one produces.
 
 `slcp --help` prints the same list.
 

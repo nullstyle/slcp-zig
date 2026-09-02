@@ -84,7 +84,9 @@ $ ./zig-out/bin/slcp lint-quorum docs/recipes/three-friends-2of3.json
 ```
 
 Exit 0 = clean or warnings only, 1 = lint errors (the node would refuse to
-start without `allow_unsafe_quorum`), 2 = bad input.
+start without `allow_unsafe_quorum`), 2 = bad input — or a report that could
+not be written to stdout, so `slcp lint-quorum q.json > report.txt || exit`
+never leaves an empty report behind with a 0.
 
 ## 1. Three friends (2-of-3)
 
