@@ -481,6 +481,12 @@ fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: a
 /// decode (design §8.5: command evolution is consensus surface).
 const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
 
+/// The teaching text for a `combine` whose result does not self-validate
+/// (§8.5: the composite must be `.valid`, or `.maybe_valid` when this node is
+/// behind); the node goes inert with DriverFault rather than balloting a
+/// value every peer rejects.
+const bad_composite_fmt = "{s}.combine returned a Command that its own validate judges .invalid (slot {d}) — the composite must self-validate (§8.5); the node goes inert (DriverFault) instead of balloting a value every peer would reject.";
+
 /// The typed node (§8.5, §11.2): a comptime adapter that compiles `App` into
 /// the frozen §8.2 `Driver` and a §8.5 delivery hook over the bytes-level
 /// `node.Node`.
@@ -718,7 +724,6 @@ pub fn AppNode(comptime App: type) type {
         }
 
         fn driverCombine(ctx: *anyopaque, slot: u64, candidates: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) DriverError!void {
-            _ = slot;
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (candidates.len == 0) return error.DriverFault;
             if (comptime @hasDecl(App, "combine")) {
@@ -734,6 +739,16 @@ pub fn AppNode(comptime App: type) type {
                 }
                 if (n == 0) return error.DriverFault;
                 const best = App.combine(self.state, cmds[0..n]);
+                // §8.5: the composite must self-validate. A `.invalid`
+                // composite would be balloted by this node and rejected by
+                // every peer — a silent stall with only `insane` counters as
+                // evidence — so it is the contract violation DriverFault is
+                // for (docs/determinism.md §6). `.maybe_valid` stays legal:
+                // a node behind on State cannot judge what it combines.
+                if (App.validate(self.state, best) == .invalid) {
+                    if (self.created.load(.acquire)) log.err(bad_composite_fmt, .{ @typeName(App), slot });
+                    return error.DriverFault;
+                }
                 if (comptime codec.is_custom) {
                     try out.resize(gpa, max_encoded_bytes);
                     const written = codec.encode(best, out.items);
@@ -1602,4 +1617,63 @@ test "deinit while another thread is parked in waitApplied: the waiter returns n
         t.join();
         try testing.expect(w.saw_null.load(.acquire));
     }
+}
+
+// -- combine result must self-validate (S8 review, D1) --------------------------
+
+/// The README Counter with a `combine` that violates the §8.5 contract: its
+/// result never self-validates (`{next=0}` is `.invalid` for every State).
+const BadCombine = struct {
+    pub const State = Counter.State;
+    pub const Command = Counter.Command;
+    pub const validate = Counter.validate;
+    pub const apply = Counter.apply;
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        _ = cmds;
+        return .{ .next = 0 };
+    }
+};
+
+/// A lagging node's combine: the composite is ahead of this node's State,
+/// so `validate` says `.maybe_valid` — legitimate, never a fault.
+const AheadCombine = struct {
+    pub const State = Counter.State;
+    pub const Command = Counter.Command;
+    pub const validate = Counter.validate;
+    pub const apply = Counter.apply;
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        _ = cmds;
+        return .{ .next = 5 };
+    }
+};
+
+// Non-vacuity: dropping the `App.validate(self.state, best)` check in
+// `driverCombine` (the shipped M6 code) encodes `{next=0}` and returns
+// success — every peer then rejects the composite as `.invalid` and the
+// network stalls with only `insane` counters as evidence; treating
+// `.maybe_valid` as a fault fails the AheadCombine arm.
+test "driverCombine: a composite that self-validates .invalid is DriverFault, .maybe_valid (lagging node) is not" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var b1: [8]u8 = undefined;
+    const cands = [_][]const u8{CounterNode.codec.encode(.{ .next = 1 }, &b1)};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    const BadNode = AppNode(BadCombine);
+    const bad = try BadNode.createDetached(gpa, io, 4096);
+    defer bad.deinit();
+    const bd = bad.driver();
+    try testing.expectError(error.DriverFault, bd.combine_candidates(bd.ctx, 1, &cands, gpa, &out));
+
+    const AheadNode = AppNode(AheadCombine);
+    const ahead = try AheadNode.createDetached(gpa, io, 4096);
+    defer ahead.deinit();
+    const ad = ahead.driver();
+    out.clearRetainingCapacity();
+    try ad.combine_candidates(ad.ctx, 1, &cands, gpa, &out);
+    try testing.expectEqual(@as(u64, 5), CounterNode.codec.decode(out.items).?.next);
+    try testing.expectEqual(Validity.maybe_valid, ad.validate_value(ad.ctx, 1, out.items, false));
 }

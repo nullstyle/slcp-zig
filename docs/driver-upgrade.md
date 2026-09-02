@@ -78,6 +78,11 @@ const App = struct {
   arrays, nested structs. Floats, pointers/slices, optionals, unions and
   non-exhaustive enums are compile errors that name the rule and the
   workaround.
+- **`combine` is checked**: `AppNode` runs `validate(state, result)` on
+  every composite. `.invalid` is a `DriverFault` — the node logs the App name
+  at error level and latches inert instead of balloting a value every peer
+  would reject (a silent stall). `.maybe_valid` is fine: a node behind on
+  `State` cannot judge what it combines.
 - **State is not persisted** (v1 limitation, plan R17): after a restart
   `State = initialState()` + `apply` over the replayed journal tail (the last
   ≥ 16 slots). That is why commands must be full values; apps with delta
