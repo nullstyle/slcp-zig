@@ -1,0 +1,115 @@
+name: Release tag audit
+
+# The detective half of the release ceremony (RELEASING.md; design §13.9).
+#
+# `just release-tag` is the preventive half: it refuses to create a tag on a
+# dirty tree, a version mismatch, a missing CHANGELOG section, an unrecorded
+# package hash, or a commit without a green CI run. This workflow runs on the
+# tag itself, so a tag cut any other way (by hand, through a red gate) leaves
+# a permanent red mark on the release instead of being discovered later.
+# Shape copied from capnp-zig's release.yml, which exists because its v0.4.0
+# was tagged three minutes before its own CI went red.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    name: Audit tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: The tagged commit must have a green CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "Tag ${GITHUB_REF_NAME} points at ${sha}"
+
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}" \
+            --jq '[.workflow_runs[] | select(.name == "CI")]')"
+
+          count="$(printf '%s' "$runs" | jq 'length')"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No CI run exists for ${sha}. A tag must be cut from a commit whose CI has already concluded successfully (RELEASING.md: tag only on green CI)."
+            exit 1
+          fi
+
+          printf '%s' "$runs" | jq -r '.[] | "\(.conclusion)\t\(.html_url)"'
+
+          failed="$(printf '%s' "$runs" | jq '[.[] | select(.conclusion != "success")] | length')"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::${failed} CI run(s) for ${sha} did not conclude successfully. This tag was cut through a red gate."
+            exit 1
+          fi
+
+          echo "CI is green for ${sha}."
+
+      - name: The tag must match the manifest and the CHANGELOG
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          manifest="$(sed -n 's/^ *\.version = "\([^"]*\)",$/\1/p' build.zig.zon | head -n 1)"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::Tag ${tag} does not match build.zig.zon version ${manifest}."
+            exit 1
+          fi
+
+          if ! grep -q "^## \[${version}\] - " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated '## [${version}] - YYYY-MM-DD' section."
+            exit 1
+          fi
+
+          if ! grep -q "^\[${version}\]: " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md link footer does not define [${version}]."
+            exit 1
+          fi
+
+          echo "Tag ${tag}, manifest ${manifest}, and CHANGELOG agree."
+
+      # The package hash README's pin block advertises must be the one this
+      # tag's package has. README.md and CHANGELOG.md are outside `.paths`,
+      # so the hash was computed BEFORE the tag (just release-hash) and
+      # recorded in both; a mismatch means the pin block lies to consumers
+      # (fix: a docs-only commit on main, never a re-tag). A `git archive
+      # HEAD` tarball hashed through a throwaway global cache is what
+      # `just release-hash` does; the same is done here.
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: README.md and CHANGELOG.md must carry this tag's package hash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          recorded="$(grep -oE "slcp-${version}-[A-Za-z0-9_-]{20,}" README.md | head -n 1 || true)"
+          if [ -z "$recorded" ]; then
+            echo "::error::README.md does not record a slcp-${version}-<hash> package hash."
+            exit 1
+          fi
+          if ! grep -qF "$recorded" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not carry README's hash ${recorded}."
+            exit 1
+          fi
+          git archive --format=tar.gz -o "${RUNNER_TEMP}/slcp.tgz" HEAD
+          actual="$(tools/pkg_hash.sh "${RUNNER_TEMP}/slcp.tgz")"
+          echo "recorded ${recorded}"
+          echo "actual   ${actual}"
+          if [ "$recorded" != "$actual" ]; then
+            echo "::error::The recorded package hash ${recorded} is not this tag's ${actual}. Record the real one in README.md and CHANGELOG.md (docs-only commit)."
+            exit 1
+          fi
+          echo "README.md, CHANGELOG.md and the tagged package agree on ${actual}."
