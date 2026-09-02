@@ -778,13 +778,17 @@ pub const Node = struct {
         }
         if (!rec.own_log_corrupt) {
             for (rec.own_latest) |r| {
-                self.feedInput(.{
+                const clean = self.feedInput(.{
                     .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
                     .source_peer = null,
                 }) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return fail(diag, error.EngineFailed, "the own.log restore of {s} failed for slot {d}: {t}; the data_dir's own.log may be damaged — move it aside to start fresh, or report this.", .{ opts.data_dir, r.slot, e }),
                 };
+                // A restored statement that never made it into the catch-up
+                // cache would be re-sent to nobody: OOM here is a create
+                // failure, not a degraded start.
+                if (!clean) return error.OutOfMemory;
             }
         }
         // An effect dispatched during the restore can latch the node inert
@@ -1121,20 +1125,30 @@ pub const Node = struct {
 
     /// Feed one input and drain all its effects (engine thread only).
     fn applyInput(self: *Node, item: InputItem) void {
-        self.feedInput(item) catch |err| self.markFailed(err);
+        const clean = self.feedInput(item) catch |err| {
+            self.markFailed(err);
+            return;
+        };
+        // Best-effort effects (the catch-up cache, a timer arm) failed on
+        // OOM: the node keeps running — the cache is refilled by the next
+        // emission for that slot and the timer is re-armed on the next
+        // heard/round transition — but say so (review finding: silent).
+        if (!clean) log.warn("out of memory dispatching an effect; catch-up cache or a timer is degraded until the next emission", .{});
     }
 
     /// `applyInput` without the latch: a `pushInput` failure is returned to
-    /// the caller (the input is freed either way). `create` uses this for
-    /// the own.log restore so an allocation failure there is a create
-    /// failure (`OutOfMemory`), never a successfully-created inert node
-    /// (review finding); the engine thread wraps it in `markFailed`.
-    fn feedInput(self: *Node, item_in: InputItem) engine.PushError!void {
+    /// the caller (the input is freed either way); the result says whether
+    /// every effect was dispatched cleanly (false = a best-effort effect hit
+    /// OOM — see `dispatch`). `create` uses this for the own.log restore so
+    /// an allocation failure there is a create failure (`OutOfMemory`),
+    /// never a successfully-created inert or degraded node (review
+    /// findings); the engine thread wraps it in `markFailed` / a warning.
+    fn feedInput(self: *Node, item_in: InputItem) engine.PushError!bool {
         var item = item_in;
         if (self.failed.load(.acquire)) {
             // Inert: consume and free inputs without touching the engine.
             core.host_codec.freeInput(self.gpa, &item.input);
-            return;
+            return true;
         }
         self.cur_source = item.source_peer;
         defer self.cur_source = null;
@@ -1143,15 +1157,19 @@ pub const Node = struct {
             return err;
         };
         core.host_codec.freeInput(self.gpa, &item.input);
+        var clean = true;
         while (self.eng.popEffect()) |eff| {
             // A dispatch that trips markFailed (a failed write-ahead append)
             // must suppress every LATER effect of this input — most
             // importantly the broadcast paired with a failed persist (§10:
             // never send what is not durable). The remaining effects are
             // still committed so their payloads are freed.
-            if (!self.failed.load(.acquire)) self.dispatch(eff);
+            if (!self.failed.load(.acquire)) self.dispatch(eff) catch {
+                clean = false;
+            };
             self.eng.commitEffect();
         }
+        return clean;
     }
 
     /// Latch the node inert: no further inputs are applied, no further
@@ -1171,7 +1189,12 @@ pub const Node = struct {
         }
     }
 
-    fn dispatch(self: *Node, eff: *const engine.Effect) void {
+    /// Dispatch one effect. Returns `OutOfMemory` only for the two
+    /// best-effort effects (the catch-up cache copy, a timer arm) — after
+    /// doing everything else the effect asks for; the fatal ones (a failed
+    /// write-ahead append, OOM buffering an externalization) latch inert
+    /// inside, per §10.
+    fn dispatch(self: *Node, eff: *const engine.Effect) std.mem.Allocator.Error!void {
         switch (eff.*) {
             .persist_own_envelope => |sb| {
                 // CRITICAL invariant (§5.3/§10): this append+fsync must
@@ -1186,8 +1209,9 @@ pub const Node = struct {
             .broadcast_envelope => |sb| {
                 // Always record as our latest for on-connect catch-up, even
                 // during restore; only touch the network once live.
-                self.recordOwnLatest(sb.slot, sb.bytes);
+                const recorded = self.recordOwnLatest(sb.slot, sb.bytes);
                 if (self.live) self.emitEnvelope("dispatch-broadcast", .all, sb.bytes);
+                try recorded;
             },
             .forward_envelope => |sb| {
                 if (!self.live) return;
@@ -1197,10 +1221,7 @@ pub const Node = struct {
                     self.emitEnvelope("dispatch-forward-all", .all, sb.bytes);
                 }
             },
-            .arm_timer => |a| {
-                self.wheel.arm(a.slot, @backingInt(a.timer), a.delay_ms) catch |e|
-                    log.err("timer arm failed: {s}", .{@errorName(e)});
-            },
+            .arm_timer => |a| try self.wheel.arm(a.slot, @backingInt(a.timer), a.delay_ms),
             .cancel_timer => |c| self.wheel.cancel(c.slot, @backingInt(c.timer)),
             .request_qset => |r| {
                 if (!self.live) return;
@@ -1368,21 +1389,27 @@ pub const Node = struct {
     // own_latest (catch-up source)
     // -------------------------------------------------------------------
 
-    fn recordOwnLatest(self: *Node, slot: u64, framed_env: []const u8) void {
+    /// Record our own envelope as the catch-up source for `slot`. OOM is
+    /// returned (the cache then lacks this slot until the next emission for
+    /// it); an envelope that does not decode is logged and skipped.
+    fn recordOwnLatest(self: *Node, slot: u64, framed_env: []const u8) std.mem.Allocator.Error!void {
         // Zero-frame placeholders (engine lagger self-records) never reach
         // effects today, but the skip-zero-frames host contract applies here
         // too — never let an empty frame into the catch-up source.
         if (framed_env.len == 0) return;
-        const bucket = envelopeBucket(self.gpa, framed_env) catch {
-            log.warn("could not bucket own envelope for slot {d}", .{slot});
-            return;
+        const bucket = envelopeBucket(self.gpa, framed_env) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("could not bucket own envelope for slot {d}: {t}", .{ slot, e });
+                return;
+            },
         };
-        const copy = self.gpa.dupe(u8, framed_env) catch return;
+        const copy = try self.gpa.dupe(u8, framed_env);
         self.own_mu.lockUncancelable(self.io);
         defer self.own_mu.unlock(self.io);
-        const gop = self.own_latest.getOrPut(self.gpa, slot) catch {
+        const gop = self.own_latest.getOrPut(self.gpa, slot) catch |e| {
             self.gpa.free(copy);
-            return;
+            return e;
         };
         if (!gop.found_existing) gop.value_ptr.* = .{};
         switch (bucket) {
@@ -2025,4 +2052,60 @@ test "create() never returns an already-inert node: FailingAllocator sweep over 
     std.debug.print("create() sweep: {d} allocation points, {d} ok, {d} inert-at-create\n", .{ errs + oks, oks, inert_creates });
     try std.testing.expect(idx < 4096); // the sweep reached a clean create
     try std.testing.expectEqual(@as(usize, 0), inert_creates);
+}
+
+// Non-vacuity: `recordOwnLatest`'s bare `catch return` on the envelope copy /
+// map insert (or a `catch` that only logs on the arm_timer effect) makes an
+// induced allocation failure inside the own.log restore return a
+// successfully-created node whose catch-up cache lacks the restored slot —
+// this sweep counts creates that succeeded WITH an induced failure (red:
+// "expected 0, found N"; the design's D5 bar is checkAllAllocationFailures
+// over Node.create).
+test "create() swallows no allocation failure: every induced OOM in the sweep is an OutOfMemory return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const passphrase = "swallowed-oom v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    try seedCrashedDir(std.testing.allocator, io, data_dir, seed, passphrase);
+
+    var diag: Diagnostic = .{};
+    var swallowed: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = idx });
+        diag.len = 0;
+        if (Node.create(fa.allocator(), io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = 0,
+            .data_dir = data_dir,
+            .diagnostic = &diag,
+        })) |n| {
+            const induced = fa.has_induced_failure;
+            const has_8 = blk: {
+                n.own_mu.lockUncancelable(io);
+                defer n.own_mu.unlock(io);
+                break :blk n.own_latest.contains(8);
+            };
+            n.deinit();
+            if (induced) {
+                swallowed += 1;
+                std.debug.print("fail_index {d}: create() returned OK although an allocation failed (own_latest has slot 8: {})\n", .{ idx, has_8 });
+            } else {
+                try std.testing.expect(has_8); // the clean create restored slot 8 into the catch-up cache
+                break;
+            }
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try std.testing.expect(idx < 4096);
+    try std.testing.expectEqual(@as(usize, 0), swallowed);
 }
