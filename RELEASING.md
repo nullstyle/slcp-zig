@@ -319,7 +319,9 @@ the first hypothesis; a real own-statement regression is the second. The
 build runner's `--seed` cannot be passed through `zig build`, so the run is
 not replayable by seed; the saved input is the repro. Re-run `just fuzz-long 50K` (32 s, the corpus preserved in `.zig-cache/f/`):
 input-seq FAILED again with the same error at run 33490 (12.5K further
-runs) — reproducible on this machine — and the amended recipe exited 1
+runs) on a DIFFERENT input (sha256 `2d05cef1cfd3a1bf…`, copied to
+`/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input-2.bin`) — a recurring
+class, not a corpus replay — and the amended recipe exited 1
 (`fuzz-long: a fuzz target FAILED …`), its own red proven.
 Ticket for v0.1.x: classify it (replay the input through the harness with
 the EXTERNALIZE-pair rule from HANDOFF §6 applied, or fix the engine).
