@@ -59,7 +59,11 @@
 //! re-armed. Why this is safe: it matches stellar-core's host timer
 //! semantics, and the engine treats any `timer_fired` purely as a timeout
 //! nudge — a spurious nudge can at worst cause an extra round-timeout
-//! evaluation, never a safety (agreement) violation. A v2 fix, if the
+//! evaluation, never a safety (agreement) violation. That puts a
+//! requirement ON THE ENGINE: it must tolerate a stale fire in EVERY phase,
+//! including a slot already externalized (current ballot at counter ∞ —
+//! `ballot.bumpState` refuses the bump instead of computing counter + 1;
+//! S8 D13 found the trap that killed the node). A v2 fix, if the
 //! spurious nudges ever matter, is a generation counter per (slot, timer_id)
 //! pair: `arm`/`cancel` bump the generation under the lock, the wheel
 //! captures the generation at selection and delivers it with the fire (or
