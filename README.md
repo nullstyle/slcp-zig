@@ -248,7 +248,7 @@ text.
 | Option | Default | Meaning |
 |---|---|---|
 | `.network` | required | Passphrase, hashed into the 32-byte networkId that keeps unrelated networks apart. Never transmitted. Must be non-empty. |
-| `.key_file` | `null` | Path of the Ed25519 seed (raw 32 bytes, mode 0600). Loaded, or minted on first run. The usual identity source. |
+| `.key_file` | `null` | Path of the Ed25519 seed (raw 32 bytes, minted with mode 0600; a looser mode is warned about, not refused). Loaded, or minted on first run. The usual identity source. |
 | `.secret_seed` | `null` | The 32-byte seed itself, instead of `.key_file` (one of the two, never both). |
 | `.node_id` | `null` | Optional; when given it must be the public key of the seed (a mismatch is refused). |
 | `.quorum` | required | The quorum spec: `slcp.Quorum.twoThirdsOf(&.{ … })` (the blessed default), `majorityOf`, `of(t, &.{ … })`, or nested `ofSets` / `twoThirdsOfSets`. Validated, normalized and linted at `create`. |

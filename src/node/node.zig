@@ -819,6 +819,16 @@ pub const Node = struct {
     /// silently. Every failure is mapped to a specific `KeyFile*` member.
     fn loadKeyFile(io: std.Io, path: []const u8, diag: ?*Diagnostic) CreateError!keys_mod.KeyPair {
         if (keys_mod.load(io, path)) |kp| {
+            // The mint ceremony writes 0600; a file copied in by cp/scp or
+            // restored under umask 022 arrives 0644 and would otherwise be
+            // accepted in silence (S8 finding). Warn, do not refuse: the
+            // seed is still this node's identity and a running deployment
+            // must keep starting — the operator fixes the mode.
+            if (keys_mod.modeOf(io, path)) |mode| {
+                if (keys_mod.modeTooOpen(mode)) {
+                    create_log.warn(".key_file \"{s}\" is mode 0{o}: readable by group/other, not the 0600 slcp mints; run `chmod 600 {s}`", .{ path, mode, path });
+                }
+            } else |_| {}
             return kp;
         } else |err| switch (err) {
             error.FileNotFound => {

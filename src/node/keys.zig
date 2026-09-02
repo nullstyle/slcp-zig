@@ -122,6 +122,23 @@ pub fn load(io: std.Io, path: []const u8) LoadError!KeyPair {
     return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
 }
 
+/// The permission bits (`mode & 0o777`) of the file at `path` — the load-time
+/// companion of the 0600 mint contract. `mint` writes owner-only; this is
+/// how a caller finds out whether a `cp`/`scp`/umask-022 restore loosened it.
+/// Zero on targets without POSIX modes (a `stat` failure surfaces as is).
+pub fn modeOf(io: std.Io, path: []const u8) std.Io.Dir.StatFileError!std.posix.mode_t {
+    if (comptime std.posix.mode_t == u0 or builtin.os.tag == .windows) return 0;
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    return st.permissions.toMode() & 0o777;
+}
+
+/// `true` when `mode` grants group or other ANY access (`mode & 0o077`):
+/// a seed such a file holds is readable by every account in the group or on
+/// the machine. Owner-only modes (0600, 0400, 0700) are fine.
+pub fn modeTooOpen(mode: std.posix.mode_t) bool {
+    return mode & 0o077 != 0;
+}
+
 /// Mint a fresh key file at `path` (0600, atomic + durable — the same
 /// ceremony as `loadOrCreate`'s first run). `error.KeyFileExists` if any
 /// file already sits there — a key file is never overwritten.
@@ -322,4 +339,43 @@ test "createNew twice is KeyFileExists (bytes unchanged); load on an absent path
         try testing.expectEqualStrings("new.seed", entry.name);
     }
     try testing.expectEqual(@as(usize, 1), entries);
+}
+
+// Pins the S8 finding "A world-readable key file (mode 0644) is accepted
+// silently despite the documented 0600 contract": the load side can now SEE
+// the mode, and group/other bits (0o077) are exactly what `Node.create`
+// warns about. Red before the fix: neither `modeOf` nor `modeTooOpen`
+// existed — nothing on the load path looked at the mode at all. Ablations:
+// masking with 0o007 instead of 0o077 lets the 0640 case through (red);
+// returning the raw mode without `& 0o777` breaks the equality on file
+// systems that set the type bits (red).
+test "modeOf/modeTooOpen: a minted key file is owner-only; 0640, 0644 and 0666 are too open" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "mode.seed");
+    _ = try createNew(io, path);
+
+    // The mint contract: owner-only.
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, path));
+    try testing.expect(!modeTooOpen(try modeOf(io, path)));
+
+    // Anything a `cp`/`scp`/umask-022 restore leaves behind is too open.
+    for ([_]std.posix.mode_t{ 0o640, 0o644, 0o666 }) |mode| {
+        try tmp.dir.setFilePermissions(io, "mode.seed", std.Io.File.Permissions.fromMode(mode), .{});
+        try testing.expectEqual(mode, try modeOf(io, path));
+        try testing.expect(modeTooOpen(mode));
+        // The seed itself still loads: the mode is a warning, not a refusal.
+        _ = try load(io, path);
+    }
+
+    // Owner-only variants stay quiet (0400 is a legitimate read-only seed).
+    try testing.expect(!modeTooOpen(0o400));
+    try testing.expect(!modeTooOpen(0o700));
+    // An absent file is the stat error, not a false "fine".
+    var absent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const absent = try tmpPath(io, &tmp, &absent_buf, "absent.seed");
+    try testing.expectError(error.FileNotFound, modeOf(io, absent));
 }
