@@ -14,6 +14,8 @@ const qset = core.qset;
 const Quorum = slcp.Quorum;
 const keys = slcp.keys;
 const lint_report = slcp.lint_report;
+/// `version` = build.zig.zon's `.version`, injected by build.zig.
+const build_options = @import("build_options");
 
 pub const usage =
     \\usage: slcp <command> [args]
@@ -21,16 +23,42 @@ pub const usage =
     \\  slcp lint-quorum <quorum.json> [--self <hex64>]
     \\      Validate and lint a quorum spec: {"threshold":T,"validators":[<hex64>...],"innerSets":[...]}.
     \\      Prints the normalized tree, its hash, the minimum blocking-set size, critical nodes and
-    \\      every finding. --self adds your own node id to the top level when absent (what
-    \\      Node.create does by default). Exit 0 clean/warnings, 1 lint errors, 2 bad input.
+    \\      every finding. --self (or --self=<hex64>, before or after the path) adds your own node
+    \\      id to the top level when absent (what Node.create does by default). Exit 0
+    \\      clean/warnings, 1 lint errors, 2 bad input.
     \\  slcp key new <file>
     \\      Mint a new Ed25519 key file (raw 32-byte seed, mode 0600) and print its public key
     \\      (your node id). Never overwrites an existing file.
     \\  slcp key show <file>
     \\      Print the public key (node id) of an existing key file.
     \\  slcp --help
+    \\      This text (also `slcp <command> --help`). `--` ends the options: what follows is a path.
+    \\  slcp --version
+    \\      Print the package version.
     \\
 ;
+
+/// `--help` / `-h` anywhere before a `--` separator: every verb prints the
+/// usage to stdout and exits 0 before it touches the filesystem.
+fn wantsHelp(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--")) return false;
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
+}
+
+/// An argument that looks like an option (`-x`, `--x`); never a path unless
+/// it follows `--`. A lone `-` is a path.
+fn looksLikeOption(a: []const u8) bool {
+    return a.len > 1 and a[0] == '-';
+}
+
+fn unknownOption(err_out: *std.Io.Writer, verb: []const u8, arg: []const u8) RunError!u8 {
+    try err_out.print("slcp{s}{s}: unknown option \"{s}\" (use `--` before a path that starts with `-`)\n\n", .{ if (verb.len == 0) "" else " ", verb, arg });
+    try err_out.writeAll(usage);
+    return 2;
+}
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) u8 {
     return runInner(gpa, io, args, out, err_out) catch |err| switch (err) {
@@ -72,42 +100,85 @@ fn runInner(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *
         try out.writeAll(usage);
         return 0;
     }
+    if (std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
+        try out.writeAll("slcp " ++ build_options.version ++ "\n");
+        return 0;
+    }
     if (std.mem.eql(u8, verb, "lint-quorum")) return lintQuorum(gpa, io, args[1..], out, err_out);
     if (std.mem.eql(u8, verb, "key")) return keyCommand(io, args[1..], out, err_out);
+    if (looksLikeOption(verb)) return unknownOption(err_out, "", verb);
     try err_out.print("slcp: unknown command \"{s}\"\n\n", .{verb});
     try err_out.writeAll(usage);
     return 2;
 }
 
 fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) RunError!u8 {
-    if (args.len == 0) {
+    if (wantsHelp(args)) {
+        try out.writeAll(usage);
+        return 0;
+    }
+    // Options and the one positional may come in any order; `--` ends the
+    // options so a path may start with `-`.
+    var path: ?[]const u8 = null;
+    var self_id: ?qset.NodeId = null;
+    var literal = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!literal and std.mem.eql(u8, a, "--")) {
+            literal = true;
+            continue;
+        }
+        if (!literal and looksLikeOption(a)) {
+            var value: []const u8 = undefined;
+            if (std.mem.eql(u8, a, "--self")) {
+                if (i + 1 >= args.len) {
+                    try err_out.writeAll("slcp lint-quorum: --self needs a <hex64> node id\n");
+                    return 2;
+                }
+                i += 1;
+                value = args[i];
+            } else if (std.mem.startsWith(u8, a, "--self=")) {
+                value = a["--self=".len..];
+            } else {
+                return unknownOption(err_out, "lint-quorum", a);
+            }
+            if (self_id != null) {
+                try err_out.writeAll("slcp lint-quorum: --self given twice; a node has one id\n");
+                return 2;
+            }
+            self_id = slcp.parseNodeId(value) catch {
+                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{value});
+                return 2;
+            };
+            continue;
+        }
+        if (path != null) {
+            try err_out.print("slcp lint-quorum: expected one <quorum.json>, got a second: \"{s}\"\n\n", .{a});
+            try err_out.writeAll(usage);
+            return 2;
+        }
+        path = a;
+    }
+    const spec_path = path orelse {
         try err_out.writeAll("slcp lint-quorum: missing <quorum.json>\n\n");
         try err_out.writeAll(usage);
         return 2;
-    }
-    const path = args[0];
-    var self_id: ?qset.NodeId = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--self")) {
-            if (i + 1 >= args.len) {
-                try err_out.writeAll("slcp lint-quorum: --self needs a <hex64> node id\n");
-                return 2;
-            }
-            i += 1;
-            self_id = slcp.parseNodeId(args[i]) catch {
-                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{args[i]});
-                return 2;
-            };
-        } else {
-            try err_out.print("slcp lint-quorum: unknown argument \"{s}\"\n", .{args[i]});
-            return 2;
-        }
+    };
+    if (spec_path.len == 0) {
+        try err_out.writeAll("slcp lint-quorum: missing <quorum.json> (the path is empty)\n\n");
+        try err_out.writeAll(usage);
+        return 2;
     }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| {
-        try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ path, err });
-        return 2;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, spec_path, gpa, .limited(1 << 20)) catch |err| switch (err) {
+        // An allocation failure is ours, not the file's: it takes `run`'s
+        // dedicated `slcp: out of memory` path like every other site.
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ spec_path, err });
+            return 2;
+        },
     };
     defer gpa.free(bytes);
 
@@ -115,8 +186,16 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
     defer arena_state.deinit();
     const spec = Quorum.fromJson(arena_state.allocator(), bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        // The parser caps the depth at the wire limit (it is the only
+        // recursion bound for the tree walkers), so the structural verdict
+        // is reported here in the same voice, channel and exit code as the
+        // other `create`-would-refuse limits (§12: exit 1, not "bad input").
+        error.TooDeep => {
+            try out.print("ERROR too_deep: the tree nests more than {d} levels but the wire limit is {d}\n", .{ qset.max_depth, qset.max_depth });
+            return 1;
+        },
         else => {
-            try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ path, err });
+            try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ spec_path, err });
             return 2;
         },
     };
@@ -135,7 +214,21 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
     qset.validateAndNormalize(gpa, &owned) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EmptyQuorumSet => {
-            try out.writeAll("ERROR empty_quorum: the spec has no members; list the validators\n");
+            // Any level can be the empty one; name it (the top level, or the
+            // `innerSets[i]...` path to the inner set) so the user looks in
+            // the right place.
+            if (lint_report.firstEmptyLevel(&owned)) |at| {
+                if (at.len > 0) {
+                    try out.writeAll("ERROR empty_quorum: ");
+                    for (at.path[0..at.len], 0..) |ix, k| {
+                        if (k > 0) try out.writeByte('.');
+                        try out.print("innerSets[{d}]", .{ix});
+                    }
+                    try out.print(" (depth {d}) has no members; list its validators or remove it\n", .{@as(u32, at.len) + 1});
+                    return 1;
+                }
+            }
+            try out.writeAll("ERROR empty_quorum: the top level has no members; list the validators\n");
             return 1;
         },
         error.ThresholdOutOfRange => {
@@ -176,19 +269,39 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
 }
 
 fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) RunError!u8 {
-    if (args.len != 2 or !(std.mem.eql(u8, args[0], "new") or std.mem.eql(u8, args[0], "show"))) {
+    if (wantsHelp(args)) {
+        try out.writeAll(usage);
+        return 0;
+    }
+    const known_verb = args.len >= 1 and (std.mem.eql(u8, args[0], "new") or std.mem.eql(u8, args[0], "show"));
+    // `key new -- <file>`: the path is taken verbatim however it looks.
+    const literal = args.len >= 2 and std.mem.eql(u8, args[1], "--");
+    const rest = if (known_verb) args[@as(usize, if (literal) 2 else 1)..] else args;
+    if (!known_verb or rest.len != 1) {
         try err_out.writeAll("slcp key: expected `key new <file>` or `key show <file>`\n\n");
         try err_out.writeAll(usage);
         return 2;
     }
-    const path = args[1];
+    const path = rest[0];
+    const verb: []const u8 = if (std.mem.eql(u8, args[0], "new")) "key new" else "key show";
+    if (path.len == 0) {
+        try err_out.print("slcp {s}: missing <file> (the path is empty)\n\n", .{verb});
+        try err_out.writeAll(usage);
+        return 2;
+    }
+    if (!literal and looksLikeOption(path)) return unknownOption(err_out, verb, path);
     if (std.mem.eql(u8, args[0], "new")) {
         const kp = keys.createNew(io, path) catch |err| switch (err) {
             error.KeyFileExists => {
+                // Something sits at that name. Say WHAT, so the advice fits:
+                // only a real key file is "an existing identity".
                 if (keys.load(io, path)) |existing| {
                     try err_out.print("slcp key new: {s} already exists (public key: {s}); move it aside first to mint a new identity\n", .{ path, &std.fmt.bytesToHex(existing.public_key, .lower) });
-                } else |_| {
-                    try err_out.print("slcp key new: {s} already exists; move it aside first to mint a new identity\n", .{path});
+                } else |load_err| switch (load_err) {
+                    error.FileNotFound => try err_out.print("slcp key new: {s} is a dangling symbolic link; remove it (or point it at a key file)\n", .{path}),
+                    error.IsDir => try err_out.print("slcp key new: {s} is a directory; pick a file path\n", .{path}),
+                    error.BadKeyFile => try printNotKeyFile(io, err_out, "key new", path, "remove it or pick another path"),
+                    else => |e| try err_out.print("slcp key new: {s} already exists but cannot be read ({t}); move it aside first to mint a new identity\n", .{ path, e }),
                 }
                 return 1;
             },
@@ -206,11 +319,22 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
     }
     const kp = keys.load(io, path) catch |err| switch (err) {
         error.FileNotFound => {
-            try err_out.print("slcp key show: {s} not found; create one with: slcp key new {s}\n", .{ path, path });
+            // A dangling link is not "absent": `key new` would refuse it
+            // (link() will not replace), so the two verbs must not send
+            // the user back and forth.
+            if (isSymlink(io, path)) {
+                try err_out.print("slcp key show: {s} is a dangling symbolic link; remove it (or point it at a key file)\n", .{path});
+            } else {
+                try err_out.print("slcp key show: {s} not found; create one with: slcp key new {s}\n", .{ path, path });
+            }
+            return 1;
+        },
+        error.IsDir => {
+            try err_out.print("slcp key show: {s} is a directory; expected a key file\n", .{path});
             return 1;
         },
         error.BadKeyFile => {
-            try err_out.print("slcp key show: {s} is not a slcp key file (expected exactly 32 raw seed bytes)\n", .{path});
+            try printNotKeyFile(io, err_out, "key show", path, "expected exactly 32 raw seed bytes");
             return 1;
         },
         else => |e| {
@@ -220,6 +344,23 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
     };
     try out.print("public key: {s}\n", .{&std.fmt.bytesToHex(kp.public_key, .lower)});
     return 0;
+}
+
+/// `<path> is not a slcp key file (N bytes; <advice>)` — the byte count is
+/// what tells a truncated seed from a stray file.
+fn printNotKeyFile(io: std.Io, err_out: *std.Io.Writer, verb: []const u8, path: []const u8, advice: []const u8) std.Io.Writer.Error!void {
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        try err_out.print("slcp {s}: {s} is not a slcp key file ({d} bytes; {s})\n", .{ verb, path, st.size, advice });
+    } else |_| {
+        try err_out.print("slcp {s}: {s} is not a slcp key file ({s})\n", .{ verb, path, advice });
+    }
+}
+
+/// True when `path` itself is a symbolic link (whatever it points at).
+fn isSymlink(io: std.Io, path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -460,4 +601,319 @@ test "cli runAndFlush: a failed stdout flush is exit 2 with a note on stderr; a 
     code = runAndFlush(gpa, io, &.{"frobnicate"}, &c.out.writer, &broken_err);
     try testing.expectEqual(@as(u8, 2), code);
     try testing.expect(std.mem.indexOf(u8, err_buf[0..broken_err.end], "unknown command") != null);
+}
+
+// Non-vacuity: a bare `catch` around `readFileAlloc` (blaming the file for
+// an OutOfMemory) turns the fail_index=0 point red with
+// `cannot read <path>: OutOfMemory`; the sweep stops only once a run
+// completes with no induced failure, so every allocation point is covered.
+test "cli lint-quorum: an allocation failure anywhere is `slcp: out of memory`, never blamed on the file" {
+    const base = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.json", .data = two_of_three_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try tmpPath(io, &tmp, &b1, "two.json");
+
+    // The capture buffers live on the base allocator so only the CLI's own
+    // allocations are subject to the induced failure.
+    var c = Captured.init(base);
+    defer c.deinit();
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        c.exec(failing.allocator(), io, &.{ "lint-quorum", two });
+        if (!failing.has_induced_failure) break;
+        try testing.expectEqual(@as(u8, 2), c.code);
+        try testing.expectEqualStrings("slcp: out of memory\n", c.stderr());
+        try testing.expectEqualStrings("", c.stdout());
+    }
+    // The sweep really exercised several allocation points and ended on a
+    // clean run.
+    try testing.expect(fail_index >= 3);
+    try testing.expectEqual(@as(u8, 0), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), two_of_three_hash) != null);
+}
+
+// Non-vacuity: treating `--help` as a file name mints a key literally named
+// `--help` (exit 0 with a `public key:` line) and makes `lint-quorum --help`
+// a FileNotFound (exit 2); dropping the option check lets `--bogus` through
+// as a path; `--version` was "unknown command" (exit 2).
+test "cli per-verb --help/-h prints usage (exit 0, no file touched); option-looking paths are refused; --version" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var c = Captured.init(gpa);
+    defer c.deinit();
+    // On a red run `key new --help` mints a file literally named `--help`
+    // in the cwd; remove it so a failure does not litter the tree.
+    defer std.Io.Dir.cwd().deleteFile(io, "--help") catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, "-h") catch {};
+
+    const help_forms = [_][]const []const u8{
+        &.{ "key", "new", "--help" },
+        &.{ "key", "new", "-h" },
+        &.{ "key", "show", "--help" },
+        &.{ "key", "--help" },
+        &.{ "lint-quorum", "--help" },
+        &.{ "lint-quorum", "-h" },
+        &.{ "lint-quorum", "spec.json", "--help" },
+        &.{ "help", "key" },
+    };
+    for (help_forms) |args| {
+        c.exec(gpa, io, args);
+        try testing.expectEqual(@as(u8, 0), c.code);
+        try testing.expectEqualStrings(usage, c.stdout());
+        try testing.expectEqualStrings("", c.stderr());
+    }
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "--help", .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "-h", .{}));
+
+    // An option-looking positional is refused before the filesystem is
+    // touched (exit 2, names the option, shows the usage).
+    const option_paths = [_][]const []const u8{
+        &.{ "key", "new", "--bogus" },
+        &.{ "key", "show", "-x" },
+        &.{ "lint-quorum", "--bogus" },
+        &.{ "lint-quorum", "-x.json" },
+        &.{"--bogus"},
+    };
+    for (option_paths) |args| {
+        c.exec(gpa, io, args);
+        try testing.expectEqual(@as(u8, 2), c.code);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), "unknown option") != null);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), args[args.len - 1]) != null);
+        try testing.expect(std.mem.indexOf(u8, c.stderr(), "usage: slcp") != null);
+        try testing.expectEqualStrings("", c.stdout());
+    }
+    // `--` ends option parsing: what follows is a path, however it looks.
+    c.exec(gpa, io, &.{ "lint-quorum", "--", "-x.json" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "cannot read -x.json") != null);
+
+    // `--version` / `-V` print the manifest version on stdout.
+    for ([_][]const u8{ "--version", "-V" }) |flag| {
+        c.exec(gpa, io, &.{flag});
+        try testing.expectEqual(@as(u8, 0), c.code);
+        try testing.expectEqualStrings("slcp " ++ build_options.version ++ "\n", c.stdout());
+        try testing.expect(std.ascii.isDigit(build_options.version[0]));
+    }
+}
+
+// Non-vacuity: reporting fromJson's `TooDeep` as "not a quorum spec" (exit
+// 2 on stderr) makes the 5-level case red; the 256-validator twin pins the
+// channel/exit both wire limits must share (design §12: structural errors
+// `create` would refuse are exit 1 on stdout with the limit stated).
+test "cli lint-quorum: depth > 4 and > 255 validators are both `ERROR <code>` on stdout, exit 1, naming the limit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Five nested levels: 2-of-{v, inner} down to a 1-of-1 leaf.
+    const id = "0505050505050505050505050505050505050505050505050505050505050505";
+    const leaf = "{\"threshold\":1,\"validators\":[\"" ++ id ++ "\"],\"innerSets\":[]}";
+    const l4 = "{\"threshold\":2,\"validators\":[\"0404040404040404040404040404040404040404040404040404040404040404\"],\"innerSets\":[" ++ leaf ++ "]}";
+    const l3 = "{\"threshold\":2,\"validators\":[\"0303030303030303030303030303030303030303030303030303030303030303\"],\"innerSets\":[" ++ l4 ++ "]}";
+    const l2 = "{\"threshold\":2,\"validators\":[\"0202020202020202020202020202020202020202020202020202020202020202\"],\"innerSets\":[" ++ l3 ++ "]}";
+    const deep5 = "{\"threshold\":2,\"validators\":[\"0101010101010101010101010101010101010101010101010101010101010101\"],\"innerSets\":[" ++ l2 ++ "]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep5.json", .data = deep5 });
+
+    // 256 distinct validators, threshold 171 (a majority, so the only
+    // complaint is the wire limit).
+    var many: std.Io.Writer.Allocating = .init(gpa);
+    defer many.deinit();
+    try many.writer.writeAll("{\"threshold\":171,\"validators\":[");
+    for (0..256) |n| {
+        if (n > 0) try many.writer.writeByte(',');
+        var raw: qset.NodeId = @splat(0);
+        raw[0] = @intCast(n);
+        raw[31] = 0xee;
+        try many.writer.print("\"{s}\"", .{&std.fmt.bytesToHex(raw, .lower)});
+    }
+    try many.writer.writeAll("],\"innerSets\":[]}");
+    try tmp.dir.writeFile(io, .{ .sub_path = "v256.json", .data = many.written() });
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const deep_path = try tmpPath(io, &tmp, &b1, "deep5.json");
+    const many_path = try tmpPath(io, &tmp, &b2, "v256.json");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    c.exec(gpa, io, &.{ "lint-quorum", deep_path });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqualStrings("ERROR too_deep: the tree nests more than 4 levels but the wire limit is 4\n", c.stdout());
+    try testing.expectEqual(@as(u8, 1), c.code);
+
+    c.exec(gpa, io, &.{ "lint-quorum", many_path });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqualStrings("ERROR too_many_validators: the tree names 256 validators but the wire limit is 255\n", c.stdout());
+    try testing.expectEqual(@as(u8, 1), c.code);
+}
+
+// Non-vacuity: a fixed "the spec has no members" sentence makes both inner
+// cases red (the spec HAS members; an inner set is what is empty); dropping
+// the path makes the two-deep case indistinguishable from the one-deep one.
+test "cli lint-quorum: empty_quorum names the empty level (top level vs innerSets[i] path)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = "0101010101010101010101010101010101010101010101010101010101010101";
+    const b = "0202020202020202020202020202020202020202020202020202020202020202";
+    try tmp.dir.writeFile(io, .{ .sub_path = "top.json", .data = "{\"threshold\":1,\"validators\":[],\"innerSets\":[]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "inner.json", .data = "{\"threshold\":1,\"validators\":[\"" ++ a ++ "\"],\"innerSets\":[{\"threshold\":1,\"validators\":[]}]}" });
+    // The empty set is the FIRST inner set of the SECOND inner set.
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep.json", .data = "{\"threshold\":2,\"validators\":[\"" ++ a ++ "\"],\"innerSets\":[{\"threshold\":1,\"validators\":[\"" ++ b ++ "\"]},{\"threshold\":1,\"validators\":[],\"innerSets\":[{\"threshold\":1,\"validators\":[]}]}]}" });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    const top = try tmpPath(io, &tmp, &b1, "top.json");
+    const inner = try tmpPath(io, &tmp, &b2, "inner.json");
+    const deep = try tmpPath(io, &tmp, &b3, "deep.json");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    c.exec(gpa, io, &.{ "lint-quorum", inner });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: innerSets[0] (depth 2) has no members; list its validators or remove it\n", c.stdout());
+
+    c.exec(gpa, io, &.{ "lint-quorum", top });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: the top level has no members; list the validators\n", c.stdout());
+
+    c.exec(gpa, io, &.{ "lint-quorum", deep });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: innerSets[1].innerSets[0] (depth 3) has no members; list its validators or remove it\n", c.stdout());
+    try testing.expectEqualStrings("", c.stderr());
+}
+
+// Non-vacuity: printing the same "already exists; move it aside first to
+// mint a new identity" sentence for every `KeyFileExists` makes the
+// dangling-symlink, directory and short-file cases red; letting `key show`
+// answer "not found; create one with" on a dangling link (the advice that
+// loops with `key new`) is red; an empty path reaching the filesystem is red.
+test "cli key new / key show: dangling symlink, directory and non-key files are named for what they are; empty path is usage" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(io, "nowhere.key", "dangling", .{});
+    try tmp.dir.createDirPath(io, "adir");
+    const short: [31]u8 = @splat(0xab);
+    try tmp.dir.writeFile(io, .{ .sub_path = "k31", .data = &short });
+    try tmp.dir.writeFile(io, .{ .sub_path = "k0", .data = "" });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    var b4: [std.fs.max_path_bytes]u8 = undefined;
+    const dangling = try tmpPath(io, &tmp, &b1, "dangling");
+    const adir = try tmpPath(io, &tmp, &b2, "adir");
+    const k31 = try tmpPath(io, &tmp, &b3, "k31");
+    const k0 = try tmpPath(io, &tmp, &b4, "k0");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    // Dangling symlink: both verbs say so, neither loops to the other.
+    c.exec(gpa, io, &.{ "key", "new", dangling });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "dangling symbolic link") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "mint a new identity") == null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "nowhere.key", .{}));
+    c.exec(gpa, io, &.{ "key", "show", dangling });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "dangling symbolic link") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "create one with") == null);
+
+    // A directory.
+    c.exec(gpa, io, &.{ "key", "new", adir });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is a directory") != null);
+    c.exec(gpa, io, &.{ "key", "show", adir });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is a directory") != null);
+
+    // Wrong-length files: not an identity, and the size is stated.
+    c.exec(gpa, io, &.{ "key", "new", k31 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (31 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "mint a new identity") == null);
+    c.exec(gpa, io, &.{ "key", "new", k0 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (0 bytes") != null);
+    c.exec(gpa, io, &.{ "key", "show", k31 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (31 bytes") != null);
+    // Nothing was overwritten.
+    const st = try tmp.dir.statFile(io, "k31", .{});
+    try testing.expectEqual(@as(u64, 31), st.size);
+
+    // An empty path is a usage error for every verb (exit 2, no fs access).
+    c.exec(gpa, io, &.{ "key", "new", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <file>") != null);
+    c.exec(gpa, io, &.{ "key", "show", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <file>") != null);
+    c.exec(gpa, io, &.{ "lint-quorum", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <quorum.json>") != null);
+}
+
+// Non-vacuity: taking args[0] as the path makes `--self <hex> spec` red
+// (the flag was "the file"); exact-token matching makes `--self=<hex>` red;
+// last-wins assignment makes the twice case red (it printed a note for the
+// second id and exit 1 instead of refusing); two positionals were "unknown
+// argument" with no hint.
+test "cli lint-quorum: --self before or after the path, --self=<hex>, --self twice refused, two paths refused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.json", .data = two_of_three_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try tmpPath(io, &tmp, &b1, "two.json");
+    const absent_self = "0909090909090909090909090909090909090909090909090909090909090909";
+    const other_self = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    // Flag first: identical to the documented flag-last form.
+    c.exec(gpa, io, &.{ "lint-quorum", "--self", absent_self, two });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "note: added self " ++ absent_self) != null);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "quorum: 2-of-4") != null);
+
+    // `--self=<hex>` spelling.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self=" ++ absent_self });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "note: added self " ++ absent_self) != null);
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self=" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "64 hex") != null);
+
+    // Repeated --self is refused, never silently last-wins.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self", absent_self, "--self", other_self });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "--self given twice") != null);
+    try testing.expectEqualStrings("", c.stdout());
+
+    // Two positionals: say so, name the second.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "extra.json" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "expected one <quorum.json>") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "extra.json") != null);
+
+    // A bare --self still wants its value.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "--self needs") != null);
 }

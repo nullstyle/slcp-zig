@@ -285,7 +285,8 @@ same binary through `slcp_dep.artifact("slcp")`, as the example's
   `docs/quorum-recipes.md` holds three copy-paste specs with the exact output
   each one produces.
 
-`slcp --help` prints the same list.
+`slcp --help` prints the same list (so does `--help` after any verb, and it
+never touches a file); `slcp --version` prints the package version.
 
 ## Building and testing
 
