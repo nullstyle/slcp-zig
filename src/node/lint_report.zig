@@ -167,6 +167,31 @@ fn collectValidators(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned, out
     for (qs.inner_sets) |*inner| try collectValidators(gpa, inner, out);
 }
 
+/// Where the first (pre-order) level with no validators and no inner sets
+/// sits: `path[0..len]` are the `innerSets` indices from the top down, so
+/// `len == 0` is the top level itself. Indices are those of the input tree:
+/// `validateAndNormalize` normalizes children before it reorders a parent,
+/// so when it reports `EmptyQuorumSet` no ancestor has been reordered yet.
+pub const EmptyLevel = struct { path: [qset.max_depth]u32, len: u8 };
+
+pub fn firstEmptyLevel(qs: *const qset.QuorumSetOwned) ?EmptyLevel {
+    var found: EmptyLevel = .{ .path = @splat(0), .len = 0 };
+    return if (findEmpty(qs, &found, 0)) found else null;
+}
+
+fn findEmpty(qs: *const qset.QuorumSetOwned, out: *EmptyLevel, level: usize) bool {
+    if (qs.validators.len == 0 and qs.inner_sets.len == 0) {
+        out.len = @intCast(level);
+        return true;
+    }
+    if (level >= qset.max_depth) return false; // deeper than the wire limit: not ours to name
+    for (qs.inner_sets, 0..) |*inner, i| {
+        out.path[level] = @intCast(i);
+        if (findEmpty(inner, out, level + 1)) return true;
+    }
+    return false;
+}
+
 /// Nesting depth (a flat set is 1).
 pub fn depth(qs: *const qset.QuorumSetOwned) u32 {
     var deepest: u32 = 0;
@@ -278,4 +303,18 @@ test "byzantineTolerance and the tree-fact helpers" {
     try testing.expectEqual(@as(u32, 3), depth(&nested));
     try testing.expect(firstBadThreshold(&nested) == null);
     try testing.expect((try firstDuplicate(gpa, &nested)) == null);
+    try testing.expect(firstEmptyLevel(&nested) == null);
+
+    // The empty level is innerSets[1].innerSets[0]: path {1, 0}, len 2.
+    const empty = Quorum{ .threshold = 1, .validators = &.{}, .inner_sets = &.{} };
+    const holder = Quorum.ofSets(1, &.{empty});
+    const spec_with_empty = Quorum{ .threshold = 2, .validators = ids[0..1], .inner_sets = &.{ inner[0], holder } };
+    var with_empty = try spec_with_empty.toOwned(gpa);
+    defer with_empty.deinit(gpa);
+    const at = firstEmptyLevel(&with_empty).?;
+    try testing.expectEqual(@as(u8, 2), at.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 0 }, at.path[0..at.len]);
+    var empty_top = try empty.toOwned(gpa);
+    defer empty_top.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), firstEmptyLevel(&empty_top).?.len);
 }

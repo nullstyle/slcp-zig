@@ -1113,6 +1113,9 @@ slcp.core.values.order: fn ([]const u8, []const u8) math.Order
 slcp.core.values: struct
 slcp.core: struct
 slcp.keys: struct
+slcp.lint_report.EmptyLevel.len: field u8
+slcp.lint_report.EmptyLevel.path: field [4]u32
+slcp.lint_report.EmptyLevel: struct
 slcp.lint_report.Level.members: field u32
 slcp.lint_report.Level.threshold: field u32
 slcp.lint_report.Level: struct
@@ -1124,6 +1127,7 @@ slcp.lint_report.byzantineTolerance: fn (u32, u32) u32
 slcp.lint_report.depth: fn (*const engine.qset.QuorumSetOwned) u32
 slcp.lint_report.firstBadThreshold: fn (*const engine.qset.QuorumSetOwned) ?node.lint_report.Level
 slcp.lint_report.firstDuplicate: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!?[32]u8
+slcp.lint_report.firstEmptyLevel: fn (*const engine.qset.QuorumSetOwned) ?node.lint_report.EmptyLevel
 slcp.lint_report.hasErrors: fn ([]const engine.qset.LintFinding) bool
 slcp.lint_report.totalValidators: fn (*const engine.qset.QuorumSetOwned) usize
 slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFailed}!void

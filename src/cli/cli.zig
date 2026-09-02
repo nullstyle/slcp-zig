@@ -171,7 +171,21 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
     qset.validateAndNormalize(gpa, &owned) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EmptyQuorumSet => {
-            try out.writeAll("ERROR empty_quorum: the spec has no members; list the validators\n");
+            // Any level can be the empty one; name it (the top level, or the
+            // `innerSets[i]...` path to the inner set) so the user looks in
+            // the right place.
+            if (lint_report.firstEmptyLevel(&owned)) |at| {
+                if (at.len > 0) {
+                    try out.writeAll("ERROR empty_quorum: ");
+                    for (at.path[0..at.len], 0..) |ix, k| {
+                        if (k > 0) try out.writeByte('.');
+                        try out.print("innerSets[{d}]", .{ix});
+                    }
+                    try out.print(" (depth {d}) has no members; list its validators or remove it\n", .{@as(u32, at.len) + 1});
+                    return 1;
+                }
+            }
+            try out.writeAll("ERROR empty_quorum: the top level has no members; list the validators\n");
             return 1;
         },
         error.ThresholdOutOfRange => {
@@ -595,4 +609,42 @@ test "cli lint-quorum: depth > 4 and > 255 validators are both `ERROR <code>` on
     try testing.expectEqualStrings("", c.stderr());
     try testing.expectEqualStrings("ERROR too_many_validators: the tree names 256 validators but the wire limit is 255\n", c.stdout());
     try testing.expectEqual(@as(u8, 1), c.code);
+}
+
+// Non-vacuity: a fixed "the spec has no members" sentence makes both inner
+// cases red (the spec HAS members; an inner set is what is empty); dropping
+// the path makes the two-deep case indistinguishable from the one-deep one.
+test "cli lint-quorum: empty_quorum names the empty level (top level vs innerSets[i] path)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = "0101010101010101010101010101010101010101010101010101010101010101";
+    const b = "0202020202020202020202020202020202020202020202020202020202020202";
+    try tmp.dir.writeFile(io, .{ .sub_path = "top.json", .data = "{\"threshold\":1,\"validators\":[],\"innerSets\":[]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "inner.json", .data = "{\"threshold\":1,\"validators\":[\"" ++ a ++ "\"],\"innerSets\":[{\"threshold\":1,\"validators\":[]}]}" });
+    // The empty set is the FIRST inner set of the SECOND inner set.
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep.json", .data = "{\"threshold\":2,\"validators\":[\"" ++ a ++ "\"],\"innerSets\":[{\"threshold\":1,\"validators\":[\"" ++ b ++ "\"]},{\"threshold\":1,\"validators\":[],\"innerSets\":[{\"threshold\":1,\"validators\":[]}]}]}" });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    const top = try tmpPath(io, &tmp, &b1, "top.json");
+    const inner = try tmpPath(io, &tmp, &b2, "inner.json");
+    const deep = try tmpPath(io, &tmp, &b3, "deep.json");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    c.exec(gpa, io, &.{ "lint-quorum", inner });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: innerSets[0] (depth 2) has no members; list its validators or remove it\n", c.stdout());
+
+    c.exec(gpa, io, &.{ "lint-quorum", top });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: the top level has no members; list the validators\n", c.stdout());
+
+    c.exec(gpa, io, &.{ "lint-quorum", deep });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("ERROR empty_quorum: innerSets[1].innerSets[0] (depth 3) has no members; list its validators or remove it\n", c.stdout());
+    try testing.expectEqualStrings("", c.stderr());
 }
