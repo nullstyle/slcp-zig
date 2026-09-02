@@ -122,8 +122,11 @@ What the program relies on:
   semantically right. Floats, pointers, slices, optionals and unions are
   rejected at compile time with the reason and the workaround.
 - **It agrees on values, never on operations.** `Command` is "the count
-  becomes `next`", not "add one": operations double-apply under combine and
-  under journal replay; values cannot.
+  becomes `next`", not "add one": operations break under combine (two
+  proposers both adding one collapse to a single increment) and under journal
+  replay (a restarted node re-applies only the journal tail onto
+  `initialState()`, so a delta loses every increment before the compaction
+  floor); values survive both.
 - **`apply` runs on the engine thread**, after the journal append and before
   the next input; `waitApplied` hands the user thread a value copy of the
   state. Keep `apply` fast and pure.

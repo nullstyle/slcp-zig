@@ -68,8 +68,10 @@ Two things the program does on purpose:
 
 - **It agrees on values, never on operations.** `Command` is "the count
   becomes `next`", not "add one": under the default highest-value-wins
-  combine and under replay after a crash, operations would double-apply;
-  values cannot.
+  combine two "add one" proposals collapse to a single increment, and under
+  replay after a crash only the journal tail is re-applied onto
+  `initialState()`, so a delta would lose every increment before the
+  compaction floor; values survive both.
 - **Its first proposal after a restart is stale.** A restarted process
   proposes `{ .next = 1 }` again while the network is at slot 30. The other
   nodes judge it `.invalid` (`validate` sees `next < count + 1`), the
