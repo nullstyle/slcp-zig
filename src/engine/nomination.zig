@@ -758,11 +758,10 @@ fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
         // NominationProtocol.cpp:170-180): store an unsigned zero-frame
         // placeholder so own votes count in own federated math — nothing
         // hits the wire and own_nom (the rebroadcast source) is untouched.
-        var placeholder = try placeholderNomStored(gpa, ctx, s);
-        const delta = s.storeLatest(gpa, placeholder) catch |err| {
-            placeholder.deinit(gpa);
-            return err;
-        };
+        // storeLatest owns the placeholder from here, including on failure
+        // (a caller-side deinit after a failed store is a double free).
+        const placeholder = try placeholderNomStored(gpa, ctx, s);
+        const delta = try s.storeLatest(gpa, placeholder);
         ctx.addStoredBytes(delta); // §5.1 budget: self-stores must account
     } else {
         var env = try emit_mod.emit(ctx, s.index, .{ .nominate = .{
@@ -772,11 +771,10 @@ fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
         } });
         {
             errdefer env.deinit(gpa);
-            var dup = try cloneNomStored(gpa, &env);
-            const delta = s.storeLatest(gpa, dup) catch |err| {
-                dup.deinit(gpa);
-                return err;
-            };
+            // storeLatest owns `dup` from here, including on failure (a
+            // caller-side deinit after a failed store is a double free).
+            const dup = try cloneNomStored(gpa, &env);
+            const delta = try s.storeLatest(gpa, dup);
             ctx.addStoredBytes(delta); // §5.1 budget: self-stores must account
         }
         // mLastEnvelope replacement (cpp:172-176; own sets only grow, so the
@@ -1553,4 +1551,69 @@ test "stopNomination: sticky — nominate refused, timer and peer promotion iner
     const d = h.drain();
     try testing.expectEqual(@as(usize, 0), d.arm);
     try testing.expectEqual(@as(usize, 0), d.persist);
+}
+
+/// One nomination emission with allocation `fail_index` (through ctx.gpa)
+/// made to fail (maxInt = none). `placeholder_path` reaches emitNomination's
+/// lagger self-record (fully_validated == false) instead of the signed path.
+/// Returns the number of ctx.gpa allocations the run made.
+fn emitUnderOom(fail_index: usize, placeholder_path: bool) !usize {
+    var h: TestHarness = undefined;
+    if (placeholder_path) {
+        var d0 = driver_test.Driver.default();
+        d0.validate_value = greyValidate;
+        try h.setup(testing.allocator, .{ .advertise = false, .drv = d0 });
+    } else {
+        try h.setup(testing.allocator, .{});
+    }
+    defer h.deinit();
+    h.resetSlot(try h.findSlotLedBy(h.ids[0]));
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+
+    if (placeholder_path) {
+        // A maybe_valid peer value clears fully_validated; a second peer's
+        // accept then promotes "gg" into own accepted, so emitNomination runs
+        // with fully_validated == false → the zero-frame placeholder store.
+        try testing.expect(try nominate(&h.ctx, &h.s, "aa", "prev"));
+        try h.peerNom(h.ids[1], &.{"gg"}, &.{"gg"});
+        try testing.expect(!h.s.fully_validated);
+        const stp = try h.storePeerNom(h.ids[2], &.{"gg"}, &.{"gg"});
+        h.ctx.gpa = fa.allocator();
+        defer h.ctx.gpa = testing.allocator;
+        if (processEnvelope(&h.ctx, &h.s, stp)) |_| {
+            try testing.expect(!fa.has_induced_failure); // an induced OOM must surface
+            try testing.expect(h.s.nom.accepted.contains("gg"));
+        } else |err| {
+            try testing.expectEqual(@as(anyerror, error.OutOfMemory), @as(anyerror, err));
+            try testing.expect(fa.has_induced_failure);
+        }
+    } else {
+        h.ctx.gpa = fa.allocator();
+        defer h.ctx.gpa = testing.allocator;
+        if (nominate(&h.ctx, &h.s, "v1", "prev")) |ok| {
+            try testing.expect(ok);
+            try testing.expect(!fa.has_induced_failure); // an induced OOM must surface
+            try testing.expect(h.s.latestFor(h.ids[0], true) != null);
+        } else |err| {
+            try testing.expectEqual(@as(anyerror, error.OutOfMemory), @as(anyerror, err));
+            try testing.expect(fa.has_induced_failure);
+        }
+    }
+    return fa.alloc_index;
+}
+
+// Non-vacuity: restore the caller-side `dup.deinit(gpa)` / `placeholder.deinit(gpa)`
+// after a failed storeLatest in emitNomination and this sweep double-frees
+// the self-recorded StoredEnvelope (testing.allocator panics: "double free")
+// at the map getOrPut and the box-create fail indexes (S8 finding
+// "Engine-thread double free: storeLatest frees the envelope on OOM and
+// emitNomination frees it again"). Leaks on any index fail the test via
+// testing.allocator's leak check.
+test "oom sweep: emitNomination self-record under every allocation failure — OOM surfaces, no double free, no leak" {
+    for ([_]bool{ false, true }) |placeholder_path| {
+        const total = try emitUnderOom(std.math.maxInt(usize), placeholder_path);
+        try testing.expect(total >= 4); // a sweep over nothing proves nothing
+        var k: usize = 0;
+        while (k < total) : (k += 1) _ = try emitUnderOom(k, placeholder_path);
+    }
 }

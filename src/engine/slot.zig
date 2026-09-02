@@ -388,7 +388,9 @@ pub const Slot = struct {
     }
 
     /// Replace the stored latest envelope for (node, protocol), returning
-    /// the byte-size delta (new - old). Takes ownership of `env`.
+    /// the byte-size delta (new - old). Takes ownership of `env` on EVERY
+    /// path: on failure `env` is freed here, so callers must not deinit it
+    /// (no errdefer / catch-free across this call).
     pub fn storeLatest(self: *Slot, gpa: std.mem.Allocator, env: stored.StoredEnvelope) !isize {
         var owned = env;
         const map = if (owned.statement.isNomination()) &self.latest_nom else &self.latest_ballot;
