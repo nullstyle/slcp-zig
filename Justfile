@@ -104,3 +104,55 @@ check-api:
 
 # ===== M6:release =====
 # M6 stage anchor (release): preflight / package-preflight / release-hash / release-tag / verify-release-hash go here.
+
+
+# The package-completeness proof (design §13.9; HANDOFF §6 ".paths rule"): a
+# path dependency (example-smoke's in-tree copies) does NOT apply `.paths`,
+# only a tarball fetch does. So: `git archive HEAD` → a scratch consumer made
+# from examples/counter with its `.path = "../.."` dep REMOVED → `zig fetch
+# --save=slcp ../slcp.tgz` (writes `.url` + `.hash`) → assert the extracted
+# package's contents → consumer build → the loopback smoke (`example-smoke
+# --counter-src`) against the fetched package. Shape pinned by the S8 D9
+# finding on Zig 0.17.0-dev.1786: `--save`/`--save-exact` over an existing
+# `.path` dep keeps the PATH form (`.path = "<tarball>"` → "expected path
+# relative to build root" / NotDir); a `file://` URL segfaults `zig fetch`;
+# the global cache `p/` holds only the tarball — the extracted package lands
+# in the consumer's `zig-pkg/` (ZIG_LOCAL_PKG_DIR, set explicitly so the
+# caller's shared package dir is never consulted). Network once (capnp-zig).
+package-preflight:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root=$(pwd)
+    tmp=$(mktemp -d)
+    ver=$(sed -n 's/^ *\.version = "\([^"]*\)",$/\1/p' build.zig.zon)
+    [ -n "$ver" ] || { echo "package-preflight: no .version in build.zig.zon"; exit 1; }
+    # HEAD is what gets tagged; uncommitted edits are NOT in the package.
+    [ -z "$(git status --porcelain)" ] || echo "package-preflight: note: tree is dirty; archiving HEAD, not the working tree"
+    git archive --format=tar.gz -o "$tmp/slcp.tgz" HEAD
+    mkdir -p "$tmp/counter/src"
+    cp examples/counter/build.zig "$tmp/counter/build.zig"
+    cp examples/counter/src/main.zig "$tmp/counter/src/main.zig"
+    # The consumer manifest is the example's minus its in-tree path dep: a
+    # `.path` entry left in place is what `zig fetch --save` would preserve.
+    grep -v '\.slcp = \.{ \.path = "\.\./\.\." },' examples/counter/build.zig.zon > "$tmp/counter/build.zig.zon"
+    if grep -q '\.path = ' "$tmp/counter/build.zig.zon"; then echo "package-preflight: scratch build.zig.zon still carries a .path dep"; exit 1; fi
+    export ZIG_GLOBAL_CACHE_DIR="$tmp/gc" ZIG_LOCAL_PKG_DIR="$tmp/counter/zig-pkg"
+    cd "$tmp/counter"
+    zig fetch --save=slcp ../slcp.tgz
+    grep -q '\.url = "\.\./slcp\.tgz"' build.zig.zon || { echo "package-preflight: fetch did not record a .url dep:"; cat build.zig.zon; exit 1; }
+    grep -q "\.hash = \"slcp-$ver-" build.zig.zon || { echo "package-preflight: fetch did not record a slcp-$ver hash:"; cat build.zig.zon; exit 1; }
+    pkgs=( "$ZIG_LOCAL_PKG_DIR"/slcp-"$ver"-* )
+    if [ "${#pkgs[@]}" -ne 1 ] || [ ! -d "${pkgs[0]}" ]; then echo "package-preflight: expected exactly one extracted slcp-$ver-* under $ZIG_LOCAL_PKG_DIR:"; ls -la "$ZIG_LOCAL_PKG_DIR" || true; exit 1; fi
+    pkg=${pkgs[0]}
+    for f in build.zig build.zig.zon src/gen/host.zig schema/host.capnp; do
+        [ -f "$pkg/$f" ] || { echo "package-preflight: package is missing $f (.paths filter?)"; exit 1; }
+    done
+    for f in tests sim tools vectors docs examples README.md CHANGELOG.md; do
+        [ ! -e "$pkg/$f" ] || { echo "package-preflight: package ships $f (.paths too wide)"; exit 1; }
+    done
+    zig build -Doptimize=ReleaseSafe
+    [ -x zig-out/bin/counter ] && [ -x zig-out/bin/slcp ] || { echo "package-preflight: consumer build installed no counter/slcp"; exit 1; }
+    cd "$root"
+    zig build example-smoke -- --counter-src "$tmp/counter"
+    echo "package-preflight: OK $(basename "$pkg")"
+    rm -rf "$tmp"
