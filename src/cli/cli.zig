@@ -106,6 +106,11 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
         return 2;
     }
     const path = rest[0];
+    if (path.len == 0) {
+        try err_out.writeAll("slcp lint-quorum: missing <quorum.json> (the path is empty)\n\n");
+        try err_out.writeAll(usage);
+        return 2;
+    }
     if (!literal and looksLikeOption(path)) return unknownOption(err_out, "lint-quorum", path);
     var self_id: ?qset.NodeId = null;
     var i: usize = 1;
@@ -240,14 +245,25 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
         return 2;
     }
     const path = rest[0];
-    if (!literal and looksLikeOption(path)) return unknownOption(err_out, if (std.mem.eql(u8, args[0], "new")) "key new" else "key show", path);
+    const verb: []const u8 = if (std.mem.eql(u8, args[0], "new")) "key new" else "key show";
+    if (path.len == 0) {
+        try err_out.print("slcp {s}: missing <file> (the path is empty)\n\n", .{verb});
+        try err_out.writeAll(usage);
+        return 2;
+    }
+    if (!literal and looksLikeOption(path)) return unknownOption(err_out, verb, path);
     if (std.mem.eql(u8, args[0], "new")) {
         const kp = keys.createNew(io, path) catch |err| switch (err) {
             error.KeyFileExists => {
+                // Something sits at that name. Say WHAT, so the advice fits:
+                // only a real key file is "an existing identity".
                 if (keys.load(io, path)) |existing| {
                     try err_out.print("slcp key new: {s} already exists (public key: {s}); move it aside first to mint a new identity\n", .{ path, &std.fmt.bytesToHex(existing.public_key, .lower) });
-                } else |_| {
-                    try err_out.print("slcp key new: {s} already exists; move it aside first to mint a new identity\n", .{path});
+                } else |load_err| switch (load_err) {
+                    error.FileNotFound => try err_out.print("slcp key new: {s} is a dangling symbolic link; remove it (or point it at a key file)\n", .{path}),
+                    error.IsDir => try err_out.print("slcp key new: {s} is a directory; pick a file path\n", .{path}),
+                    error.BadKeyFile => try printNotKeyFile(io, err_out, "key new", path, "remove it or pick another path"),
+                    else => |e| try err_out.print("slcp key new: {s} already exists but cannot be read ({t}); move it aside first to mint a new identity\n", .{ path, e }),
                 }
                 return 1;
             },
@@ -265,11 +281,22 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
     }
     const kp = keys.load(io, path) catch |err| switch (err) {
         error.FileNotFound => {
-            try err_out.print("slcp key show: {s} not found; create one with: slcp key new {s}\n", .{ path, path });
+            // A dangling link is not "absent": `key new` would refuse it
+            // (link() will not replace), so the two verbs must not send
+            // the user back and forth.
+            if (isSymlink(io, path)) {
+                try err_out.print("slcp key show: {s} is a dangling symbolic link; remove it (or point it at a key file)\n", .{path});
+            } else {
+                try err_out.print("slcp key show: {s} not found; create one with: slcp key new {s}\n", .{ path, path });
+            }
+            return 1;
+        },
+        error.IsDir => {
+            try err_out.print("slcp key show: {s} is a directory; expected a key file\n", .{path});
             return 1;
         },
         error.BadKeyFile => {
-            try err_out.print("slcp key show: {s} is not a slcp key file (expected exactly 32 raw seed bytes)\n", .{path});
+            try printNotKeyFile(io, err_out, "key show", path, "expected exactly 32 raw seed bytes");
             return 1;
         },
         else => |e| {
@@ -279,6 +306,23 @@ fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out
     };
     try out.print("public key: {s}\n", .{&std.fmt.bytesToHex(kp.public_key, .lower)});
     return 0;
+}
+
+/// `<path> is not a slcp key file (N bytes; <advice>)` — the byte count is
+/// what tells a truncated seed from a stray file.
+fn printNotKeyFile(io: std.Io, err_out: *std.Io.Writer, verb: []const u8, path: []const u8, advice: []const u8) std.Io.Writer.Error!void {
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        try err_out.print("slcp {s}: {s} is not a slcp key file ({d} bytes; {s})\n", .{ verb, path, st.size, advice });
+    } else |_| {
+        try err_out.print("slcp {s}: {s} is not a slcp key file ({s})\n", .{ verb, path, advice });
+    }
+}
+
+/// True when `path` itself is a symbolic link (whatever it points at).
+fn isSymlink(io: std.Io, path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,4 +691,77 @@ test "cli lint-quorum: empty_quorum names the empty level (top level vs innerSet
     try testing.expectEqual(@as(u8, 1), c.code);
     try testing.expectEqualStrings("ERROR empty_quorum: innerSets[1].innerSets[0] (depth 3) has no members; list its validators or remove it\n", c.stdout());
     try testing.expectEqualStrings("", c.stderr());
+}
+
+// Non-vacuity: printing the same "already exists; move it aside first to
+// mint a new identity" sentence for every `KeyFileExists` makes the
+// dangling-symlink, directory and short-file cases red; letting `key show`
+// answer "not found; create one with" on a dangling link (the advice that
+// loops with `key new`) is red; an empty path reaching the filesystem is red.
+test "cli key new / key show: dangling symlink, directory and non-key files are named for what they are; empty path is usage" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(io, "nowhere.key", "dangling", .{});
+    try tmp.dir.createDirPath(io, "adir");
+    const short: [31]u8 = @splat(0xab);
+    try tmp.dir.writeFile(io, .{ .sub_path = "k31", .data = &short });
+    try tmp.dir.writeFile(io, .{ .sub_path = "k0", .data = "" });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    var b4: [std.fs.max_path_bytes]u8 = undefined;
+    const dangling = try tmpPath(io, &tmp, &b1, "dangling");
+    const adir = try tmpPath(io, &tmp, &b2, "adir");
+    const k31 = try tmpPath(io, &tmp, &b3, "k31");
+    const k0 = try tmpPath(io, &tmp, &b4, "k0");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    // Dangling symlink: both verbs say so, neither loops to the other.
+    c.exec(gpa, io, &.{ "key", "new", dangling });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "dangling symbolic link") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "mint a new identity") == null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "nowhere.key", .{}));
+    c.exec(gpa, io, &.{ "key", "show", dangling });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "dangling symbolic link") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "create one with") == null);
+
+    // A directory.
+    c.exec(gpa, io, &.{ "key", "new", adir });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is a directory") != null);
+    c.exec(gpa, io, &.{ "key", "show", adir });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is a directory") != null);
+
+    // Wrong-length files: not an identity, and the size is stated.
+    c.exec(gpa, io, &.{ "key", "new", k31 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (31 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "mint a new identity") == null);
+    c.exec(gpa, io, &.{ "key", "new", k0 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (0 bytes") != null);
+    c.exec(gpa, io, &.{ "key", "show", k31 });
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "is not a slcp key file (31 bytes") != null);
+    // Nothing was overwritten.
+    const st = try tmp.dir.statFile(io, "k31", .{});
+    try testing.expectEqual(@as(u64, 31), st.size);
+
+    // An empty path is a usage error for every verb (exit 2, no fs access).
+    c.exec(gpa, io, &.{ "key", "new", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <file>") != null);
+    c.exec(gpa, io, &.{ "key", "show", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <file>") != null);
+    c.exec(gpa, io, &.{ "lint-quorum", "" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <quorum.json>") != null);
 }
