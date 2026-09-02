@@ -218,7 +218,11 @@ after the next crash (it could re-emit an older, conflicting statement).
 - On disk: `key_file` is exactly 32 raw seed bytes, mode `0600`, created
   atomically and durably (`src/node/keys.zig`). `Node.create` refuses a
   file of any other length (`KeyFileBad`) so a typo cannot mint a second
-  identity, and `slcp key new` never overwrites.
+  identity, and `slcp key new` never overwrites. The mode is enforced only
+  at mint time: a seed copied in by `cp`/`scp` or restored under umask 022
+  arrives `0644` and still loads, with a `slcp_create` warning naming the
+  mode and `chmod 600 <path>` — a warning, not a refusal, so a running
+  deployment keeps starting while the operator tightens the file.
 - The `identity` marker binds a `data_dir` to one (network, key) pair on
   the first create attempt (protocol §13): moving a data_dir under another
   key is `DataDirOtherNode`. The marker does **not** stop the *same* key

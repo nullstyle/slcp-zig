@@ -1112,6 +1112,8 @@ slcp.core.values.dupe: fn (mem.Allocator, []const u8) error{OutOfMemory}![]u8
 slcp.core.values.order: fn ([]const u8, []const u8) math.Order
 slcp.core.values: struct
 slcp.core: struct
+slcp.keys.modeOf: fn (Io, []const u8) error{AccessDenied,AntivirusInterference,BadPathName,Canceled,DeviceBusy,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,IsDir,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,Streaming,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!u16
+slcp.keys.modeTooOpen: fn (u16) bool
 slcp.keys: struct
 slcp.lint_report.EmptyLevel.len: field u8
 slcp.lint_report.EmptyLevel.path: field [4]u32

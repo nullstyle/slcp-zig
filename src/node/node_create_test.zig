@@ -636,3 +636,36 @@ test "propose: watcher, empty, oversized, and a 1-byte value" {
     defer w.deinit();
     try testing.expectError(error.WatcherCannotPropose, w.propose("x"));
 }
+
+// Policy pin for the S8 finding "A world-readable key file (mode 0644) is
+// accepted silently despite the documented 0600 contract": the chosen fix is
+// a `slcp_create` WARNING (`keys.modeTooOpen`, pinned in keys.zig), not a
+// new CreateError — a seed an operator copied in with umask 022 is still
+// this node's identity, and an existing deployment must keep starting. This
+// test pins the "keep starting" half: 0644 and 0666 files create with the
+// key's own id and an empty diagnostic. If the policy ever flips to a
+// refusal, this test is the one to invert (and CreateError, a Stable line,
+// grows a member).
+test "key_file: a 0644 / 0666 seed still creates (warned, not refused) with an empty diagnostic" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    for ([_]std.posix.mode_t{ 0o644, 0o666 }, [_][]const u8{ "world644.key", "world666.key" }) |mode, name| {
+        try g.tmp.dir.writeFile(io, .{ .sub_path = name, .data = &g.seeds[0] });
+        try g.tmp.dir.setFilePermissions(io, name, std.Io.File.Permissions.fromMode(mode), .{});
+        var b: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try g.sub(&b, name);
+        try testing.expectEqual(mode, try keys.modeOf(io, path));
+        try testing.expect(keys.modeTooOpen(mode));
+
+        var opts = g.options();
+        opts.secret_seed = null;
+        opts.key_file = path;
+        g.diag.len = 0;
+        const n = try Node.create(testing.allocator, io, opts);
+        defer n.deinit();
+        try testing.expectEqualSlices(u8, &g.ids[0], &n.node_id);
+        try testing.expectEqualStrings("", g.diag.message());
+    }
+}
