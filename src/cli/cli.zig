@@ -22,8 +22,9 @@ pub const usage =
     \\  slcp lint-quorum <quorum.json> [--self <hex64>]
     \\      Validate and lint a quorum spec: {"threshold":T,"validators":[<hex64>...],"innerSets":[...]}.
     \\      Prints the normalized tree, its hash, the minimum blocking-set size, critical nodes and
-    \\      every finding. --self adds your own node id to the top level when absent (what
-    \\      Node.create does by default). Exit 0 clean/warnings, 1 lint errors, 2 bad input.
+    \\      every finding. --self (or --self=<hex64>, before or after the path) adds your own node
+    \\      id to the top level when absent (what Node.create does by default). Exit 0
+    \\      clean/warnings, 1 lint errors, 2 bad input.
     \\  slcp key new <file>
     \\      Mint a new Ed25519 key file (raw 32-byte seed, mode 0600) and print its public key
     \\      (your node id). Never overwrites an existing file.
@@ -97,48 +98,66 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
         try out.writeAll(usage);
         return 0;
     }
-    // A leading `--` makes the next argument a path however it looks.
-    const literal = args.len > 0 and std.mem.eql(u8, args[0], "--");
-    const rest = if (literal) args[1..] else args;
-    if (rest.len == 0) {
+    // Options and the one positional may come in any order; `--` ends the
+    // options so a path may start with `-`.
+    var path: ?[]const u8 = null;
+    var self_id: ?qset.NodeId = null;
+    var literal = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!literal and std.mem.eql(u8, a, "--")) {
+            literal = true;
+            continue;
+        }
+        if (!literal and looksLikeOption(a)) {
+            var value: []const u8 = undefined;
+            if (std.mem.eql(u8, a, "--self")) {
+                if (i + 1 >= args.len) {
+                    try err_out.writeAll("slcp lint-quorum: --self needs a <hex64> node id\n");
+                    return 2;
+                }
+                i += 1;
+                value = args[i];
+            } else if (std.mem.startsWith(u8, a, "--self=")) {
+                value = a["--self=".len..];
+            } else {
+                return unknownOption(err_out, "lint-quorum", a);
+            }
+            if (self_id != null) {
+                try err_out.writeAll("slcp lint-quorum: --self given twice; a node has one id\n");
+                return 2;
+            }
+            self_id = slcp.parseNodeId(value) catch {
+                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{value});
+                return 2;
+            };
+            continue;
+        }
+        if (path != null) {
+            try err_out.print("slcp lint-quorum: expected one <quorum.json>, got a second: \"{s}\"\n\n", .{a});
+            try err_out.writeAll(usage);
+            return 2;
+        }
+        path = a;
+    }
+    const spec_path = path orelse {
         try err_out.writeAll("slcp lint-quorum: missing <quorum.json>\n\n");
         try err_out.writeAll(usage);
         return 2;
-    }
-    const path = rest[0];
-    if (path.len == 0) {
+    };
+    if (spec_path.len == 0) {
         try err_out.writeAll("slcp lint-quorum: missing <quorum.json> (the path is empty)\n\n");
         try err_out.writeAll(usage);
         return 2;
     }
-    if (!literal and looksLikeOption(path)) return unknownOption(err_out, "lint-quorum", path);
-    var self_id: ?qset.NodeId = null;
-    var i: usize = 1;
-    while (i < rest.len) : (i += 1) {
-        if (std.mem.eql(u8, rest[i], "--self")) {
-            if (i + 1 >= rest.len) {
-                try err_out.writeAll("slcp lint-quorum: --self needs a <hex64> node id\n");
-                return 2;
-            }
-            i += 1;
-            self_id = slcp.parseNodeId(rest[i]) catch {
-                try err_out.print("slcp lint-quorum: --self expects 64 hex characters, got \"{s}\"\n", .{rest[i]});
-                return 2;
-            };
-        } else if (looksLikeOption(rest[i])) {
-            return unknownOption(err_out, "lint-quorum", rest[i]);
-        } else {
-            try err_out.print("slcp lint-quorum: unknown argument \"{s}\"\n", .{rest[i]});
-            return 2;
-        }
-    }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, spec_path, gpa, .limited(1 << 20)) catch |err| switch (err) {
         // An allocation failure is ours, not the file's: it takes `run`'s
         // dedicated `slcp: out of memory` path like every other site.
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ path, err });
+            try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ spec_path, err });
             return 2;
         },
     };
@@ -157,7 +176,7 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
             return 1;
         },
         else => {
-            try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ path, err });
+            try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ spec_path, err });
             return 2;
         },
     };
@@ -764,4 +783,57 @@ test "cli key new / key show: dangling symlink, directory and non-key files are 
     c.exec(gpa, io, &.{ "lint-quorum", "" });
     try testing.expectEqual(@as(u8, 2), c.code);
     try testing.expect(std.mem.indexOf(u8, c.stderr(), "missing <quorum.json>") != null);
+}
+
+// Non-vacuity: taking args[0] as the path makes `--self <hex> spec` red
+// (the flag was "the file"); exact-token matching makes `--self=<hex>` red;
+// last-wins assignment makes the twice case red (it printed a note for the
+// second id and exit 1 instead of refusing); two positionals were "unknown
+// argument" with no hint.
+test "cli lint-quorum: --self before or after the path, --self=<hex>, --self twice refused, two paths refused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.json", .data = two_of_three_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try tmpPath(io, &tmp, &b1, "two.json");
+    const absent_self = "0909090909090909090909090909090909090909090909090909090909090909";
+    const other_self = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    // Flag first: identical to the documented flag-last form.
+    c.exec(gpa, io, &.{ "lint-quorum", "--self", absent_self, two });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "note: added self " ++ absent_self) != null);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "quorum: 2-of-4") != null);
+
+    // `--self=<hex>` spelling.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self=" ++ absent_self });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), "note: added self " ++ absent_self) != null);
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self=" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "64 hex") != null);
+
+    // Repeated --self is refused, never silently last-wins.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self", absent_self, "--self", other_self });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "--self given twice") != null);
+    try testing.expectEqualStrings("", c.stdout());
+
+    // Two positionals: say so, name the second.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "extra.json" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "expected one <quorum.json>") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "extra.json") != null);
+
+    // A bare --self still wants its value.
+    c.exec(gpa, io, &.{ "lint-quorum", two, "--self" });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "--self needs") != null);
 }
