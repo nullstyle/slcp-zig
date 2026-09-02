@@ -638,3 +638,25 @@ test "corrupt own.log + allocation failure at the watcher re-init: every index i
     try testing.expect(idx < 4096);
     try testing.expect(watchers >= 1);
 }
+
+// Non-vacuity: with only the top-level `memberCount() == 0` guard, an empty
+// INNER level reaches `firstBadThreshold` first (no threshold fits [1, 0])
+// and create() reports QuorumThresholdOutOfRange with the nonsense range
+// "[1, 0]" — the expectFail's member check goes red (WrongCreateError); the
+// design (§12, S12 (a)) names an empty level QuorumEmpty.
+test "quorum: an empty INNER level is QuorumEmpty, not a threshold outside [1, 0]" {
+    var g = try Golden.init();
+    defer g.deinit();
+
+    const empty_inner = [_]Quorum{Quorum.of(1, &.{})};
+    var nested = g.options();
+    nested.quorum = Quorum.ofSets(1, &empty_inner);
+    try g.expectFail(nested, error.QuorumEmpty, "a level with no members");
+    try testing.expect(std.mem.indexOf(u8, g.diag.message(), "[1, 0]") == null);
+
+    // Threshold 0 on the empty level is the same misconfiguration.
+    const zero_inner = [_]Quorum{Quorum.of(0, &.{})};
+    var zero = g.options();
+    zero.quorum = Quorum.ofSets(1, &zero_inner);
+    try g.expectFail(zero, error.QuorumEmpty, "a level with no members");
+}

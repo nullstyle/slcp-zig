@@ -558,6 +558,11 @@ pub const Node = struct {
         // are most useful; `validateAndNormalize` is the authority and its
         // errors map 1:1 to the same members as a fallback.
         if (lint_report.firstBadThreshold(&owned)) |bad| {
+            // An empty level has no threshold in range by construction:
+            // report the level, not a "[1, 0]" range (review finding).
+            if (bad.members == 0) {
+                return fail(diag, error.QuorumEmpty, ".quorum has a level with no members (threshold {d} of 0); every level needs at least one validator or inner set.", .{bad.threshold});
+            }
             return fail(diag, error.QuorumThresholdOutOfRange, ".quorum threshold {d} is outside [1, {d}] for a level with {d} members; use slcp.Quorum.twoThirdsOf (the blessed default) or a threshold within range.", .{ bad.threshold, bad.members, bad.members });
         }
         if (try lint_report.firstDuplicate(gpa, &owned)) |dup| {
