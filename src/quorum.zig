@@ -120,25 +120,53 @@ pub const Quorum = struct {
         return false;
     }
 
-    pub const JsonError = error{ BadJson, MissingField, BadThreshold, BadValidator, BadInnerSets, TooDeep } ||
+    pub const JsonError = error{ BadJson, MissingField, UnknownField, BadThreshold, BadValidator, BadInnerSets, TooDeep } ||
         ParseNodeIdError || std.mem.Allocator.Error;
 
+    /// The three keys a level may carry. Anything else is `UnknownField`:
+    /// with `innerSets` the only optional key, a tolerated typo (`innersets`,
+    /// `inner_sets`, `innerSet`) would silently drop every nested org and lint
+    /// a different, flatter quorum as OK (S8 finding).
+    pub const json_keys = [_][]const u8{ "threshold", "validators", "innerSets" };
+
+    /// Optional detail for a `fromJsonDiag` failure: the offending key of an
+    /// `UnknownField` (borrowed from `arena`; empty for every other error).
+    pub const JsonDiagnostic = struct {
+        unknown_key: []const u8 = "",
+    };
+
     /// Parse `{"threshold":T,"validators":[hex64...],"innerSets":[...]}`.
-    /// `innerSets` is optional; unknown keys are ignored. The result borrows
-    /// from `arena` (the caller's arena; nothing to free individually).
-    /// Depth is capped at `qset.max_depth` (4) — the wire limit — so
-    /// `TooDeep` surfaces here rather than as a hash-time rejection.
+    /// `innerSets` is optional; any other key is `UnknownField` (use
+    /// `fromJsonDiag` to learn which). The result borrows from `arena` (the
+    /// caller's arena; nothing to free individually). Depth is capped at
+    /// `qset.max_depth` (4) — the wire limit — so `TooDeep` surfaces here
+    /// rather than as a hash-time rejection.
     pub fn fromJson(arena: std.mem.Allocator, bytes: []const u8) JsonError!Quorum {
+        return fromJsonDiag(arena, bytes, null);
+    }
+
+    /// `fromJson` that also names the offending key of an `UnknownField`
+    /// through `diag` (what `slcp lint-quorum` prints).
+    pub fn fromJsonDiag(arena: std.mem.Allocator, bytes: []const u8, diag: ?*JsonDiagnostic) JsonError!Quorum {
         const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.BadJson,
         };
         if (root != .object) return error.BadJson;
-        return fromObject(arena, root.object, 1);
+        return fromObject(arena, root.object, 1, diag);
     }
 
-    fn fromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) JsonError!Quorum {
+    fn fromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32, diag: ?*JsonDiagnostic) JsonError!Quorum {
         if (depth > qset.max_depth) return error.TooDeep;
+
+        for (obj.keys()) |key| {
+            var known = false;
+            for (json_keys) |k| known = known or std.mem.eql(u8, key, k);
+            if (!known) {
+                if (diag) |d| d.unknown_key = key;
+                return error.UnknownField;
+            }
+        }
 
         const t = obj.get("threshold") orelse return error.MissingField;
         if (t != .integer or t.integer < 0 or t.integer > std.math.maxInt(u32)) return error.BadThreshold;
@@ -157,7 +185,7 @@ pub const Quorum = struct {
             inners = try arena.alloc(Quorum, inner_v.array.items.len);
             for (inner_v.array.items, 0..) |v, i| {
                 if (v != .object) return error.BadInnerSets;
-                inners[i] = try fromObject(arena, v.object, depth + 1);
+                inners[i] = try fromObject(arena, v.object, depth + 1, diag);
             }
         }
 
@@ -323,6 +351,45 @@ test "fromJson errors: missing threshold, validators not array, 5-deep, 62-char 
     try testing.expectError(error.BadNodeIdLength, Quorum.fromJson(arena, short_key));
     const bad_hex = "{\"threshold\":1,\"validators\":[\"zz07070707070707070707070707070707070707070707070707070707070707\"]}";
     try testing.expectError(error.BadNodeIdHex, Quorum.fromJson(arena, bad_hex));
+}
+
+// Pinning test for S8 finding "Unknown JSON keys are silently ignored, so a
+// mistyped `innersets`/`inner_sets` lints a different (flat) quorum as
+// `result: OK`". Non-vacuity: dropping the unknown-key walk in `fromObject`
+// makes every case parse (the typo'd inner set silently vanishes) → red.
+test "fromJson rejects unknown keys (innersets / inner_sets / innerSet typos) as UnknownField" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inner = "{\"threshold\":2,\"validators\":[\"0404040404040404040404040404040404040404040404040404040404040404\",\"0505050505050505050505050505050505050505050505050505050505050505\",\"0606060606060606060606060606060606060606060606060606060606060606\"],\"innerSets\":[]}";
+    const head = "{\"threshold\":2,\"validators\":[\"0101010101010101010101010101010101010101010101010101010101010101\",\"0202020202020202020202020202020202020202020202020202020202020202\",\"0303030303030303030303030303030303030303030303030303030303030303\"],";
+    const typo_lower = head ++ "\"innersets\":[" ++ inner ++ "]}";
+    const typo_snake = head ++ "\"inner_sets\":[" ++ inner ++ "]}";
+    const typo_singular = head ++ "\"innerSet\":[" ++ inner ++ "]}";
+    try testing.expectError(error.UnknownField, Quorum.fromJson(arena, typo_lower));
+    try testing.expectError(error.UnknownField, Quorum.fromJson(arena, typo_snake));
+    try testing.expectError(error.UnknownField, Quorum.fromJson(arena, typo_singular));
+    // An unknown key INSIDE an inner set is rejected too (the walk recurses),
+    // and `fromJsonDiag` names it.
+    const nested_typo = head ++ "\"innerSets\":[{\"threshold\":1,\"validators\":[],\"innersets\":[]}]}";
+    try testing.expectError(error.UnknownField, Quorum.fromJson(arena, nested_typo));
+    var diag: Quorum.JsonDiagnostic = .{};
+    try testing.expectError(error.UnknownField, Quorum.fromJsonDiag(arena, nested_typo, &diag));
+    try testing.expectEqualStrings("innersets", diag.unknown_key);
+    diag = .{};
+    try testing.expectError(error.UnknownField, Quorum.fromJsonDiag(arena, typo_snake, &diag));
+    try testing.expectEqualStrings("inner_sets", diag.unknown_key);
+    // Other errors leave the diagnostic untouched.
+    diag = .{};
+    try testing.expectError(error.MissingField, Quorum.fromJsonDiag(arena, "{\"validators\":[]}", &diag));
+    try testing.expectEqualStrings("", diag.unknown_key);
+    // The correct spelling still parses, with the inner set present.
+    const ok = head ++ "\"innerSets\":[" ++ inner ++ "]}";
+    const q = try Quorum.fromJson(arena, ok);
+    try testing.expectEqual(@as(usize, 1), q.inner_sets.len);
+    try testing.expectEqual(@as(usize, 4), q.memberCount());
 }
 
 const flat_two_of_three_json =

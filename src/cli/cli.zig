@@ -21,7 +21,8 @@ pub const usage =
     \\usage: slcp <command> [args]
     \\
     \\  slcp lint-quorum <quorum.json> [--self <hex64>]
-    \\      Validate and lint a quorum spec: {"threshold":T,"validators":[<hex64>...],"innerSets":[...]}.
+    \\      Validate and lint a quorum spec: {"threshold":T,"validators":[<hex64>...],"innerSets":[...]}
+    \\      (innerSets optional; any other key is rejected).
     \\      Prints the normalized tree, its hash, the minimum blocking-set size, critical nodes and
     \\      every finding. --self (or --self=<hex64>, before or after the path) adds your own node
     \\      id to the top level when absent (what Node.create does by default). Exit 0
@@ -184,7 +185,8 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const spec = Quorum.fromJson(arena_state.allocator(), bytes) catch |err| switch (err) {
+    var diag: Quorum.JsonDiagnostic = .{};
+    const spec = Quorum.fromJsonDiag(arena_state.allocator(), bytes, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // The parser caps the depth at the wire limit (it is the only
         // recursion bound for the tree walkers), so the structural verdict
@@ -193,6 +195,12 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
         error.TooDeep => {
             try out.print("ERROR too_deep: the tree nests more than {d} levels but the wire limit is {d}\n", .{ qset.max_depth, qset.max_depth });
             return 1;
+        },
+        error.UnknownField => {
+            try err_out.print("slcp lint-quorum: {s}: unknown key \"{s}\"", .{ spec_path, diag.unknown_key });
+            if (suggestKey(diag.unknown_key)) |want| try err_out.print(" (did you mean \"{s}\"?)", .{want});
+            try err_out.writeAll("; a level carries exactly \"threshold\", \"validators\" and (optionally) \"innerSets\"\n");
+            return 2;
         },
         else => {
             try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ spec_path, err });
@@ -266,6 +274,33 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
     defer gpa.free(findings);
     try lint_report.write(out, .{ .qs = &owned, .findings = findings, .hash = hash });
     return if (lint_report.hasErrors(findings)) 1 else 0;
+}
+
+/// The known key a mistyped one most likely meant: equal after lower-casing
+/// and dropping `_`/`-`, or one a prefix of the other that way (`innersets`,
+/// `inner_sets`, `innerSet`, `Threshold` → their spelling). Null when nothing
+/// is close (`foo`).
+fn suggestKey(key: []const u8) ?[]const u8 {
+    var got_buf: [32]u8 = undefined;
+    const got = foldKey(&got_buf, key) orelse return null;
+    for (Quorum.json_keys) |want| {
+        var want_buf: [32]u8 = undefined;
+        const folded = foldKey(&want_buf, want).?;
+        if (std.mem.startsWith(u8, folded, got) or std.mem.startsWith(u8, got, folded)) return want;
+    }
+    return null;
+}
+
+fn foldKey(buf: []u8, key: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    for (key) |c| {
+        if (c == '_' or c == '-') continue;
+        if (n == buf.len) return null;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    if (n == 0) return null;
+    return buf[0..n];
 }
 
 fn keyCommand(io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) RunError!u8 {
@@ -486,6 +521,55 @@ test "cli lint-quorum: clean 2-of-3 (pinned hash), 1-of-3 errors, malformed JSON
     c.exec(gpa, io, &.{ "lint-quorum", over });
     try testing.expectEqual(@as(u8, 1), c.code);
     try testing.expect(std.mem.indexOf(u8, c.stdout(), "ERROR threshold_out_of_range: threshold 4 is outside [1, 1]") != null);
+}
+
+// Pinning test for S8 finding "Unknown JSON keys are silently ignored, so a
+// mistyped `innersets`/`inner_sets` lints a different (flat) quorum as
+// `result: OK`". Before the fix this file linted as a flat 2-of-3 with
+// `result: OK` and exit 0. Non-vacuity: tolerating unknown keys again (or
+// dropping the key name / the suggestion from the message) is red.
+test "cli lint-quorum: a mistyped `innersets` key is exit 2 naming the key, not a flat OK" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const typo_json =
+        \\{"threshold":2,"validators":[
+        \\ "0101010101010101010101010101010101010101010101010101010101010101",
+        \\ "0202020202020202020202020202020202020202020202020202020202020202",
+        \\ "0303030303030303030303030303030303030303030303030303030303030303"],
+        \\ "innersets":[{"threshold":2,"validators":[
+        \\ "0404040404040404040404040404040404040404040404040404040404040404",
+        \\ "0505050505050505050505050505050505050505050505050505050505050505",
+        \\ "0606060606060606060606060606060606060606060606060606060606060606"],"innerSets":[]}]}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "typo.json", .data = typo_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const typo = try tmpPath(io, &tmp, &b1, "typo.json");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+    c.exec(gpa, io, &.{ "lint-quorum", typo });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expectEqualStrings("", c.stdout());
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "typo.json") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "unknown key \"innersets\"") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "did you mean \"innerSets\"") != null);
+
+    // An unrelated key is still exit 2, named, without a suggestion.
+    try tmp.dir.writeFile(io, .{ .sub_path = "extra.json", .data = "{\"threshold\":1,\"validators\":[],\"comment\":\"x\"}" });
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try tmpPath(io, &tmp, &b2, "extra.json");
+    c.exec(gpa, io, &.{ "lint-quorum", extra });
+    try testing.expectEqual(@as(u8, 2), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "unknown key \"comment\"") != null);
+    try testing.expect(std.mem.indexOf(u8, c.stderr(), "did you mean") == null);
+
+    try testing.expectEqual(@as(?[]const u8, "innerSets"), suggestKey("inner_sets"));
+    try testing.expectEqual(@as(?[]const u8, "innerSets"), suggestKey("innerSet"));
+    try testing.expectEqual(@as(?[]const u8, "threshold"), suggestKey("Threshold"));
+    try testing.expectEqual(@as(?[]const u8, null), suggestKey("comment"));
+    try testing.expectEqual(@as(?[]const u8, null), suggestKey(""));
 }
 
 // Non-vacuity: letting `key new` overwrite makes the bytes-unchanged check
