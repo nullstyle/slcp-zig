@@ -346,7 +346,7 @@ fn validateAppContract(comptime App: type) void {
                 "\n  spelling per command) and numeric order are YOUR job — supply `combine` too.");
         if (@TypeOf(App.encode) != fn (Command, []u8) []u8)
             contractError(App, "encode has the wrong signature." ++
-                "\n  want: fn (Command, []u8) []u8   (write into buf, return the written prefix)" ++
+                "\n  want: fn (Command, []u8) []u8   (write into buf, return the encoded bytes — normally buf[0..n])" ++
                 "\n  got:  " ++ @typeName(@TypeOf(App.encode)));
         if (@TypeOf(App.decode) != fn ([]const u8) ?Command)
             contractError(App, "decode has the wrong signature." ++
@@ -750,9 +750,15 @@ pub fn AppNode(comptime App: type) type {
                     return error.DriverFault;
                 }
                 if (comptime codec.is_custom) {
-                    try out.resize(gpa, max_encoded_bytes);
-                    const written = codec.encode(best, out.items);
-                    out.shrinkRetainingCapacity(written.len);
+                    // Ship the slice `encode` RETURNS (what `propose` sends),
+                    // not a prefix of the scratch: an encoder may return a
+                    // window of `buf` or static storage. Sized to the frozen
+                    // cap like `propose`'s scratch.
+                    const scratch = try gpa.alloc(u8, max_encoded_bytes);
+                    defer gpa.free(scratch);
+                    const written = codec.encode(best, scratch);
+                    out.clearRetainingCapacity();
+                    try out.appendSlice(gpa, written);
                 } else {
                     try out.resize(gpa, codec.size);
                     const written = codec.encode(best, out.items);
@@ -1676,4 +1682,90 @@ test "driverCombine: a composite that self-validates .invalid is DriverFault, .m
     try ad.combine_candidates(ad.ctx, 1, &cands, gpa, &out);
     try testing.expectEqual(@as(u64, 5), CounterNode.codec.decode(out.items).?.next);
     try testing.expectEqual(Validity.maybe_valid, ad.validate_value(ad.ctx, 1, out.items, false));
+}
+
+// -- custom encode: propose and combine trust the same bytes (S8 review, D3) ---
+
+/// A custom codec whose `encode` returns a slice into static storage and
+/// ignores `buf` entirely.
+const StaticEncode = struct {
+    pub const State = struct { k: u8 = 0 };
+    pub const Command = struct { k: u8 };
+    const table = [_][2]u8{ "aa".*, "bb".*, "cc".* };
+    pub fn validate(state: State, cmd: Command) Validity {
+        _ = state;
+        return if (cmd.k < 3) .valid else .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        _ = state;
+        return .{ .k = cmd.k };
+    }
+    pub fn encode(cmd: Command, buf: []u8) []u8 {
+        _ = buf;
+        return @constCast(&table[cmd.k]);
+    }
+    pub fn decode(bytes: []const u8) ?Command {
+        if (bytes.len != 2 or bytes[0] != bytes[1] or bytes[0] < 'a' or bytes[0] > 'c') return null;
+        return .{ .k = bytes[0] - 'a' };
+    }
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        var best = cmds[0];
+        for (cmds[1..]) |c| if (c.k > best.k) {
+            best = c;
+        };
+        return best;
+    }
+};
+
+/// A custom codec whose `encode` writes a marker at `buf[0]` and returns
+/// the window `buf[1..3]` (not a prefix of `buf`).
+const OffsetEncode = struct {
+    pub const State = StaticEncode.State;
+    pub const Command = StaticEncode.Command;
+    pub const validate = StaticEncode.validate;
+    pub const apply = StaticEncode.apply;
+    pub const decode = StaticEncode.decode;
+    pub const combine = StaticEncode.combine;
+    pub fn encode(cmd: Command, buf: []u8) []u8 {
+        buf[0] = 0xEE;
+        buf[1] = 'a' + cmd.k;
+        buf[2] = 'a' + cmd.k;
+        return buf[1..3];
+    }
+};
+
+fn combineBytesOf(comptime N: type, gpa: std.mem.Allocator, io: std.Io, cands: []const []const u8, out: *std.ArrayList(u8)) !void {
+    const n = try N.createDetached(gpa, io, 4096);
+    defer n.deinit();
+    const d = n.driver();
+    out.clearRetainingCapacity();
+    try d.combine_candidates(d.ctx, 1, cands, gpa, out);
+}
+
+// Non-vacuity: shipping `out.items[0..written.len]` instead of the slice
+// `encode` returned (the M6 code) makes the static-storage app's composite
+// the scratch buffer's uninitialized bytes (0xAA 0xAA under the testing
+// allocator) and the offset app's `EE 63` — while `propose` sends "cc" for
+// the same winning command.
+test "custom encode: driverCombine ships the slice encode returns, byte-equal to what propose sends, for static-storage and non-prefix encoders" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const cands = [_][]const u8{ "aa", "cc", "bb" };
+
+    const SN = AppNode(StaticEncode);
+    var sbuf: [8]u8 = undefined;
+    const s_propose = SN.codec.encode(.{ .k = 2 }, &sbuf);
+    try testing.expectEqualSlices(u8, "cc", s_propose);
+    try combineBytesOf(SN, gpa, io, &cands, &out);
+    try testing.expectEqualSlices(u8, s_propose, out.items);
+
+    const ON = AppNode(OffsetEncode);
+    var obuf: [8]u8 = undefined;
+    const o_propose = ON.codec.encode(.{ .k = 2 }, &obuf);
+    try testing.expectEqualSlices(u8, "cc", o_propose);
+    try combineBytesOf(ON, gpa, io, &cands, &out);
+    try testing.expectEqualSlices(u8, o_propose, out.items);
 }

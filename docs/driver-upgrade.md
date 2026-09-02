@@ -224,8 +224,11 @@ pub fn combine(state: State, cmds: []const Command) Command {
 
 `decode` must be **strict-canonical** — exactly one spelling per command
 (exact length, no slack bytes), or the codec becomes a value-malleability
-source. A custom `encode` that returns zero bytes is `ValueEmpty`; more than
-`max_value_bytes` is `ValueTooLarge` (`propose` errors, not silent drops).
+source. `encode` writes into `buf` (64 KiB, the frozen cap) and returns the
+encoded bytes — normally `buf[0..n]`; the slice it returns is what goes on
+the wire, from `propose` and from `combine` alike. A custom `encode` that
+returns zero bytes is `ValueEmpty`; more than `max_value_bytes` is
+`ValueTooLarge` (`propose` errors, not silent drops).
 
 ### The halt-on-undecodable rule
 
