@@ -128,7 +128,7 @@ slcp-0.1.0-p1Kf2iJtEwBe2gyU1SFRaJQ3tqSh-XMOTSwxmp4pxgKz
 
 The S8 adversarial review wave (202 agents, 79 findings, 68 confirmed by two
 independent skeptics, 63 fixed with a red-then-green pinning test each) and
-the S8b liveness follow-up. The four findings rated critical:
+the S8b liveness follow-up. The five findings rated critical (the two engine double frees share one bullet):
 
 - **Engine double free on OOM:** `storeLatest` freed a failed self-record
   and its callers in `nomination.zig` / `ballot.zig` freed it again. One

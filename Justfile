@@ -44,7 +44,7 @@ vectors-sweep:
 # M6 stage anchor (appnode).
 
 # Expected-fail compile of every AppNode / auto-codec teaching error
-# (tests/appnode_errors/, 20 cases; also part of `zig build test`).
+# (tests/appnode_errors/, 23 cases; also part of `zig build test`).
 appnode-errors:
     zig build appnode-errors --summary all
 
