@@ -126,7 +126,7 @@ pub fn load(io: std.Io, path: []const u8) LoadError!KeyPair {
 /// companion of the 0600 mint contract. `mint` writes owner-only; this is
 /// how a caller finds out whether a `cp`/`scp`/umask-022 restore loosened it.
 /// Zero on targets without POSIX modes (a `stat` failure surfaces as is).
-pub fn modeOf(io: std.Io, path: []const u8) std.Io.Dir.StatFileError!std.posix.mode_t {
+pub fn modeOf(io: std.Io, path: []const u8) std.Io.Dir.StatFileError!u32 {
     if (comptime std.posix.mode_t == u0 or builtin.os.tag == .windows) return 0;
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     return st.permissions.toMode() & 0o777;
@@ -135,7 +135,7 @@ pub fn modeOf(io: std.Io, path: []const u8) std.Io.Dir.StatFileError!std.posix.m
 /// `true` when `mode` grants group or other ANY access (`mode & 0o077`):
 /// a seed such a file holds is readable by every account in the group or on
 /// the machine. Owner-only modes (0600, 0400, 0700) are fine.
-pub fn modeTooOpen(mode: std.posix.mode_t) bool {
+pub fn modeTooOpen(mode: u32) bool {
     return mode & 0o077 != 0;
 }
 
@@ -359,12 +359,12 @@ test "modeOf/modeTooOpen: a minted key file is owner-only; 0640, 0644 and 0666 a
     _ = try createNew(io, path);
 
     // The mint contract: owner-only.
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, path));
+    try testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
     try testing.expect(!modeTooOpen(try modeOf(io, path)));
 
     // Anything a `cp`/`scp`/umask-022 restore leaves behind is too open.
-    for ([_]std.posix.mode_t{ 0o640, 0o644, 0o666 }) |mode| {
-        try tmp.dir.setFilePermissions(io, "mode.seed", std.Io.File.Permissions.fromMode(mode), .{});
+    for ([_]u32{ 0o640, 0o644, 0o666 }) |mode| {
+        try tmp.dir.setFilePermissions(io, "mode.seed", std.Io.File.Permissions.fromMode(@intCast(mode)), .{});
         try testing.expectEqual(mode, try modeOf(io, path));
         try testing.expect(modeTooOpen(mode));
         // The seed itself still loads: the mode is a warning, not a refusal.
