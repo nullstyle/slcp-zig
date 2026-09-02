@@ -474,6 +474,53 @@ test "data_dir: empty, regular file, read-only parent, other network, other node
     }
 }
 
+// Non-vacuity (S8 review, D12): the identity marker only refuses a DIFFERENT
+// key, so the same key + same data_dir used to start twice — two live
+// signers over one own.log (the equivocation threat-model §7 claims the
+// marker prevents). The store now holds an exclusive lock on the data_dir
+// for the node's lifetime; dropping it turns this red ("expected
+// DataDirBusy, but create succeeded"). The retry after deinit proves the
+// lock dies with the node (the restart path), and the OTHER data_dir proves
+// the lock is per-directory, not per-key.
+test "data_dir: a live node holds its data_dir; the same key + same dir again is DataDirBusy" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var first = g.options();
+    first.data_dir = try g.sub(&b1, "held");
+    var live: ?*Node = try Node.create(testing.allocator, io, first);
+    defer if (live) |n| n.deinit();
+    try testing.expect(!live.?.watcher);
+
+    // Same identity, same dir, while the first is live: refused, and the
+    // message names the directory and says what to do.
+    try g.expectFail(first, error.DataDirBusy, "held");
+    try expectContains(g.diag.message(), "another live slcp node");
+    // A watcher on the held dir is refused too: it would read the same logs.
+    var watcher = first;
+    watcher.watcher = true;
+    watcher.secret_seed = null;
+    try g.expectFail(watcher, error.DataDirBusy, "held");
+
+    // The same key in ANOTHER data_dir is not what the lock guards (that is
+    // the operator's key hygiene, examples/counter/README.md).
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var elsewhere = first;
+    elsewhere.data_dir = try g.sub(&b2, "elsewhere");
+    {
+        const n = try Node.create(testing.allocator, io, elsewhere);
+        n.deinit();
+    }
+
+    // The lock is released with the node: a restart over the dir succeeds.
+    live.?.deinit();
+    live = null;
+    const again = try Node.create(testing.allocator, io, first);
+    again.deinit();
+}
+
 // Non-vacuity: mapping AddressInUse to ListenFailed (or letting the overlay
 // swallow the bind error) changes the member; mapping AccessDenied without
 // the < 1024 test turns the privileged case into ListenFailed.

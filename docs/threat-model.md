@@ -221,7 +221,18 @@ after the next crash (it could re-emit an older, conflicting statement).
   identity, and `slcp key new` never overwrites.
 - The `identity` marker binds a `data_dir` to one (network, key) pair on
   the first create attempt (protocol §13): moving a data_dir under another
-  key is `DataDirOtherNode`, not silent equivocation.
+  key is `DataDirOtherNode`. The marker does **not** stop the *same* key
+  from starting twice; the `lock` file does: `Store.open` holds an
+  exclusive `flock` on `data_dir/lock` for the node's lifetime, so a second
+  process (or a second node in the same process) over one data_dir is
+  `DataDirBusy`, not two signers appending to one `own.log`.
+- Neither guard reaches a **copied** data_dir or key file: the same
+  `key_file` run from two directories, or on two machines, is two live
+  signers with one identity — equivocation by operator error, which no peer
+  can tell from a Byzantine node. Never copy `slcp.key` or `slcp-data/`;
+  mint one key per machine (`slcp key new`). On macOS the duplicate would
+  even bind the same `listen_port` (`reuse_address` sets `SO_REUSEPORT`
+  there), so a port collision is not a signal you can rely on.
 - No HSM / external signer in v1: ABI feature bit 1 (`external_signer`) is
   reserved and OFF.
 

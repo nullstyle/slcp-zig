@@ -767,6 +767,7 @@ torn tail, crc) are the pin.
 ```
 slcp-data/
   identity           # slcp-identity-v1 marker: binds the dir to (network, key)
+  lock               # exclusive advisory lock (flock), held while a node runs: one live process per dir
   own.log            # append-only: (u64 slot, u32 len, envelope bytes, u32 crc32); fsync'd
   externalized.log   # append-only: (u64 slot, u32 len, value, u32 crc32); fsync'd —
                      # the app-visible journal AND the crash-fallback slot bound
@@ -811,6 +812,15 @@ later fails), compared on every later create: a different network prefix is
 `DataDirOtherNetwork`, a different node id is `DataDirOtherNode`, a malformed
 marker is `DataDirUnusable`. A watcher skips the node-id comparison (its id
 is ephemeral).
+
+**Data-dir lock** (`store.zig`, M6 S8): the marker only refuses a *different*
+key, so `Store.open` also takes an exclusive advisory lock (`flock`) on the
+file `lock` in `data_dir` and holds it until the store closes. A second open
+of the same directory while the first is live — the same key started twice,
+or a watcher over a running node's logs — is `DataDirBusy`. The OS releases
+the lock when the process exits or dies, so a leftover `lock` file after a
+crash is inert and a restart needs no cleanup. On a filesystem without lock
+support the node logs a warning and starts unguarded.
 
 **Restart order** (`Node.create`, M6 S3): (1) the delivery frontier comes
 from the journal high-water mark; (2) the journal tail is replayed to the app
