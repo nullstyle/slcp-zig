@@ -1145,14 +1145,7 @@ pub const Node = struct {
             since_ms = 0;
             if (self.failed.load(.acquire)) continue;
 
-            // Borrow envelopes under own_mu; the overlay copies on enqueue.
-            self.own_mu.lockUncancelable(self.io);
-            var it = self.own_latest.iterator();
-            while (it.next()) |e| {
-                if (e.value_ptr.nom) |b| self.emitEnvelope("resync-nom", .all, b);
-                if (e.value_ptr.ballot) |b| self.emitEnvelope("resync-ballot", .all, b);
-            }
-            self.own_mu.unlock(self.io);
+            self.sendOwnLatest(.all, "resync");
             self.ov.broadcast(.{ .get_slot_state = 0 });
         }
     }
@@ -1482,6 +1475,40 @@ pub const Node = struct {
         }
     }
 
+    /// The catch-up cache's slots, ascending (own_mu held by the caller;
+    /// caller frees). `own_latest` is a hash map, and bucket order put
+    /// N+1 before N for consecutive slots often enough that a rejoining
+    /// peer saw NOMINATE(N+1) before EXTERNALIZE(N) on the same stream
+    /// (review finding); every sender goes through this instead.
+    fn ownSlotsAscending(self: *Node) std.mem.Allocator.Error![]u64 {
+        var slots = try self.gpa.alloc(u64, self.own_latest.count());
+        var i: usize = 0;
+        var it = self.own_latest.keyIterator();
+        while (it.next()) |k| : (i += 1) slots[i] = k.*;
+        std.mem.sort(u64, slots, {}, std.sort.asc(u64));
+        return slots;
+    }
+
+    /// Re-flood our latest own envelopes to `target` in ascending slot
+    /// order, nomination before ballot per slot (the on-connect catch-up
+    /// and the anti-entropy backstop, §9.2). Borrowed under own_mu; the
+    /// overlay copies on enqueue. OOM skips this round (the next resync
+    /// retries).
+    fn sendOwnLatest(self: *Node, target: EmitTarget, comptime site: []const u8) void {
+        self.own_mu.lockUncancelable(self.io);
+        defer self.own_mu.unlock(self.io);
+        const slots = self.ownSlotsAscending() catch {
+            log.warn("out of memory re-flooding own statements ({s}); the next resync retries", .{site});
+            return;
+        };
+        defer self.gpa.free(slots);
+        for (slots) |slot| {
+            const e = self.own_latest.getPtr(slot).?;
+            if (e.nom) |b| self.emitEnvelope(site ++ "-nom", target, b);
+            if (e.ballot) |b| self.emitEnvelope(site ++ "-ballot", target, b);
+        }
+    }
+
     // -------------------------------------------------------------------
     // Overlay callbacks (reader threads)
     // -------------------------------------------------------------------
@@ -1508,13 +1535,7 @@ pub const Node = struct {
         log.info("peer {d} up ({d} live connection(s); {d} peer(s) configured)", .{ peer_id, live, self.peer_specs.len });
         // Catch-up (§9.2): send our latest own envelopes, then ask for the
         // peer's externalized state.
-        self.own_mu.lockUncancelable(self.io);
-        var it = self.own_latest.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.nom) |b| self.emitEnvelope("peerup-nom", .{ .one = peer_id }, b);
-            if (e.value_ptr.ballot) |b| self.emitEnvelope("peerup-ballot", .{ .one = peer_id }, b);
-        }
-        self.own_mu.unlock(self.io);
+        self.sendOwnLatest(.{ .one = peer_id }, "peerup");
         self.ov.send(peer_id, .{ .get_slot_state = 0 });
     }
 
@@ -1582,11 +1603,15 @@ pub const Node = struct {
         var highest: u64 = 0;
 
         self.own_mu.lockUncancelable(self.io);
-        var it = self.own_latest.iterator();
-        while (it.next()) |e| {
-            const slot = e.key_ptr.*;
+        defer self.own_mu.unlock(self.io);
+        // Ascending, so the receiver sees N before N+1 and the 64-envelope
+        // cap drops the newest slots, deterministically (review finding).
+        const slots = self.ownSlotsAscending() catch return; // the peer's next resync re-asks
+        defer self.gpa.free(slots);
+        for (slots) |slot| {
             if (req_slot != 0 and slot != req_slot) continue;
-            const env = e.value_ptr.ballot orelse e.value_ptr.nom orelse continue;
+            const e = self.own_latest.getPtr(slot).?;
+            const env = e.ballot orelse e.nom orelse continue;
             if (list.items.len >= wire.max_slot_state_envelopes) break;
             list.append(self.gpa, env) catch break;
             if (slot > highest) highest = slot;
@@ -1594,7 +1619,6 @@ pub const Node = struct {
         // Send while holding own_mu so the borrowed env slices stay valid
         // through encode (overlay copies them).
         self.ov.send(peer_id, .{ .slot_state = .{ .slot = highest, .envelopes = list.items } });
-        self.own_mu.unlock(self.io);
     }
 
     // -------------------------------------------------------------------
@@ -2269,4 +2293,157 @@ test "propose: one allocation failure on the calling thread is either OutOfMemor
         const e2 = node.waitExternalized(.{ .timeout_ms = 10_000 }) orelse return error.NodeStuckAfterOom;
         gpa.free(e2.value);
     }
+}
+
+// -- catch-up re-flood order ---------------------------------------------------
+
+/// The slot index of a framed Envelope (test helper for the order pins).
+fn slotOfFramedEnvelope(gpa: std.mem.Allocator, framed_env: []const u8) !u64 {
+    var emsg = try core.capnpc.message.Message.init(gpa, framed_env, .{});
+    defer emsg.deinit();
+    const er = try gen_slcp.Envelope.Reader.init(&emsg);
+    const stmt_bytes = try er.getStatementBytes();
+    var smsg = try canonical.decodeFlat(gpa, stmt_bytes, .{});
+    defer smsg.deinit();
+    const sr = try gen_slcp.Statement.Reader.init(&smsg);
+    return sr.getSlotIndex();
+}
+
+/// A bare overlay peer (no Node behind it) that records the slot of every
+/// envelope it receives, in arrival order, plus the envelope order of the
+/// first slotState answer.
+const OrderProbe = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mu: std.Io.Mutex = .init,
+    peer: ?usize = null,
+    flood: std.ArrayList(u64) = .empty,
+    answer: std.ArrayList(u64) = .empty,
+    answered: bool = false,
+
+    fn onRecv(ctx: ?*anyopaque, peer_id: usize, frame: *const wire.OverlayFrame) void {
+        const self: *OrderProbe = @ptrCast(@alignCast(ctx.?));
+        _ = peer_id;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        switch (frame.*) {
+            .envelope => |bytes| {
+                const slot = slotOfFramedEnvelope(self.gpa, bytes) catch return;
+                self.flood.append(self.gpa, slot) catch {};
+            },
+            .slot_state => |ss| {
+                if (self.answered) return;
+                self.answered = true;
+                for (ss.envelopes) |env| {
+                    const slot = slotOfFramedEnvelope(self.gpa, env) catch continue;
+                    self.answer.append(self.gpa, slot) catch {};
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn onPeerUp(ctx: ?*anyopaque, peer_id: usize) void {
+        const self: *OrderProbe = @ptrCast(@alignCast(ctx.?));
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.peer = peer_id;
+    }
+
+    fn floodCount(self: *OrderProbe) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.flood.items.len;
+    }
+
+    fn hasAnswer(self: *OrderProbe) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.answered;
+    }
+
+    fn hasPeer(self: *OrderProbe) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.peer != null;
+    }
+
+    fn deinit(self: *OrderProbe) void {
+        self.flood.deinit(self.gpa);
+        self.answer.deinit(self.gpa);
+    }
+};
+
+// Non-vacuity: iterating `own_latest` with `.iterator()` (bucket order) in
+// onPeerUp / answerGetSlotState instead of by ascending slot sends the
+// eight restored slots as {7, 1, 8, 4, 6, 5, 2, 3} on this std — both
+// `expectEqualSlices` go red (a rejoining peer then sees NOMINATE(N+1)
+// before EXTERNALIZE(N), the amplifier behind the 2-of-3 rejoin stall).
+test "catch-up: onPeerUp's re-flood and the getSlotState answer send own statements in ascending slot order" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const passphrase = "reflood-order v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+    var diag: Diagnostic = .{};
+
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    // Eight consecutive slots in the catch-up cache, inserted ascending —
+    // exactly what a node holds after externalizing 1..8 (or restoring
+    // them from own.log).
+    const want = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    for (want) |slot| {
+        const env = try buildSignedExternalize(gpa, seed, network_id, slot, "v");
+        defer gpa.free(env);
+        try n.recordOwnLatest(slot, env);
+    }
+
+    // A bare overlay peer dials the node: its Hello completes, the node's
+    // onPeerUp re-floods, then we ask for the slot state ourselves.
+    var probe = OrderProbe{ .gpa = gpa, .io = io };
+    defer probe.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{n.boundPort()});
+    var ov = try overlay_mod.Overlay.init(gpa, io, .{
+        .listen_port = 0,
+        .peers = &.{spec},
+        .network_id_prefix = network_id[0..8].*,
+        .node_id = peer_a,
+    }, .{ .ctx = &probe, .on_recv = OrderProbe.onRecv, .on_peer_up = OrderProbe.onPeerUp });
+    defer ov.deinit();
+    try ov.start();
+    defer ov.stop();
+
+    try pollUntil(io, 10_000, &probe, OrderProbe.hasPeer);
+    const Wait = struct {
+        fn flooded(p: *OrderProbe) bool {
+            return p.floodCount() >= 8;
+        }
+    };
+    try pollUntil(io, 10_000, &probe, Wait.flooded);
+    ov.send(probe.peer.?, .{ .get_slot_state = 0 });
+    try pollUntil(io, 10_000, &probe, OrderProbe.hasAnswer);
+
+    probe.mu.lockUncancelable(io);
+    defer probe.mu.unlock(io);
+    std.debug.print("\nre-flood order: {any}\nslotState order: {any}\n", .{ probe.flood.items[0..8], probe.answer.items });
+    try std.testing.expectEqualSlices(u64, &want, probe.flood.items[0..8]);
+    try std.testing.expectEqualSlices(u64, &want, probe.answer.items);
 }
