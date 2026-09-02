@@ -486,6 +486,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_e2e = b.addRunArtifact(e2e_node_tests);
+    // The clusters open their scratch trees (.zig-cache/e2e/<scenario>) by
+    // relative path through Dir.cwd(), so cwd is pinned like every other
+    // file-touching run step (HANDOFF §6: both lines, always).
+    run_e2e.setCwd(b.path("."));
     run_e2e.has_side_effects = true; // real sockets/files: never answer from cache
     const e2e_step = b.step("e2e", "Run the 4-node end-to-end cluster (200 slots, kill/restart, partition/heal, equivocator)");
     e2e_step.dependOn(&run_e2e.step);
