@@ -1022,9 +1022,14 @@ pub const Node = struct {
         return self.ext_queue.orderedRemove(0);
     }
 
+    /// Observability snapshot (racy counters). `.failed` is true when EITHER
+    /// the engine latched (§7.2 DriverFault/EngineFailed) or the node itself
+    /// went inert (`markFailed`: a hook refusal, a failed write-ahead append,
+    /// a buffering OOM) — a halted node must not report itself healthy.
     pub fn stats(self: *Node) engine.Stats {
-        // Read-only snapshot; safe enough for observability (racy counters).
-        return self.eng.stats();
+        var s = self.eng.stats();
+        s.failed = s.failed or self.failed.load(.acquire);
+        return s;
     }
 
     pub fn boundPort(self: *Node) u16 {
@@ -1930,4 +1935,44 @@ test "compaction cadence: a drain that ends on 64 compacts, and so does a drain 
     try std.testing.expectEqual(@as(usize, 65), b.delivered);
     try std.testing.expectEqual(@as(usize, 13), b.records);
     try std.testing.expectEqual(@as(u64, 50), b.min_slot);
+}
+
+// -- S8 D2: stats().failed reflects the node-level inert latch ------------------
+
+// Non-vacuity: `Node.stats()` returning `self.eng.stats()` verbatim (the
+// engine's own DriverFault/EngineFailed latch only) leaves `.failed` false
+// after the NODE latch is set — the second assertion goes red. The latch is
+// set directly here (the same atomic `markFailed` swaps to true on a hook
+// refusal, a failed own.log/externalized.log append, or a buffering OOM)
+// because `markFailed` logs at err level, which this test runner counts as
+// a failure; the live path is covered by the S8 d2-restart harness
+// (waitApplied -> NodeHalted, then `raw().stats()`).
+test "stats: .failed is true once the node latched inert, not only on an engine failure" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x5a);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x5b);
+    const peer_b: [32]u8 = @splat(0x5c);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "stats inert latch v1",
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    try std.testing.expect(!n.stats().failed);
+    try std.testing.expect(!n.eng.failed);
+    n.failed.store(true, .seq_cst); // the inert latch, with the engine itself healthy
+    try std.testing.expect(!n.eng.failed);
+    try std.testing.expect(n.stats().failed);
 }
