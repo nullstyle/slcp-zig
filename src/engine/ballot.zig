@@ -704,7 +704,15 @@ fn checkInvariants(bs: *const State) void {
 pub fn bumpState(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, value: []const u8, force: bool) Error!bool {
     const bs = &s.ballot;
     if (!force and bs.current != null) return false;
-    const n: u32 = if (bs.current) |*b| b.counter + 1 else 1;
+    // At counter ∞ (an EXTERNALIZE restore, or a live catch-up externalize
+    // whose h = ∞) there is no next counter. The oracle's u32 wraps to 0 and
+    // bumpState(Value, 0) is then refused as a bump to a smaller ballot; in
+    // Zig the add would trap. Refuse before the arithmetic — a stale or
+    // queued ballot timer_fired must be a no-op here (S8 D13).
+    const n: u32 = if (bs.current) |*b|
+        (if (b.counter == std.math.maxInt(u32)) return false else b.counter + 1)
+    else
+        1;
     return bumpStateN(ctx, s, value, n);
 }
 
@@ -2458,4 +2466,60 @@ test "recordSelf: allocation failure inside storeLatest is a clean OutOfMemory, 
     }
     // The sweep must actually inject failures on the emission path.
     try testing.expect(saw_oom > 0);
+}
+
+// s8 D13 pin: a ballot timer_fired that reaches a slot whose current ballot
+// sits at counter ∞ (EXTERNALIZE restore, or a live catch-up externalize
+// from peer EXTERNALIZEs) must be a no-op, not a `b.counter + 1` trap. The
+// oracle wraps the u32 to 0 and rejects the bump; SLCP must refuse the bump
+// without the arithmetic. Non-vacuity: removing the maxInt guard in
+// bumpState turns both halves into `panic: integer overflow`.
+test "timerFired on a slot at counter ∞ (restored or live externalize) is a no-op, never an overflow trap" {
+    const inf = std.math.maxInt(u32);
+    // (a) restored EXTERNALIZE: setStateFromEnvelope puts b at (∞, v).
+    {
+        var env: TestEnv = undefined;
+        try env.init(driver_mod.Driver.default(), false);
+        defer env.deinit();
+        const gpa = env.gpa;
+        var st = try mkExternalizeSt(gpa, env.cfg.node_id, .{ .counter = 2, .value = "v" }, 5);
+        defer st.deinit(gpa);
+        try setStateFromEnvelope(&env.ctx, &env.slot, &st);
+        var fx0 = try drain(&env);
+        fx0.deinit(gpa);
+        try expectBallot(env.slot.ballot.current, .{ .counter = inf, .value = "v" });
+
+        try timerFired(&env.ctx, &env.slot);
+
+        try testing.expectEqual(Phase.externalize, env.slot.ballot.phase);
+        try expectBallot(env.slot.ballot.current, .{ .counter = inf, .value = "v" });
+        var fx = try drain(&env);
+        defer fx.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), fx.broadcast);
+        try testing.expectEqual(@as(usize, 0), fx.persist);
+        try testing.expectEqual(@as(usize, 0), fx.arm_ballot);
+    }
+    // (b) live: two peer EXTERNALIZEs over 2-of-3 externalize the laggard
+    // with h = ∞, so updateCurrentIfNeeded leaves b at (∞, v) — no restart.
+    {
+        var env: TestEnv = undefined;
+        try env.init(driver_mod.Driver.default(), false);
+        defer env.deinit();
+        const gpa = env.gpa;
+        try feed(&env, try mkExternalizeSt(gpa, node_a, .{ .counter = 2, .value = "vv" }, 3));
+        try feed(&env, try mkExternalizeSt(gpa, node_b, .{ .counter = 2, .value = "vv" }, 3));
+        var fx0 = try drain(&env);
+        fx0.deinit(gpa);
+        try testing.expectEqual(Phase.externalize, env.slot.ballot.phase);
+        try expectBallot(env.slot.ballot.current, .{ .counter = inf, .value = "vv" });
+
+        try timerFired(&env.ctx, &env.slot);
+
+        try testing.expectEqual(Phase.externalize, env.slot.ballot.phase);
+        try expectBallot(env.slot.ballot.current, .{ .counter = inf, .value = "vv" });
+        var fx = try drain(&env);
+        defer fx.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), fx.broadcast);
+        try testing.expectEqual(@as(usize, 0), fx.arm_ballot);
+    }
 }
