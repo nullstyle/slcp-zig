@@ -144,6 +144,11 @@ frozen; "exact" means the one symbol only (its fields stay Experimental).
   every `export` keyword in the file must open a `fn` it rendered, and
   `@export(...)` or `export var` in that file is a hard `check-api` error —
   an export the text parser cannot render is never a silently unfrozen one.
+  Cosmetic shape is not contract: a trailing `// comment` on one of these
+  lines, or a signature `zig fmt` split one-parameter-per-line (a trailing
+  comma does that), renders the same `slcp-abi` line as the plain one-line
+  spelling; a signature that never closes is a `check-api` error naming the
+  file line and the declaration.
 
 ## Held out: entry points whose error set is `anyerror` today
 

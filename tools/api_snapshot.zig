@@ -844,13 +844,22 @@ const experimental_lines: []const []const u8 = blk: {
 // (`slcp-abi.import.<module>.<name>: fn (...) <ret>`), plus the negotiation
 // constants (`slcp-abi.abi_version: const u32 = <n>`, `abi_min_version`,
 // `abi_max_version`, `feature_flags` — `abi_pinned_consts`). The parser is
-// deliberately line-oriented and strict: an export or import whose signature
-// does not close on the line that opens it is an error, never a silently
-// truncated line — a truncated signature would freeze the wrong contract.
+// line-oriented and strict about one thing: a signature renders only once
+// its parentheses balance and its terminator (`{` / `;`) has been seen —
+// otherwise it is an error naming the source line, never a silently
+// truncated line, which would freeze the wrong contract. Cosmetic shape is
+// not contract: trailing `//` comments are stripped, an optional `pub` is
+// accepted, and a signature `zig fmt` split one-parameter-per-line (a
+// trailing comma does that) is joined and renders byte-identically to its
+// one-line spelling (S8 D10 "line-shape fragile" finding).
 // ---------------------------------------------------------------------------
 
 const AbiParseError = error{
-    AbiSignatureSpansLines,
+    /// An `export fn` / `extern` signature whose parentheses never balance
+    /// or whose terminator never comes within `max_signature_lines`.
+    AbiSignatureUnterminated,
+    /// An `extern "…"` or pinned-const line the parser cannot split.
+    AbiLineMalformed,
     AbiVersionMissing,
     /// `@export(...)` in the ABI source: a real wasm export whose name the
     /// text never spells next to a signature, so the line parser cannot
@@ -865,11 +874,38 @@ const AbiParseError = error{
     OutOfMemory,
 };
 
+/// A signature may continue over at most this many source lines before the
+/// parser gives up (zig fmt puts one parameter per line; the widest ABI
+/// signature has six).
+const max_signature_lines = 32;
+
 /// `pub export fn` / `pub extern "…"` are the same exports as the bare
 /// spellings: `pub` only widens the Zig-side visibility. Strip it so both
 /// render (S8 D10 finding: a `pub export fn` shipped unfrozen and unlisted).
 fn stripPub(line: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, line, "pub ")) line["pub ".len..] else line;
+}
+
+/// Drop a trailing `// comment` (outside string literals) and the whitespace
+/// before it. A comment-only edit must not be a Stable drift.
+fn stripLineComment(line: []const u8) []const u8 {
+    var in_string = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return std.mem.trimEnd(u8, line[0..i], " \t");
+        }
+    }
+    return line;
 }
 
 /// The line parser's self-check: tokenize the source (comments and string
@@ -900,11 +936,12 @@ fn countExportFns(gpa: std.mem.Allocator, src: []const u8) error{ OutOfMemory, A
     return count;
 }
 
-/// The signature must open and close on this line and end with `terminator`
-/// (`{` for an export body, `;` for an extern prototype). Returns it with the
-/// terminator and surrounding whitespace stripped.
-fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureSpansLines}![]const u8 {
-    if (text.len == 0 or text[text.len - 1] != terminator) return error.AbiSignatureSpansLines;
+/// A complete signature ends with `terminator` (`{` for an export body, `;`
+/// for an extern prototype), opens a parenthesis, and balances it. Returns
+/// the text with the terminator and surrounding whitespace stripped, or
+/// `AbiSignatureUnterminated` when more lines are needed.
+fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureUnterminated}![]const u8 {
+    if (text.len == 0 or text[text.len - 1] != terminator) return error.AbiSignatureUnterminated;
     const sig = std.mem.trim(u8, text[0 .. text.len - 1], " \t");
     var depth: isize = 0;
     var saw_open = false;
@@ -916,8 +953,65 @@ fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureSpansLin
             depth -= 1;
         }
     }
-    if (!saw_open or depth != 0) return error.AbiSignatureSpansLines;
+    if (!saw_open or depth != 0) return error.AbiSignatureUnterminated;
     return sig;
+}
+
+/// The joined spelling of a signature must equal its one-line spelling:
+/// `( ` → `(`, and `, )` / ` )` (zig fmt's trailing comma before the closing
+/// paren on its own line) → `)`. A well-formed one-line signature is
+/// unchanged.
+fn normalizeSignature(gpa: std.mem.Allocator, sig: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (sig) |c| {
+        if (c == ' ' and out.items.len > 0 and out.items[out.items.len - 1] == '(') continue;
+        if (c == ')') {
+            while (out.items.len > 0 and (out.items[out.items.len - 1] == ' ' or out.items[out.items.len - 1] == ',')) {
+                out.items.len -= 1;
+            }
+        }
+        try out.append(gpa, c);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Gather a signature that opens with `first` and may continue on the lines
+/// `it` yields (zig fmt's one-parameter-per-line form) until it closes.
+/// `line_no` is the source line of `first` and is advanced past every line
+/// consumed. A signature that never closes is an error that names the file
+/// line and the declaration — the caller's `try` alone would not.
+fn collectSignature(
+    gpa: std.mem.Allocator,
+    first: []const u8,
+    terminator: u8,
+    it: *std.mem.SplitIterator(u8, .scalar),
+    line_no: *usize,
+) AbiParseError![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, first);
+    const start_line = line_no.*;
+    var lines_used: usize = 1;
+    while (true) {
+        if (oneLineSignature(buf.items, terminator)) |sig| {
+            return normalizeSignature(gpa, sig);
+        } else |_| {}
+        if (lines_used >= max_signature_lines) break;
+        const raw = it.next() orelse break;
+        line_no.* += 1;
+        lines_used += 1;
+        const cont = stripLineComment(std.mem.trim(u8, raw, " \t\r"));
+        if (cont.len == 0) continue;
+        try buf.append(gpa, ' ');
+        try buf.appendSlice(gpa, cont);
+    }
+    const name_end = std.mem.indexOfScalar(u8, first, '(') orelse first.len;
+    std.debug.print(
+        "api-snapshot: {s}:{d}: `{s}` — signature does not close (unbalanced parentheses or no `{c}` within {d} lines)\n",
+        .{ abi_source_path, start_line, std.mem.trim(u8, first[0..name_end], " \t"), terminator, max_signature_lines },
+    );
+    return error.AbiSignatureUnterminated;
 }
 
 /// Render the frozen ABI surface from the module's source text. Lines come
@@ -930,25 +1024,29 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
     }
     var saw_version = false;
     var exports_rendered: usize = 0;
+    var line_no: usize = 0;
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
+        line_no += 1;
+        const line = stripLineComment(std.mem.trim(u8, raw, " \t\r"));
         const decl = stripPub(line);
         if (std.mem.startsWith(u8, decl, "export fn ")) {
-            const sig = try oneLineSignature(decl["export fn ".len..], '{');
-            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiSignatureSpansLines;
+            const sig = try collectSignature(gpa, decl["export fn ".len..], '{', &it, &line_no);
+            defer gpa.free(sig);
+            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.export.{s}: fn {s}", .{
                 abi_prefix, sig[0..name_len], sig[name_len..],
             }));
             exports_rendered += 1;
         } else if (std.mem.startsWith(u8, decl, "extern \"")) {
             const rest = decl["extern \"".len..];
-            const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.AbiSignatureSpansLines;
+            const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.AbiLineMalformed;
             const module = rest[0..q];
             const after = rest[q + 1 ..];
-            if (!std.mem.startsWith(u8, after, " fn ")) return error.AbiSignatureSpansLines;
-            const sig = try oneLineSignature(after[" fn ".len..], ';');
-            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiSignatureSpansLines;
+            if (!std.mem.startsWith(u8, after, " fn ")) return error.AbiLineMalformed;
+            const sig = try collectSignature(gpa, after[" fn ".len..], ';', &it, &line_no);
+            defer gpa.free(sig);
+            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.import.{s}.{s}: fn {s}", .{
                 abi_prefix, module, sig[0..name_len], sig[name_len..],
             }));
@@ -956,7 +1054,7 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
             // `pub const abi_version: u32 = 1;` → `slcp-abi.abi_version: const u32 = 1`
             // (same shape for abi_min_version / abi_max_version / feature_flags).
             const body = std.mem.trim(u8, raw_body, "; \t");
-            const colon = std.mem.indexOf(u8, body, ": ") orelse return error.AbiSignatureSpansLines;
+            const colon = std.mem.indexOf(u8, body, ": ") orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.{s}: const {s}", .{
                 abi_prefix, body[0..colon], body[colon + 2 ..],
             }));
@@ -1421,20 +1519,78 @@ test "ABI text parser pins only the four negotiation consts" {
     try std.testing.expectEqualStrings("slcp-abi.feature_flags: const u64 = 0b101", lines[1]);
 }
 
-// Non-vacuity: removing the terminator check in `oneLineSignature` makes the
-// parser emit a truncated `slcp_multi(` line instead of erroring.
-test "ABI text parser refuses a signature that spans lines" {
+// Non-vacuity (S8 D10 "ABI text parser is line-shape fragile"): before the
+// fix a trailing `// comment` on the abi_version line rendered INTO the
+// frozen line (`const u32 = 1; // bump with care`), so a comment-only edit
+// was a Stable drift whose printed remedy would freeze the comment; and the
+// zig-fmt one-param-per-line spelling (a trailing comma is all it takes) was
+// `AbiSignatureSpansLines` with no file line and no export name. Dropping
+// `stripLineComment` makes the first expect red; dropping the continuation
+// join in `collectSignature` makes the second fixture error again.
+test "ABI text parser ignores trailing comments and renders a zig-fmt split signature like the one-line form" {
+    const gpa = std.testing.allocator;
+    const commented =
+        \\pub const abi_version: u32 = 1; // bump with care
+        \\pub const feature_flags: u64 = 0b101; // "//" in a comment is fine
+        \\export fn slcp_alloc(len: u32) u32 { // returns 0 on OOM
+        \\    return 0;
+        \\}
+        \\const imports = struct {
+        \\    extern "slcp_driver" fn validate_value(slot_lo: u32, ptr: u32) u32; // §7.3
+        \\};
+        \\
+    ;
+    const lines = try renderAbiLines(gpa, commented);
+    defer freeAbiLines(gpa, lines);
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings("slcp-abi.abi_version: const u32 = 1", lines[0]);
+    try std.testing.expectEqualStrings("slcp-abi.feature_flags: const u64 = 0b101", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.export.slcp_alloc: fn (len: u32) u32", lines[2]);
+    try std.testing.expectEqualStrings("slcp-abi.import.slcp_driver.validate_value: fn (slot_lo: u32, ptr: u32) u32", lines[3]);
+
+    // `zig fmt` output for the same two declarations with a trailing comma.
+    const split =
+        \\pub const abi_version: u32 = 1;
+        \\export fn slcp_engine_pop_effect(
+        \\    handle: u32,
+        \\    out_ptr_ptr: u32, // where the frame goes
+        \\    out_len_ptr: u32,
+        \\) u32 {
+        \\    return 0;
+        \\}
+        \\const imports = struct {
+        \\    extern "slcp_driver" fn combine_candidates(
+        \\        slot_lo: u32,
+        \\        slot_hi: u32,
+        \\    ) u32;
+        \\};
+        \\
+    ;
+    const joined = try renderAbiLines(gpa, split);
+    defer freeAbiLines(gpa, joined);
+    try std.testing.expectEqual(@as(usize, 3), joined.len);
+    try std.testing.expectEqualStrings(
+        "slcp-abi.export.slcp_engine_pop_effect: fn (handle: u32, out_ptr_ptr: u32, out_len_ptr: u32) u32",
+        joined[1],
+    );
+    try std.testing.expectEqualStrings(
+        "slcp-abi.import.slcp_driver.combine_candidates: fn (slot_lo: u32, slot_hi: u32) u32",
+        joined[2],
+    );
+}
+
+// Non-vacuity: removing the terminator/paren-depth check in
+// `oneLineSignature` lets `collectSignature` accept the first line and emit a
+// truncated `slcp_open(` line instead of erroring with the file line.
+test "ABI text parser refuses a signature that never closes" {
     const gpa = std.testing.allocator;
     const fixture =
         \\pub const abi_version: u32 = 1;
-        \\export fn slcp_multi(
+        \\export fn slcp_open(
         \\    a: u32,
-        \\) u32 {
-        \\    return a;
-        \\}
         \\
     ;
-    try std.testing.expectError(error.AbiSignatureSpansLines, renderAbiLines(gpa, fixture));
+    try std.testing.expectError(error.AbiSignatureUnterminated, renderAbiLines(gpa, fixture));
 }
 
 // Non-vacuity (S8 D10 "ABI text parser misses `pub export fn` and
