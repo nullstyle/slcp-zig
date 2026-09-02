@@ -660,3 +660,24 @@ test "quorum: an empty INNER level is QuorumEmpty, not a threshold outside [1, 0
     zero.quorum = Quorum.ofSets(1, &zero_inner);
     try g.expectFail(zero, error.QuorumEmpty, "a level with no members");
 }
+
+// Non-vacuity: without the reset at the top of create() and the OOM
+// mapping through `fail`, an allocation failure returns OutOfMemory with
+// the Diagnostic untouched — the reused buffer still says "STALE ..."
+// (red on the indexOf check) and a fresh one stays empty; a successful
+// create would keep a previous failure's text as well.
+test "create(): OutOfMemory writes its own message into a reused Diagnostic, and success clears it" {
+    var g = try Golden.init();
+    defer g.deinit();
+
+    g.diag.set("STALE MESSAGE FROM A PREVIOUS FAILURE", .{});
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Node.create(fa.allocator(), testing.io, g.options()));
+    try testing.expect(std.mem.indexOf(u8, g.diag.message(), "STALE") == null);
+    try expectContains(g.diag.message(), "out of memory");
+
+    g.diag.set("STALE MESSAGE FROM A PREVIOUS FAILURE", .{});
+    const n = try Node.create(testing.allocator, testing.io, g.options());
+    n.deinit();
+    try testing.expectEqualStrings("", g.diag.message());
+}

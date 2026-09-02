@@ -564,6 +564,17 @@ pub fn AppNode(comptime App: type) type {
         /// `CreateError`: an auto-encoded Command larger than
         /// `max_value_bytes`, and a journaled value the Command cannot decode.
         pub fn create(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
+            // Same contract as Node.create: a reused Diagnostic never keeps
+            // a previous failure's text, and OutOfMemory gets a message too
+            // (the adapter allocation fails before Node.create runs).
+            if (opts.diagnostic) |d| d.len = 0;
+            return createChecked(gpa, io, opts) catch |e| switch (e) {
+                error.OutOfMemory => fail(opts.diagnostic, error.OutOfMemory, "out of memory while creating the node; nothing was started — free memory or raise the process limit and try again.", .{}),
+                else => e,
+            };
+        }
+
+        fn createChecked(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
             const diag = opts.diagnostic;
             if (comptime !codec.is_custom) {
                 // Only once the range itself is sane: an out-of-range value
@@ -1541,4 +1552,30 @@ test "codec mismatch at create: a bytes-level Node journals \"abc\"; AppNode(Cou
         try testing.expectEqual(@as(u64, 1), e.slot);
         try testing.expectEqualSlices(u8, "abc", e.value);
     }
+}
+
+// Non-vacuity: without the reset at the top of AppNode.create and the OOM
+// mapping through `fail`, the adapter allocation failing returns
+// OutOfMemory with the Diagnostic untouched — the reused buffer still says
+// "STALE ..." (red on the indexOf check).
+test "AppNode.create: OutOfMemory writes its own message into a reused Diagnostic" {
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var diag: node.Diagnostic = .{};
+    const seed = seedOf(0x63);
+    const me = try crypto.publicKeyFromSeed(seed);
+
+    diag.set("STALE MESSAGE FROM A PREVIOUS FAILURE", .{});
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, CounterNode.create(fa.allocator(), io, .{
+        .network = "appnode-oom-diag v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "STALE") == null);
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "out of memory") != null);
 }

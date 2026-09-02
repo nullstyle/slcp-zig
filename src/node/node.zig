@@ -444,8 +444,20 @@ pub const Node = struct {
     /// Build and start a node. Fail-fast: every misconfiguration is checked
     /// in a fixed order (passphrase → identity → limits → peers → quorum →
     /// data_dir → engine → store/recovery → listener → threads) and reported
-    /// as ONE `CreateError` member with a message in `options.diagnostic`.
+    /// as ONE `CreateError` member with a message in `options.diagnostic` —
+    /// `OutOfMemory` included, and a reused buffer never keeps a previous
+    /// failure's text (it is cleared first; a success leaves it empty).
     pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
+        if (options.diagnostic) |d| d.len = 0;
+        return createChecked(gpa, io, options) catch |e| switch (e) {
+            // The one member no check site writes (every `try` allocation
+            // can raise it): give it the paragraph here (review finding).
+            error.OutOfMemory => fail(options.diagnostic, error.OutOfMemory, "out of memory while creating the node; nothing was started — free memory or raise the process limit and try again.", .{}),
+            else => e,
+        };
+    }
+
+    fn createChecked(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
         const opts = options;
         const diag = opts.diagnostic;
 
