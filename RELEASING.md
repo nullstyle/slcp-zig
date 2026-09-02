@@ -353,8 +353,13 @@ between either (input 3's restore is for slot 5). Input 2 is a 512-byte
 truncated prefix (the runner's crash writer buffer): its stream is
 exhausted after 8 inputs — which already contain own NOMINATE slot 7 then
 `purge_slots 8` — so it cannot be settled from the bytes. Fix (harness
-only, `sim/invariants.zig` + the fuzz target; no `src/` change, package
-hash unchanged): the invariants `Tracker` forgets slots below an APPLIED
+only, `sim/invariants.zig` + the fuzz target; no `src/` change — but
+`build.zig` is inside `.paths` and gained the `sim-tests` and `fuzz-replay`
+steps, so the package hash MOVED to
+`slcp-0.1.0-p1Kf2iJtEwBe2gyU1SFRaJQ3tqSh-XMOTSwxmp4pxgKz` (`just
+release-hash` on the branch head; main's `1eb4e04` still hashes to the
+`…p1Kf2mJn…` value above) and README.md + CHANGELOG.md were re-recorded to
+it in the audit — step 5 must be re-run on the final pre-tag HEAD): the invariants `Tracker` forgets slots below an APPLIED
 `purge_slots` (`Tracker.purgeBelow`, mirroring the engine and
 `node.zig`'s `pruneOwnLatest`), and own EXTERNALIZE pairs are judged by
 committed value exactly as the e2e watchdog does (different value =

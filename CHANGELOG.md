@@ -25,7 +25,7 @@ from the tagged tree — README.md and this file are outside `.paths`, so
 recording it here does not change it):
 
 ```
-slcp-0.1.0-p1Kf2mJnEwBKcaQ_OIRLIUCqCheAsWHROjZeUtKJkUfQ
+slcp-0.1.0-p1Kf2iJtEwBe2gyU1SFRaJQ3tqSh-XMOTSwxmp4pxgKz
 ```
 
 ### Added
@@ -207,7 +207,9 @@ test; and a dozen documentation claims that disagreed with the code
   EXTERNALIZE pairs by committed value (as the e2e watchdog already did);
   the three saved inputs are a committed regression corpus
   (`tests/fuzz/crash/`, replayed inside `zig build test`, traced by
-  `zig build fuzz-replay`). No `src/` change; the package hash is unchanged.
+  `zig build fuzz-replay`). No `src/` change; the package hash above moved
+  only because `build.zig` (inside `.paths`) gained the `sim-tests` and
+  `fuzz-replay` steps.
 - A watcher (no key) skips the identity node-id comparison; `Hello.listenPort`
   is sent but never used for dialing.
 - No license is granted.

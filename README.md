@@ -344,7 +344,7 @@ bare commit — and let `zig fetch` record the content hash in your
 zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.1.0.tar.gz
 ```
 
-The hash `zig fetch` records for v0.1.0 is `slcp-0.1.0-p1Kf2mJnEwBKcaQ_OIRLIUCqCheAsWHROjZeUtKJkUfQ`
+The hash `zig fetch` records for v0.1.0 is `slcp-0.1.0-p1Kf2iJtEwBe2gyU1SFRaJQ3tqSh-XMOTSwxmp4pxgKz`
 (computed from the tagged tree with `just release-hash`; the same value is in
 `CHANGELOG.md`, and `just verify-release-hash 0.1.0` re-checks it against the
 published tarball). If your `build.zig.zon` shows a different hash for that
