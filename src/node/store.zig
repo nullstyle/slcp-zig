@@ -274,6 +274,9 @@ pub const Store = struct {
         while (ext_iter.next()) |item| {
             if (hwm == null or item.slot > hwm.?) hwm = item.slot;
             const copy = try gpa.dupe(u8, item.payload);
+            // Nobody owns `copy` until it is IN the map: the errdefer above
+            // walks only stored values, so a failed getOrPut must free it here.
+            errdefer gpa.free(copy);
             const gop = try tail_map.getOrPut(gpa, item.slot);
             if (gop.found_existing) gpa.free(gop.value_ptr.*);
             gop.value_ptr.* = copy;
@@ -1003,6 +1006,43 @@ test "store: torn externalized.log tail is repaired and keeps prefix hwm" {
     try testing.expect(!rec.own_log_corrupt);
     try testing.expect(!rec.torn_tail_repaired);
     try testing.expectEqual(@as(?u64, 43), rec.externalized_hwm);
+}
+
+/// One full startup recovery over an existing data_dir, the shape Node.create
+/// runs: open → recover → free. The allocation-failure sweep calls this once
+/// per allocation site with that site made to fail.
+fn recoverUnderOom(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+    var store = try Store.open(gpa, io, data_dir);
+    defer store.deinit();
+    var rec = try store.recover(gpa);
+    Store.deinitRecovery(gpa, &rec);
+}
+
+// Non-vacuity (S8 review, D4/D5): recover() duplicated each journal payload
+// BEFORE inserting it into the tail map, and the errdefer freed only values
+// already IN the map — an OutOfMemory from getOrPut (the map's first insert or
+// a grow) leaked the fresh copy. Two journal records make the map's first
+// insert allocate; dropping the errdefer on `copy` turns this red with
+// "MemoryLeakDetected" at the getOrPut fail index.
+test "store: recover frees everything at every allocation failure (journal tail)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try tmpDataDir(&tmp, &path_buf);
+
+    const env = try buildTestEnvelope(gpa, 5, .nominate, 0x01);
+    defer gpa.free(env);
+    {
+        var store = try Store.open(gpa, io, data_dir);
+        defer store.deinit();
+        try store.appendOwn(5, env);
+        try store.appendExternalized(3, "value-a");
+        try store.appendExternalized(7, "value-b");
+    }
+
+    try testing.checkAllAllocationFailures(gpa, recoverUnderOom, .{ io, data_dir });
 }
 
 test "store: compact keeps only slots >= keep_from_slot and stays appendable" {
