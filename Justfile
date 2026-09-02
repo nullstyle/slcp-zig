@@ -104,3 +104,20 @@ check-api:
 
 # ===== M6:release =====
 # M6 stage anchor (release): preflight / package-preflight / release-hash / release-tag / verify-release-hash go here.
+
+# A bare `zig fetch <archive>` (no --save*) on this Zig rewrites
+# ~/.cache/zig/p/<hash>.tar.gz double-nested when the archive has a single
+# root directory (any GitHub archive, any `git archive --prefix`), and every
+# later build-time fetch of that hash from a project whose zig-pkg/ lacks it
+# fails with `hash mismatch … N-V-…` (S8 finding 23; HANDOFF §6).
+# release-hash / verify-release-hash must hash through this recipe.
+# Print the package hash of SRC (tarball, dir or URL) without touching the real global cache.
+pkg-hash SRC:
+    tools/pkg_hash.sh {{SRC}}
+
+# A scratch cache stands in for ~/.cache/zig; a bare fetch of a --prefix
+# tarball must poison it (the control — red on purpose if a newer Zig stops
+# doing that) and `pkg-hash` must not. Also a CI step. ~1 min.
+# The pinning check for `pkg-hash`. Evidence line: `[pkg-hash-check] checks=N failures=0`.
+pkg-hash-check:
+    tools/pkg_hash_check.sh

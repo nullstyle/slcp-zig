@@ -152,6 +152,14 @@ jobs:
       - name: Check formatting
         run: just fmt-check
 
+      # A bare `zig fetch <single-root-dir archive>` on this Zig poisons the
+      # global cache tarball for that hash (double-nested; later build-time
+      # fetches fail with `hash mismatch … N-V-…`). tools/pkg_hash.sh hashes
+      # through a throwaway cache instead; this check pins both facts against
+      # a scratch cache (S8 finding 23). Needs git + zig + just — all here.
+      - name: Package-hash cache hygiene
+        run: just pkg-hash-check
+
   gen-check:
     name: Generated code drift (ubuntu)
     runs-on: ubuntu-latest
