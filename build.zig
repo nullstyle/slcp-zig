@@ -405,6 +405,17 @@ pub fn build(b: *std.Build) void {
     const byz_matrix_step = b.step("byz-matrix", "Run the FULL 1000-seed Byzantine matrix (long)");
     byz_matrix_step.dependOn(&run_byz_matrix.step);
 
+    // `zig build test` COMPILES the three simulator executables (never runs
+    // them — sim-matrix is minutes-scale). Same rot class as gen-vectors
+    // below: nothing in `test` or CI referenced sim/main.zig,
+    // sim/matrix_main.zig or sim/byz_matrix_main.zig, so an engine API
+    // change could break the §13.1 / §14-M3 matrix runners while `test`
+    // stayed green (S8 review). They share the slcp_core_sim module instance
+    // already built for sim_tests, so the cost is seconds warm.
+    test_step.dependOn(&sim_exe.step);
+    test_step.dependOn(&sim_matrix_exe.step);
+    test_step.dependOn(&byz_matrix_exe.step);
+
     // Deterministic conformance-vector generator: writes vectors/*.json.
     const gen_vectors = b.addExecutable(.{
         .name = "gen-vectors",
