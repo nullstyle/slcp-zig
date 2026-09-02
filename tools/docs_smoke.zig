@@ -102,6 +102,9 @@ pub const protocol_needles = [_][]const u8{
     "4096",
     "255",
     "60 s",
+    // S8 finding 17: strikes are cumulative for the connection's lifetime
+    // (overlay.zig never resets `Conn.strikes`); the budget row must say so.
+    "| `max_budget_strikes` | `32` breaches over the connection's lifetime (strikes never reset) ⇒ disconnect |",
 };
 pub const threat_model_needles = [_][]const u8{
     "**No transport authentication in v1.**",
@@ -115,6 +118,7 @@ pub const forbidden_needles = [_][]const u8{
     "slcp-zig.git#v",
     "slcp keygen",
     "key create",
+    "consecutive breaches", // S8 finding 17: strikes never reset, so they are not consecutive
 };
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row

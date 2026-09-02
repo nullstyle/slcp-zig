@@ -716,7 +716,7 @@ most `max_slot_state_envelopes = 64` envelopes.
 | `max_write_queue_items` / `max_write_queue_bytes` | `1024` / `16 * 1024 * 1024` (overflow ⇒ disconnect) |
 | `max_inbound_conns` | `128` (over-cap accepts closed before any allocation) |
 | `handshake_timeout_s` | 10 s, as an `std.Io.Timeout` on the read operation (absolute across the whole handshake) |
-| `max_budget_strikes` | `32` consecutive breaches ⇒ disconnect |
+| `max_budget_strikes` | `32` breaches over the connection's lifetime (strikes never reset) ⇒ disconnect |
 | reconnect backoff | exponential 1 s → 60 s (`max_backoff_shift = 6`, capped) plus deterministic per-peer jitter < 1 s (Wyhash over the attempt counter — no clock, no RNG) |
 
 **Relay policy — as built** (`src/node/node.zig` `dispatch`, `onRecv`,

@@ -139,8 +139,10 @@ const handshake_timeout_s: std.Io.Timeout = .{ .duration = .{
 /// few hundred milliseconds instead of stalling the suite for ten seconds.
 var handshake_deadline: std.Io.Timeout = handshake_timeout_s;
 
-/// Consecutive per-peer budget breaches before we disconnect the peer. Kept
-/// well clear of anything healthy loopback traffic produces.
+/// Per-peer budget breaches before we disconnect the peer, counted over the
+/// connection's lifetime (`Conn.strikes` is never reset; a clean window does
+/// not forgive earlier breaches). Kept well clear of anything healthy
+/// loopback traffic produces.
 const max_budget_strikes: u32 = 32;
 /// Upper bound on the backoff-window exponent (1s<<6 = 64s, capped to 60s).
 const max_backoff_shift: u6 = 6;
@@ -1716,4 +1718,66 @@ test "dialer resolves a hostname peer spec" {
     try waitPeerCount(io, &ov_b, 1);
     try testing.expectEqual(@as(usize, 1), a_rec.peerUpCount());
     try testing.expectEqual(@as(usize, 1), b_rec.peerUpCount());
+}
+
+// Non-vacuity (S8 finding 17, docs-vs-code): docs/protocol.md's budget row
+// and this file's `max_budget_strikes` comment used to say "consecutive"
+// breaches; strikes are in fact cumulative for the connection's lifetime.
+// Adding `conn.strikes = 0` to `rollWindow` (the "consecutive" semantics)
+// makes the first expectEqual read 0 and the disconnect never happen (red),
+// which is the signal to rewrite the doc row again.
+test "budget strikes are cumulative across clean windows: the 32nd lifetime breach disconnects" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{ .mode = .stream, .reuse_address = true });
+    defer server.deinit(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", portOf(server.socket.address));
+    const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    const srv_side = try server.accept(io);
+    defer srv_side.close(io);
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xCC), rec.callbacks());
+    defer ov.deinit();
+
+    const conn = try gpa.create(Conn);
+    conn.* = .{ .io = io, .gpa = gpa, .stream = client, .read_buf = try gpa.alloc(u8, 64) };
+    defer {
+        conn.deinit();
+        gpa.destroy(conn);
+    }
+
+    // One breach, then ten clean windows (each aged past 1 s and charged a
+    // single byte; win_bytes == 1 proves the window really rolled).
+    try testing.expect(ov.chargeBytes(conn, inbound_rate_soft_cap_bytes_per_s + 1));
+    try testing.expectEqual(@as(u32, 1), conn.strikes);
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+        try testing.expect(ov.chargeBytes(conn, 1));
+        try testing.expectEqual(@as(usize, 1), conn.win_bytes);
+    }
+    try testing.expectEqual(@as(u32, 1), conn.strikes);
+
+    // Breaches separated by clean windows are never consecutive, yet the
+    // 32nd lifetime breach disconnects.
+    var breaches: u32 = 1;
+    var disconnected = false;
+    while (breaches < 2 * max_budget_strikes) {
+        conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+        try testing.expect(ov.chargeBytes(conn, 1));
+        conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+        const ok = ov.chargeBytes(conn, inbound_rate_soft_cap_bytes_per_s + 1);
+        breaches += 1;
+        if (!ok) {
+            disconnected = true;
+            break;
+        }
+    }
+    try testing.expect(disconnected);
+    try testing.expectEqual(max_budget_strikes, breaches);
+    try testing.expectEqual(max_budget_strikes, conn.strikes);
 }
