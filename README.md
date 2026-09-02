@@ -242,8 +242,12 @@ loopback proof of the node layer is `zig build e2e` and the counter's
 `AppNode(App).create` takes the same set minus `.driver` and `.delivery`,
 which it supplies itself). Every misconfiguration is refused with a specific
 error and a one-paragraph message naming the offending option — pass a
-`.diagnostic` to receive it, or use `slcp.Node.explain(err)` for the static
-text.
+`.diagnostic` to receive it (the pattern is in `docs/driver-upgrade.md`).
+`slcp.Node.explain(err)` gives the static text for a `Node.create` error. It
+does not accept an `AppNode(App).CreateError`, which adds two members of its
+own — `CommandExceedsMaxValueBytes` and `UndecodableExternalizedValue`, both
+always reported through `.diagnostic` — so narrow first:
+`switch (err) { error.CommandExceedsMaxValueBytes, error.UndecodableExternalizedValue => "app-level", else => |e| slcp.Node.explain(e) }`.
 
 | Option | Default | Meaning |
 |---|---|---|

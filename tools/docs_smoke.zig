@@ -117,6 +117,15 @@ pub const forbidden_needles = [_][]const u8{
     "key create",
 };
 
+/// `Node.explain` takes `node.CreateError`; `AppNode(App).CreateError` adds
+/// these two members, which it has no arm for — `Node.explain(err)` on an
+/// AppNode create error does not compile. Every doc paragraph that
+/// recommends calling `explain(` must name both, so a reader of the typed
+/// path is told to narrow (or to read `.diagnostic`) instead.
+pub const explain_call_needle = "explain(";
+pub const explain_caveat_needles = [_][]const u8{ "CommandExceedsMaxValueBytes", "UndecodableExternalizedValue" };
+pub const min_explain_paragraphs: usize = 1;
+
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
 /// in a docs option table must be one of these, and README's table must
 /// list every one of them.
@@ -533,6 +542,38 @@ pub fn scanOptionRows(gpa: std.mem.Allocator, text: []const u8) ![]PinHit {
     return out.toOwnedSlice(gpa);
 }
 
+pub const ParagraphHit = struct { text: []const u8, line: usize };
+
+/// Every paragraph of `text` (a maximal run of non-blank lines; fences count
+/// like prose) that contains `needle`, with the 1-based line of its first line.
+pub fn scanParagraphsMentioning(gpa: std.mem.Allocator, text: []const u8, needle: []const u8) ![]ParagraphHit {
+    var out: std.ArrayList(ParagraphHit) = .empty;
+    errdefer out.deinit(gpa);
+    var line_no: usize = 0;
+    var start: ?usize = null; // byte offset of the current paragraph
+    var start_line: usize = 0;
+    var pos: usize = 0;
+    while (pos <= text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+        const line = text[pos..nl];
+        line_no += 1;
+        const blank = std.mem.trim(u8, line, " \t\r").len == 0;
+        if (!blank and start == null) {
+            start = pos;
+            start_line = line_no;
+        }
+        const at_end = nl >= text.len;
+        if ((blank or at_end) and start != null) {
+            const para = std.mem.trimEnd(u8, text[start.?..if (blank) pos else nl], "\r\n");
+            if (std.mem.indexOf(u8, para, needle) != null) try out.append(gpa, .{ .text = para, .line = start_line });
+            start = null;
+        }
+        if (at_end) break;
+        pos = nl + 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 pub fn isOptionField(name: []const u8) bool {
     inline for (option_fields) |f| if (std.mem.eql(u8, f, name)) return true;
     return false;
@@ -729,6 +770,21 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
         }
+    }
+
+    // ---- (9b) the explain caveat ----
+    {
+        var found: usize = 0;
+        for (docs) |doc| {
+            const paras = try scanParagraphsMentioning(arena, doc.text, explain_call_needle);
+            for (paras) |p| {
+                found += 1;
+                for (explain_caveat_needles) |n| {
+                    rep.checkFmt(std.mem.indexOf(u8, p.text, n) != null, doc.path, p.line, "paragraph recommending `{s}` names `{s}`", .{ explain_call_needle, n }, "an AppNode(App).CreateError member Node.explain does not accept — say so or show the narrowing switch", .{});
+                }
+            }
+        }
+        rep.checkFmt(found >= min_explain_paragraphs, "README.md", 0, "at least {d} paragraph recommends `{s}`", .{ min_explain_paragraphs, explain_call_needle }, "found {d}", .{found});
     }
 
     // ---- (10) version needles ----
@@ -999,6 +1055,53 @@ test "option rows: table rows parse; names are checked against slcp.NodeOptions"
     try testing.expect(isOptionField("diagnostic"));
     try testing.expect(!isOptionField("no_such_option"));
     try testing.expect(option_fields.len >= 10);
+}
+
+// Non-vacuity: paragraphs are blank-line delimited — a sentence mentioning
+// `explain(` two lines below a blank line is its own paragraph, so the caveat
+// in the paragraph above does not cover it (merge the paragraphs in the
+// scanner and the second expectation fails). The needles are checked against
+// the live types: each is a member of `AppNode(Counter).CreateError` and NOT
+// of `slcp.node.CreateError` — rename either member in app_node.zig and this
+// goes red before the docs do.
+test "explain caveat: paragraph scanner splits on blank lines; needles are the AppNode-only CreateError members" {
+    const gpa = testing.allocator;
+    const doc = "intro\n\nUse `Node.explain(err)` for the text; `CommandExceedsMaxValueBytes` and\n`UndecodableExternalizedValue` are not covered.\n\nOr just `explain(e)`.\n   \nno mention here\n```zig\n_ = explain(x);\n```\n";
+    const hits = try scanParagraphsMentioning(gpa, doc, explain_call_needle);
+    defer gpa.free(hits);
+    try testing.expectEqual(@as(usize, 3), hits.len);
+    try testing.expectEqual(@as(usize, 3), hits[0].line);
+    try testing.expect(std.mem.indexOf(u8, hits[0].text, explain_caveat_needles[0]) != null);
+    try testing.expect(std.mem.indexOf(u8, hits[0].text, explain_caveat_needles[1]) != null);
+    try testing.expectEqual(@as(usize, 6), hits[1].line);
+    try testing.expectEqualStrings("Or just `explain(e)`.", hits[1].text);
+    try testing.expect(std.mem.indexOf(u8, hits[1].text, explain_caveat_needles[1]) == null);
+    try testing.expectEqual(@as(usize, 8), hits[2].line);
+    try testing.expectEqualStrings("no mention here\n```zig\n_ = explain(x);\n```", hits[2].text);
+
+    const Counter = struct {
+        pub const State = struct { count: u64 = 0 };
+        pub const Command = struct { next: u64 };
+        pub fn validate(state: State, cmd: Command) slcp.Validity {
+            return if (cmd.next == state.count + 1) .valid else .invalid;
+        }
+        pub fn apply(state: State, cmd: Command) State {
+            _ = state;
+            return .{ .count = cmd.next };
+        }
+    };
+    const app_members = std.meta.fieldNames(slcp.AppNode(Counter).CreateError);
+    const node_members = std.meta.fieldNames(slcp.node.CreateError);
+    for (explain_caveat_needles) |n| {
+        try testing.expect(hasName(app_members, n));
+        try testing.expect(!hasName(node_members, n));
+    }
+    try testing.expect(hasName(node_members, "NoIdentity"));
+}
+
+fn hasName(names: []const [:0]const u8, name: []const u8) bool {
+    for (names) |m| if (std.mem.eql(u8, m, name)) return true;
+    return false;
 }
 
 // Non-vacuity: the evidence line is what `just preflight` greps and the
