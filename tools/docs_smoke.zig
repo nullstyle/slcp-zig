@@ -107,6 +107,7 @@ pub const threat_model_needles = [_][]const u8{
     "**No transport authentication in v1.**",
     "WireGuard",
     "quorum intersection",
+    "Top-level threshold sanity",
 };
 /// Spellings that must appear in NO active doc (stale designs, wrong verbs).
 pub const forbidden_needles = [_][]const u8{
@@ -115,6 +116,24 @@ pub const forbidden_needles = [_][]const u8{
     "slcp-zig.git#v",
     "slcp keygen",
     "key create",
+};
+/// Phrases that must appear in NO active doc, matched across line wraps
+/// (`findWrappedPhrase`: each space matches any whitespace run).
+/// `qset.lint`'s threshold checks (`sub_majority_threshold`,
+/// `below_two_thirds`, `all_members_critical`) judge the TOP level only —
+/// the report is per-level, the checks are not — so a doc must never call
+/// them "per-level" (S8 finding: an inner 1-of-2 lints `result: OK`).
+pub const forbidden_phrases = [_][]const u8{
+    "per-level threshold",
+    "Per-level threshold",
+    "per-level `sub_majority_threshold`",
+    "Per-level `sub_majority_threshold`",
+};
+/// docs/quorum-recipes.md must say where the threshold checks apply
+/// (matched across line wraps).
+pub const recipes_needles = [_][]const u8{
+    "top-level threshold sanity",
+    "applies only to the top level",
 };
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
@@ -611,6 +630,28 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, read_limit);
 }
 
+/// Byte offset of the first occurrence of `phrase` in `text` where every
+/// space in `phrase` matches a run of whitespace (a line wrap included);
+/// null if none. Words never match without whitespace between them.
+pub fn findWrappedPhrase(text: []const u8, phrase: []const u8) ?usize {
+    var words = std.mem.tokenizeScalar(u8, phrase, ' ');
+    const first = words.next() orelse return null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, first)) |at| {
+        from = at + 1;
+        var i = at + first.len;
+        var rest = words;
+        const ok = while (rest.next()) |w| {
+            var j = i;
+            while (j < text.len and std.ascii.isWhitespace(text[j])) j += 1;
+            if (j == i or !std.mem.startsWith(u8, text[j..], w)) break false;
+            i = j + w.len;
+        } else true;
+        if (ok) return at;
+    }
+    return null;
+}
+
 fn containsBackticked(text: []const u8, name: []const u8) bool {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "`{s}`", .{name}) catch return false;
@@ -791,6 +832,13 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         for (forbidden_needles) |n| {
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
+        }
+    }
+    for (recipes_needles) |n| rep.checkFmt(findWrappedPhrase(recipes, n) != null, "docs/quorum-recipes.md", 0, "says `{s}`", .{n}, "the threshold checks are top-level only; say so", .{});
+    for (docs) |doc| {
+        for (forbidden_phrases) |ph| {
+            const at = findWrappedPhrase(doc.text, ph);
+            rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not say `{s}`", .{ph}, "qset.lint's threshold checks apply to the top level only", .{});
         }
     }
 
@@ -1123,4 +1171,22 @@ test "nested label: prefix scan and the lint.json case shape" {
     try testing.expect(lintCaseShape(arena, json, "no such case") == null);
     try testing.expect(lintCaseShape(arena, "{\"cases\":[{\"name\":\"x\",\"input\":{\"threshold\":1,\"innerSets\":[{\"threshold\":1,\"validators\":[]},{\"threshold\":2,\"validators\":[]}]}}]}", "x") == null);
     try testing.expect(lintCaseShape(arena, "not json", "x") == null);
+}
+
+// Non-vacuity: the phrase finder matches across a line wrap (quorum-recipes
+// wrapped "per-level\nthreshold" over two lines — the S8 finding's red),
+// reports the FIRST word's offset, needs whitespace between words, and
+// does not match when another word sits between two of them; drop the
+// whitespace skip and the wrapped cases return null.
+test "wrapped phrase: per-level threshold across a line break; no false match" {
+    const text = "Lint judges per-level\nthreshold sanity, and the per-level report; per-level (not threshold)\n";
+    const at = findWrappedPhrase(text, "per-level threshold") orelse return error.NotFound;
+    try testing.expectEqual(@as(usize, 12), at);
+    try testing.expectEqual(@as(usize, 1), lineOf(text, at));
+    try testing.expect(findWrappedPhrase(text, "per-level sanity") == null);
+    try testing.expect(findWrappedPhrase(text, "per-levelthreshold") == null);
+    try testing.expect(findWrappedPhrase("the per-level\n  `sub_majority_threshold` check", "per-level `sub_majority_threshold`") != null);
+    try testing.expect(findWrappedPhrase("applies only to the top\nlevel (like", "applies only to the top level") != null);
+    try testing.expect(findWrappedPhrase("top-level threshold sanity", "per-level threshold") == null);
+    try testing.expect(forbidden_phrases.len >= 4 and recipes_needles.len >= 2);
 }
