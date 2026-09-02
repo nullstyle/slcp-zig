@@ -109,7 +109,15 @@ fn checkEncodable(comptime T: type, comptime path: []const u8) void {
             "\n  (Tag-prefixed fixed-size union encoding is the first v2 codec target.)"),
         .array => |a| checkEncodable(a.child, path ++ "[i]"),
         .@"struct" => |s| {
-            inline for (s.field_names, s.field_types) |fname, FT| checkEncodable(FT, path ++ "." ++ fname);
+            inline for (s.field_names, s.field_types, s.field_attrs) |fname, FT, attrs| {
+                // A comptime field has an ordinary type, so the leaf rules
+                // would accept it — but decode cannot store a wire value
+                // into it (the compiler would object deep inside decodeValue).
+                if (attrs.@"comptime")
+                    @compileError("slcp auto-codec: `" ++ path ++ "." ++ fname ++ "` is a comptime field — it has one fixed value and no wire representation." ++
+                        "\n  Drop it, or make it a runtime field (decode must be able to store the wire value into it).");
+                checkEncodable(FT, path ++ "." ++ fname);
+            }
         },
         else => unsupportedType(T, path),
     }

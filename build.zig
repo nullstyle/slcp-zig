@@ -545,8 +545,9 @@ pub fn build(b: *std.Build) void {
         .{ .stem = "err_zero_size_command", .needle = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field." },
         .{ .stem = "err_oversized_command", .needle = " bytes, above the frozen 65536-byte value cap (§4.5)." },
         .{ .stem = "err_wide_int", .needle = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." },
+        .{ .stem = "err_comptime_field", .needle = "` is a comptime field — it has one fixed value and no wire representation." },
     };
-    comptime std.debug.assert(appnode_error_cases.len == 21);
+    comptime std.debug.assert(appnode_error_cases.len == 22);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
         const obj = b.addObject(.{
