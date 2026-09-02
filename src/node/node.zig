@@ -286,7 +286,22 @@ const InputQueue = struct {
     head: usize = 0,
     closed: bool = false,
 
+    /// Enqueue, or drop on OOM (freeing the input, one err-level log line):
+    /// for producers with nothing to retry — timer fires, received frames,
+    /// purges. The engine degrades, it does not corrupt.
     fn push(self: *InputQueue, item: InputItem) void {
+        self.tryPush(item) catch {
+            var in = item.input;
+            core.host_codec.freeInput(self.gpa, &in);
+            log.err("input queue OOM; dropped one input", .{});
+        };
+    }
+
+    /// Enqueue; on OOM the caller still owns `item` (nothing is freed or
+    /// logged) so it can roll back — `maybeStartNomination` re-queues the
+    /// proposal instead of losing it (review finding). A closed queue frees
+    /// the input and reports success (the node is shutting down).
+    fn tryPush(self: *InputQueue, item: InputItem) std.mem.Allocator.Error!void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.closed) {
@@ -294,14 +309,7 @@ const InputQueue = struct {
             core.host_codec.freeInput(self.gpa, &in);
             return;
         }
-        self.items.append(self.gpa, item) catch {
-            // OOM enqueuing: drop the input (freeing it) rather than crash;
-            // the engine degrades, it does not corrupt.
-            var in = item.input;
-            core.host_codec.freeInput(self.gpa, &in);
-            log.err("input queue OOM; dropped one input", .{});
-            return;
-        };
+        try self.items.append(self.gpa, item);
         self.cond.signal(self.io);
     }
 
@@ -1034,7 +1042,21 @@ pub const Node = struct {
             return e;
         };
         self.prop_mu.unlock(self.io);
-        self.maybeStartNomination();
+        self.maybeStartNomination() catch |e| {
+            // Not accepted: take OUR value back out (an older head that
+            // failed to nominate is already back at the head) so the
+            // caller's OutOfMemory means exactly "propose it again".
+            self.prop_mu.lockUncancelable(self.io);
+            defer self.prop_mu.unlock(self.io);
+            for (self.proposal_queue.items, 0..) |v, i| {
+                if (v.ptr == copy.ptr) {
+                    _ = self.proposal_queue.orderedRemove(i);
+                    self.gpa.free(v);
+                    break;
+                }
+            }
+            return e;
+        };
     }
 
     pub const WaitOptions = struct {
@@ -1267,7 +1289,11 @@ pub const Node = struct {
         }
         self.nominating = false;
         self.prop_mu.unlock(self.io);
-        self.maybeStartNomination();
+        self.maybeStartNomination() catch {
+            // The proposal is back at the head and `nominating` is clear:
+            // the next propose() or externalization retries it.
+            log.warn("out of memory starting the next nomination; retried on the next proposal or externalization", .{});
+        };
 
         // App delivery is IN SLOT ORDER (§11.2's stream semantics): buffer
         // out-of-order externalizations (catch-up delivers slots in arbitrary
@@ -1375,26 +1401,31 @@ pub const Node = struct {
     }
 
     /// If idle and a proposal is queued, nominate the head for current_slot.
-    fn maybeStartNomination(self: *Node) void {
+    /// OOM anywhere (the prev copy, the input enqueue) is rolled back — the
+    /// value goes back to the head and `nominating` stays clear — and
+    /// returned, so no proposal is ever silently dropped and the node never
+    /// latches "nominating" with nothing in flight (review finding).
+    fn maybeStartNomination(self: *Node) std.mem.Allocator.Error!void {
         if (self.watcher) return;
+        // Held across the enqueue (q.mu is a leaf lock, never taken before
+        // prop_mu) so the rollback's re-insert is into the same list state
+        // the pop left: the capacity is still there.
         self.prop_mu.lockUncancelable(self.io);
-        if (self.nominating or self.proposal_queue.items.len == 0) {
-            self.prop_mu.unlock(self.io);
-            return;
-        }
+        defer self.prop_mu.unlock(self.io);
+        if (self.nominating or self.proposal_queue.items.len == 0) return;
         const value = self.proposal_queue.orderedRemove(0);
         const slot = self.current_slot;
-        const prev = self.gpa.dupe(u8, self.last_ext_value) catch {
-            // put it back on OOM
-            self.proposal_queue.insert(self.gpa, 0, value) catch self.gpa.free(value);
-            self.prop_mu.unlock(self.io);
-            return;
+        const prev = self.gpa.dupe(u8, self.last_ext_value) catch |e| {
+            self.proposal_queue.insertAssumeCapacity(0, value);
+            return e;
+        };
+        // value + prev are owned; the input carries them, freed after push.
+        self.q.tryPush(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null }) catch |e| {
+            self.gpa.free(prev);
+            self.proposal_queue.insertAssumeCapacity(0, value);
+            return e;
         };
         self.nominating = true;
-        self.prop_mu.unlock(self.io);
-
-        // value + prev are owned; the input carries them, freed after push.
-        self.q.push(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null });
     }
 
     // -------------------------------------------------------------------
@@ -2120,4 +2151,122 @@ test "create() swallows no allocation failure: every induced OOM in the sweep is
     }
     try std.testing.expect(idx < 4096);
     try std.testing.expectEqual(@as(usize, 0), swallowed);
+}
+
+// -- propose under allocation failure ------------------------------------------
+
+/// Fails exactly ONE allocation — the `n`-th made by the arming thread after
+/// `arm(n)` — and passes everything else through, so a live Node's other
+/// threads (engine, wheel, overlay, resync) are never touched. The std
+/// FailingAllocator fails every allocation after its index on every thread,
+/// which would confound "one transient failure" with "the engine went OOM".
+const ThreadFailOnce = struct {
+    backing: std.mem.Allocator,
+    tid: std.Thread.Id,
+    armed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    remaining: usize = 0,
+    fired: bool = false,
+
+    fn arm(self: *ThreadFailOnce, n: usize) void {
+        self.tid = std.Thread.getCurrentId();
+        self.remaining = n;
+        self.fired = false;
+        self.armed.store(true, .release);
+    }
+
+    fn disarm(self: *ThreadFailOnce) void {
+        self.armed.store(false, .release);
+    }
+
+    fn allocator(self: *ThreadFailOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        if (self.armed.load(.acquire) and std.Thread.getCurrentId() == self.tid) {
+            if (self.remaining == 0) {
+                self.fired = true;
+                self.armed.store(false, .release);
+                return null;
+            }
+            self.remaining -= 1;
+        }
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+// Non-vacuity: with `InputQueue.push` swallowing the enqueue OOM (drop +
+// log) and `maybeStartNomination` having already popped the value and set
+// `nominating = true`, the index that lands on the queue append makes
+// propose() return success while nothing is ever nominated — the first
+// waitExternalized times out (red: NominationDropped) and `nominating`
+// stays latched so the retry is never nominated either; the push's err-level
+// log trips the runner too. The `prev` dupe index shows the same
+// propose-succeeded-but-not-nominated shape.
+test "propose: one allocation failure on the calling thread is either OutOfMemory or a nomination — never a silently dropped proposal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const seed: [32]u8 = @splat(0x51);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    var tfo = ThreadFailOnce{ .backing = std.testing.allocator, .tid = std.Thread.getCurrentId() };
+    const gpa = tfo.allocator();
+
+    // The calling thread allocates at most a handful of times inside
+    // propose (value copy, queue append, prev copy, input enqueue); sweep
+    // past that so the last iterations are the no-failure control.
+    var n: usize = 0;
+    while (n < 6) : (n += 1) {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "{s}/n{d}", .{ root, n });
+        const node = try Node.create(gpa, io, .{
+            .network = "propose-oom v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}), // 1-of-1 self quorum: a nomination externalizes
+            .listen_port = 0,
+            .data_dir = dir,
+            .diagnostic = &diag,
+        });
+        defer node.deinit();
+
+        tfo.arm(n);
+        const res = node.propose("first");
+        tfo.disarm();
+        if (res) |_| {
+            const e = node.waitExternalized(.{ .timeout_ms = 10_000 }) orelse {
+                std.debug.print("\nfail #{d}: propose() succeeded but nothing externalized (fired={})\n", .{ n, tfo.fired });
+                return error.NominationDropped;
+            };
+            gpa.free(e.value);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(tfo.fired);
+            node.prop_mu.lockUncancelable(io);
+            const nominating = node.nominating;
+            const queued = node.proposal_queue.items.len;
+            node.prop_mu.unlock(io);
+            try std.testing.expect(!nominating); // no latch without a nomination in flight
+            try std.testing.expectEqual(@as(usize, 0), queued); // the refused value is not held either
+        }
+        // The node is never stuck: the next proposal always goes through.
+        try node.propose("second");
+        const e2 = node.waitExternalized(.{ .timeout_ms = 10_000 }) orelse return error.NodeStuckAfterOom;
+        gpa.free(e2.value);
+    }
 }
