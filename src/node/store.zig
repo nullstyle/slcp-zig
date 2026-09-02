@@ -137,21 +137,21 @@ pub const Store = struct {
     /// Owned copy of the data-dir path (diagnostics only).
     data_dir: []u8,
 
-    /// Open (creating if needed) the data dir and both logs.
+    /// Open (creating if needed) the data dir and both logs. The filesystem
+    /// error is returned as is (not collapsed into `IoFailed`) so the node
+    /// can tell "permission denied" from "read-only" from "disk full"
+    /// (review finding).
     pub fn open(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) !Store {
-        const dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch
-            return Error.IoFailed;
+        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{});
         errdefer dir.close(io);
 
-        dir.createDirPath(io, qsets_dir_name) catch return Error.IoFailed;
+        try dir.createDirPath(io, qsets_dir_name);
 
         // truncate=false: preserve an existing log across a restart (recovery).
         // read=true: compact() re-reads each log through its open handle.
-        const own_file = dir.createFile(io, own_log_name, .{ .truncate = false, .read = true }) catch
-            return Error.IoFailed;
+        const own_file = try dir.createFile(io, own_log_name, .{ .truncate = false, .read = true });
         errdefer own_file.close(io);
-        const ext_file = dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true }) catch
-            return Error.IoFailed;
+        const ext_file = try dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true });
         errdefer ext_file.close(io);
 
         const dd = try gpa.dupe(u8, data_dir);

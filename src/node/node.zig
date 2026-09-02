@@ -695,7 +695,8 @@ pub const Node = struct {
         // ---- store + recovery ----
         self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the logs could not be opened ({t}); check the path, the filesystem and free space.", .{ opts.data_dir, e }),
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\": a write-ahead log cannot be opened for writing (permission denied); fix the ownership/permissions of its files (own.log, externalized.log, qsets/) — a restart as a different user than the one that created them is the usual cause — or point .data_dir at a directory this user owns.", .{opts.data_dir}),
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the write-ahead logs could not be opened ({t}); check the path, the filesystem (read-only?) and free space.", .{ opts.data_dir, e }),
         };
         errdefer self.store.deinit();
 

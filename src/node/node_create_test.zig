@@ -681,3 +681,28 @@ test "create(): OutOfMemory writes its own message into a reused Diagnostic, and
     n.deinit();
     try testing.expectEqualStrings("", g.diag.message());
 }
+
+// Non-vacuity: with Store.open collapsing every log-open failure into
+// `IoFailed`, a log this user cannot write is reported as DataDirUnusable
+// with "(IoFailed); check the path, the filesystem and free space" — the
+// expectFail's member check goes red (WrongCreateError); every earlier
+// data_dir check already maps AccessDenied to DataDirAccessDenied.
+test "data_dir: an existing log without write permission is DataDirAccessDenied, not DataDirUnusable(IoFailed)" {
+    if (isRoot()) return error.SkipZigTest; // root ignores mode bits
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var first = g.options();
+    first.data_dir = try g.sub(&b1, "ro-log");
+    {
+        const n = try Node.create(testing.allocator, io, first);
+        n.deinit();
+    }
+    try g.tmp.dir.setFilePermissions(io, "ro-log/own.log", std.Io.File.Permissions.fromMode(0o400), .{});
+    defer g.tmp.dir.setFilePermissions(io, "ro-log/own.log", std.Io.File.Permissions.fromMode(0o600), .{}) catch {};
+
+    try g.expectFail(first, error.DataDirAccessDenied, "permission denied");
+    try expectContains(g.diag.message(), "own.log");
+}

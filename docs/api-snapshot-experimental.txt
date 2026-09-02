@@ -1252,7 +1252,7 @@ slcp.store.Store.ext_file: field Io.File
 slcp.store.Store.getQset: fn (*node.store.Store, mem.Allocator, [32]u8) error{BadRecord,IoFailed,OutOfMemory}!?[]u8
 slcp.store.Store.gpa: field mem.Allocator
 slcp.store.Store.io: field Io
-slcp.store.Store.open: fn (mem.Allocator, Io, []const u8) error{BadRecord,IoFailed,OutOfMemory}!node.store.Store
+slcp.store.Store.open: fn (mem.Allocator, Io, []const u8) error{AccessDenied,AntivirusInterference,BadPathName,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,IsDir,LinkQuotaExceeded,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,OutOfMemory,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,Streaming,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.store.Store
 slcp.store.Store.own_file: field Io.File
 slcp.store.Store.putQset: fn (*node.store.Store, [32]u8, []const u8) void
 slcp.store.Store.recover: fn (*node.store.Store, mem.Allocator) error{BadRecord,IoFailed,OutOfMemory}!node.store.Recovery
