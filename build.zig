@@ -855,6 +855,24 @@ pub fn build(b: *std.Build) void {
     // M6 stage anchor (release): the preflight aggregate step. Insert under
     // this anchor only; it may reference every step declared above.
     // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // preflight: every mandatory pre-tag gate in ONE build graph (design
+    // §13.9; RELEASING.md). check-api, api-closure, docs-smoke, the
+    // appnode-errors compiles, the tools' tests and the soft wasm-diff are
+    // already inside `test`; the rest are the long, deliberately-manual
+    // steps. `just preflight` runs this from a FRESH `--cache-dir` and greps
+    // each gate's evidence line out of the `--summary all` log — that fresh
+    // cache is what makes the step non-vacuous: run_sim_matrix and
+    // run_byz_matrix carry no has_side_effects on purpose (a 7-minute step
+    // must stay cache-answerable in an ordinary `zig build`), so a warm
+    // `zig build preflight` may legitimately print ` cached` for them.
+    const preflight_step = b.step("preflight", "Every mandatory pre-tag gate: test, e2e, wasm-diff, byz-matrix, sim-matrix, example-smoke (run via `just preflight`: fresh cache + evidence greps)");
+    preflight_step.dependOn(test_step);
+    preflight_step.dependOn(e2e_step);
+    preflight_step.dependOn(wasm_diff_step);
+    preflight_step.dependOn(byz_matrix_step);
+    preflight_step.dependOn(sim_matrix_step);
+    preflight_step.dependOn(example_smoke_step);
 }
 
 /// `.version = "<v>"` of build.zig.zon, the one place the version lives.
