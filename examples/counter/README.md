@@ -238,8 +238,12 @@ every box.
 | Two nodes stop agreeing with each other, or one keeps rejecting the other's statements | The same `slcp.key` runs in two processes (a copied directory, or a node started twice). One identity must never run twice: a second process from the same directory reads the same `slcp-data/` too, and on macOS it even binds the same port. | Stop the duplicate. Every machine mints its own key with `slcp key new`. |
 
 Startup errors come with a one-paragraph explanation naming the offending
-option (`Node.explain(err)` gives the static text; pass a `.diagnostic` for
-the full message).
+option: pass a `.diagnostic` to `create` and print `diag.message()` (the
+pattern is in `docs/driver-upgrade.md`). `slcp.Node.explain(err)` does not
+accept an `AppNode(Counter).CreateError` — it has no arm for the two
+`AppNode`-only members, `CommandExceedsMaxValueBytes` and
+`UndecodableExternalizedValue` — so narrow with a `switch` on those two first
+if you want the static text (the top-level README shows the idiom).
 
 ## Security
 

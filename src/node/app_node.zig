@@ -1076,6 +1076,29 @@ test "contract acceptance: Counter, pointer-apply, initialState + defaultless St
     try std.testing.expect(MemoNode.codec.decode("") == null);
 }
 
+// Non-vacuity: this is the README's narrowing idiom. `node.explain` takes
+// `node.CreateError`, and `AppNode(App).CreateError` is a strict superset
+// (+CommandExceedsMaxValueBytes, +UndecodableExternalizedValue): pass `c.err`
+// to `node.explain` directly and this is a compile error ("not a member of
+// destination error set"); drop either arm of the switch and the `else`
+// capture stops coercing. The needles pin that the narrowed call reaches the
+// real static text.
+test "README idiom: AppNode(Counter).CreateError narrows to node.explain via a switch on its two extra members" {
+    const CN = AppNode(Counter);
+    const cases = [_]struct { err: CN.CreateError, needle: []const u8 }{
+        .{ .err = error.NoIdentity, .needle = "no identity" },
+        .{ .err = error.CommandExceedsMaxValueBytes, .needle = "app-level" },
+        .{ .err = error.UndecodableExternalizedValue, .needle = "app-level" },
+    };
+    for (cases) |c| {
+        const text: []const u8 = switch (c.err) {
+            error.CommandExceedsMaxValueBytes, error.UndecodableExternalizedValue => "app-level",
+            else => |e| node.explain(e),
+        };
+        try std.testing.expect(std.mem.indexOf(u8, text, c.needle) != null);
+    }
+}
+
 // -- AppNode over the Node (M6 S3) ---------------------------------------------
 
 const Quorum = core.quorum.Quorum;
