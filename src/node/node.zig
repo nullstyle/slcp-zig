@@ -647,6 +647,12 @@ pub const Node = struct {
             .delivery = opts.delivery,
             .max_value_bytes = opts.max_value_bytes,
         };
+        // Registered FIRST so it runs LAST on the unwind (after the thread
+        // joins and the ov/wheel stops below): the journal-tail replay and
+        // the own.log restore populate ext_queue / own_latest / pending_ext
+        // BEFORE the listen and the thread spawns can still fail (review
+        // finding: ListenPortInUse on a restart leaked the replayed tail).
+        errdefer self.freeAppBuffers();
 
         // Engine.init does NOT free cfg.quorum_set on failure; we still own
         // it until this succeeds.
@@ -668,6 +674,7 @@ pub const Node = struct {
         self.store.putQset(local_hash, framed_local);
 
         self.wheel = timers_mod.Wheel.init(gpa, io, onTimerFire, self);
+        errdefer self.wheel.deinit(); // stop() is idempotent; frees the timer list
 
         // Own the peer specs: the overlay's dialers re-parse them on every
         // reconnect for the node's lifetime; never borrow the caller's.
@@ -693,6 +700,7 @@ pub const Node = struct {
             .on_peer_up = onPeerUp,
             .on_peer_down = onPeerDown, // M6:example logs
         });
+        errdefer self.ov.deinit(); // after ov.stop() below on the unwind
 
         // ---- Restart recovery (§10), synchronous, pre-threads ----
         var rec = self.store.recover(gpa) catch |e| switch (e) {
@@ -947,10 +955,22 @@ pub const Node = struct {
         for (self.peer_specs) |s| self.gpa.free(s);
         self.gpa.free(self.peer_specs);
 
-        self.q.deinit();
         self.store.deinit();
         self.eng.deinit();
+        self.freeAppBuffers();
 
+        const gpa = self.gpa;
+        self.* = undefined;
+        gpa.destroy(self);
+    }
+
+    /// Free every buffer the replay/restore inside `create` and the engine
+    /// thread populate: the input queue's leftovers, own_latest, the
+    /// proposal queue, last_ext_value, ext_queue, pending_ext, req_qsets.
+    /// Shared by `deinit` and `create`'s unwind; safe on the zero state.
+    /// Callers must have joined every thread that pushes or dispatches.
+    fn freeAppBuffers(self: *Node) void {
+        self.q.deinit();
         {
             var it = self.own_latest.iterator();
             while (it.next()) |e| e.value_ptr.free(self.gpa);
@@ -967,10 +987,6 @@ pub const Node = struct {
             self.pending_ext.deinit(self.gpa);
         }
         self.req_qsets.deinit(self.gpa);
-
-        const gpa = self.gpa;
-        self.* = undefined;
-        gpa.destroy(self);
     }
 
     // -------------------------------------------------------------------
@@ -1832,4 +1848,92 @@ test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount dro
     b_live = false;
     try pollUntil(io, 10_000, a, Probe.down);
     try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
+}
+
+// -- create() unwind after a restart replay ------------------------------------
+
+/// Hold an ephemeral port with a plain listener (no SO_REUSEPORT) so a
+/// `create` on that port fails at the listen step — AFTER the journal-tail
+/// replay and the own.log restore have run.
+fn holdEphemeralPort(io: std.Io) !std.Io.net.Server {
+    const net = std.Io.net;
+    const bind: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    return try net.IpAddress.listen(&bind, io, .{ .mode = .stream, .reuse_address = false });
+}
+
+fn portOfServer(server: *const std.Io.net.Server) u16 {
+    return switch (server.socket.address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+}
+
+// Non-vacuity: removing `errdefer self.freeAppBuffers()` from create() (or
+// registering it after the thread-join errdefers so it runs before them)
+// leaks the three replayed tail values + the ext_queue backing on the queue
+// path, and the own_latest map + envelope copy on the own.log path — the
+// testing allocator reports the leaks and the test goes red. On a host
+// where a held port can still be bound (SO_REUSEPORT sandbox) the test
+// skips rather than pass vacuously.
+test "create() unwind: ListenPortInUse after a journal-tail replay (queue path) and after an own.log restore leaks nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_q_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_o_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_q = try std.fmt.bufPrint(&dir_q_buf, "{s}/queue", .{root});
+    const dir_o = try std.fmt.bufPrint(&dir_o_buf, "{s}/own", .{root});
+
+    const passphrase = "create-unwind v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+
+    // Queue path: the journal holds 3, 5, 7 (replayed into ext_queue).
+    {
+        var st = try store_mod.Store.open(gpa, io, dir_q);
+        defer st.deinit();
+        try st.appendExternalized(3, "three");
+        try st.appendExternalized(5, "five");
+        try st.appendExternalized(7, "seven");
+    }
+    // Own.log path: journal 7 + this node's EXTERNALIZE for 8 (restored
+    // into own_latest through the engine's re-emitted broadcast).
+    {
+        var st = try store_mod.Store.open(gpa, io, dir_o);
+        defer st.deinit();
+        try st.appendExternalized(7, "seven");
+        const env = try buildSignedExternalize(gpa, seed, network_id, 8, "eight");
+        defer gpa.free(env);
+        try st.appendOwn(8, env);
+    }
+
+    var server = try holdEphemeralPort(io);
+    defer server.deinit(io);
+    const port = portOfServer(&server);
+    try std.testing.expect(port != 0);
+
+    var diag: Diagnostic = .{};
+    for ([_][]const u8{ dir_q, dir_o }) |dir| {
+        diag.len = 0;
+        if (Node.create(gpa, io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = port,
+            .data_dir = dir,
+            .diagnostic = &diag,
+        })) |n| {
+            n.deinit();
+            std.debug.print("\nnode bound port {d} while a test listener held it (SO_REUSEPORT sandbox?); skipping\n", .{port});
+            return error.SkipZigTest;
+        } else |err| {
+            try std.testing.expectEqual(error.ListenPortInUse, err);
+        }
+    }
 }
