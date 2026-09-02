@@ -324,6 +324,13 @@ bare commit — and let `zig fetch` record the content hash in your
 zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.1.0.tar.gz
 ```
 
+Keep the `--save`. On this Zig a bare `zig fetch <archive-url>` (no `--save`)
+prints the right hash but stores the archive double-nested in the global
+cache, and later builds that need that package fail with `hash mismatch …
+N-V-…` until `zig fetch --save` runs again or `$ZIG_GLOBAL_CACHE_DIR/p/<hash>.tar.gz`
+is deleted. To only print a hash, use `just pkg-hash <tarball|url>` from a
+checkout; it fetches into a throwaway cache.
+
 Then in `build.zig`:
 
 ```zig
