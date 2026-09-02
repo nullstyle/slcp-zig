@@ -219,6 +219,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_tests = b.addRunArtifact(sim_tests);
+    const sim_tests_step = b.step("sim-tests", "Run the simulator's own tests: invariants, oracle scenarios, Byzantine suite, restart safety, smoke matrix (part of `test`)");
+    sim_tests_step.dependOn(&run_sim_tests.step);
 
     // Fuzz targets (design §13.5). Two std.testing.fuzz targets — a decode
     // target (arbitrary bytes → typed rejection, never UB/leak) and an

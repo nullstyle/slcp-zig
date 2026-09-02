@@ -194,13 +194,20 @@ test; and a dozen documentation claims that disagreed with the code
   `canonicalBytes` entry points are held out of the Stable tier: their
   inferred error sets resolve to `anyerror` through capnp-zig's builders.
 - Long fuzzing is advisory: the release ran what `RELEASING.md`'s run log
-  says it ran, nothing more. The 200K-iteration run before this tag found
-  one **unconfirmed** input-sequence fuzz failure
-  (`error.OwnStatementNotMonotonic`, the §13.1 harness invariant; the
-  input is preserved) that is either a known harness false positive — the
-  engine re-emits EXTERNALIZE with a grown `nH`, which `isNewerStatement`
-  does not rank — or a real own-statement ordering bug; it is a v0.1.x
-  ticket, not classified here.
+  says it ran, nothing more. The long runs before this tag (200K, then
+  50K, then a re-run) failed the input-sequence target three times
+  (`error.OwnStatementNotMonotonic`, the §13.1 harness invariant). Settled
+  before the tag as a **harness
+  artifact**, not an engine bug: the target nominated for a slot it had
+  already purged (`purge_slots`), the engine re-created the slot from
+  empty state — exactly what stellar-core's `SCP::getSlot(create=true)`
+  does after `purgeSlotsOutsideRange` — and the checker compared the fresh
+  slot's first NOMINATE against the forgotten one. The sim invariants
+  tracker now forgets purged slots with the engine and judges own
+  EXTERNALIZE pairs by committed value (as the e2e watchdog already did);
+  the three saved inputs are a committed regression corpus
+  (`tests/fuzz/crash/`, replayed inside `zig build test`, traced by
+  `zig build fuzz-replay`). No `src/` change; the package hash is unchanged.
 - A watcher (no key) skips the identity node-id comparison; `Hello.listenPort`
   is sent but never used for dialing.
 - No license is granted.

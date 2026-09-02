@@ -7,8 +7,10 @@
 //! line per derived input, every own statement the engine persisted, and
 //! the decoded pair the own-monotonicity invariant rejected. With no
 //! arguments it replays the three S9 crash inputs embedded from
-//! tests/fuzz/crash/. Exit code 0 either way: this is a diagnostic, the
-//! pinning test lives in input_seq_fuzz.zig.
+//! tests/fuzz/crash/ (they replay clean since the tracker forgets purged
+//! slots; the trace still shows the own NOMINATE → purge_slots → own
+//! NOMINATE shape they were saved for). Exit code 0 either way: this is a
+//! diagnostic, the regression pin lives in input_seq_fuzz.zig.
 
 const std = @import("std");
 const seq = @import("input_seq_fuzz");
@@ -42,20 +44,25 @@ fn replayOne(gpa: std.mem.Allocator, w: *std.Io.Writer, name: []const u8, bytes:
     seq.replayBytes(gpa, bytes, &trace) catch |err| {
         try w.print("--- {s}: {t} after {d} inputs\n", .{ name, err, trace.steps });
         if (trace.finding) |f| {
+            // Same-value EXTERNALIZE pairs are accepted by the checker
+            // (invariants.ownEmissionAllowed), so a reported EXTERNALIZE
+            // pair is always a fork; a non-EXTERNALIZE pair is a live-slot
+            // stale-vs-self emission (purged slots are forgotten, so it is
+            // not the cross-purge class this tool was written for).
             const class: []const u8 = if (f.same_committed_value) |eq|
-                (if (eq) "(a) two EXTERNALIZE, same committed value — isNewerOwned's .externalize arm (HANDOFF §6 class)" else "(b) two EXTERNALIZE, DIFFERENT committed values — FORK")
+                (if (eq) "two EXTERNALIZE, same committed value — unexpected: the checker accepts this pair" else "two EXTERNALIZE, DIFFERENT committed values — FORK")
             else
-                "(c) non-EXTERNALIZE pair not newer — stale-vs-self emission";
+                "non-EXTERNALIZE pair not newer on a live slot — stale-vs-self emission";
             try w.print("    class: {s}\n    restore_own_envelope applied between the pair: {}\n", .{ class, f.restore_between });
         }
         try w.flush();
         return;
     };
-    try w.print("--- {s}: NOT reproduced ({d} inputs, no invariant violation; {d} input bytes left{s})\n", .{
+    try w.print("--- {s}: clean ({d} inputs, no invariant violation; {d} input bytes left{s})\n", .{
         name,
         trace.steps,
         trace.bytes_left,
-        if (trace.bytes_left == 0) " — stream exhausted: the saved input is a truncated prefix" else "",
+        if (trace.bytes_left == 0) " — stream exhausted: the saved bytes end here" else "",
     });
     try w.flush();
 }

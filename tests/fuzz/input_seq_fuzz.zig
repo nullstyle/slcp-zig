@@ -11,7 +11,12 @@
 //!   - the effect queue stays within its bounds (§13.1 / EffectQueue budget);
 //!   - own emitted statements are strictly newer than the previous own
 //!     statement of the same protocol — phase/counter monotonic per slot
-//!     (invariants.recordOwnStatement);
+//!     (invariants.recordOwnStatement; own EXTERNALIZE pairs are judged by
+//!     committed value, invariants.ownEmissionAllowed) — with the tracker's
+//!     memory scoped like the engine's: an APPLIED purge_slots forgets the
+//!     purged slots (invariants.Tracker.purgeBelow), because the target draws
+//!     `nominate` slots independently of its purges and the engine restarts a
+//!     purged slot from empty state (the S9 fuzz-long class, tests/fuzz/crash/);
 //!   - `externalized` is emitted at most once per slot
 //!     (invariants.recordExternalizedEffect);
 //!   - the per-slot ballot invariants (invariants.checkEngine, the oracle's
@@ -172,6 +177,30 @@ fn pushOne(gpa: std.mem.Allocator, fx: *Fixture, input: engine.Input) !PushOutco
     return .ok;
 }
 
+/// Push a purge_slots input and, once the engine APPLIED it, scope the
+/// harness memory the same way: the invariants tracker forgets the purged
+/// slots (§10 — the engine dropped all state for them; a later input for
+/// such a slot re-creates it from empty state) and so does the replay
+/// bookkeeping.
+fn purgeSlots(gpa: std.mem.Allocator, fx: *Fixture, max_slot: u64) !PushOutcome {
+    const outcome = try pushOne(gpa, fx, .{ .purge_slots = .{ .max_slot = max_slot } });
+    if (outcome == .ok and fx.last_status == .applied) try forgetPurged(gpa, fx, max_slot);
+    return outcome;
+}
+
+fn forgetPurged(gpa: std.mem.Allocator, fx: *Fixture, max_slot: u64) !void {
+    try fx.tracker.purgeBelow(gpa, max_slot);
+    var doomed: std.ArrayList(u64) = .empty;
+    defer doomed.deinit(gpa);
+    var it = fx.prev_own.keyIterator();
+    while (it.next()) |k| if (k.* < max_slot) try doomed.append(gpa, k.*);
+    for (doomed.items) |k| _ = fx.prev_own.remove(k);
+    doomed.clearRetainingCapacity();
+    var rit = fx.restore_steps.keyIterator();
+    while (rit.next()) |k| if (k.* < max_slot) try doomed.append(gpa, k.*);
+    for (doomed.items) |k| _ = fx.restore_steps.remove(k);
+}
+
 /// Trace one derived input (replay only; a no-op without a trace sink).
 fn traceInput(fx: *Fixture, comptime fmt: []const u8, args: anytype) !void {
     const t = fx.trace orelse return;
@@ -243,7 +272,7 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
         4 => {
             const max_slot = smith.valueRangeAtMost(u64, 0, 8);
             try traceInput(fx, "purge_slots max_slot={d}", .{max_slot});
-            return pushOne(gpa, fx, .{ .purge_slots = .{ .max_slot = max_slot } });
+            return purgeSlots(gpa, fx, max_slot);
         },
         5 => {
             // Replay a captured own frame (startup-only in practice; a
@@ -482,7 +511,7 @@ fn noteViolation(fx: *Fixture, s: OwnSummary) !void {
         null;
     t.finding = .{ .prev = prev, .new = s, .restore_between = restore_between, .same_committed_value = same };
     if (t.w) |w| {
-        try w.writeAll("      VIOLATION own statement not strictly newer (stored.isNewerOwned == false)\n        prev: ");
+        try w.writeAll("      VIOLATION own statement rejected (invariants.ownEmissionAllowed == false)\n        prev: ");
         try writeSummary(w, prev);
         try w.writeAll("\n        new:  ");
         try writeSummary(w, s);
@@ -500,79 +529,66 @@ pub const crash_inputs = [_]struct { name: []const u8, bytes: []const u8 }{
     .{ .name = "tests/fuzz/crash/input-seq-3.bin", .bytes = @embedFile("crash/input-seq-3.bin") },
 };
 
-// Non-vacuity: replays the bytes `just fuzz-long` saved (S9 finding 2)
-// through the coverage-guided path and pins what they are. Inputs 1 and 3
-// reproduce error.OwnStatementNotMonotonic; the rejected pair is two own
-// NOMINATE statements for slot 7 with disjoint single votes, no
-// restore_own_envelope in between — NOT the HANDOFF §6 EXTERNALIZE class.
-// The cause is a `purge_slots max_slot=8` between the two `nominate slot=7`
-// inputs: the engine drops slot 7 (design §10 GC) and the second nominate
-// starts a fresh nomination whose vote set {b} is not a superset of the
-// forgotten {a}, while the harness tracker remembers {a}. Input 2's saved
-// bytes are a 512-byte prefix (the runner's crash writer truncated it): the
-// stream is exhausted after 8 inputs, no violation. Red if: the engine stops
-// emitting after a purge + re-nominate, isNewerOwned's nomination arm
-// changes, the harness tracker forgets purged slots, or the corpus bytes
-// change (sha256s pinned in RELEASING.md).
-test "replay: S9 fuzz-long crash inputs — NOMINATE pair across purge_slots (1, 3); input 2 is a truncated prefix" {
+// Regression corpus (S9 finding 2): the three inputs `just fuzz-long` saved
+// during the v0.1.0 preflight, replayed through the coverage-guided path.
+// How they were found: `zig build fuzz --fuzz` (200K, then 50K, then a
+// re-run) failed the input-seq target with error.OwnStatementNotMonotonic
+// three times on distinct inputs; the runner copied each failing Smith byte
+// stream to .zig-cache/f/crash. What they are: inputs 1 and 3 carry an own
+// NOMINATE for slot 7, an APPLIED `purge_slots max_slot=8` (the engine drops
+// slot 7, design §10 GC), then `nominate slot=7` with a fresh value — the
+// engine re-creates the slot and starts nomination from empty state (the
+// oracle's SCP::getSlot(create=true) after purgeSlotsOutsideRange does the
+// same), so its vote set {b} is not a superset of the forgotten {a}. The
+// harness tracker used to compare across the purge; it now forgets purged
+// slots with the engine. Neither input involves an EXTERNALIZE pair or a
+// restore_own_envelope between the pair (input 3's restore at input 10 is
+// for slot 5). Input 2's saved bytes are a 512-byte prefix (the runner's
+// crash writer truncated it): the stream is exhausted after 8 inputs.
+// Red if: the tracker stops forgetting on purge (the pair is flagged again
+// at input 14 / 13), the engine stops emitting after a purge + re-nominate,
+// or the corpus bytes change (sha256s pinned in RELEASING.md).
+test "regression corpus: the S9 fuzz-long crash inputs replay clean (own NOMINATE after an applied purge_slots is a fresh slot, not stale-vs-self)" {
     const gpa = testing.allocator;
 
-    // Input 1 (sha256 86afba4c…): 14 inputs, violation on the 14th.
+    // Input 1 (sha256 86afba4c…): used to fail on the 14th input.
     {
         var trace: Trace = .{};
-        try testing.expectError(error.OwnStatementNotMonotonic, replayBytes(gpa, crash_inputs[0].bytes, &trace));
-        try testing.expectEqual(@as(usize, 14), trace.steps);
-        const f = trace.finding.?;
-        try testing.expectEqual(OwnKind.nominate, f.prev.kind);
-        try testing.expectEqual(OwnKind.nominate, f.new.kind);
-        try testing.expectEqual(@as(u64, 7), f.prev.slot);
-        try testing.expectEqual(@as(u64, 7), f.new.slot);
-        try testing.expectEqual(@as(usize, 2), f.prev.step);
-        try testing.expectEqual(@as(usize, 14), f.new.step);
-        try testing.expectEqual(@as(usize, 1), f.prev.votes);
-        try testing.expectEqual(@as(usize, 1), f.new.votes);
-        try testing.expect(!std.mem.eql(u8, &f.prev.value_hash, &f.new.value_hash)); // disjoint votes
-        try testing.expect(!f.restore_between);
-        try testing.expectEqual(@as(?bool, null), f.same_committed_value); // not an EXTERNALIZE pair
+        try replayBytes(gpa, crash_inputs[0].bytes, &trace);
+        try testing.expect(trace.finding == null);
+        try testing.expect(trace.steps >= 14);
     }
     // Input 2 (sha256 2d05cef1…): truncated — exhausted after 8 inputs.
     {
         var trace: Trace = .{};
         try replayBytes(gpa, crash_inputs[1].bytes, &trace);
+        try testing.expect(trace.finding == null);
         try testing.expectEqual(@as(usize, 8), trace.steps);
         try testing.expectEqual(@as(usize, 0), trace.bytes_left);
-        try testing.expect(trace.finding == null);
     }
-    // Input 3 (sha256 2307f4ae…): 13 inputs, violation on the 13th; a
-    // restore_own_envelope (slot 5) was applied at input 10 — a different
-    // slot, so not between the pair.
+    // Input 3 (sha256 2307f4ae…): used to fail on the 13th input.
     {
         var trace: Trace = .{};
-        try testing.expectError(error.OwnStatementNotMonotonic, replayBytes(gpa, crash_inputs[2].bytes, &trace));
-        try testing.expectEqual(@as(usize, 13), trace.steps);
-        const f = trace.finding.?;
-        try testing.expectEqual(OwnKind.nominate, f.prev.kind);
-        try testing.expectEqual(OwnKind.nominate, f.new.kind);
-        try testing.expectEqual(@as(u64, 7), f.prev.slot);
-        try testing.expectEqual(@as(usize, 2), f.prev.step);
-        try testing.expectEqual(@as(usize, 13), f.new.step);
-        try testing.expect(!std.mem.eql(u8, &f.prev.value_hash, &f.new.value_hash));
-        try testing.expect(!f.restore_between);
-        try testing.expectEqual(@as(?bool, null), f.same_committed_value);
+        try replayBytes(gpa, crash_inputs[2].bytes, &trace);
+        try testing.expect(trace.finding == null);
+        try testing.expect(trace.steps >= 13);
     }
 }
 
 // Non-vacuity: the minimal three-input form of what inputs 1 and 3 hit,
-// against the same Fixture + invariants, with a no-purge control. Red if
-// the purge stops dropping the slot, the second nominate stops emitting, or
-// the control starts flagging (own votes only ever grow while the slot
-// lives). Documents the class: a host that nominates for a slot it already
-// purged makes the engine re-start nomination from empty state — the
-// harness tracker (which never purges) then sees a non-superset vote set.
-test "minimal: nominate, purge_slots, nominate the purged slot → own NOMINATE with disjoint votes; no purge → no violation" {
+// against the same Fixture + invariants, plus the two controls that keep it
+// honest. (1) nominate 7 "a" → purge_slots 8 → nominate 7 "b": the engine
+// emits a fresh own NOMINATE whose single vote differs from "a" (proves the
+// engine restarted the slot from empty state — the class is real) and the
+// tracker, having forgotten slot 7, accepts it. (2) The SAME pair fed to a
+// tracker that was not told about the purge is still a violation (the rule
+// is live; forgetting is what changed). (3) No purge: two nominates on a
+// live slot never violate (own votes only grow). Red if the purge stops
+// dropping the slot, the second nominate stops emitting, the tracker keeps
+// purged slots, or a live-slot shrink stops being flagged.
+test "minimal: nominate, purge_slots, nominate the purged slot → fresh own NOMINATE accepted; the same pair on an unpurged tracker is a violation" {
     const gpa = testing.allocator;
 
-    // Purge between the two nominations: the pair is rejected.
     {
         var fx = try Fixture.init(gpa);
         defer fx.deinit(gpa);
@@ -581,20 +597,33 @@ test "minimal: nominate, purge_slots, nominate the purged slot → own NOMINATE 
         fx.step = 1;
         try testing.expectEqual(PushOutcome.ok, try pushOne(gpa, &fx, .{ .nominate = .{ .slot = 7, .value = "a", .prev_value = &.{} } }));
         try testing.expectEqual(engine.InputStatus.applied, fx.last_status.?);
-        try testing.expect(fx.prev_own.get(7).?[0] != null); // own NOMINATE {a} recorded
+        const first = fx.prev_own.get(7).?[0].?; // own NOMINATE {a} recorded
+        try testing.expectEqual(@as(usize, 1), first.votes);
+
+        // A second tracker that never hears about the purge: the control.
+        var unpurged: invariants.Tracker = .{};
+        defer unpurged.deinit(gpa);
+        try testing.expect((try invariants.recordOwnStatement(&unpurged, gpa, try invariants.decodeOwnEnvelope(gpa, fx.last_own.?))) == null);
+
         fx.step = 2;
-        try testing.expectEqual(PushOutcome.ok, try pushOne(gpa, &fx, .{ .purge_slots = .{ .max_slot = 8 } }));
-        try testing.expect(fx.eng.slots.get(7) == null); // §10: slot 7 dropped
+        try testing.expectEqual(PushOutcome.ok, try purgeSlots(gpa, &fx, 8));
+        try testing.expectEqual(engine.InputStatus.applied, fx.last_status.?);
+        try testing.expect(fx.eng.slots.get(7) == null); // §10: slot 7 dropped by the engine …
+        try testing.expect(fx.tracker.per_slot.get(7) == null); // … and forgotten by the tracker
+        try testing.expect(fx.prev_own.get(7) == null);
+
         fx.step = 3;
-        try testing.expectError(error.OwnStatementNotMonotonic, pushOne(gpa, &fx, .{ .nominate = .{ .slot = 7, .value = "b", .prev_value = &.{} } }));
-        const f = trace.finding.?;
-        try testing.expectEqual(OwnKind.nominate, f.prev.kind);
-        try testing.expectEqual(OwnKind.nominate, f.new.kind);
-        try testing.expectEqual(@as(usize, 1), f.prev.votes);
-        try testing.expectEqual(@as(usize, 1), f.new.votes);
-        try testing.expect(!f.restore_between);
-        // Drain whatever the failed input left queued so the fixture deinits cleanly.
-        while (fx.eng.popEffect()) |_| fx.eng.commitEffect();
+        try testing.expectEqual(PushOutcome.ok, try pushOne(gpa, &fx, .{ .nominate = .{ .slot = 7, .value = "b", .prev_value = &.{} } }));
+        try testing.expectEqual(engine.InputStatus.applied, fx.last_status.?);
+        try testing.expect(trace.finding == null);
+        const second = fx.prev_own.get(7).?[0].?;
+        try testing.expectEqual(@as(usize, 3), second.step);
+        try testing.expectEqual(@as(usize, 1), second.votes);
+        try testing.expect(!std.mem.eql(u8, &first.value_hash, &second.value_hash)); // {b}, not {a,b}: a fresh slot
+
+        // Control: the unpurged tracker still rejects {a} → {b}.
+        const v = try invariants.recordOwnStatement(&unpurged, gpa, try invariants.decodeOwnEnvelope(gpa, fx.last_own.?));
+        try testing.expectEqualStrings(invariants.msg_not_newer, v.?.msg);
     }
     // Control: same two nominations, no purge — own votes grow (or the
     // second nominate is a no-op); either way the order holds.
@@ -619,11 +648,18 @@ const testing = std.testing;
 // zig build fuzz — corpus-driven std.testing.fuzz target
 // ---------------------------------------------------------------------------
 
+// Seed corpus. The three S9 crash inputs are in the fuzzer's own Smith
+// encoding, so they seed coverage-guided runs with the purge → re-nominate
+// shape and are replayed by every non-fuzz run of this test (the test
+// runner feeds each corpus entry through testOne when not built with --fuzz).
 const seq_corpus = [_][]const u8{
     &.{},
     &.{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, // one qset_received-ish
     &.{ 0x02, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xaa, 0xbb }, // envelope path
     "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    crash_inputs[0].bytes,
+    crash_inputs[1].bytes,
+    crash_inputs[2].bytes,
 };
 
 test "fuzz: random valid-typed input interleavings preserve §13.1 invariants" {

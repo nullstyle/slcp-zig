@@ -320,10 +320,71 @@ input-seq FAILED again with the same error at run 33490 (12.5K further
 runs) on a DIFFERENT input (sha256 `2d05cef1cfd3a1bf…`, copied to
 `/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input-2.bin`) — a recurring
 class, not a corpus replay — and the amended recipe exited 1
-(`fuzz-long: a fuzz target FAILED …`), its own red proven.
-Ticket for v0.1.x: classify it (replay the input through the harness with
-the EXTERNALIZE-pair rule from HANDOFF §6 applied, or fix the engine).
+(`fuzz-long: a fuzz target FAILED …`), its own red proven. A third
+distinct input (sha256 `2307f4ae0f8c9e77…`,
+`/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input-3.bin`, byte-identical
+to main's `.zig-cache/f/crash` when the fix branch forked) was preserved
+from a later run.
 A 1M-iteration or overnight run is a post-tag v0.1.x task (R21).
+
+**Fuzz finding settled** (branch `m6/s9-fuzz`, before the tag). Replay
+tooling first: the fuzzer logs every value it hands the Smith in the
+`Smith{ .in = bytes }` encoding and the runner copies the failing stream
+to `.zig-cache/f/crash`, so `zig build fuzz-replay -- <file.bin>` feeds it
+back through the target's own eos-gated `run` with a per-input trace
+(`tests/fuzz/input_seq_replay.zig`). The three inputs are committed
+byte-identical as `tests/fuzz/crash/input-seq-{1,2,3}.bin` (sha256
+`86afba4c…`, `2d05cef1…`, `2307f4ae…`). Verdict — a **harness artifact**,
+the auditor's EXTERNALIZE hypothesis refuted, two independent skeptics
+(one trying to prove an engine bug, one a harness artifact) agreeing:
+inputs 1 and 3 both carry an own NOMINATE for slot 7, an applied
+`purge_slots max_slot=8`, then `nominate slot=7` with a fresh value; the
+engine drops slot 7 on the purge (design §10 GC, `pipeline.handlePurge`)
+and re-creates it from empty state on the next nominate
+(`getOrCreateSlot` → `nomination.nominateInternal`), so the fresh slot's
+first NOMINATE votes `{b}` are not a superset of the forgotten `{a}` —
+`stored.isNewerOwned`'s nomination arm answers false and the harness
+tracker, which never forgot slot 7, fired. stellar-core does the same
+(`SCP::nominate` → `getSlot(slotIndex, true)` constructs a new Slot after
+`purgeSlotsOutsideRange` erased it; `NominationProtocol::emitNomination`
+emits on a null `mLastEnvelope`), and no M6/S8 change is on the path.
+Neither pair is an EXTERNALIZE pair and no `restore_own_envelope` sits
+between either (input 3's restore is for slot 5). Input 2 is a 512-byte
+truncated prefix (the runner's crash writer buffer): its stream is
+exhausted after 8 inputs — which already contain own NOMINATE slot 7 then
+`purge_slots 8` — so it cannot be settled from the bytes. Fix (harness
+only, `sim/invariants.zig` + the fuzz target; no `src/` change, package
+hash unchanged): the invariants `Tracker` forgets slots below an APPLIED
+`purge_slots` (`Tracker.purgeBelow`, mirroring the engine and
+`node.zig`'s `pruneOwnLatest`), and own EXTERNALIZE pairs are judged by
+committed value exactly as the e2e watchdog does (different value =
+fork, red; same value with grown `nH` = legal) while every other pair
+keeps the strict `isNewerStatement` order. Pinned red-then-green: the
+regression-corpus test (`slcp-fuzz-input-seq`, inside `zig build test`
+and `fuzz-smoke`) failed `OwnStatementNotMonotonic` on inputs 1 and 3
+with purge-forgetting disabled and passes with it; the synthetic-fork
+test in `sim/invariants.zig` (`zig build sim-tests`) failed under the
+strict comparator on the same-value nH re-emit and passes with the
+committed-value rule, while the fork, a stale PREPARE, a backward phase,
+a non-growing NOMINATE and mixed protocols stay red. The three inputs
+also seed the target's corpus, so every non-fuzz run of the target
+replays them and coverage-guided runs start from the purge → re-nominate
+shape. Gates on the branch: `zig build test --summary all` → `Build
+Summary: 78/78 steps succeeded; 343/348 tests passed (5 skipped)`,
+`[docs-smoke] checks=393 failures=0`; `zig build fuzz-smoke` 7/7, 4/4;
+`zig build sim-tests` 39/39; `zig build wasm && zig build wasm-diff` →
+`[wasm-diff] traces=4 normative_effects=32 observable_effects=9` ·
+`[wasm-diff] fuzz iters=300 …`; `zig build byz-matrix` → `1000 seeds x
+2 actors green`; `just fuzz-long 100K` (70 s, cache preserved) → decode
+`Runs: 0 -> 101866`, `Coverage … 1867/14035`; input-seq `Runs: 0 ->
+104013`, `Coverage … 2811/15164 (18.54%)`; codec `Runs: 0 -> 100055`;
+`fuzz-long: 100K iterations, no failure`. Not settled here: the
+deterministic 5000-iteration smoke is degenerate under `Smith{ .in =
+random bytes }` (every range-limited draw collapses to its minimum and
+the first `slice` swallows the buffer, so it only ever runs `nominate
+slot=1 value=<empty>`); its non-vacuity gate counts steps, not
+diversity — a v0.1.x ticket, the corpus replay above is what now covers
+the purge shape deterministically.
 
 **Not done here** (the orchestrator's half of S9): push, CI on the branch,
 merge to `main`, `just release-tag 0.1.0 "omakase polish"`, `just
