@@ -1129,9 +1129,10 @@ slcp.lint_report.firstBadThreshold: fn (*const engine.qset.QuorumSetOwned) ?node
 slcp.lint_report.firstDuplicate: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!?[32]u8
 slcp.lint_report.firstEmptyLevel: fn (*const engine.qset.QuorumSetOwned) ?node.lint_report.EmptyLevel
 slcp.lint_report.hasErrors: fn ([]const engine.qset.LintFinding) bool
+slcp.lint_report.minSliceSize: fn (*const engine.qset.QuorumSetOwned) usize
 slcp.lint_report.totalValidators: fn (*const engine.qset.QuorumSetOwned) usize
 slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFailed}!void
-slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding) error{WriteFailed}!void
+slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding, *const engine.qset.QuorumSetOwned) error{WriteFailed}!void
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
