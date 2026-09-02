@@ -425,6 +425,45 @@ pub fn hasJustRecipe(justfile: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// The one-line body of a Justfile recipe `name:` — the first indented line
+/// after the header — or null when the recipe is absent or has no body.
+pub fn justRecipeBody(justfile: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, justfile, '\n');
+    var in_recipe = false;
+    while (it.next()) |line| {
+        if (in_recipe) {
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return std.mem.trim(u8, line, " \t\r");
+            return null;
+        }
+        if (!std.mem.startsWith(u8, line, name)) continue;
+        if (line.len == name.len) continue;
+        const c = line[name.len];
+        if (c != ':' and c != ' ') continue;
+        if (std.mem.indexOfScalar(u8, line, ':') == null) continue;
+        in_recipe = true;
+    }
+    return null;
+}
+
+/// `path` is one whitespace-separated token of a recipe body. Exact match on
+/// purpose: `src/*.zig` is a glob over top-level FILES and covers no
+/// directory — that is how src/cli slipped past `fmt-check` (S8 finding 20).
+pub fn recipeListsPath(body: []const u8, path: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, body, " \t");
+    while (it.next()) |tok| if (std.mem.eql(u8, tok, path)) return true;
+    return false;
+}
+
+/// The `zig fmt` recipes whose path list must name every hand-written
+/// src/<dir> explicitly (and must NOT name the exempt one).
+pub const fmt_recipes = [_][]const u8{ "fmt", "fmt-check" };
+/// The only src/ subdirectory `zig fmt` may skip: generated code, not
+/// fmt-clean (docs/upstream/06).
+pub const fmt_exempt_dir = "gen";
+/// src/ holds at least cli, engine, gen, node, wasm — fewer means the scan
+/// ran in the wrong cwd.
+pub const min_src_dirs: usize = 5;
+
 pub const CliToken = struct {
     /// `slcp <verb>` or `slcp <verb> <verb>` (the longest verb chain).
     needle: []const u8,
@@ -866,6 +905,30 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         rep.checkFmt(hasJustRecipe(justfile, s), "Justfile", 0, "recipe `{s}` exists", .{s}, "required by the docs gate", .{});
     }
 
+    // ---- (5b) fmt recipes cover every hand-written src/<dir> (S8 finding 20) ----
+    {
+        var src_dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+        defer src_dir.close(io);
+        var it = src_dir.iterate();
+        var dirs_seen: usize = 0;
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            dirs_seen += 1;
+            var path_buf: [256]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "src/{s}", .{entry.name});
+            const exempt = std.mem.eql(u8, entry.name, fmt_exempt_dir);
+            for (fmt_recipes) |r| {
+                const listed = recipeListsPath(justRecipeBody(justfile, r) orelse "", path);
+                if (exempt) {
+                    rep.checkFmt(!listed, "Justfile", 0, "`{s}` does not list {s}", .{ r, path }, "generated code is not fmt-clean (docs/upstream/06)", .{});
+                } else {
+                    rep.checkFmt(listed, "Justfile", 0, "`{s}` lists {s}", .{ r, path }, "every hand-written src/<dir> must be named; `src/*.zig` covers files only", .{});
+                }
+            }
+        }
+        rep.checkFmt(dirs_seen >= min_src_dirs, "src", 0, "at least {d} src/ directories scanned", .{min_src_dirs}, "found {d}", .{dirs_seen});
+    }
+
     // ---- (6) CLI verbs ----
     {
         const help = cli.run(&.{"--help"}) catch |err| blk: {
@@ -1305,6 +1368,47 @@ test "stall rows: backticked names and cause cells parse; needles are phrases of
     // The finding: the merged row satisfies UnsafeQuorum's needle and not the other's.
     try testing.expect(std.mem.indexOf(u8, rows[0].cause, stall_cause_needles[0].needle) != null);
     try testing.expect(std.mem.indexOf(u8, rows[0].cause, stall_cause_needles[1].needle) == null);
+}
+
+// Non-vacuity (S8 finding 20): the pre-fix Justfile listed `src/*.zig` — a
+// glob over top-level FILES — and forgot src/cli, so an unformatted CLI
+// shipped green through `just fmt-check` and CI. This reads the REAL
+// Justfile and the REAL src/ listing: drop `src/cli` from either recipe, or
+// add a new hand-written src/<dir> without listing it, and it fails; listing
+// src/gen (generated, not fmt-clean) fails too. The parser cases pin that a
+// glob token is not a directory match.
+test "fmt recipes: every src/<dir> except gen is listed in `fmt` and `fmt-check`" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    // the parser
+    try testing.expectEqualStrings("zig fmt --check a b", justRecipeBody("x:\n    echo\n\nfmt-check:\n    zig fmt --check a b\n", "fmt-check").?);
+    try testing.expect(justRecipeBody("fmt-check:\n    zig fmt\n", "fmt") == null);
+    try testing.expect(justRecipeBody("fmt:\n\nfmt-check:\n    x\n", "fmt") == null);
+    try testing.expect(recipeListsPath("zig fmt src/*.zig src/node", "src/node"));
+    try testing.expect(!recipeListsPath("zig fmt src/*.zig src/node", "src/cli"));
+    try testing.expect(!recipeListsPath("zig fmt src/*.zig src/node", "src"));
+    // the real tree
+    const justfile = try readFile(gpa, io, "Justfile");
+    defer gpa.free(justfile);
+    var src_dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+    defer src_dir.close(io);
+    var it = src_dir.iterate();
+    var dirs: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        dirs += 1;
+        var buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "src/{s}", .{entry.name});
+        const want = !std.mem.eql(u8, entry.name, fmt_exempt_dir);
+        for (fmt_recipes) |r| {
+            const body = justRecipeBody(justfile, r) orelse return error.FmtRecipeMissing;
+            if (recipeListsPath(body, path) != want) {
+                std.debug.print("Justfile `{s}` {s} {s}\n", .{ r, if (want) "does not list" else "must not list", path });
+                return error.FmtRecipeCoverage;
+            }
+        }
+    }
+    try testing.expect(dirs >= min_src_dirs);
 }
 
 // Non-vacuity: the evidence line is what `just preflight` greps and the
