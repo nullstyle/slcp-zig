@@ -1767,12 +1767,19 @@ const DeltaSnapNode = AppNode(DeltaSnap);
 
 /// Pump the delta loop ("add 1" after every applied slot) on `peer` until
 /// `n` applies its next slot; returns that first applied item. `n` is
-/// re-proposed too, so 2-of-2 keeps moving whichever side is behind.
-fn nextDeltaApplied(n: anytype, peer: *DeltaNode, deadline_ms: u64) !@TypeOf(n.*).Applied {
+/// re-proposed too, so 2-of-2 keeps moving whichever side is behind. The
+/// peer's applied items consumed here are appended to `peer_seen` (if
+/// given) — a caller that waits for a specific peer slot afterwards must
+/// not lose it to this pump (S8b skeptic: `PeerNeverAppliedSlot4` under
+/// CPU load, when the peer externalized slot 4 > 50 ms before `n` did).
+fn nextDeltaApplied(n: anytype, peer: *DeltaNode, deadline_ms: u64, peer_seen: ?*std.ArrayList(DeltaNode.Applied)) !@TypeOf(n.*).Applied {
     var waited: u64 = 0;
     while (waited < deadline_ms) {
         if (try n.waitApplied(.{ .timeout_ms = 50 })) |a| return a;
-        if (try peer.waitApplied(.{ .timeout_ms = 1 })) |_| try peer.propose(.{ .add = 1 });
+        if (try peer.waitApplied(.{ .timeout_ms = 1 })) |x| {
+            if (peer_seen) |list| try list.append(testing.allocator, x);
+            try peer.propose(.{ .add = 1 });
+        }
         waited += 50;
     }
     return error.Timeout;
@@ -1822,7 +1829,7 @@ test "restart of a DELTA app from a persisted snapshot (2-of-2 loopback): initia
         try b.propose(.{ .add = 1 });
         var last: DeltaSnapNode.Applied = undefined;
         while (true) {
-            last = try nextDeltaApplied(a, b, 60_000);
+            last = try nextDeltaApplied(a, b, 60_000, null);
             try testing.expectEqual(@as(i64, @intCast(last.slot)), last.state.sum);
             if (last.slot >= 3) break;
             try a.propose(.{ .add = 1 });
@@ -1849,11 +1856,17 @@ test "restart of a DELTA app from a persisted snapshot (2-of-2 loopback): initia
     defer a2.deinit();
     try a2.propose(.{ .add = 1 });
     try b.propose(.{ .add = 1 });
-    const r4 = try nextDeltaApplied(a2, b, 90_000);
+    var b_seen: std.ArrayList(DeltaNode.Applied) = .empty;
+    defer b_seen.deinit(gpa);
+    const r4 = try nextDeltaApplied(a2, b, 90_000, &b_seen);
     try testing.expectEqual(@as(u64, 4), r4.slot);
     try testing.expectEqual(@as(i64, 4), r4.state.sum);
-    // The live peer agrees on slot 4's state.
+    // The live peer agrees on slot 4's state (its item may already have
+    // been consumed by the pump above).
     var b4: ?DeltaNode.Applied = null;
+    for (b_seen.items) |x| if (x.slot == 4) {
+        b4 = x;
+    };
     var waited: u64 = 0;
     while (b4 == null and waited < 30_000) : (waited += 50) {
         if (try b.waitApplied(.{ .timeout_ms = 50 })) |x| {
