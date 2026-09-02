@@ -674,6 +674,11 @@ comptime {
 // no Stable API can construct that type, the frozen entry point is unusable
 // on its own terms. `zig build api-closure` fails when one does.
 //
+// Every nominal type a signature mentions is checked — through pointers,
+// optionals, error unions, arrays, vectors and function-pointer types — and a
+// container the walk never reached (a non-`pub` type) is a violation too:
+// it would otherwise render, unfrozen and unlisted, into the Stable line.
+//
 // KNOWN BLIND SPOT: a generic parameter (`anytype`) has no type to resolve, so
 // such signatures are SKIPPED rather than cleared.
 // ---------------------------------------------------------------------------
@@ -716,30 +721,118 @@ const type_tiers: []const TypeTier = blk: {
     break :blk out;
 };
 
-/// Strip the wrappers a signature puts around a nominal type.
-fn peel(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .pointer => |pi| peel(pi.child),
-        .optional => |oi| peel(oi.child),
-        .error_union => |eu| peel(eu.payload),
-        else => T,
-    };
-}
+/// The tier of a nominal type as the closure check sees it. `unlisted` is a
+/// container the walk never reached — a non-`pub` (Internal) type, which
+/// stability.md says "never appears in either file", yet would be rendered
+/// into the Stable line that mentions it.
+const Tier = enum { stable, experimental, unlisted };
 
-/// `null` when the type is not one of ours (std type, primitive, capnp-zig).
-fn tierOfType(comptime T: type) ?bool {
-    const P = peel(T);
-    var found: ?bool = null;
+fn tierOfType(comptime T: type) Tier {
+    var found: Tier = .unlisted;
     for (type_tiers) |entry| {
-        if (entry.ty == P) {
-            if (entry.stable) return true; // any Stable path wins
-            found = false;
+        if (entry.ty == T) {
+            if (entry.stable) return .stable; // any Stable path wins
+            found = .experimental;
         }
     }
     return found;
 }
 
-const Violation = struct { decl: []const u8, offender: []const u8, role: []const u8 };
+/// Is `T` the declaration `root.<@typeName(T)>`? On this toolchain
+/// `@typeName` renders std types module-relative (`Io`, `mem.Allocator`,
+/// `Io.Writer`, `math.Order`), so a name prefix cannot tell a std type from
+/// one of ours; resolving the dotted path under `root` and comparing the
+/// TYPE can. A generic instantiation (`array_list.Aligned(u8,null)`) resolves
+/// to the generic `fn` that made it.
+fn declaredUnder(comptime root: type, comptime T: type) bool {
+    const name = @typeName(T);
+    comptime var cur: type = root;
+    comptime var pos: usize = 0;
+    inline while (true) {
+        const end = std.mem.indexOfScalarPos(u8, name, pos, '.') orelse name.len;
+        const seg = name[pos..end];
+        const paren = std.mem.indexOfScalar(u8, seg, '(');
+        const ident = if (paren) |at| seg[0..at] else seg;
+        if (ident.len == 0 or !@hasDecl(cur, ident)) return false;
+        const D = @field(cur, ident);
+        if (paren != null) return @typeInfo(@TypeOf(D)) == .@"fn";
+        if (@TypeOf(D) != type) return false;
+        if (end == name.len) return D == T;
+        if (!isContainer(D)) return false;
+        cur = D;
+        pos = end + 1;
+    }
+}
+
+/// A nominal type that is not ours to freeze: std, builtin, `anyopaque`, or
+/// capnp-zig's (frozen by upstream's own gate).
+fn isForeignNominal(comptime T: type) bool {
+    return T == anyopaque or foreignType(T) or
+        declaredUnder(std, T) or declaredUnder(slcp.core.capnpc, T);
+}
+
+const Violation = struct { decl: []const u8, offender: []const u8, role: []const u8, why: []const u8 };
+
+/// Check every nominal type `T` mentions — through pointers, optionals,
+/// error unions, arrays, vectors and function-pointer types — against the
+/// tiers. (S8 D10 finding: the old top-level `peel` saw `[2]LintFinding`,
+/// `*const fn (LintFinding) void` and a non-pub struct as "foreign, ignore".)
+fn checkType(
+    comptime T: type,
+    comptime Self: ?type,
+    comptime decl_path: []const u8,
+    comptime role: []const u8,
+    comptime out: *[]const Violation,
+) void {
+    switch (@typeInfo(T)) {
+        .pointer => |pi| checkType(pi.child, Self, decl_path, role, out),
+        .optional => |oi| checkType(oi.child, Self, decl_path, role, out),
+        .error_union => |eu| checkType(eu.payload, Self, decl_path, role, out),
+        .array => |ai| checkType(ai.child, Self, decl_path, role, out),
+        .vector => |vi| checkType(vi.child, Self, decl_path, role, out),
+        .@"fn" => |fi| {
+            for (fi.param_types) |maybe_pt| {
+                const PT = maybe_pt orelse continue;
+                checkType(PT, Self, decl_path, role, out);
+            }
+            if (fi.return_type) |RT| checkType(RT, Self, decl_path, role, out);
+        },
+        .@"struct", .@"enum", .@"union", .@"opaque" => {
+            if (Self != null and T == Self.?) return;
+            if (isForeignNominal(T)) return;
+            const why: ?[]const u8 = switch (tierOfType(T)) {
+                .stable => null,
+                .experimental => "Experimental",
+                .unlisted => "not pub — Internal, never walked into either snapshot",
+            };
+            if (why) |w| out.* = out.* ++ [_]Violation{.{
+                .decl = decl_path,
+                .offender = @typeName(T),
+                .role = role,
+                .why = w,
+            }};
+        },
+        else => {},
+    }
+}
+
+/// The violations one Stable function signature carries. `Self` is the
+/// enclosing type: a method that takes or returns its OWN enclosing type is
+/// not a closure violation — `Node.propose(self: *Node, ...)` is the frozen
+/// method of a type deliberately frozen only at its entry points; the
+/// receiver is the same declaration cluster, not an unfrozen dependency a
+/// consumer must obtain elsewhere.
+fn signatureViolations(comptime FnType: type, comptime Self: ?type, comptime decl_path: []const u8) []const Violation {
+    const fn_info = @typeInfo(FnType).@"fn";
+    if (fn_info.is_generic) return &.{};
+    var out: []const Violation = &.{};
+    for (fn_info.param_types) |maybe_pt| {
+        const PT = maybe_pt orelse continue;
+        checkType(PT, Self, decl_path, "parameter", &out);
+    }
+    if (fn_info.return_type) |RT| checkType(RT, Self, decl_path, "return", &out);
+    return out;
+}
 
 /// Walk again, this time checking each Stable function's signature. The check
 /// has to happen inside the walk: that is the only place a declaration and its
@@ -768,37 +861,7 @@ fn collectClosure(
         }
         if (@typeInfo(DType) != .@"fn") continue;
         if (!tierIsStable(decl_path)) continue;
-
-        const fn_info = @typeInfo(DType).@"fn";
-        if (fn_info.is_generic) continue;
-
-        // A method that takes or returns its OWN enclosing type is not a
-        // closure violation: `Node.propose(self: *Node, ...)` is the frozen
-        // method of a type deliberately frozen only at its entry points — the
-        // receiver is the same declaration cluster, not an unfrozen
-        // dependency a consumer must obtain elsewhere.
-        for (fn_info.param_types) |maybe_pt| {
-            const PT = maybe_pt orelse continue;
-            if (peel(PT) == T) continue;
-            if (tierOfType(PT)) |is_stable| {
-                if (!is_stable) out.* = out.* ++ [_]Violation{.{
-                    .decl = decl_path,
-                    .offender = @typeName(peel(PT)),
-                    .role = "parameter",
-                }};
-            }
-        }
-        if (fn_info.return_type) |RT| {
-            if (peel(RT) != T) {
-                if (tierOfType(RT)) |is_stable| {
-                    if (!is_stable) out.* = out.* ++ [_]Violation{.{
-                        .decl = decl_path,
-                        .offender = @typeName(peel(RT)),
-                        .role = "return",
-                    }};
-                }
-            }
-        }
+        out.* = out.* ++ signatureViolations(DType, T, decl_path);
     }
 }
 
@@ -1315,16 +1378,17 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         std.debug.print(
-            "api-closure: {d} Stable declaration(s) mention an Experimental type.\n" ++
+            "api-closure: {d} Stable declaration(s) mention an Experimental or non-pub type.\n" ++
                 "Each is an API decision: promote the type, or narrow the entry point.\n\n",
             .{closure_violations.len},
         );
         for (closure_violations) |v| {
-            std.debug.print("  {s}\n    {s}: {s}\n", .{ v.decl, v.role, v.offender });
+            std.debug.print("  {s}\n    {s}: {s} ({s})\n", .{ v.decl, v.role, v.offender, v.why });
         }
         std.debug.print(
-            "\nNOTE: signatures with an `anytype` parameter are skipped — there is no\n" ++
-                "type to resolve until instantiation.\n",
+            "\nNOTE: types are checked through pointers, optionals, error unions, arrays,\n" ++
+                "vectors and function-pointer types; only signatures with an `anytype`\n" ++
+                "parameter are skipped — there is no type to resolve until instantiation.\n",
             .{},
         );
         return error.StableSurfaceNotClosed;
@@ -1677,6 +1741,49 @@ test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + the 4 neg
     // Every ABI line is Stable under `p("slcp-abi")`, and the rule is live.
     for (lines) |line| try std.testing.expect(tierIsStable(abiLinePath(line)));
     try checkAbiRuleLiveness(lines);
+}
+
+// Non-vacuity (S8 D10 "api-closure passes silently for array,
+// function-pointer and private-type signatures"): before the fix `peel`
+// stripped only pointer/optional/error-union wrappers and an unlisted type
+// was "foreign, ignore", so a Stable fn taking `[2]LintFinding`, returning
+// `*const fn (LintFinding) void`, or taking a non-pub struct passed
+// `api-closure` while `api-snapshot` wrote the Experimental/Internal type
+// into docs/api-snapshot.txt. Reverting `checkType` to top-level `peel` makes
+// the array, fn-pointer and hidden expects red (0 ≠ 1); treating unlisted
+// types as foreign again makes the hidden expect red; dropping the `Self`
+// exemption makes the receiver expect red; dropping the std resolution in
+// `isForeignNominal` makes the std-types expect red (Io, Io.Writer,
+// mem.Allocator and math.Order render module-relative, so a name prefix
+// cannot tell them from ours).
+test "closure check sees through arrays and fn pointers, flags non-pub types, exempts std and the receiver" {
+    const LF = slcp.core.qset.LintFinding; // Experimental
+    const Hidden = struct { x: u32 }; // never walked: Internal
+    const n = comptime blk: {
+        @setEvalBranchQuota(8_000_000);
+        break :blk .{
+            .slice = signatureViolations(fn ([]const LF) void, null, "t.slice").len, // control: caught before too
+            .arr = signatureViolations(fn ([2]LF) void, null, "t.arr").len,
+            .fnptr = signatureViolations(fn () *const fn (LF) void, null, "t.fnptr").len,
+            .hidden = signatureViolations(fn (Hidden) void, null, "t.hidden").len,
+            .hidden_ret = signatureViolations(fn () ?*const Hidden, null, "t.hidden_ret").len,
+            .std = signatureViolations(
+                fn (std.mem.Allocator, std.Io, *std.Io.Writer, *std.ArrayList(u8), *anyopaque) std.math.Order,
+                null,
+                "t.std",
+            ).len,
+            .stable = signatureViolations(fn (slcp.core.quorum.Quorum) *slcp.node.Node, null, "t.stable").len,
+            .self = signatureViolations(fn (*Hidden, []const Hidden) ?Hidden, Hidden, "t.self").len,
+        };
+    };
+    try std.testing.expectEqual(@as(usize, 1), n.slice);
+    try std.testing.expectEqual(@as(usize, 1), n.arr);
+    try std.testing.expectEqual(@as(usize, 1), n.fnptr);
+    try std.testing.expectEqual(@as(usize, 1), n.hidden);
+    try std.testing.expectEqual(@as(usize, 1), n.hidden_ret);
+    try std.testing.expectEqual(@as(usize, 0), n.std);
+    try std.testing.expectEqual(@as(usize, 0), n.stable);
+    try std.testing.expectEqual(@as(usize, 0), n.self);
 }
 
 // Non-vacuity: the comptime walk must reach the frozen declarations —
