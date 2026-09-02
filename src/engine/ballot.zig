@@ -557,9 +557,14 @@ fn recordSelf(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedSt
     const gpa = ctx.gpa;
     if (st.pledges == .externalize) try ensureSingleton(gpa, &s.ballot, st.node_id);
     var clone = try cloneStatement(gpa, st);
-    errdefer clone.deinit(gpa);
-    const frame = try gpa.alloc(u8, 0);
-    errdefer gpa.free(frame);
+    const frame = gpa.alloc(u8, 0) catch |err| {
+        clone.deinit(gpa);
+        return err;
+    };
+    // Slot.storeLatest takes ownership of the envelope on BOTH outcomes: on
+    // its own allocation failure it deinit's the statement and the frame
+    // before returning the error. No errdefer may cover `clone`/`frame`
+    // past this call — that was an engine-thread double free (S8 D5-oom).
     // §5.1 budget: every self-store must account, or purge_slots (which
     // subtracts the slot's real storedBytes) under-counts. Zero-length frames
     // make this a no-op today; accounting anyway keeps the invariant local.
@@ -2420,4 +2425,37 @@ test "setStateFromEnvelope: restore own ballot state per statement type, no emis
         defer fx.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), fx.broadcast);
     }
+}
+
+// s8 D5-oom pin: recordSelf must not free the statement/frame a second time
+// when Slot.storeLatest fails — storeLatest owns (and deinit's) `env` on its
+// own failure paths. Non-vacuity: restoring the `errdefer clone.deinit` /
+// `errdefer gpa.free(frame)` pair in recordSelf turns this into a
+// DebugAllocator "double free" panic at the fail index that lands inside
+// storeLatest's getOrPut / gpa.create.
+test "recordSelf: allocation failure inside storeLatest is a clean OutOfMemory, never a double free" {
+    var saw_oom: usize = 0;
+    var idx: usize = 0;
+    while (idx < 96) : (idx += 1) {
+        var env: TestEnv = undefined;
+        try env.init(driver_mod.Driver.default(), false);
+        defer env.deinit();
+        try setState(&env, .prepare, .{ .counter = 1, .value = "v" }, null, null, null, null);
+
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        env.ctx.gpa = fa.allocator();
+        const r = bumpState(&env.ctx, &env.slot, "v", true);
+        env.ctx.gpa = testing.allocator;
+        if (r) |bumped| {
+            try testing.expect(bumped);
+            try expectBallot(env.slot.ballot.current, .{ .counter = 2, .value = "v" });
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            saw_oom += 1;
+        }
+        var fx = try drain(&env);
+        fx.deinit(env.gpa);
+    }
+    // The sweep must actually inject failures on the emission path.
+    try testing.expect(saw_oom > 0);
 }
