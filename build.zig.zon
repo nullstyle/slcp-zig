@@ -8,6 +8,15 @@
             .hash = "capnpc_zig-0.16.0-nUduFXLZNgAmDvsQZOn7lNOEtNbRBYquaALRB24zUAvS",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "schema" },
+    // The package: the build script, the manifest, the sources (checked-in
+    // src/gen included) and the schemas — README.md, docs/, CHANGELOG.md,
+    // tests/, sim/, tools/, vectors/, examples/ stay OUT so recording the
+    // package hash in the docs cannot change it. The one file from tests/ is
+    // the appnode-errors case table build.zig `@import`s: every file build.zig
+    // imports or embeds must be in the package or a tarball consumer's
+    // `zig build` cannot compile build.zig at all (`just package-preflight`
+    // caught exactly that at v0.1.0 — S8 fix-21 added the import after fix-22
+    // authored the check, and the two were never run together).
+    .paths = .{ "build.zig", "build.zig.zon", "src", "schema", "tests/appnode_errors/cases.zig" },
     .fingerprint = 0x7d6ab72da9f52a7,
 }

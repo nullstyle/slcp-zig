@@ -326,10 +326,15 @@ package-preflight:
     pkgs=( "$ZIG_LOCAL_PKG_DIR"/slcp-"$ver"-* )
     if [ "${#pkgs[@]}" -ne 1 ] || [ ! -d "${pkgs[0]}" ]; then echo "package-preflight: expected exactly one extracted slcp-$ver-* under $ZIG_LOCAL_PKG_DIR:"; ls -la "$ZIG_LOCAL_PKG_DIR" || true; exit 1; fi
     pkg=${pkgs[0]}
-    for f in build.zig build.zig.zon src/gen/host.zig schema/host.capnp; do
+    for f in build.zig build.zig.zon src/gen/host.zig schema/host.capnp tests/appnode_errors/cases.zig; do
         [ -f "$pkg/$f" ] || { echo "package-preflight: package is missing $f (.paths filter?)"; exit 1; }
     done
-    for f in tests sim tools vectors docs examples README.md CHANGELOG.md; do
+    # tests/ ships exactly ONE file: the appnode-errors case table build.zig
+    # `@import`s (a build.zig import outside the package broke every tarball
+    # consumer's `zig build` at v0.1.0 — the reason this recipe exists).
+    ntests=$(find "$pkg/tests" -type f | wc -l | tr -d ' ')
+    [ "$ntests" = "1" ] || { echo "package-preflight: package ships $ntests files under tests/, expected only appnode_errors/cases.zig:"; find "$pkg/tests" -type f; exit 1; }
+    for f in sim tools vectors docs examples README.md CHANGELOG.md RELEASING.md Justfile; do
         [ ! -e "$pkg/$f" ] || { echo "package-preflight: package ships $f (.paths too wide)"; exit 1; }
     done
     zig build -Doptimize=ReleaseSafe
