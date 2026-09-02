@@ -427,12 +427,22 @@ fn isOwnedOptionField(comptime name: []const u8) bool {
     return false;
 }
 
-/// `AppNode.Options`: every `node.Options` field except `driver` and
-/// `delivery`, with the SAME types and defaults — reified from
+/// The field lists of `AppNode.Options`: every `node.Options` field except
+/// `driver` and `delivery`, with the SAME types and defaults — taken from
 /// `node.Options` itself, so a field added to the bytes-level node appears
-/// here automatically. `checkOptionsParity` is the comptime guard that the
-/// mirror really is field-for-field the bytes-level set minus the two.
-fn MirrorOptions() type {
+/// in the mirror automatically. The `@Struct` call itself lives in
+/// `AppNode(App).Options` (not here) so the reified type's `@typeName` is
+/// the public path `…AppNode(App).Options…`, not a private helper's name:
+/// the Stable API snapshot pins that spelling on the `create` line.
+/// `checkOptionsParity` is the comptime guard that the mirror really is
+/// field-for-field the bytes-level set minus the two.
+const MirrorFields = struct {
+    names: []const [:0]const u8,
+    types: []const type,
+    attrs: []const std.builtin.Type.Struct.FieldAttributes,
+};
+
+fn mirrorOptionFields() MirrorFields {
     const info = @typeInfo(node.Options).@"struct";
     comptime var names: []const [:0]const u8 = &.{};
     comptime var types: []const type = &.{};
@@ -443,9 +453,7 @@ fn MirrorOptions() type {
         types = types ++ [_]type{FT};
         attrs = attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{attr};
     }
-    const Mirror = @Struct(.auto, null, names, types, attrs);
-    comptime checkOptionsParity(Mirror);
-    return Mirror;
+    return .{ .names = names, .types = types, .attrs = attrs };
 }
 
 /// Comptime parity: (a) every non-owned `node.Options` field exists in the
@@ -483,8 +491,6 @@ fn checkOptionsParity(comptime Mirror: type) void {
     if (dst.field_names.len != expected)
         @compileError("AppNode.Options carries a field node.Options does not have.");
 }
-
-const OptionsMirror = MirrorOptions();
 
 const create_log = std.log.scoped(.slcp_create);
 const log = std.log.scoped(.slcp_app_node);
@@ -539,8 +545,16 @@ pub fn AppNode(comptime App: type) type {
         /// true when `apply` uses the large-state shape `fn (*State, Command) void`.
         pub const apply_in_place = @TypeOf(App.apply) == fn (*State, Command) void;
         /// Every `node.Options` field except `driver` and `delivery`
-        /// (same types, same defaults; comptime parity-checked).
-        pub const Options = OptionsMirror;
+        /// (same types, same defaults; comptime parity-checked). Reified
+        /// here so its `@typeName` is this public path (see
+        /// `mirrorOptionFields`).
+        pub const Options = blk: {
+            const f = mirrorOptionFields();
+            break :blk @Struct(.auto, null, f.names, f.types, f.attrs);
+        };
+        comptime {
+            checkOptionsParity(Options);
+        }
         pub const WaitOptions = node.Node.WaitOptions;
         /// One applied slot: the value copy of `State` taken on the engine
         /// thread right after `apply`.
@@ -1843,4 +1857,17 @@ test "codec exhaustive per-leaf canonicality: i1, i3, u3, i8, i9, i12, u12, i16,
     try probeExhaustive(bool, 2);
     try probeExhaustive(enum(u2) { a, b, c }, 3);
     try probeExhaustive(enum(i4) { lo = -8, zero = 0, hi = 7 }, 3);
+}
+
+// -- Options is spelled by its public path (S8 review, D10) --------------------
+
+// Non-vacuity: reifying the mirror inside a private helper (`fn
+// MirrorOptions() type { ... @Struct(...) }`, the M6 code) spells the type
+// `node.app_node.MirrorOptions.Mirror` — a private name the Stable API
+// snapshot then pins on the `create` line, so renaming that helper is a
+// "breaking change" with no consumer-visible effect.
+test "AppNode(App).Options: @typeName is the public AppNode(...) path, not a private helper's" {
+    const name = @typeName(CounterNode.Options);
+    try testing.expect(std.mem.indexOf(u8, name, "AppNode(") != null);
+    try testing.expect(std.mem.indexOf(u8, name, "Mirror") == null);
 }
