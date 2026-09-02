@@ -482,6 +482,54 @@ test "rejections: empty, threshold range, duplicates, depth, 255 cap" {
     try std.testing.expectError(Error.TooManyValidators, validateAndNormalize(gpa, &big));
 }
 
+// Non-vacuity: checkTree sorts the collected validators before its neighbour
+// compare. Every other DuplicateNode check (the flat [1,1] above, the qset.json
+// `duplicate node across tree` vector: top [01] + inner [01,02]) collects its
+// duplicate ADJACENTLY in pre-order, so deleting the `std.mem.sort` in
+// checkTree leaves them green. The four shapes below are never adjacent in
+// collection order; delete that sort and this goes red
+// (`expected error.DuplicateNode, found void`).
+test "rejections: duplicate validators that are not adjacent in collection order" {
+    const gpa = std.testing.allocator;
+
+    // t1: top [1, 2] + inner {2, [1, 3]} — collected 1,2,1,3.
+    var t1 = try ownedNested(gpa, 2, &.{ 1, 2 }, &.{
+        try ownedFlat(gpa, 2, &.{ 1, 3 }),
+    });
+    defer t1.deinit(gpa);
+    try std.testing.expectError(Error.DuplicateNode, validateAndNormalize(gpa, &t1));
+
+    // t2: node 1 in two sibling inner sets — collected 1,5,1,6 (or 1,6,1,5
+    // after the inner-set hash sort); never adjacent either way.
+    var t2 = try ownedNested(gpa, 2, &.{}, &.{
+        try ownedFlat(gpa, 1, &.{ 1, 5 }),
+        try ownedFlat(gpa, 1, &.{ 6, 1 }),
+    });
+    defer t2.deinit(gpa);
+    try std.testing.expectError(Error.DuplicateNode, validateAndNormalize(gpa, &t2));
+
+    // t3: node 1 at the root and again at depth 4, with 9, 8, 7, 2 between.
+    var t3 = try ownedNested(gpa, 2, &.{ 1, 9 }, &.{
+        try ownedNested(gpa, 1, &.{8}, &.{
+            try ownedNested(gpa, 1, &.{7}, &.{
+                try ownedFlat(gpa, 2, &.{ 2, 1 }),
+            }),
+        }),
+    });
+    defer t3.deinit(gpa);
+    try std.testing.expectError(Error.DuplicateNode, validateAndNormalize(gpa, &t3));
+
+    // t4: duplicate visible only after singleton flattening:
+    // {2, [2], [{1,[1]}, {2,[1,3]}]} — flattening lifts 1 beside 2 at the
+    // root, then the inner [1,3] repeats it: collected 1,2,1,3.
+    var t4 = try ownedNested(gpa, 2, &.{2}, &.{
+        try ownedFlat(gpa, 1, &.{1}),
+        try ownedFlat(gpa, 2, &.{ 1, 3 }),
+    });
+    defer t4.deinit(gpa);
+    try std.testing.expectError(Error.DuplicateNode, validateAndNormalize(gpa, &t4));
+}
+
 test "wire roundtrip: build → read → normalize → hash matches direct hash" {
     const gpa = std.testing.allocator;
 
