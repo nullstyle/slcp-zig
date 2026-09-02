@@ -143,6 +143,14 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
     defer arena_state.deinit();
     const spec = Quorum.fromJson(arena_state.allocator(), bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        // The parser caps the depth at the wire limit (it is the only
+        // recursion bound for the tree walkers), so the structural verdict
+        // is reported here in the same voice, channel and exit code as the
+        // other `create`-would-refuse limits (§12: exit 1, not "bad input").
+        error.TooDeep => {
+            try out.print("ERROR too_deep: the tree nests more than {d} levels but the wire limit is {d}\n", .{ qset.max_depth, qset.max_depth });
+            return 1;
+        },
         else => {
             try err_out.print("slcp lint-quorum: {s}: not a quorum spec ({t}); expected {{\"threshold\":T,\"validators\":[<hex64>...],\"innerSets\":[...]}}\n", .{ path, err });
             return 2;
@@ -534,4 +542,57 @@ test "cli per-verb --help/-h prints usage (exit 0, no file touched); option-look
         try testing.expectEqualStrings("slcp " ++ build_options.version ++ "\n", c.stdout());
         try testing.expect(std.ascii.isDigit(build_options.version[0]));
     }
+}
+
+// Non-vacuity: reporting fromJson's `TooDeep` as "not a quorum spec" (exit
+// 2 on stderr) makes the 5-level case red; the 256-validator twin pins the
+// channel/exit both wire limits must share (design §12: structural errors
+// `create` would refuse are exit 1 on stdout with the limit stated).
+test "cli lint-quorum: depth > 4 and > 255 validators are both `ERROR <code>` on stdout, exit 1, naming the limit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Five nested levels: 2-of-{v, inner} down to a 1-of-1 leaf.
+    const id = "0505050505050505050505050505050505050505050505050505050505050505";
+    const leaf = "{\"threshold\":1,\"validators\":[\"" ++ id ++ "\"],\"innerSets\":[]}";
+    const l4 = "{\"threshold\":2,\"validators\":[\"0404040404040404040404040404040404040404040404040404040404040404\"],\"innerSets\":[" ++ leaf ++ "]}";
+    const l3 = "{\"threshold\":2,\"validators\":[\"0303030303030303030303030303030303030303030303030303030303030303\"],\"innerSets\":[" ++ l4 ++ "]}";
+    const l2 = "{\"threshold\":2,\"validators\":[\"0202020202020202020202020202020202020202020202020202020202020202\"],\"innerSets\":[" ++ l3 ++ "]}";
+    const deep5 = "{\"threshold\":2,\"validators\":[\"0101010101010101010101010101010101010101010101010101010101010101\"],\"innerSets\":[" ++ l2 ++ "]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep5.json", .data = deep5 });
+
+    // 256 distinct validators, threshold 171 (a majority, so the only
+    // complaint is the wire limit).
+    var many: std.Io.Writer.Allocating = .init(gpa);
+    defer many.deinit();
+    try many.writer.writeAll("{\"threshold\":171,\"validators\":[");
+    for (0..256) |n| {
+        if (n > 0) try many.writer.writeByte(',');
+        var raw: qset.NodeId = @splat(0);
+        raw[0] = @intCast(n);
+        raw[31] = 0xee;
+        try many.writer.print("\"{s}\"", .{&std.fmt.bytesToHex(raw, .lower)});
+    }
+    try many.writer.writeAll("],\"innerSets\":[]}");
+    try tmp.dir.writeFile(io, .{ .sub_path = "v256.json", .data = many.written() });
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const deep_path = try tmpPath(io, &tmp, &b1, "deep5.json");
+    const many_path = try tmpPath(io, &tmp, &b2, "v256.json");
+
+    var c = Captured.init(gpa);
+    defer c.deinit();
+
+    c.exec(gpa, io, &.{ "lint-quorum", deep_path });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqualStrings("ERROR too_deep: the tree nests more than 4 levels but the wire limit is 4\n", c.stdout());
+    try testing.expectEqual(@as(u8, 1), c.code);
+
+    c.exec(gpa, io, &.{ "lint-quorum", many_path });
+    try testing.expectEqualStrings("", c.stderr());
+    try testing.expectEqualStrings("ERROR too_many_validators: the tree names 256 validators but the wire limit is 255\n", c.stdout());
+    try testing.expectEqual(@as(u8, 1), c.code);
 }
