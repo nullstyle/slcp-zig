@@ -272,6 +272,11 @@ fn sleepMs(io: std.Io, ms: u64) void {
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
+/// Scratch root for every cluster's data dirs: under the (gitignored) build
+/// cache, like example-smoke, so a killed run leaves nothing untracked.
+/// Relative to the build root — build.zig pins cwd with setCwd.
+const scratch_root = ".zig-cache/e2e";
+
 fn removeTree(io: std.Io, path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, path) catch {};
 }
@@ -302,6 +307,19 @@ fn assertAgreement(cl: *Cluster, upto: u64) !void {
     }
 }
 
+// Non-vacuity: every cluster below opens its scratch tree by a RELATIVE path
+// through Dir.cwd() (node.zig checkDataDir / store.zig open), so the e2e
+// binary must run with cwd = the build root or the tree lands wherever
+// `zig build` was invoked from. build.zig pins that with
+// `run_e2e.setCwd(b.path("."))`; drop that line and `cd src && zig build
+// e2e` goes red here (S8 review: it was the one side-effectful run step
+// without setCwd, and left untracked `src/e2e-*` after a killed run).
+test "e2e: runs from the build root (build.zig and this file are reachable by relative path)" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "build.zig", .{}) catch return error.E2eNotAtBuildRoot;
+    std.Io.Dir.cwd().access(io, "tests/e2e/cluster_test.zig", .{}) catch return error.E2eNotAtBuildRoot;
+}
+
 test "e2e: 4 nodes externalize 200 slots with agreement" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -310,7 +328,7 @@ test "e2e: 4 nodes externalize 200 slots with agreement" {
         .gpa = gpa,
         .io = io,
         .base_port = 39100,
-        .data_root = "e2e-happy",
+        .data_root = scratch_root ++ "/happy",
     };
     removeTree(io, cl.data_root);
     defer cl.deinit();
@@ -331,7 +349,7 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
         .gpa = gpa,
         .io = io,
         .base_port = 39200,
-        .data_root = "e2e-restart",
+        .data_root = scratch_root ++ "/restart",
     };
     removeTree(io, cl.data_root);
     defer cl.deinit();
@@ -392,7 +410,7 @@ test "e2e: partition halts without quorum, heals on reconnect" {
         .gpa = gpa,
         .io = io,
         .base_port = 39300,
-        .data_root = "e2e-partition",
+        .data_root = scratch_root ++ "/partition",
     };
     removeTree(io, cl.data_root);
     defer cl.deinit();
@@ -845,7 +863,7 @@ test "e2e: an equivocating quorum member cannot fork the honest nodes" {
         .gpa = gpa,
         .io = io,
         .base_port = 39400,
-        .data_root = "e2e-equiv",
+        .data_root = scratch_root ++ "/equiv",
         .n_validators = N + 1, // 4 honest + the equivocator
         .threshold = 3,
     };
