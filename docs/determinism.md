@@ -29,8 +29,8 @@ For `validate`, `apply`, `combine`, a custom `encode` / `decode`, and any raw
 1. **No clock, no time.** Not `std.time`, not a slot-to-wallclock mapping,
    not "reject if older than an hour". Slots are your only clock.
 2. **No floats.** The auto-codec rejects float fields at compile time
-   (`src/node/app_node.zig`: "floats are NONDETERMINISTIC across nodes —
-   NaN payloads, ±0, platform math differences"). Do not compute with them
+   (`src/node/app_node.zig`: "floats are NONDETERMINISTIC across nodes (NaN
+   payloads, ±0, platform math differences)"). Do not compute with them
    either; use fixed-point integers (cents as `u64`).
 3. **No hash-map iteration order.** `std.HashMap` / `AutoHashMap` iterate in
    an order that depends on insertion history and allocator behaviour. Sort
