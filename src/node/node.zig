@@ -661,7 +661,11 @@ pub const Node = struct {
             else => return fail(diag, error.EngineFailed, "the consensus engine could not be initialized: {t}; this is a bug in slcp or an exotic limit — please report it with your options.", .{e}),
         };
         owned_live = false;
-        errdefer self.eng.deinit();
+        // False only inside the corrupt-own.log watcher re-init below, while
+        // the first engine is torn down and the second not yet up (review
+        // finding: the unguarded errdefer ran deinit on an undefined Engine).
+        var eng_live = true;
+        errdefer if (eng_live) self.eng.deinit();
 
         // ---- store + recovery ----
         self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
@@ -730,22 +734,30 @@ pub const Node = struct {
             log.warn("torn log tail repaired on recovery (normal after a crash)", .{});
         }
         if (rec.own_log_corrupt and !self.watcher) {
-            log.err("own.log integrity failure — falling back to WATCHER mode " ++
+            // warn, not err: the node starts (degraded) — and the test
+            // runner fails any test that logs at err, which would leave
+            // this fallback path untestable through a live create().
+            log.warn("own.log integrity failure — falling back to WATCHER mode " ++
                 "for the node's lifetime (safe: a watcher never emits, so it " ++
                 "cannot emit stale-vs-self). Slots up to the externalized " ++
                 "high-water mark + 1 were at risk.", .{});
             // Rebuild the engine as a watcher (secret_seed cleared). The old
             // engine owns a normalized qset clone; give the new one a fresh
-            // clone.
+            // clone. Engine.init does not free cfg.quorum_set on failure.
             const qs_clone = try qset.clone(gpa, &self.eng.cfg.quorum_set);
             self.eng.deinit();
+            eng_live = false;
             var wcfg = cfg;
             wcfg.secret_seed = null;
             wcfg.quorum_set = qs_clone;
-            self.eng = engine.Engine.init(gpa, wcfg, drv) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return fail(diag, error.EngineFailed, "the consensus engine could not be re-initialized in watcher mode: {t}; please report this.", .{e}),
+            self.eng = engine.Engine.init(gpa, wcfg, drv) catch |e| {
+                wcfg.quorum_set.deinit(gpa);
+                switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return fail(diag, error.EngineFailed, "the consensus engine could not be re-initialized in watcher mode: {t}; please report this.", .{e}),
+                }
             };
+            eng_live = true;
             self.watcher = true;
         }
 

@@ -589,3 +589,52 @@ test "propose: watcher, empty, oversized, and a 1-byte value" {
     defer w.deinit();
     try testing.expectError(error.WatcherCannotPropose, w.propose("x"));
 }
+
+// Non-vacuity: without the `eng_live` guard on create()'s `errdefer
+// self.eng.deinit()`, an allocation failure inside the watcher re-init
+// (Engine.init after the corrupt-own.log fallback tore the first engine
+// down) runs Engine.deinit on an already-deinit'd engine — the sweep dies
+// with "panic: integer overflow" (Debug) instead of reporting; with the
+// guard but without freeing the qset clone on that failure the testing
+// allocator reports one leaked clone per failing index. recover() truncates
+// the corrupt record on disk, so the corrupt own.log is re-seeded before
+// every iteration (a once-seeded sweep never reaches the fallback twice).
+test "corrupt own.log + allocation failure at the watcher re-init: every index is OutOfMemory or a watcher, no panic, no leak" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+    {
+        var st = try store.Store.open(testing.allocator, io, g.dataDir());
+        defer st.deinit();
+        try st.appendOwn(1, "not-an-envelope");
+    }
+    // Flip the last byte (the crc trailer): structurally complete, bad crc
+    // = the §10 "corrupt" verdict (a torn tail would merely be repaired).
+    const corrupt = try g.tmp.dir.readFileAlloc(io, "own.log", testing.allocator, .unlimited);
+    defer testing.allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 0xff;
+
+    var watchers: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        {
+            var f = try g.tmp.dir.createFile(io, "own.log", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, corrupt);
+        }
+        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        g.diag.len = 0;
+        if (Node.create(fa.allocator(), io, g.options())) |n| {
+            const is_watcher = n.watcher;
+            const induced = fa.has_induced_failure;
+            n.deinit();
+            try testing.expect(is_watcher); // the fallback always ends as a watcher
+            watchers += 1;
+            if (!induced) break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try testing.expect(idx < 4096);
+    try testing.expect(watchers >= 1);
+}
