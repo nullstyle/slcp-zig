@@ -384,6 +384,11 @@ pub const Node = struct {
     /// (values owned), and the next slot to hand the app (§11.2 ordering).
     pending_ext: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     next_deliver: u64,
+    /// The externalized.log tail found at `create` (first and last slot;
+    /// null when the journal was empty). Written once before go-live, then
+    /// read-only: `AppNode` checks an app's `initialSlot()` against it
+    /// (§8.5 delta-app recipe, S8 D2).
+    journal_tail: ?JournalTail = null,
     /// Slots below this are purged; the timer wheel drops stale fires for
     /// them (read on the wheel thread).
     purge_floor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -761,6 +766,9 @@ pub const Node = struct {
         // -bounded) journal tail into the app stream — the app dedups by slot
         // (the §10 contract). Without this, journaled-but-unconsumed values
         // would be silently lost across a restart (review finding).
+        if (rec.ext_tail.len > 0) {
+            self.journal_tail = .{ .first = rec.ext_tail[0].slot, .last = rec.ext_tail[rec.ext_tail.len - 1].slot };
+        }
         for (rec.ext_tail) |r| {
             const v = try gpa.dupe(u8, r.value);
             self.deliverSlot(r.slot, v) catch |e| switch (e) {
@@ -994,6 +1002,9 @@ pub const Node = struct {
         self.prop_mu.unlock(self.io);
         self.maybeStartNomination();
     }
+
+    /// Bounds of the journal tail replayed at `create` (ascending slots).
+    pub const JournalTail = struct { first: u64, last: u64 };
 
     pub const WaitOptions = struct {
         /// null = block until the next externalization or shutdown.

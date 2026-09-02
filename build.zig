@@ -532,6 +532,7 @@ pub fn build(b: *std.Build) void {
         .{ .stem = "err_bad_apply_signature", .needle = "): apply has the wrong signature." },
         .{ .stem = "err_bad_combine_signature", .needle = "): combine has the wrong signature." },
         .{ .stem = "err_bad_initial_state_signature", .needle = "): initialState has the wrong signature." },
+        .{ .stem = "err_bad_initial_slot_signature", .needle = "): initialSlot has the wrong signature." },
         .{ .stem = "err_lone_encode", .needle = "): a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." },
         .{ .stem = "err_bad_encode_signature", .needle = "): encode has the wrong signature." },
         .{ .stem = "err_bad_decode_signature", .needle = "): decode has the wrong signature." },
@@ -545,7 +546,7 @@ pub fn build(b: *std.Build) void {
         .{ .stem = "err_zero_size_command", .needle = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field." },
         .{ .stem = "err_oversized_command", .needle = " bytes, above the frozen 65536-byte value cap (§4.5)." },
     };
-    comptime std.debug.assert(appnode_error_cases.len == 20);
+    comptime std.debug.assert(appnode_error_cases.len == 21);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
         const obj = b.addObject(.{

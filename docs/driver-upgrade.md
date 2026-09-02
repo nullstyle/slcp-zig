@@ -58,6 +58,7 @@ const App = struct {
     pub fn combine(state: State, cmds: []const Command) Command;  // deterministic, total;
                               // result must self-validate .valid; may synthesize
     pub fn initialState() State;                                  // default: State{}
+    pub fn initialSlot() u64;                                     // default: 0 (the slot initialState() already includes)
     pub fn encode(cmd: Command, buf: []u8) []u8;                  // codec override (both or neither)
     pub fn decode(bytes: []const u8) ?Command;
 };
@@ -80,15 +81,24 @@ const App = struct {
   workaround.
 - **State is not persisted** (v1 limitation, plan R17): after a restart
   `State = initialState()` + `apply` over the replayed journal tail (the last
-  ≥ 16 slots). That is why commands must be full values; apps with delta
-  semantics persist `State` themselves. Expect the first proposal after a
-  restart to be stale — the network rejects it and the loop catches up from
-  the applied stream.
+  ≥ 16 slots). That is why commands must be full values. An app with delta
+  semantics persists `State` itself, keyed by the slot it was taken at (every
+  `waitApplied` item carries one), and declares **both** `initialState()`
+  (the snapshot) and `initialSlot()` (that slot): `create` seeds its
+  dedup floor from `initialSlot()` before the tail replays, so journaled
+  slots at or below it are skipped instead of being applied a second time on
+  top of the snapshot. Persist at least every 16 applied slots: a snapshot
+  the retained tail cannot catch up — older than the tail's first slot,
+  ahead of its last, or with no journal at all — is refused at `create`
+  with `InitialSlotOutsideJournal` rather than started on a wrong `State`.
+  Expect the first proposal after a restart to be stale — the network
+  rejects it and the loop catches up from the applied stream.
 - `create` reports failures the same way `Node.create` does: pass a
   `slcp.node.Diagnostic` in `.diagnostic` and print `diag.message()` on
   error (`slcp.node.explain(err)` is the static fallback for the bytes-level
-  members; `AppNode`'s two extra members — `CommandExceedsMaxValueBytes`,
-  `UndecodableExternalizedValue` — always have a diagnostic message):
+  members; `AppNode`'s three extra members — `CommandExceedsMaxValueBytes`,
+  `InitialSlotOutsideJournal`, `UndecodableExternalizedValue` — always have a
+  diagnostic message):
 
   ```zig
   var diag: slcp.node.Diagnostic = .{};

@@ -42,6 +42,7 @@ slcp.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <de
 slcp.Node.failed: field atomic.Value(bool) = <default>
 slcp.Node.gpa: field mem.Allocator
 slcp.Node.io: field Io
+slcp.Node.journal_tail: field ?node.node.Node.JournalTail = null
 slcp.Node.last_ext_value: field []u8
 slcp.Node.live: field bool = false
 slcp.Node.local_qset_hash: field [32]u8
@@ -1131,6 +1132,9 @@ slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding) error{Wr
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
+slcp.node.Node.JournalTail.first: field u64
+slcp.node.Node.JournalTail.last: field u64
+slcp.node.Node.JournalTail: struct
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
 slcp.node.Node.delivery: field ?node.node.DeliveryHook
@@ -1143,6 +1147,7 @@ slcp.node.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) 
 slcp.node.Node.failed: field atomic.Value(bool) = <default>
 slcp.node.Node.gpa: field mem.Allocator
 slcp.node.Node.io: field Io
+slcp.node.Node.journal_tail: field ?node.node.Node.JournalTail = null
 slcp.node.Node.last_ext_value: field []u8
 slcp.node.Node.live: field bool = false
 slcp.node.Node.local_qset_hash: field [32]u8

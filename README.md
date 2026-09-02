@@ -113,7 +113,8 @@ What the program relies on:
 
 - **`AppNode(App)` checks the contract at compile time.** `App` declares a
   `State`, a `Command`, a pure `validate(state, cmd) slcp.Validity` and a
-  pure `apply(state, cmd) State` (optionally `combine`, `initialState`, and
+  pure `apply(state, cmd) State` (optionally `combine`, `initialState`,
+  `initialSlot`, and
   an `encode`/`decode` pair). Every violation is a teaching compile error
   with the wanted signature, not a vtable type mismatch.
 - **`slcp.Codec(Command)` derives the wire encoding**: fields in declaration
