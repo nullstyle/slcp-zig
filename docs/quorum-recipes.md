@@ -256,7 +256,7 @@ why the recipe writes them out.
 
 **Recommendation: three nodes per org.** With `2-of-2` orgs a single node
 down removes its whole org, and the minimum blocking set is only 2. The
-`3-of-{2-of-3 × 3}` variant — each org `2-of-3`, network `2-of-3` orgs —
+`2-of-{2-of-3 × 3}` variant — each org `2-of-3`, network `2-of-3` orgs —
 tolerates one node per org *and* one whole org, and its minimum blocking
 set rises to 4 (two nodes in each of two orgs). That variant's normalized
 form and hash are pinned in `vectors/qset.json` ("nested 3 orgs") and its

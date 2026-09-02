@@ -122,6 +122,12 @@ pub const forbidden_needles = [_][]const u8{
 /// list every one of them.
 pub const option_fields = std.meta.fieldNames(slcp.NodeOptions);
 
+/// The vectors/lint.json case docs/quorum-recipes.md cites for the
+/// recommended nested variant; every `N-of-{…}` label in that doc must
+/// carry the case's top-level threshold as N (S8 finding: the label said
+/// `3-of-` while the vector and the sentence around it are 2-of-3 orgs).
+pub const nested_variant_case = "nested 3 orgs 2-of-3 majority within (clean)";
+
 pub const read_limit: std.Io.Limit = .limited(4 << 20);
 
 // ---------------------------------------------------------------------------
@@ -538,6 +544,63 @@ pub fn isOptionField(name: []const u8) bool {
     return false;
 }
 
+/// The shape of one lint.json case's input: top-level threshold, inner-set
+/// count, and the (t, n) every inner set shares.
+pub const NestedShape = struct { threshold: u32, inner_sets: u32, inner_threshold: u32, inner_members: u32 };
+
+/// Reads `input.threshold` / `input.innerSets[*]` of the named case in a
+/// vectors/lint.json text. Null when the case is missing, the JSON is not
+/// what the vectors write, or the inner sets are not all the same shape.
+pub fn lintCaseShape(arena: std.mem.Allocator, json_text: []const u8, case_name: []const u8) ?NestedShape {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{}) catch return null;
+    const cases = (if (root == .object) root.object.get("cases") else null) orelse return null;
+    if (cases != .array) return null;
+    for (cases.array.items) |c| {
+        if (c != .object) continue;
+        const name = c.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, case_name)) continue;
+        const input = c.object.get("input") orelse return null;
+        if (input != .object) return null;
+        const t = input.object.get("threshold") orelse return null;
+        const inner = input.object.get("innerSets") orelse return null;
+        if (t != .integer or inner != .array or inner.array.items.len == 0) return null;
+        var shape: ?NestedShape = null;
+        for (inner.array.items) |set| {
+            if (set != .object) return null;
+            const st = set.object.get("threshold") orelse return null;
+            const sv = set.object.get("validators") orelse return null;
+            if (st != .integer or sv != .array) return null;
+            const cur = NestedShape{
+                .threshold = std.math.cast(u32, t.integer) orelse return null,
+                .inner_sets = @intCast(inner.array.items.len),
+                .inner_threshold = std.math.cast(u32, st.integer) orelse return null,
+                .inner_members = @intCast(sv.array.items.len),
+            };
+            if (shape) |prev| {
+                if (prev.inner_threshold != cur.inner_threshold or prev.inner_members != cur.inner_members) return null;
+            } else shape = cur;
+        }
+        return shape;
+    }
+    return null;
+}
+
+/// Every `N-of-{` label in `text` (the recipes doc's nested-variant
+/// notation): `version` is the decimal N directly before `-of-{`.
+pub fn scanNestedLabels(gpa: std.mem.Allocator, text: []const u8) ![]PinHit {
+    var out: std.ArrayList(PinHit) = .empty;
+    errdefer out.deinit(gpa);
+    const key = "-of-{";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, key)) |at| {
+        from = at + key.len;
+        var start = at;
+        while (start > 0 and std.ascii.isDigit(text[start - 1])) start -= 1;
+        try out.append(gpa, .{ .version = text[start..at], .line = lineOf(text, at) });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
@@ -728,6 +791,21 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         for (forbidden_needles) |n| {
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
+        }
+    }
+
+    // ---- (9b) the nested-variant label agrees with its vector ----
+    {
+        const lint_json = readFile(arena, io, "vectors/lint.json") catch "";
+        const shape = lintCaseShape(arena, lint_json, nested_variant_case);
+        rep.checkFmt(shape != null, "vectors/lint.json", 0, "case `{s}` parses to a nested shape", .{nested_variant_case}, "missing or not top/inner t-of-n", .{});
+        if (shape) |sh| {
+            const label = try std.fmt.allocPrint(arena, "`{d}-of-{{{d}-of-{d} × {d}}}`", .{ sh.threshold, sh.inner_threshold, sh.inner_members, sh.inner_sets });
+            rep.checkFmt(std.mem.indexOf(u8, recipes, label) != null, "docs/quorum-recipes.md", 0, "names the nested variant {s}", .{label}, "the label must match the `{s}` vector", .{nested_variant_case});
+            const expect = try std.fmt.allocPrint(arena, "{d}", .{sh.threshold});
+            const hits = try scanNestedLabels(arena, recipes);
+            rep.checkFmt(hits.len >= 1, "docs/quorum-recipes.md", 0, "carries at least one `N-of-{{…}}` label", .{}, "found none", .{});
+            for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, expect), "docs/quorum-recipes.md", h.line, "label `{s}-of-{{…}}` has the vector's top-level threshold", .{h.version}, "vectors/lint.json `{s}` has threshold {d}", .{ nested_variant_case, sh.threshold });
         }
     }
 
@@ -1015,4 +1093,34 @@ test "report: failure line shape and the evidence line" {
     try testing.expectEqual(@as(usize, 2), rep.checks);
     try testing.expectEqual(@as(usize, 1), rep.failures);
     try testing.expectEqualStrings("[FAIL] README.md:42: snippet examples/bytes_node.zig is byte-equal to the file (first difference at body offset 7)\n[docs-smoke] checks=2 failures=1\n", aw.written());
+}
+
+// Non-vacuity: the label scan reads the digits directly before `-of-{`, so
+// a `3-of-{2-of-3 × 3}` label is reported as "3" (the S8 finding's red);
+// the vector reader returns the real case's 2 / 3 × (2-of-3) shape and null
+// for a missing case, so the gate compares a real threshold, not a default.
+test "nested label: prefix scan and the lint.json case shape" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const hits = try scanNestedLabels(gpa, "the `3-of-{2-of-3 × 3}` variant\nand `2-of-{2-of-3 × 3}` again\nno label here\n");
+    defer gpa.free(hits);
+    try testing.expectEqual(@as(usize, 2), hits.len);
+    try testing.expectEqualStrings("3", hits[0].version);
+    try testing.expectEqual(@as(usize, 1), hits[0].line);
+    try testing.expectEqualStrings("2", hits[1].version);
+    try testing.expectEqual(@as(usize, 2), hits[1].line);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, "vectors/lint.json", gpa, read_limit);
+    defer gpa.free(json);
+    const sh = lintCaseShape(arena, json, nested_variant_case) orelse return error.CaseMissing;
+    try testing.expectEqual(@as(u32, 2), sh.threshold);
+    try testing.expectEqual(@as(u32, 3), sh.inner_sets);
+    try testing.expectEqual(@as(u32, 2), sh.inner_threshold);
+    try testing.expectEqual(@as(u32, 3), sh.inner_members);
+    try testing.expect(lintCaseShape(arena, json, "no such case") == null);
+    try testing.expect(lintCaseShape(arena, "{\"cases\":[{\"name\":\"x\",\"input\":{\"threshold\":1,\"innerSets\":[{\"threshold\":1,\"validators\":[]},{\"threshold\":2,\"validators\":[]}]}}]}", "x") == null);
+    try testing.expect(lintCaseShape(arena, "not json", "x") == null);
 }
