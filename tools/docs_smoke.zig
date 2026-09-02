@@ -105,6 +105,9 @@ pub const protocol_needles = [_][]const u8{
     // §13 compaction trigger (S8 D2 finding): compaction is gated on a drain
     // ending with the frontier a multiple of 64, not on every drain.
     "a multiple of 64",
+    // S8 finding 17: strikes are cumulative for the connection's lifetime
+    // (overlay.zig never resets `Conn.strikes`); the budget row must say so.
+    "| `max_budget_strikes` | `32` breaches over the connection's lifetime (strikes never reset) ⇒ disconnect |",
 };
 pub const threat_model_needles = [_][]const u8{
     "**No transport authentication in v1.**",
@@ -136,6 +139,7 @@ pub const forbidden_needles = [_][]const u8{
     // false under prefix rules": a new `pub` under any `p()` subtree IS
     // Stable with no new rule (only `check-api`'s red guards it).
     "frozen by accident",
+    "consecutive breaches", // S8 finding 17: strikes never reset, so they are not consecutive
 };
 /// docs/stability.md AND the tool's module doc (tools/api_snapshot.zig) must
 /// state the tiering rule as it actually behaves: a new declaration under a
