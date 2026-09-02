@@ -86,9 +86,14 @@ fn lintQuorum(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
         }
     }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| {
-        try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ path, err });
-        return 2;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| switch (err) {
+        // An allocation failure is ours, not the file's: it takes `run`'s
+        // dedicated `slcp: out of memory` path like every other site.
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try err_out.print("slcp lint-quorum: cannot read {s}: {t}\n", .{ path, err });
+            return 2;
+        },
     };
     defer gpa.free(bytes);
 
@@ -380,4 +385,38 @@ test "cli key new / key show: mint once, refuse to overwrite, show, missing file
     try testing.expectEqual(@as(u8, 2), c.code);
     c.exec(gpa, io, &.{ "key", "burn", key_path });
     try testing.expectEqual(@as(u8, 2), c.code);
+}
+
+// Non-vacuity: a bare `catch` around `readFileAlloc` (blaming the file for
+// an OutOfMemory) turns the fail_index=0 point red with
+// `cannot read <path>: OutOfMemory`; the sweep stops only once a run
+// completes with no induced failure, so every allocation point is covered.
+test "cli lint-quorum: an allocation failure anywhere is `slcp: out of memory`, never blamed on the file" {
+    const base = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.json", .data = two_of_three_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try tmpPath(io, &tmp, &b1, "two.json");
+
+    // The capture buffers live on the base allocator so only the CLI's own
+    // allocations are subject to the induced failure.
+    var c = Captured.init(base);
+    defer c.deinit();
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        c.exec(failing.allocator(), io, &.{ "lint-quorum", two });
+        if (!failing.has_induced_failure) break;
+        try testing.expectEqual(@as(u8, 2), c.code);
+        try testing.expectEqualStrings("slcp: out of memory\n", c.stderr());
+        try testing.expectEqualStrings("", c.stdout());
+    }
+    // The sweep really exercised several allocation points and ended on a
+    // clean run.
+    try testing.expect(fail_index >= 3);
+    try testing.expectEqual(@as(u8, 0), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), two_of_three_hash) != null);
 }
