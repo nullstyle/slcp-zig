@@ -118,7 +118,8 @@ What the program relies on:
 
 - **`AppNode(App)` checks the contract at compile time.** `App` declares a
   `State`, a `Command`, a pure `validate(state, cmd) slcp.Validity` and a
-  pure `apply(state, cmd) State` (optionally `combine`, `initialState`, and
+  pure `apply(state, cmd) State` (optionally `combine`, `initialState`,
+  `initialSlot`, and
   an `encode`/`decode` pair). Every violation is a teaching compile error
   with the wanted signature, not a vtable type mismatch.
 - **`slcp.Codec(Command)` derives the wire encoding**: fields in declaration
@@ -252,10 +253,11 @@ which it supplies itself). Every misconfiguration is refused with a specific
 error and a one-paragraph message naming the offending option — pass a
 `.diagnostic` to receive it (the pattern is in `docs/driver-upgrade.md`).
 `slcp.Node.explain(err)` gives the static text for a `Node.create` error. It
-does not accept an `AppNode(App).CreateError`, which adds two members of its
-own — `CommandExceedsMaxValueBytes` and `UndecodableExternalizedValue`, both
-always reported through `.diagnostic` — so narrow first:
-`switch (err) { error.CommandExceedsMaxValueBytes, error.UndecodableExternalizedValue => "app-level", else => |e| slcp.Node.explain(e) }`.
+does not accept an `AppNode(App).CreateError`, which adds three members of
+its own — `CommandExceedsMaxValueBytes`, `InitialSlotOutsideJournal` and
+`UndecodableExternalizedValue`, all always reported through `.diagnostic` — so
+narrow first:
+`switch (err) { error.CommandExceedsMaxValueBytes, error.InitialSlotOutsideJournal, error.UndecodableExternalizedValue => "app-level", else => |e| slcp.Node.explain(e) }`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -300,7 +302,10 @@ never touches a file); `slcp --version` prints the package version.
 ## Building and testing
 
 The toolchain is pinned in `mise.toml` to one exact Zig nightly,
-`0.17.0-dev.1786+75044cb04` (`build.zig.zon` carries only a floor). With
+`0.17.0-dev.1786+75044cb04` (`build.zig.zon` carries only a floor, which
+`build.zig` enforces at comptime — an older Zig stops with a one-line
+message naming the floor instead of failing somewhere inside `std.Io`).
+With
 [mise](https://mise.jdx.dev) installed:
 
 ```sh

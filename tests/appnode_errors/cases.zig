@@ -1,5 +1,5 @@
-//! The appnode-errors case table: ONE source of truth for the twenty
-//! teaching `@compileError`s in src/node/app_node.zig.
+//! The appnode-errors case table: ONE source of truth for every teaching
+//! `@compileError` in src/node/app_node.zig.
 //!
 //! build.zig imports it to build one expected-fail object per row
 //! (`tests/appnode_errors/<stem>.zig` with `expect_errors = .{ .contains =
@@ -40,6 +40,7 @@ pub const cases = [_]Case{
     .{ .stem = "err_bad_apply_signature", .needle = "): apply has the wrong signature.", .src = "apply has the wrong signature." },
     .{ .stem = "err_bad_combine_signature", .needle = "): combine has the wrong signature.", .src = "combine has the wrong signature." },
     .{ .stem = "err_bad_initial_state_signature", .needle = "): initialState has the wrong signature.", .src = "initialState has the wrong signature." },
+    .{ .stem = "err_bad_initial_slot_signature", .needle = "): initialSlot has the wrong signature.", .src = "initialSlot has the wrong signature." },
     .{ .stem = "err_lone_encode", .needle = "): a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`.", .src = "a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." },
     .{ .stem = "err_bad_encode_signature", .needle = "): encode has the wrong signature.", .src = "encode has the wrong signature." },
     .{ .stem = "err_bad_decode_signature", .needle = "): decode has the wrong signature.", .src = "decode has the wrong signature." },

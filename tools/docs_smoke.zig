@@ -195,12 +195,12 @@ pub const ci_strict_experimental = "strict_experimental: -Dstrict-experimental=t
 pub const ci_test_legs: usize = 2;
 
 /// `Node.explain` takes `node.CreateError`; `AppNode(App).CreateError` adds
-/// these two members, which it has no arm for — `Node.explain(err)` on an
+/// these three members, which it has no arm for — `Node.explain(err)` on an
 /// AppNode create error does not compile. Every doc paragraph that
-/// recommends calling `explain(` must name both, so a reader of the typed
+/// recommends calling `explain(` must name all three, so a reader of the typed
 /// path is told to narrow (or to read `.diagnostic`) instead.
 pub const explain_call_needle = "explain(";
-pub const explain_caveat_needles = [_][]const u8{ "CommandExceedsMaxValueBytes", "UndecodableExternalizedValue" };
+pub const explain_caveat_needles = [_][]const u8{ "CommandExceedsMaxValueBytes", "InitialSlotOutsideJournal", "UndecodableExternalizedValue" };
 pub const min_explain_paragraphs: usize = 1;
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
@@ -605,6 +605,28 @@ pub fn parseMiseZig(toml: []const u8) ?[]const u8 {
         return rest[1..end];
     }
     return null;
+}
+
+/// Does build.zig enforce build.zig.zon's `minimum_zig_version` itself?
+/// Zig's build runner parses the field but never compares it against the
+/// running compiler (S8 D9), so the floor is real only if build.zig reads
+/// the manifest back and `@compileError`s on an older `builtin.zig_version`.
+/// Comment-only mentions do not count.
+pub fn enforcesZigFloor(build_zig: []const u8) bool {
+    var reads_manifest = false;
+    var names_floor = false;
+    var compares = false;
+    var errors = false;
+    var it = std.mem.splitScalar(u8, build_zig, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "//")) continue;
+        if (std.mem.indexOf(u8, line, "@import(\"build.zig.zon\")") != null) reads_manifest = true;
+        if (std.mem.indexOf(u8, line, "minimum_zig_version") != null) names_floor = true;
+        if (std.mem.indexOf(u8, line, "builtin.zig_version.order(") != null) compares = true;
+        if (std.mem.indexOf(u8, line, "@compileError(") != null) errors = true;
+    }
+    return reads_manifest and names_floor and compares and errors;
 }
 
 pub const PinHit = struct { version: []const u8, line: usize };
@@ -1141,6 +1163,10 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const hits = try scanZigPins(arena, doc.text);
             for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, zig_pin), doc.path, h.line, "zig pin `{s}` matches mise.toml", .{h.version}, "mise.toml says {s}", .{zig_pin});
         }
+        // The zon floor is advisory on this toolchain (the build runner never
+        // compares it): build.zig must enforce it, or an older Zig fails deep
+        // inside std.Io instead of at the floor.
+        rep.checkFmt(enforcesZigFloor(build_zig), "build.zig", 0, "build.zig enforces build.zig.zon's minimum_zig_version at comptime", .{}, "no non-comment `@import(\"build.zig.zon\")` + `minimum_zig_version` + `builtin.zig_version.order(` + `@compileError(` — the build runner never compares the zon floor", .{});
     }
     // ---- (12) path dep ----
     {
@@ -1390,6 +1416,28 @@ test "version scanner: refs/tags/v0.0.9.tar.gz vs 0.1.0 is flagged; real manifes
     try testing.expectEqualStrings("0.17.0-dev.1786", zhits[1].version);
 }
 
+// Non-vacuity (S8 D9): Zig's build runner parses `minimum_zig_version` but
+// never compares it, so the zon floor alone is advisory; the REAL build.zig
+// must carry the comptime assert. A build.zig that mentions the pieces only
+// in a comment, or reads the manifest without comparing, is rejected.
+test "zig floor: the real build.zig enforces minimum_zig_version; comment-only and compare-less fixtures are rejected" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const build_zig = try std.Io.Dir.cwd().readFileAlloc(io, "build.zig", gpa, read_limit);
+    defer gpa.free(build_zig);
+    try testing.expect(enforcesZigFloor(build_zig));
+    try testing.expect(!enforcesZigFloor("// @import(\"build.zig.zon\").minimum_zig_version builtin.zig_version.order( @compileError(\n"));
+    try testing.expect(!enforcesZigFloor("const m = @import(\"build.zig.zon\");\nconst floor = m.minimum_zig_version;\n"));
+    try testing.expect(enforcesZigFloor(
+        \\const manifest = @import("build.zig.zon");
+        \\comptime {
+        \\    const required = std.SemanticVersion.parse(manifest.minimum_zig_version) catch unreachable;
+        \\    if (builtin.zig_version.order(required) == .lt) @compileError("too old");
+        \\}
+        \\
+    ));
+}
+
 // Non-vacuity: `option_fields` is the comptime field list of the live
 // `slcp.NodeOptions`; a row naming a field that does not exist is rejected,
 // and the frozen option names (plan §2) are accepted — rename `key_file` in
@@ -1515,13 +1563,12 @@ test "fmt recipes: every src/<dir> except gen is listed in `fmt` and `fmt-check`
 // goes red before the docs do.
 test "explain caveat: paragraph scanner splits on blank lines; needles are the AppNode-only CreateError members" {
     const gpa = testing.allocator;
-    const doc = "intro\n\nUse `Node.explain(err)` for the text; `CommandExceedsMaxValueBytes` and\n`UndecodableExternalizedValue` are not covered.\n\nOr just `explain(e)`.\n   \nno mention here\n```zig\n_ = explain(x);\n```\n";
+    const doc = "intro\n\nUse `Node.explain(err)` for the text; `CommandExceedsMaxValueBytes`,\n`InitialSlotOutsideJournal` and `UndecodableExternalizedValue` are not covered.\n\nOr just `explain(e)`.\n   \nno mention here\n```zig\n_ = explain(x);\n```\n";
     const hits = try scanParagraphsMentioning(gpa, doc, explain_call_needle);
     defer gpa.free(hits);
     try testing.expectEqual(@as(usize, 3), hits.len);
     try testing.expectEqual(@as(usize, 3), hits[0].line);
-    try testing.expect(std.mem.indexOf(u8, hits[0].text, explain_caveat_needles[0]) != null);
-    try testing.expect(std.mem.indexOf(u8, hits[0].text, explain_caveat_needles[1]) != null);
+    for (explain_caveat_needles) |n| try testing.expect(std.mem.indexOf(u8, hits[0].text, n) != null);
     try testing.expectEqual(@as(usize, 6), hits[1].line);
     try testing.expectEqualStrings("Or just `explain(e)`.", hits[1].text);
     try testing.expect(std.mem.indexOf(u8, hits[1].text, explain_caveat_needles[1]) == null);

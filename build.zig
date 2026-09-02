@@ -1,4 +1,30 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const manifest = @import("build.zig.zon");
+
+// The zon floor is advisory on this toolchain: Zig's build runner parses
+// `minimum_zig_version` from build.zig.zon but never compares it against the
+// running compiler (S8 D9 finding), so without this block an older Zig fails
+// with an unexplained error deep inside the tree (src/node/overlay.zig on
+// 0.17.0-dev.1683, say) — from a consumer's point of view, inside a vendored
+// dependency. This comptime assert IS the floor; it runs for dependency
+// builds too, so downstream projects get the same one-line diagnostic. The
+// floor stays in build.zig.zon (mise.toml holds the exact pin; the floor is
+// raised to the pin whenever the node layer needs a newer std.Io surface).
+// `SemanticVersion.order` ignores build metadata, so the exact commit
+// (+75044cb04) is enforced only through mise.toml, not here.
+comptime {
+    const required = std.SemanticVersion.parse(manifest.minimum_zig_version) catch
+        @compileError("build.zig.zon minimum_zig_version is not valid semver: " ++ manifest.minimum_zig_version);
+    if (builtin.zig_version.order(required) == .lt) {
+        @compileError(std.fmt.comptimePrint(
+            "slcp-zig requires zig {s} or newer (build.zig.zon minimum_zig_version; mise.toml pins the exact build); " ++
+                "this build is running zig {s}. Upgrade the toolchain (`mise install` in slcp-zig), or pin a slcp-zig " ++
+                "release whose CHANGELOG declares support for yours.",
+            .{ manifest.minimum_zig_version, builtin.zig_version_string },
+        ));
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -551,7 +577,7 @@ pub fn build(b: *std.Build) void {
     // sites in app_node.zig against it — an unpinned 21st rule goes red
     // there, not here (S8 review: this loop only pins the rows it has).
     const appnode_error_cases = @import("tests/appnode_errors/cases.zig").cases;
-    comptime std.debug.assert(appnode_error_cases.len == 20);
+    comptime std.debug.assert(appnode_error_cases.len == 21);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
         const obj = b.addObject(.{

@@ -338,6 +338,12 @@ fn validateAppContract(comptime App: type) void {
                 "\n  want: fn () State" ++
                 "\n  got:  " ++ @typeName(@TypeOf(App.initialState)));
     }
+    if (@hasDecl(App, "initialSlot")) {
+        if (@TypeOf(App.initialSlot) != fn () u64)
+            contractError(App, "initialSlot has the wrong signature." ++
+                "\n  want: fn () u64   (the slot your persisted initialState() already includes; 0 = none)" ++
+                "\n  got:  " ++ @typeName(@TypeOf(App.initialSlot)));
+    }
 
     if (hasCustomCodec(App)) {
         if (!@hasDecl(App, "encode") or !@hasDecl(App, "decode"))
@@ -477,6 +483,14 @@ fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: a
     return err;
 }
 
+/// §8.5 delta-app recipe: can a `State` persisted at slot `s0` be caught up
+/// from the retained journal tail? A snapshot at 0 claims nothing.
+fn initialSlotWithinTail(s0: u64, tail: ?node.Node.JournalTail) bool {
+    if (s0 == 0) return true;
+    const t = tail orelse return false;
+    return t.first <= s0 + 1 and s0 <= t.last;
+}
+
 /// The teaching text for a journaled value the current `Command` cannot
 /// decode (design §8.5: command evolution is consensus surface).
 const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
@@ -492,8 +506,15 @@ const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode a
 /// Restart (v1 limitation, plan R17): `State` is NOT persisted. After
 /// `create`, `state` = `initialState()` + `apply` over the replayed journal
 /// tail (compaction-bounded: the last ≥16 slots), so commands must be full
-/// VALUES ("count becomes 3"), never deltas; apps with delta semantics
-/// persist State themselves. Consequently the first proposal after a
+/// VALUES ("count becomes 3"), never deltas. An app with delta semantics
+/// persists State itself, keyed by the slot it was taken at (every
+/// `waitApplied` item carries one), and declares BOTH `initialState()` (the
+/// snapshot) and `pub fn initialSlot() u64` (that slot): `create` seeds its
+/// dedup floor from `initialSlot()` before the tail replays, so journaled
+/// slots at or below it are skipped, not re-applied (S8 D2). A snapshot the
+/// retained tail cannot catch up (older than its first slot, ahead of its
+/// last, or without a journal) is `InitialSlotOutsideJournal`, so persist at
+/// least every 16 applied slots. Either way the first proposal after a
 /// restart is usually STALE (computed from `initialState()`): the network
 /// rejects it and the §0 loop catches up from the applied stream.
 pub fn AppNode(comptime App: type) type {
@@ -515,7 +536,7 @@ pub fn AppNode(comptime App: type) type {
         /// One applied slot: the value copy of `State` taken on the engine
         /// thread right after `apply`.
         pub const Applied = struct { slot: u64, state: State };
-        pub const CreateError = error{ CommandExceedsMaxValueBytes, UndecodableExternalizedValue } || node.CreateError;
+        pub const CreateError = error{ CommandExceedsMaxValueBytes, InitialSlotOutsideJournal, UndecodableExternalizedValue } || node.CreateError;
         pub const ProposeError = node.ProposeError;
         pub const WaitError = error{NodeHalted};
 
@@ -549,11 +570,20 @@ pub fn AppNode(comptime App: type) type {
             return State{};
         }
 
+        /// The slot `initialState()` already includes (§8.5 delta-app
+        /// recipe); 0 when the app declares no `initialSlot()`.
+        fn initialSlot() u64 {
+            if (@hasDecl(App, "initialSlot")) return App.initialSlot();
+            return 0;
+        }
+
         /// Allocate the adapter without a Node (the driver / hook can be
         /// exercised directly). `deinit` handles both shapes.
         fn createDetached(gpa: std.mem.Allocator, io: std.Io, max_value_bytes: u32) std.mem.Allocator.Error!*Self {
             const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa, .io = io, .state = initialState(), .max_value_bytes = max_value_bytes };
+            // The dedup floor starts at the snapshot's slot, BEFORE any
+            // journal tail is replayed through the hook.
+            self.* = .{ .gpa = gpa, .io = io, .state = initialState(), .applied_hwm = initialSlot(), .max_value_bytes = max_value_bytes };
             return self;
         }
 
@@ -562,7 +592,9 @@ pub fn AppNode(comptime App: type) type {
         /// tail through `apply` before returning. `*Self` is the driver and
         /// hook ctx (stable address). Adds two members to the bytes-level
         /// `CreateError`: an auto-encoded Command larger than
-        /// `max_value_bytes`, and a journaled value the Command cannot decode.
+        /// `max_value_bytes`, and a journaled value the Command cannot decode;
+        /// a third for a persisted `State` whose `initialSlot()` the retained
+        /// journal tail cannot catch up.
         pub fn create(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
             const diag = opts.diagnostic;
             if (comptime !codec.is_custom) {
@@ -591,7 +623,7 @@ pub fn AppNode(comptime App: type) type {
                 @field(nopts, name) = @field(opts, name);
             }
 
-            self.n = node.Node.create(gpa, io, nopts) catch |e| {
+            const n = node.Node.create(gpa, io, nopts) catch |e| {
                 if (self.undecodable) |u| {
                     // The hook refused a journaled value during the tail
                     // replay: report OUR member with the teaching text
@@ -601,6 +633,23 @@ pub fn AppNode(comptime App: type) type {
                 }
                 return e;
             };
+            self.n = n;
+            // §8.5 delta-app recipe: a persisted State is only as good as the
+            // journal that continues it. Refuse a snapshot the retained tail
+            // cannot catch up — ahead of the journal (or with no journal at
+            // all: a snapshot from somewhere else), or older than the tail's
+            // first slot (the slots in between are gone) — rather than start
+            // on a silently wrong State.
+            const s0 = initialSlot();
+            if (s0 != 0 and !initialSlotWithinTail(s0, n.journal_tail)) {
+                const tail = n.journal_tail;
+                n.deinit();
+                self.n = null;
+                if (tail) |t| {
+                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} retains slots {d}..{d}; a persisted State must come from this data_dir and be no older than the retained tail (persist it at least every 16 applied slots, from the waitApplied stream) — or return 0 and use full-value commands.", .{ s0, opts.data_dir, t.first, t.last });
+                }
+                return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} is empty; a persisted State cannot be caught up without the journal it was taken from — start this data_dir from initialSlot() = 0 (a snapshot from elsewhere cannot be used), or restore its journal alongside it.", .{ s0, opts.data_dir });
+            }
             self.created.store(true, .release);
             return self;
         }
@@ -1106,21 +1155,22 @@ test "contract acceptance: Counter, pointer-apply, initialState + defaultless St
 
 // Non-vacuity: this is the README's narrowing idiom. `node.explain` takes
 // `node.CreateError`, and `AppNode(App).CreateError` is a strict superset
-// (+CommandExceedsMaxValueBytes, +UndecodableExternalizedValue): pass `c.err`
-// to `node.explain` directly and this is a compile error ("not a member of
-// destination error set"); drop either arm of the switch and the `else`
-// capture stops coercing. The needles pin that the narrowed call reaches the
+// (+CommandExceedsMaxValueBytes, +InitialSlotOutsideJournal,
+// +UndecodableExternalizedValue): pass `c.err` to `node.explain` directly and
+// this is a compile error ("not a member of destination error set"); drop any
+// arm of the switch and the `else` capture stops coercing. The needles pin that the narrowed call reaches the
 // real static text.
-test "README idiom: AppNode(Counter).CreateError narrows to node.explain via a switch on its two extra members" {
+test "README idiom: AppNode(Counter).CreateError narrows to node.explain via a switch on its three extra members" {
     const CN = AppNode(Counter);
     const cases = [_]struct { err: CN.CreateError, needle: []const u8 }{
         .{ .err = error.NoIdentity, .needle = "no identity" },
         .{ .err = error.CommandExceedsMaxValueBytes, .needle = "app-level" },
+        .{ .err = error.InitialSlotOutsideJournal, .needle = "app-level" },
         .{ .err = error.UndecodableExternalizedValue, .needle = "app-level" },
     };
     for (cases) |c| {
         const text: []const u8 = switch (c.err) {
-            error.CommandExceedsMaxValueBytes, error.UndecodableExternalizedValue => "app-level",
+            error.CommandExceedsMaxValueBytes, error.InitialSlotOutsideJournal, error.UndecodableExternalizedValue => "app-level",
             else => |e| node.explain(e),
         };
         try std.testing.expect(std.mem.indexOf(u8, text, c.needle) != null);
@@ -1592,4 +1642,172 @@ test "codec mismatch at create: a bytes-level Node journals \"abc\"; AppNode(Cou
         try testing.expectEqual(@as(u64, 1), e.slot);
         try testing.expectEqualSlices(u8, "abc", e.value);
     }
+}
+
+// ---- S8 D2: the delta-app recipe (§8.5) must be implementable ----
+
+/// A DELTA app: the network agrees on "add k", never on "sum becomes k", so
+/// `validate` cannot judge a command against `State` and a replayed slot
+/// applied twice is silently wrong.
+const Delta = struct {
+    pub const State = struct { sum: i64 = 0 };
+    pub const Command = struct { add: i64 };
+    pub fn validate(state: State, cmd: Command) Validity {
+        _ = state;
+        return if (cmd.add > 0) .valid else .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        return .{ .sum = state.sum + cmd.add };
+    }
+};
+const DeltaNode = AppNode(Delta);
+
+/// The §8.5 recipe for delta apps: persist `State` keyed by the slot it was
+/// taken at, rebuild it in `initialState()` and name that slot in
+/// `initialSlot()`. The "persisted" snapshot is a test global.
+var delta_snapshot: struct { state: Delta.State, slot: u64 } = .{ .state = .{}, .slot = 0 };
+const DeltaSnap = struct {
+    pub const State = Delta.State;
+    pub const Command = Delta.Command;
+    pub const validate = Delta.validate;
+    pub const apply = Delta.apply;
+    pub fn initialState() State {
+        return delta_snapshot.state;
+    }
+    pub fn initialSlot() u64 {
+        return delta_snapshot.slot;
+    }
+};
+const DeltaSnapNode = AppNode(DeltaSnap);
+
+/// Pump the delta loop ("add 1" after every applied slot) on `peer` until
+/// `n` applies its next slot; returns that first applied item. `n` is
+/// re-proposed too, so 2-of-2 keeps moving whichever side is behind.
+fn nextDeltaApplied(n: anytype, peer: *DeltaNode, deadline_ms: u64) !@TypeOf(n.*).Applied {
+    var waited: u64 = 0;
+    while (waited < deadline_ms) {
+        if (try n.waitApplied(.{ .timeout_ms = 50 })) |a| return a;
+        if (try peer.waitApplied(.{ .timeout_ms = 1 })) |_| try peer.propose(.{ .add = 1 });
+        waited += 50;
+    }
+    return error.Timeout;
+}
+
+// Non-vacuity (S8 D2 finding "the documented delta-app workaround cannot be
+// implemented correctly under AppNode"): without `initialSlot()` seeding the
+// dedup floor before the tail replays, the restarted node re-applies slots
+// 1..3 on top of the slot-3 snapshot — its first applied item is slot 1 with
+// sum 4 (then 5, 6 …) instead of slot 4 with sum 4, and it diverges from the
+// live peer with haltError == null on both. Seeding AFTER `Node.create` (or
+// in the hook's re-delivery branch) also goes red: the tail has replayed by
+// then. Dropping the outside-journal check lets a snapshot "from slot 99"
+// (nothing in this journal) or one with no journal at all start silently.
+test "restart of a DELTA app from a persisted snapshot (2-of-2 loopback): initialSlot() skips the replayed tail; sum matches the live peer; a snapshot outside the journal is refused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var pair = try Pair.init(&td);
+    var spec_buf: [32]u8 = undefined;
+    delta_snapshot = .{ .state = .{}, .slot = 0 };
+
+    const b = blk: {
+        const a = try DeltaSnapNode.create(gpa, io, .{
+            .network = Pair.network,
+            .secret_seed = pair.seed_a,
+            .quorum = Quorum.of(2, &pair.ids),
+            .listen_port = 0,
+            .data_dir = pair.dir_a[0..pair.dir_a_len],
+            .diagnostic = &pair.diag,
+        });
+        defer a.deinit();
+        const b = try DeltaNode.create(gpa, io, .{
+            .network = Pair.network,
+            .secret_seed = pair.seed_b,
+            .quorum = Quorum.of(2, &pair.ids),
+            .listen_port = 0,
+            .peers = &.{try loopbackSpec(&spec_buf, a.raw().boundPort())},
+            .data_dir = pair.dir_b[0..pair.dir_b_len],
+            .diagnostic = &pair.diag,
+        });
+        errdefer b.deinit();
+
+        // Phase 1 — "add 1" on both until a has applied slot 3 (sum 3).
+        try a.propose(.{ .add = 1 });
+        try b.propose(.{ .add = 1 });
+        var last: DeltaSnapNode.Applied = undefined;
+        while (true) {
+            last = try nextDeltaApplied(a, b, 60_000);
+            try testing.expectEqual(@as(i64, @intCast(last.slot)), last.state.sum);
+            if (last.slot >= 3) break;
+            try a.propose(.{ .add = 1 });
+        }
+        try testing.expectEqual(@as(u64, 3), last.slot);
+        // The app "persists" State keyed by the slot it was taken at.
+        delta_snapshot = .{ .state = last.state, .slot = last.slot };
+        break :blk b;
+        // `a` goes down here; its data_dir (journal slots 1..3) stays.
+    };
+    defer b.deinit();
+
+    // Phase 2 — restart a from the snapshot. The journal tail (1..3) must be
+    // skipped, not re-applied: the first applied item is slot 4 with sum 4.
+    const a2 = try DeltaSnapNode.create(gpa, io, .{
+        .network = Pair.network,
+        .secret_seed = pair.seed_a,
+        .quorum = Quorum.of(2, &pair.ids),
+        .listen_port = 0,
+        .peers = &.{try loopbackSpec(&spec_buf, b.raw().boundPort())},
+        .data_dir = pair.dir_a[0..pair.dir_a_len],
+        .diagnostic = &pair.diag,
+    });
+    defer a2.deinit();
+    try a2.propose(.{ .add = 1 });
+    try b.propose(.{ .add = 1 });
+    const r4 = try nextDeltaApplied(a2, b, 90_000);
+    try testing.expectEqual(@as(u64, 4), r4.slot);
+    try testing.expectEqual(@as(i64, 4), r4.state.sum);
+    // The live peer agrees on slot 4's state.
+    var b4: ?DeltaNode.Applied = null;
+    var waited: u64 = 0;
+    while (b4 == null and waited < 30_000) : (waited += 50) {
+        if (try b.waitApplied(.{ .timeout_ms = 50 })) |x| {
+            if (x.slot == 4) b4 = x;
+        }
+    }
+    try testing.expectEqual(@as(i64, 4), (b4 orelse return error.PeerNeverAppliedSlot4).state.sum);
+    try testing.expect(a2.haltError() == null);
+    try testing.expect(b.haltError() == null);
+
+    // A snapshot the journal cannot catch up is refused, not started blind:
+    // (a) "taken at slot 99" on a journal that ends at 4 (or not yet 4 — the
+    //     snapshot is ahead either way); (b) any nonzero slot on a fresh
+    //     data_dir (no journal at all — a snapshot from somewhere else).
+    var d2: node.Diagnostic = .{};
+    var cbuf: [std.fs.max_path_bytes]u8 = undefined;
+    delta_snapshot = .{ .state = .{ .sum = 99 }, .slot = 99 };
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = Pair.network,
+        .secret_seed = seedOf(0x73),
+        .quorum = Quorum.of(2, &pair.ids),
+        .listen_port = 0,
+        .data_dir = try td.sub(&cbuf, "c"),
+        .diagnostic = &d2,
+    }));
+    try testing.expect(std.mem.indexOf(u8, d2.message(), "initialSlot() = 99") != null);
+    try testing.expect(std.mem.indexOf(u8, d2.message(), "empty") != null);
+}
+
+// Non-vacuity: the predicate is the whole outside-journal rule; flipping
+// either comparison (or the empty-journal arm) fails one of the arms below.
+test "initialSlot vs the retained journal tail: within, at either edge, ahead, behind, no journal" {
+    // tail 49..70: a snapshot at 48 (tail starts right after it) through 70.
+    try testing.expect(initialSlotWithinTail(48, .{ .first = 49, .last = 70 }));
+    try testing.expect(initialSlotWithinTail(60, .{ .first = 49, .last = 70 }));
+    try testing.expect(initialSlotWithinTail(70, .{ .first = 49, .last = 70 }));
+    try testing.expect(!initialSlotWithinTail(71, .{ .first = 49, .last = 70 })); // ahead
+    try testing.expect(!initialSlotWithinTail(47, .{ .first = 49, .last = 70 })); // behind: 48 lost
+    try testing.expect(!initialSlotWithinTail(1, null)); // no journal
+    try testing.expect(initialSlotWithinTail(0, null)); // the default: nothing claimed
+    try testing.expect(initialSlotWithinTail(0, .{ .first = 49, .last = 70 }));
 }

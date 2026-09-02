@@ -240,10 +240,11 @@ every box.
 Startup errors come with a one-paragraph explanation naming the offending
 option: pass a `.diagnostic` to `create` and print `diag.message()` (the
 pattern is in `docs/driver-upgrade.md`). `slcp.Node.explain(err)` does not
-accept an `AppNode(Counter).CreateError` — it has no arm for the two
-`AppNode`-only members, `CommandExceedsMaxValueBytes` and
-`UndecodableExternalizedValue` — so narrow with a `switch` on those two first
-if you want the static text (the top-level README shows the idiom).
+accept an `AppNode(Counter).CreateError` — it has no arm for the three
+`AppNode`-only members, `CommandExceedsMaxValueBytes`,
+`InitialSlotOutsideJournal` and `UndecodableExternalizedValue` — so narrow
+with a `switch` on those three first if you want the static text (the
+top-level README shows the idiom).
 
 ## Security
 
