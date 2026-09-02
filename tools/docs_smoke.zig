@@ -102,6 +102,9 @@ pub const protocol_needles = [_][]const u8{
     "4096",
     "255",
     "60 s",
+    // §13 compaction trigger (S8 D2 finding): compaction is gated on a drain
+    // ending with the frontier a multiple of 64, not on every drain.
+    "a multiple of 64",
 };
 pub const threat_model_needles = [_][]const u8{
     "**No transport authentication in v1.**",
