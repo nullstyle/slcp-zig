@@ -375,6 +375,10 @@ pub const Node = struct {
     ext_cond: std.Io.Condition = .init,
     ext_queue: std.ArrayList(Externalized) = .empty,
     ext_closed: bool = false,
+    /// Threads currently inside `waitExternalized` (under `ext_mu`); `deinit`
+    /// wakes them and waits on `ext_drained` for zero before freeing.
+    ext_waiters: usize = 0,
+    ext_drained: std.Io.Condition = .init,
     /// `Options.delivery`: when set, `deliverSlot` calls it instead of
     /// queueing for `waitExternalized`. Read on the engine thread (and on
     /// the creating thread during the journal-tail replay).
@@ -923,10 +927,13 @@ pub const Node = struct {
         self.resync_stop.store(true, .release);
         if (self.resync_thread) |t| t.join();
 
-        // Wake any app thread blocked in waitExternalized so it returns null.
+        // Wake any app thread blocked in waitExternalized so it returns null,
+        // and wait until every waiter has left (a woken waiter re-locks
+        // ext_mu on its way out — that must happen before the free below).
         self.ext_mu.lockUncancelable(self.io);
         self.ext_closed = true;
         self.ext_cond.broadcast(self.io);
+        while (self.ext_waiters > 0) self.ext_drained.waitUncancelable(self.io, &self.ext_mu);
         self.ext_mu.unlock(self.io);
 
         // Order matters. Close the queue and JOIN the engine thread first, so
@@ -1005,6 +1012,11 @@ pub const Node = struct {
     pub fn waitExternalized(self: *Node, wopts: WaitOptions) ?Externalized {
         self.ext_mu.lockUncancelable(self.io);
         defer self.ext_mu.unlock(self.io);
+        self.ext_waiters += 1;
+        defer { // runs before the unlock above (reverse order)
+            self.ext_waiters -= 1;
+            if (self.ext_waiters == 0) self.ext_drained.signal(self.io);
+        }
         while (self.ext_queue.items.len == 0 and !self.ext_closed) {
             if (wopts.timeout_ms) |ms| {
                 self.ext_cond.waitTimeout(self.io, &self.ext_mu, msTimeout(ms)) catch return null;
@@ -1832,4 +1844,55 @@ test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount dro
     b_live = false;
     try pollUntil(io, 10_000, a, Probe.down);
     try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
+}
+
+/// A thread parked in `waitExternalized` until `deinit` wakes it.
+const ExtDeinitWaiter = struct {
+    n: *Node,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_null: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *ExtDeinitWaiter) void {
+        const r = self.n.waitExternalized(.{ .timeout_ms = null });
+        if (r) |e| self.n.gpa.free(e.value);
+        self.saw_null.store(r == null, .release);
+        self.done.store(true, .release);
+    }
+};
+
+// Non-vacuity (structural twin of AppNode's): `deinit` drains `ext_waiters`
+// before freeing the Node. Without the drain the woken waiter re-locks
+// `ext_mu` inside freed memory; the thread joins between wake and free mask
+// it in practice (the S8 reviewers could not make it hang), so this test
+// pins the contract rather than a reproduced crash.
+test "deinit while another thread is parked in waitExternalized: the waiter returns null before the Node is freed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const seed: [32]u8 = @splat(0x63);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+
+    const n = try Node.create(gpa, io, .{
+        .network = "ext-deinit-waiter v1",
+        .secret_seed = seed,
+        .quorum = core.quorum.Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    var w: ExtDeinitWaiter = .{ .n = n };
+    const t = try std.Thread.spawn(.{}, ExtDeinitWaiter.run, .{&w});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+    n.deinit();
+    var waited_ms: u64 = 0;
+    while (!w.done.load(.acquire) and waited_ms < 2000) : (waited_ms += 10) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+    }
+    if (!w.done.load(.acquire)) return error.WaiterHungAfterDeinit;
+    t.join();
+    try std.testing.expect(w.saw_null.load(.acquire));
 }

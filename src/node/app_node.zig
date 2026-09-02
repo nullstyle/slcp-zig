@@ -543,6 +543,11 @@ pub fn AppNode(comptime App: type) type {
         head: usize = 0,
         closed: bool = false,
         halt_err: ?anyerror = null,
+        /// Threads currently inside `waitApplied` (under `mu`). `deinit`
+        /// wakes them and then waits on `drained` for this to reach zero
+        /// BEFORE freeing, so a woken waiter never re-locks a freed `mu`.
+        waiters: usize = 0,
+        drained: std.Io.Condition = .init,
 
         fn initialState() State {
             if (@hasDecl(App, "initialState")) return App.initialState();
@@ -606,12 +611,17 @@ pub fn AppNode(comptime App: type) type {
         }
 
         /// Stop the node (joins the engine thread — no hook call can be in
-        /// flight afterwards), wake `waitApplied` callers with null, free.
+        /// flight afterwards), wake `waitApplied` callers with null, wait
+        /// for every one of them to leave `waitApplied`, then free. A thread
+        /// may therefore be parked in `waitApplied` when `deinit` runs; it
+        /// must not call anything on the adapter after `waitApplied` returns
+        /// null.
         pub fn deinit(self: *Self) void {
             if (self.n) |n| n.deinit();
             self.mu.lockUncancelable(self.io);
             self.closed = true;
             self.cond.broadcast(self.io);
+            while (self.waiters > 0) self.drained.waitUncancelable(self.io, &self.mu);
             self.mu.unlock(self.io);
             const gpa = self.gpa;
             self.queue.deinit(gpa);
@@ -643,6 +653,11 @@ pub fn AppNode(comptime App: type) type {
         pub fn waitApplied(self: *Self, wopts: WaitOptions) WaitError!?Applied {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
+            self.waiters += 1;
+            defer { // runs before the unlock above (reverse order)
+                self.waiters -= 1;
+                if (self.waiters == 0) self.drained.signal(self.io);
+            }
             while (self.head >= self.queue.items.len and !self.closed) {
                 if (wopts.timeout_ms) |ms| {
                     self.cond.waitTimeout(self.io, &self.mu, node.msTimeout(ms)) catch return null;
@@ -1540,5 +1555,51 @@ test "codec mismatch at create: a bytes-level Node journals \"abc\"; AppNode(Cou
         defer gpa.free(e.value);
         try testing.expectEqual(@as(u64, 1), e.slot);
         try testing.expectEqualSlices(u8, "abc", e.value);
+    }
+}
+
+// -- deinit vs. a parked waiter (S8 review, D4/D13) ----------------------------
+
+/// A thread parked in `waitApplied` until `deinit` wakes it; records what it
+/// got back.
+const DeinitWaiter = struct {
+    n: *CounterNode,
+    timeout_ms: ?u64,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_null: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *DeinitWaiter) void {
+        const r = self.n.waitApplied(.{ .timeout_ms = self.timeout_ms }) catch null;
+        self.saw_null.store(r == null, .release);
+        self.done.store(true, .release);
+    }
+};
+
+// Non-vacuity: reverting `deinit` to broadcast-then-free (no `waiters`
+// drain) lets the woken waiter re-lock `mu` inside the freed adapter: it
+// never returns (`WaiterHungAfterDeinit` after the 2 s poll) and the testing
+// allocator reports a write after free at teardown. Both the untimed and the
+// timed wait paths park on `cond`, so both are driven.
+test "deinit while another thread is parked in waitApplied: the waiter returns null before the adapter is freed (untimed and timed waits)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const timeouts = [_]?u64{ null, 30_000, null, 30_000 };
+    for (timeouts) |timeout_ms| {
+        const n = try CounterNode.createDetached(gpa, io, 4096);
+        var w: DeinitWaiter = .{ .n = n, .timeout_ms = timeout_ms };
+        const t = try std.Thread.spawn(.{}, DeinitWaiter.run, .{&w});
+        // Let the waiter park (an early deinit is still a valid run).
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+        n.deinit();
+        var waited_ms: u64 = 0;
+        while (!w.done.load(.acquire) and waited_ms < 2000) : (waited_ms += 10) {
+            try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+        }
+        if (!w.done.load(.acquire)) {
+            std.debug.print("\ndeinit/waitApplied(timeout_ms={?d}): waiter never returned 2 s after deinit (parked on the freed mutex)\n", .{timeout_ms});
+            return error.WaiterHungAfterDeinit; // parked for good: it cannot be joined
+        }
+        t.join();
+        try testing.expect(w.saw_null.load(.acquire));
     }
 }
