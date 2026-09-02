@@ -3,6 +3,13 @@
 //! tmpDir data_dir, ephemeral listen port) creates cleanly; every other test
 //! mutates ONE field and asserts both the `CreateError` member AND that the
 //! `Diagnostic` message names the offending value.
+//!
+//! Coverage note (S8): every member reachable from the public API without
+//! privileges is asserted here, except `EngineFailed`, which node.zig pins
+//! through a refusing delivery hook on a journaled data_dir ("a refusing
+//! hook fails create"). `ListenFailed` and `ThreadSpawnFailed` need a
+//! sandbox that refuses bind() or a process out of threads; they are covered
+//! by `explain` only (the exhaustive-switch test below).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -588,4 +595,53 @@ test "propose: watcher, empty, oversized, and a 1-byte value" {
     const w = try Node.create(testing.allocator, io, watcher);
     defer w.deinit();
     try testing.expectError(error.WatcherCannotPropose, w.propose("x"));
+}
+
+// Non-vacuity: routing the key-file `else` arm (NotDir here) to KeyFileBad
+// makes the first case red; dropping the marker header/length check lets
+// "garbage\n" fall through to DataDirOtherNetwork (red on the member);
+// swallowing OutOfMemory into another member (or leaking on the unwind —
+// testing.allocator backs the failing allocator) makes the last case red.
+// ListenFailed and ThreadSpawnFailed need a sandbox that refuses bind() or a
+// process out of threads and are covered by `explain` only; EngineFailed is
+// pinned by node.zig's "a refusing hook fails create" test.
+test "I/O members: NotDir key path is KeyFileIoFailed, a malformed marker is DataDirUnusable, a failing allocator is OutOfMemory" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    // KeyFileIoFailed: a regular file as a parent component of .key_file —
+    // neither missing (KeyFileDirMissing) nor a directory (KeyFileBad).
+    try g.tmp.dir.writeFile(io, .{ .sub_path = "afile", .data = "not a dir" });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const notdir_path = try g.sub(&b1, "afile/slcp.key");
+    var notdir = g.options();
+    notdir.secret_seed = null;
+    notdir.key_file = notdir_path;
+    try g.expectFail(notdir, error.KeyFileIoFailed, "NotDir");
+    try expectContains(g.diag.message(), notdir_path);
+
+    // DataDirUnusable: an identity marker that is not the documented three
+    // lines (§10) — the message names the file and the remedy.
+    try g.tmp.dir.createDirPath(io, "garbled");
+    try g.tmp.dir.writeFile(io, .{ .sub_path = "garbled/identity", .data = "garbage\n" });
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const garbled_dir = try g.sub(&b2, "garbled");
+    var garbled = g.options();
+    garbled.data_dir = garbled_dir;
+    try g.expectFail(garbled, error.DataDirUnusable, "is malformed");
+    try expectContains(g.diag.message(), garbled_dir);
+    try expectContains(g.diag.message(), "delete that file");
+
+    // OutOfMemory: the very first allocation fails. The member surfaces
+    // unchanged and the diagnostic stays empty (there is no offending value
+    // to name; `explain` carries the sentence).
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    var oom = g.options();
+    oom.data_dir = try g.sub(&b3, "oom");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    g.diag.len = 0;
+    try testing.expectError(error.OutOfMemory, Node.create(failing.allocator(), io, oom));
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqualStrings("", g.diag.message());
 }
