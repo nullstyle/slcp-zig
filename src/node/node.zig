@@ -584,7 +584,7 @@ pub const Node = struct {
         for (findings) |f| {
             var wbuf: [512]u8 = undefined;
             var w: std.Io.Writer = .fixed(&wbuf);
-            lint_report.writeFinding(&w, f) catch {};
+            lint_report.writeFinding(&w, f, &owned) catch {};
             const line = std.mem.trimEnd(u8, w.buffered(), "\n");
             // Both at warn: an ERROR finding only reaches this loop when
             // the operator set `.allow_unsafe_quorum = true`, i.e. accepted

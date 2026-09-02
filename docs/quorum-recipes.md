@@ -71,6 +71,15 @@ budget.
   the number of members that may lie while every two quorums still overlap
   in an honest one *and* the honest remainder still reaches `t`.
 
+Every finding line ends with `if any K of these N nodes are offline, your
+network halts`, and there the numbers are **nodes of the whole tree**, not
+members of one level: `N` is every validator in the tree and `K` is the
+fewest outages that halt you whichever nodes they hit
+(`N − smallest slice + 1`; `lint_report.minSliceSize`). On a flat set that
+is the same `n − t + 1`; on `3-of-{2-of-3 × 3}` it is `any 4 of these 9`
+while `min blocking set` is 2 — the two bracket your budget (the worst two
+nodes halt you; any four do).
+
 **The intersection caveat.** Lint judges *your* configuration: per-level
 threshold sanity plus tree-wide critical validators. It never checks that
 your slices intersect other nodes' slices (`docs/threat-model.md` §4). Keep

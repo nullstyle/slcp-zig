@@ -3,9 +3,14 @@
 //! `slcp lint-quorum` (stdout — the docs smoke byte-compares it), so every
 //! line is deterministic: lower-case hex, fixed wording, no timestamps.
 //!
-//! The availability framing on every finding — "if any n−t+1 of these n
-//! nodes are offline, your network halts" — is the May-2019 Stellar halt
-//! failure class stated in the operator's own numbers.
+//! The availability framing on every finding — "if any K of these N nodes
+//! are offline, your network halts" — is the May-2019 Stellar halt failure
+//! class stated in the operator's own numbers. It counts NODES of the whole
+//! tree, never top-level members: N is every validator in the tree and K is
+//! the fewest outages that halt you whichever nodes they hit
+//! (N − `minSliceSize` + 1; on a flat set that is n − t + 1). The report's
+//! `min blocking set` line is the other bound — the fewest outages that CAN
+//! halt you (`qset.minBlockingSize`). The two coincide on flat sets.
 
 const std = @import("std");
 const core = @import("slcp-core");
@@ -40,7 +45,7 @@ pub fn write(w: *std.Io.Writer, r: Report) std.Io.Writer.Error!void {
     var errors: usize = 0;
     var warnings: usize = 0;
     for (r.findings) |f| {
-        try writeFinding(w, f);
+        try writeFinding(w, f, r.qs);
         switch (f.level) {
             .err => errors += 1,
             .warning => warnings += 1,
@@ -69,10 +74,14 @@ fn writeLevel(w: *std.Io.Writer, qs: *const qset.QuorumSetOwned, level: usize) s
 }
 
 /// One finding on one line. Errors start with `ERROR <code>:`, warnings
-/// with `WARNING <code>:`; every line ends with the availability framing.
-pub fn writeFinding(w: *std.Io.Writer, f: qset.LintFinding) std.Io.Writer.Error!void {
+/// with `WARNING <code>:`; every line ends with the availability framing
+/// over the nodes of `qs` (the validated tree the finding was linted on —
+/// `f.members`/`f.threshold` are its top-level member numbers, which are
+/// only node numbers when the tree is flat).
+pub fn writeFinding(w: *std.Io.Writer, f: qset.LintFinding, qs: *const qset.QuorumSetOwned) std.Io.Writer.Error!void {
     const n = f.members;
     const t = f.threshold;
+    const nested = qs.inner_sets.len != 0;
     switch (f.level) {
         .err => try w.writeAll("ERROR "),
         .warning => try w.writeAll("WARNING "),
@@ -85,9 +94,11 @@ pub fn writeFinding(w: *std.Io.Writer, f: qset.LintFinding) std.Io.Writer.Error!
         ),
         .below_two_thirds => {
             const two_thirds = std.math.divCeil(u32, 2 * n, 3) catch unreachable;
+            // The tolerance counts top-level MEMBERS; on a nested tree a
+            // member is an inner set, so the noun must not say "validators".
             try w.print(
-                "threshold {d} is below ceil(2n/3) = {d} — with {d} validators and threshold {d} you tolerate {d} Byzantine nodes, {d} crashes",
-                .{ t, two_thirds, n, t, byzantineTolerance(n, t), n -| t },
+                "threshold {d} is below ceil(2n/3) = {d} — with {d} {s} and threshold {d} you tolerate {d} Byzantine {s}, {d} crashes",
+                .{ t, two_thirds, n, if (nested) "members" else "validators", t, byzantineTolerance(n, t), if (nested) "members" else "nodes", n -| t },
             );
         },
         .all_members_critical => try w.print(
@@ -102,7 +113,9 @@ pub fn writeFinding(w: *std.Io.Writer, f: qset.LintFinding) std.Io.Writer.Error!
             }
         },
     }
-    try w.print("; if any {d} of these {d} nodes are offline, your network halts\n", .{ (n + 1) -| t, n });
+    const total = totalValidators(qs);
+    const any_halt = (total + 1) -| minSliceSize(qs);
+    try w.print("; if any {d} of these {d} nodes are offline, your network halts\n", .{ any_halt, total });
 }
 
 /// Byzantine members tolerated with BOTH safety and liveness: safety needs
@@ -179,6 +192,36 @@ pub fn totalValidators(qs: *const qset.QuorumSetOwned) usize {
     var total: usize = qs.validators.len;
     for (qs.inner_sets) |*inner| total += totalValidators(inner);
     return total;
+}
+
+/// Fewest validators that can form a satisfying slice of `qs` (validator
+/// → 1; set → the sum of its t smallest member values; exact for validated
+/// trees because members are disjoint). `totalValidators − minSliceSize + 1`
+/// outages halt you whichever nodes they hit — the "if any K of these N
+/// nodes" K — while `qset.minBlockingSize` is the fewest that can halt you
+/// at worst. Unvalidated shapes (threshold 0 or above the member count)
+/// yield `totalValidators` (no slice can form).
+pub fn minSliceSize(qs: *const qset.QuorumSetOwned) usize {
+    var costs: [qset.max_total_validators + 1]usize = undefined;
+    var len: usize = 0;
+    for (qs.validators) |_| {
+        if (len < costs.len) {
+            costs[len] = 1;
+            len += 1;
+        }
+    }
+    for (qs.inner_sets) |*inner| {
+        if (len < costs.len) {
+            costs[len] = minSliceSize(inner);
+            len += 1;
+        }
+    }
+    const members = costs[0..len];
+    if (qs.threshold == 0 or qs.threshold > members.len) return totalValidators(qs);
+    std.mem.sort(usize, members, {}, std.sort.asc(usize));
+    var sum: usize = 0;
+    for (members[0..qs.threshold]) |c| sum += c;
+    return sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,4 +321,104 @@ test "byzantineTolerance and the tree-fact helpers" {
     try testing.expectEqual(@as(u32, 3), depth(&nested));
     try testing.expect(firstBadThreshold(&nested) == null);
     try testing.expect((try firstDuplicate(gpa, &nested)) == null);
+}
+
+/// Test reference: is `qs` still satisfiable with every node in `offline` down?
+fn satisfiableWithoutSet(qs: *const qset.QuorumSetOwned, offline: []const qset.NodeId) bool {
+    var sat: u32 = 0;
+    for (qs.validators) |*v| {
+        var off = false;
+        for (offline) |*o| {
+            if (std.mem.eql(u8, v, o)) off = true;
+        }
+        if (!off) sat += 1;
+    }
+    for (qs.inner_sets) |*inner| {
+        if (satisfiableWithoutSet(inner, offline)) sat += 1;
+    }
+    return sat >= qs.threshold;
+}
+
+/// Test reference for the "if any K of these N nodes are offline" K: the
+/// smallest K such that EVERY K-subset of the tree's validators offline
+/// leaves it unsatisfiable (n <= 9 validators -> 512 subsets).
+fn bruteAnyHalt(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned) !u32 {
+    var all: std.ArrayList(qset.NodeId) = .empty;
+    defer all.deinit(gpa);
+    try collectValidators(gpa, qs, &all);
+    std.debug.assert(all.items.len <= 9);
+    // largest surviving outage + 1
+    var best_survivor: u32 = 0;
+    var mask: u32 = 0;
+    while (mask < (@as(u32, 1) << @intCast(all.items.len))) : (mask += 1) {
+        var offline: [9]qset.NodeId = undefined;
+        var k: usize = 0;
+        for (all.items, 0..) |id, i| {
+            if ((mask >> @intCast(i)) & 1 == 1) {
+                offline[k] = id;
+                k += 1;
+            }
+        }
+        if (k > best_survivor and satisfiableWithoutSet(qs, offline[0..k])) best_survivor = @intCast(k);
+    }
+    return best_survivor + 1;
+}
+
+// Non-vacuity (S8 finding "if any K of these N nodes" counted top-level
+// MEMBERS as nodes): with `f.members` as N and `n − t + 1` as K the
+// 3-of-{2-of-3 ×3} line says "if any 1 of these 3 nodes" (no single node
+// halts that tree — its own `min blocking set` line says 2) and the nested
+// critical tree says "if any 1 of these 3 nodes" for 7 validators of which
+// only 0101 is critical. The brute-force half pins K = N − (smallest
+// slice) + 1 as the exact "any K" number: every K-subset offline halts,
+// some (K−1)-subset survives. Flat trees stay byte-identical (K = n − t + 1).
+test "writeFinding: the availability sentence counts nodes of the whole tree, not top-level members" {
+    const gpa = testing.allocator;
+    const a = splatId(0x01);
+    const org1 = [_]qset.NodeId{ splatId(0x02), splatId(0x03), splatId(0x04) };
+    const org2 = [_]qset.NodeId{ splatId(0x05), splatId(0x06), splatId(0x07) };
+    const org3 = [_]qset.NodeId{ splatId(0x08), splatId(0x09), splatId(0x0a) };
+
+    // 3-of-{2-of-3 ×3}: 9 nodes, smallest slice 6 -> any 4 offline halts.
+    const three_orgs = [_]Quorum{ Quorum.of(2, &org1), Quorum.of(2, &org2), Quorum.of(2, &org3) };
+    const all_orgs = try render(gpa, Quorum.ofSets(3, &three_orgs));
+    defer gpa.free(all_orgs);
+    try testing.expect(std.mem.indexOf(u8, all_orgs, "min blocking set: 2 node(s)\ncritical nodes: none\n") != null);
+    try testing.expect(std.mem.indexOf(u8, all_orgs, "WARNING all_members_critical: threshold 3 equals the member count, so every one of the 3 members is critical; if any 4 of these 9 nodes are offline, your network halts\n") != null);
+    try testing.expect(std.mem.indexOf(u8, all_orgs, "of these 3 nodes") == null);
+
+    // 3-of-{A, 2-of-3, 2-of-3}: 7 nodes, only A critical, smallest slice 5 -> any 3 offline halts.
+    const two_orgs = [_]Quorum{ Quorum.of(2, &org1), Quorum.of(2, &org2) };
+    const nested_critical = try render(gpa, .{ .threshold = 3, .validators = &.{a}, .inner_sets = &two_orgs });
+    defer gpa.free(nested_critical);
+    try testing.expect(std.mem.indexOf(u8, nested_critical, "min blocking set: 1 node(s)\ncritical nodes: 0101") != null);
+    try testing.expect(std.mem.indexOf(u8, nested_critical, "is in every slice; it alone offline halts you; if any 3 of these 7 nodes are offline, your network halts\n") != null);
+    try testing.expect(std.mem.indexOf(u8, nested_critical, "of these 3 nodes") == null);
+
+    // 1-of-{3-of-3, 3-of-3}: 6 nodes, 2 members, smallest slice 3 -> any 4 offline halts.
+    const two_tight = [_]Quorum{ Quorum.of(3, &org1), Quorum.of(3, &org2) };
+    const one_of_two = try render(gpa, Quorum.ofSets(1, &two_tight));
+    defer gpa.free(one_of_two);
+    try testing.expect(std.mem.indexOf(u8, one_of_two, "with 2 members and threshold 1 you tolerate 0 Byzantine members, 1 crashes; if any 4 of these 6 nodes are offline, your network halts\n") != null);
+    try testing.expect(std.mem.indexOf(u8, one_of_two, "validators") == null);
+
+    // The printed K is the exact brute-force "any K" number on every tree
+    // above and on the flat anti-recipes.
+    const flat3 = [_]qset.NodeId{ a, org1[0], org1[1] };
+    const specs = [_]Quorum{
+        Quorum.ofSets(3, &three_orgs),
+        .{ .threshold = 3, .validators = &.{a}, .inner_sets = &two_orgs },
+        Quorum.ofSets(1, &two_tight),
+        Quorum.of(1, &flat3),
+        Quorum.of(3, &flat3),
+        Quorum.of(2, &flat3),
+    };
+    const want_k = [_]u32{ 4, 3, 4, 3, 1, 2 };
+    for (specs, want_k) |spec, k| {
+        var owned = try spec.toOwned(gpa);
+        defer owned.deinit(gpa);
+        try qset.validateAndNormalize(gpa, &owned);
+        try testing.expectEqual(k, try bruteAnyHalt(gpa, &owned));
+        try testing.expectEqual(k, @as(u32, @intCast(totalValidators(&owned) - minSliceSize(&owned) + 1)));
+    }
 }
