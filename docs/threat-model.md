@@ -129,7 +129,7 @@ and normalize.
 `slcp lint-quorum` and the lint run inside `Node.create` (design §12,
 `src/engine/qset.zig` `lint`) check exactly two things:
 
-1. **Per-level threshold sanity of *your own* configuration**: a
+1. **Top-level threshold sanity of *your own* configuration**: a
    sub-majority top level (`sub_majority_threshold`, an error), a top level
    below two-thirds (`below_two_thirds`), and a top level that needs every
    member (`all_members_critical`).

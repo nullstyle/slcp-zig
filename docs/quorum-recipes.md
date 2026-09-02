@@ -71,7 +71,7 @@ budget.
   the number of members that may lie while every two quorums still overlap
   in an honest one *and* the honest remainder still reaches `t`.
 
-**The intersection caveat.** Lint judges *your* configuration: per-level
+**The intersection caveat.** Lint judges *your* configuration: top-level
 threshold sanity plus tree-wide critical validators. It never checks that
 your slices intersect other nodes' slices (`docs/threat-model.md` §4). Keep
 every node on the same recipe and that property holds by construction.
@@ -250,13 +250,15 @@ quorum would be "one node from each of two orgs". Then `{a1, b1}` and
 `{a2, b2}` are both quorums with **no node in common**: each can
 externalize a different value for the same slot with every signature valid.
 Majority-within-each-org (2-of-2 here) is what forces any two quorums to
-share a node. The per-level `sub_majority_threshold` check catches
-`1-of-2` at the top level; inner levels are your responsibility, which is
-why the recipe writes them out.
+share a node. The `sub_majority_threshold` check applies only to the top
+level (like `below_two_thirds` and `all_members_critical`): this inner
+`1-of-2` tree prints three `set: 1-of-2` lines and `result: OK`, exit 0.
+Inner levels are your responsibility, which is why the recipe writes them
+out.
 
 **Recommendation: three nodes per org.** With `2-of-2` orgs a single node
 down removes its whole org, and the minimum blocking set is only 2. The
-`3-of-{2-of-3 × 3}` variant — each org `2-of-3`, network `2-of-3` orgs —
+`2-of-{2-of-3 × 3}` variant — each org `2-of-3`, network `2-of-3` orgs —
 tolerates one node per org *and* one whole org, and its minimum blocking
 set rises to 4 (two nodes in each of two orgs). That variant's normalized
 form and hash are pinned in `vectors/qset.json` ("nested 3 orgs") and its

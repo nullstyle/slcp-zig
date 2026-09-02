@@ -110,6 +110,7 @@ pub const threat_model_needles = [_][]const u8{
     "**No transport authentication in v1.**",
     "WireGuard",
     "quorum intersection",
+    "Top-level threshold sanity",
 };
 /// Spellings that must appear in NO active doc (stale designs, wrong verbs,
 /// wrong failure modes). `double-appl` (S8 D2-restart): AppNode re-applies
@@ -124,11 +125,35 @@ pub const forbidden_needles = [_][]const u8{
     "key create",
     "double-appl",
 };
+/// Phrases that must appear in NO active doc, matched across line wraps
+/// (`findWrappedPhrase`: each space matches any whitespace run).
+/// `qset.lint`'s threshold checks (`sub_majority_threshold`,
+/// `below_two_thirds`, `all_members_critical`) judge the TOP level only —
+/// the report is per-level, the checks are not — so a doc must never call
+/// them "per-level" (S8 finding: an inner 1-of-2 lints `result: OK`).
+pub const forbidden_phrases = [_][]const u8{
+    "per-level threshold",
+    "Per-level threshold",
+    "per-level `sub_majority_threshold`",
+    "Per-level `sub_majority_threshold`",
+};
+/// docs/quorum-recipes.md must say where the threshold checks apply
+/// (matched across line wraps).
+pub const recipes_needles = [_][]const u8{
+    "top-level threshold sanity",
+    "applies only to the top level",
+};
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
 /// in a docs option table must be one of these, and README's table must
 /// list every one of them.
 pub const option_fields = std.meta.fieldNames(slcp.NodeOptions);
+
+/// The vectors/lint.json case docs/quorum-recipes.md cites for the
+/// recommended nested variant; every `N-of-{…}` label in that doc must
+/// carry the case's top-level threshold as N (S8 finding: the label said
+/// `3-of-` while the vector and the sentence around it are 2-of-3 orgs).
+pub const nested_variant_case = "nested 3 orgs 2-of-3 majority within (clean)";
 
 pub const read_limit: std.Io.Limit = .limited(4 << 20);
 
@@ -546,6 +571,63 @@ pub fn isOptionField(name: []const u8) bool {
     return false;
 }
 
+/// The shape of one lint.json case's input: top-level threshold, inner-set
+/// count, and the (t, n) every inner set shares.
+pub const NestedShape = struct { threshold: u32, inner_sets: u32, inner_threshold: u32, inner_members: u32 };
+
+/// Reads `input.threshold` / `input.innerSets[*]` of the named case in a
+/// vectors/lint.json text. Null when the case is missing, the JSON is not
+/// what the vectors write, or the inner sets are not all the same shape.
+pub fn lintCaseShape(arena: std.mem.Allocator, json_text: []const u8, case_name: []const u8) ?NestedShape {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{}) catch return null;
+    const cases = (if (root == .object) root.object.get("cases") else null) orelse return null;
+    if (cases != .array) return null;
+    for (cases.array.items) |c| {
+        if (c != .object) continue;
+        const name = c.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, case_name)) continue;
+        const input = c.object.get("input") orelse return null;
+        if (input != .object) return null;
+        const t = input.object.get("threshold") orelse return null;
+        const inner = input.object.get("innerSets") orelse return null;
+        if (t != .integer or inner != .array or inner.array.items.len == 0) return null;
+        var shape: ?NestedShape = null;
+        for (inner.array.items) |set| {
+            if (set != .object) return null;
+            const st = set.object.get("threshold") orelse return null;
+            const sv = set.object.get("validators") orelse return null;
+            if (st != .integer or sv != .array) return null;
+            const cur = NestedShape{
+                .threshold = std.math.cast(u32, t.integer) orelse return null,
+                .inner_sets = @intCast(inner.array.items.len),
+                .inner_threshold = std.math.cast(u32, st.integer) orelse return null,
+                .inner_members = @intCast(sv.array.items.len),
+            };
+            if (shape) |prev| {
+                if (prev.inner_threshold != cur.inner_threshold or prev.inner_members != cur.inner_members) return null;
+            } else shape = cur;
+        }
+        return shape;
+    }
+    return null;
+}
+
+/// Every `N-of-{` label in `text` (the recipes doc's nested-variant
+/// notation): `version` is the decimal N directly before `-of-{`.
+pub fn scanNestedLabels(gpa: std.mem.Allocator, text: []const u8) ![]PinHit {
+    var out: std.ArrayList(PinHit) = .empty;
+    errdefer out.deinit(gpa);
+    const key = "-of-{";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, key)) |at| {
+        from = at + key.len;
+        var start = at;
+        while (start > 0 and std.ascii.isDigit(text[start - 1])) start -= 1;
+        try out.append(gpa, .{ .version = text[start..at], .line = lineOf(text, at) });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
@@ -554,6 +636,28 @@ const Doc = struct { path: []const u8, text: []const u8 };
 
 fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, read_limit);
+}
+
+/// Byte offset of the first occurrence of `phrase` in `text` where every
+/// space in `phrase` matches a run of whitespace (a line wrap included);
+/// null if none. Words never match without whitespace between them.
+pub fn findWrappedPhrase(text: []const u8, phrase: []const u8) ?usize {
+    var words = std.mem.tokenizeScalar(u8, phrase, ' ');
+    const first = words.next() orelse return null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, first)) |at| {
+        from = at + 1;
+        var i = at + first.len;
+        var rest = words;
+        const ok = while (rest.next()) |w| {
+            var j = i;
+            while (j < text.len and std.ascii.isWhitespace(text[j])) j += 1;
+            if (j == i or !std.mem.startsWith(u8, text[j..], w)) break false;
+            i = j + w.len;
+        } else true;
+        if (ok) return at;
+    }
+    return null;
 }
 
 fn containsBackticked(text: []const u8, name: []const u8) bool {
@@ -736,6 +840,28 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         for (forbidden_needles) |n| {
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
+        }
+    }
+    for (recipes_needles) |n| rep.checkFmt(findWrappedPhrase(recipes, n) != null, "docs/quorum-recipes.md", 0, "says `{s}`", .{n}, "the threshold checks are top-level only; say so", .{});
+    for (docs) |doc| {
+        for (forbidden_phrases) |ph| {
+            const at = findWrappedPhrase(doc.text, ph);
+            rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not say `{s}`", .{ph}, "qset.lint's threshold checks apply to the top level only", .{});
+        }
+    }
+
+    // ---- (9b) the nested-variant label agrees with its vector ----
+    {
+        const lint_json = readFile(arena, io, "vectors/lint.json") catch "";
+        const shape = lintCaseShape(arena, lint_json, nested_variant_case);
+        rep.checkFmt(shape != null, "vectors/lint.json", 0, "case `{s}` parses to a nested shape", .{nested_variant_case}, "missing or not top/inner t-of-n", .{});
+        if (shape) |sh| {
+            const label = try std.fmt.allocPrint(arena, "`{d}-of-{{{d}-of-{d} × {d}}}`", .{ sh.threshold, sh.inner_threshold, sh.inner_members, sh.inner_sets });
+            rep.checkFmt(std.mem.indexOf(u8, recipes, label) != null, "docs/quorum-recipes.md", 0, "names the nested variant {s}", .{label}, "the label must match the `{s}` vector", .{nested_variant_case});
+            const expect = try std.fmt.allocPrint(arena, "{d}", .{sh.threshold});
+            const hits = try scanNestedLabels(arena, recipes);
+            rep.checkFmt(hits.len >= 1, "docs/quorum-recipes.md", 0, "carries at least one `N-of-{{…}}` label", .{}, "found none", .{});
+            for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, expect), "docs/quorum-recipes.md", h.line, "label `{s}-of-{{…}}` has the vector's top-level threshold", .{h.version}, "vectors/lint.json `{s}` has threshold {d}", .{ nested_variant_case, sh.threshold });
         }
     }
 
@@ -1047,4 +1173,52 @@ test "report: failure line shape and the evidence line" {
     try testing.expectEqual(@as(usize, 2), rep.checks);
     try testing.expectEqual(@as(usize, 1), rep.failures);
     try testing.expectEqualStrings("[FAIL] README.md:42: snippet examples/bytes_node.zig is byte-equal to the file (first difference at body offset 7)\n[docs-smoke] checks=2 failures=1\n", aw.written());
+}
+
+// Non-vacuity: the label scan reads the digits directly before `-of-{`, so
+// a `3-of-{2-of-3 × 3}` label is reported as "3" (the S8 finding's red);
+// the vector reader returns the real case's 2 / 3 × (2-of-3) shape and null
+// for a missing case, so the gate compares a real threshold, not a default.
+test "nested label: prefix scan and the lint.json case shape" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const hits = try scanNestedLabels(gpa, "the `3-of-{2-of-3 × 3}` variant\nand `2-of-{2-of-3 × 3}` again\nno label here\n");
+    defer gpa.free(hits);
+    try testing.expectEqual(@as(usize, 2), hits.len);
+    try testing.expectEqualStrings("3", hits[0].version);
+    try testing.expectEqual(@as(usize, 1), hits[0].line);
+    try testing.expectEqualStrings("2", hits[1].version);
+    try testing.expectEqual(@as(usize, 2), hits[1].line);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, "vectors/lint.json", gpa, read_limit);
+    defer gpa.free(json);
+    const sh = lintCaseShape(arena, json, nested_variant_case) orelse return error.CaseMissing;
+    try testing.expectEqual(@as(u32, 2), sh.threshold);
+    try testing.expectEqual(@as(u32, 3), sh.inner_sets);
+    try testing.expectEqual(@as(u32, 2), sh.inner_threshold);
+    try testing.expectEqual(@as(u32, 3), sh.inner_members);
+    try testing.expect(lintCaseShape(arena, json, "no such case") == null);
+    try testing.expect(lintCaseShape(arena, "{\"cases\":[{\"name\":\"x\",\"input\":{\"threshold\":1,\"innerSets\":[{\"threshold\":1,\"validators\":[]},{\"threshold\":2,\"validators\":[]}]}}]}", "x") == null);
+    try testing.expect(lintCaseShape(arena, "not json", "x") == null);
+}
+
+// Non-vacuity: the phrase finder matches across a line wrap (quorum-recipes
+// wrapped "per-level\nthreshold" over two lines — the S8 finding's red),
+// reports the FIRST word's offset, needs whitespace between words, and
+// does not match when another word sits between two of them; drop the
+// whitespace skip and the wrapped cases return null.
+test "wrapped phrase: per-level threshold across a line break; no false match" {
+    const text = "Lint judges per-level\nthreshold sanity, and the per-level report; per-level (not threshold)\n";
+    const at = findWrappedPhrase(text, "per-level threshold") orelse return error.NotFound;
+    try testing.expectEqual(@as(usize, 12), at);
+    try testing.expectEqual(@as(usize, 1), lineOf(text, at));
+    try testing.expect(findWrappedPhrase(text, "per-level sanity") == null);
+    try testing.expect(findWrappedPhrase(text, "per-levelthreshold") == null);
+    try testing.expect(findWrappedPhrase("the per-level\n  `sub_majority_threshold` check", "per-level `sub_majority_threshold`") != null);
+    try testing.expect(findWrappedPhrase("applies only to the top\nlevel (like", "applies only to the top level") != null);
+    try testing.expect(findWrappedPhrase("top-level threshold sanity", "per-level threshold") == null);
+    try testing.expect(forbidden_phrases.len >= 4 and recipes_needles.len >= 2);
 }
