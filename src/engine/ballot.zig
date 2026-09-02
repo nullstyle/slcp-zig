@@ -557,12 +557,15 @@ fn recordSelf(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedSt
     const gpa = ctx.gpa;
     if (st.pledges == .externalize) try ensureSingleton(gpa, &s.ballot, st.node_id);
     var clone = try cloneStatement(gpa, st);
-    errdefer clone.deinit(gpa);
-    const frame = try gpa.alloc(u8, 0);
-    errdefer gpa.free(frame);
+    const frame = gpa.alloc(u8, 0) catch |err| {
+        clone.deinit(gpa);
+        return err;
+    };
     // §5.1 budget: every self-store must account, or purge_slots (which
     // subtracts the slot's real storedBytes) under-counts. Zero-length frames
     // make this a no-op today; accounting anyway keeps the invariant local.
+    // storeLatest owns the envelope from here, including on failure (an
+    // errdefer over `clone`/`frame` across this call is a double free).
     ctx.addStoredBytes(try s.storeLatest(gpa, .{ .envelope_framed = frame, .statement = clone }));
 }
 
@@ -2420,4 +2423,38 @@ test "setStateFromEnvelope: restore own ballot state per statement type, no emis
         defer fx.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), fx.broadcast);
     }
+}
+
+/// One own-ballot emission (bumpState → emitCurrentStateStatement →
+/// recordSelf) with allocation `fail_index` (through ctx.gpa) made to fail
+/// (maxInt = none). Returns the number of ctx.gpa allocations the run made.
+fn bumpUnderOom(fail_index: usize) !usize {
+    var env: TestEnv = undefined;
+    try env.init(driver_mod.Driver.default(), false);
+    defer env.deinit();
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+    env.ctx.gpa = fa.allocator();
+    defer env.ctx.gpa = testing.allocator;
+    if (bumpState(&env.ctx, &env.slot, "vv", true)) |ok| {
+        try testing.expect(ok);
+        try testing.expect(!fa.has_induced_failure); // an induced OOM must surface
+        try testing.expect(env.slot.latestFor(env.cfg.node_id, false) != null);
+    } else |err| {
+        try testing.expectEqual(@as(anyerror, error.OutOfMemory), @as(anyerror, err));
+        try testing.expect(fa.has_induced_failure);
+    }
+    return fa.alloc_index;
+}
+
+// Non-vacuity: restore recordSelf's `errdefer clone.deinit(gpa)` across the
+// storeLatest call and this sweep double-frees the self-recorded statement
+// (testing.allocator panics: "double free") at the map getOrPut and the
+// box-create fail indexes (S8 finding "Engine-thread double free: storeLatest
+// frees the envelope on OOM and emitNomination frees it again", ballot
+// sibling). Leaks on any index fail the test via testing.allocator.
+test "oom sweep: recordSelf under every allocation failure — OOM surfaces, no double free, no leak" {
+    const total = try bumpUnderOom(std.math.maxInt(usize));
+    try testing.expect(total >= 4); // a sweep over nothing proves nothing
+    var k: usize = 0;
+    while (k < total) : (k += 1) _ = try bumpUnderOom(k);
 }
