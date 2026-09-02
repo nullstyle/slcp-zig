@@ -778,11 +778,21 @@ pub const Node = struct {
         }
         if (!rec.own_log_corrupt) {
             for (rec.own_latest) |r| {
-                self.applyInput(.{
+                self.feedInput(.{
                     .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
                     .source_peer = null,
-                });
+                }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return fail(diag, error.EngineFailed, "the own.log restore of {s} failed for slot {d}: {t}; the data_dir's own.log may be damaged — move it aside to start fresh, or report this.", .{ opts.data_dir, r.slot, e }),
+                };
             }
+        }
+        // An effect dispatched during the restore can latch the node inert
+        // (a failed write-ahead append, OOM buffering an externalization).
+        // Every create failure is a CreateError (§11.2): never hand back a
+        // node that is already dead (review finding).
+        if (self.failed.load(.acquire)) {
+            return fail(diag, error.EngineFailed, "the node failed while restoring its state from {s} (see the preceding log line) and cannot start; check the filesystem and free space, or move the data_dir aside to start fresh.", .{opts.data_dir});
         }
 
         // ---- Go live ----
@@ -1110,7 +1120,16 @@ pub const Node = struct {
     }
 
     /// Feed one input and drain all its effects (engine thread only).
-    fn applyInput(self: *Node, item_in: InputItem) void {
+    fn applyInput(self: *Node, item: InputItem) void {
+        self.feedInput(item) catch |err| self.markFailed(err);
+    }
+
+    /// `applyInput` without the latch: a `pushInput` failure is returned to
+    /// the caller (the input is freed either way). `create` uses this for
+    /// the own.log restore so an allocation failure there is a create
+    /// failure (`OutOfMemory`), never a successfully-created inert node
+    /// (review finding); the engine thread wraps it in `markFailed`.
+    fn feedInput(self: *Node, item_in: InputItem) engine.PushError!void {
         var item = item_in;
         if (self.failed.load(.acquire)) {
             // Inert: consume and free inputs without touching the engine.
@@ -1118,10 +1137,10 @@ pub const Node = struct {
             return;
         }
         self.cur_source = item.source_peer;
+        defer self.cur_source = null;
         self.eng.pushInput(item.input) catch |err| {
             core.host_codec.freeInput(self.gpa, &item.input);
-            self.markFailed(err);
-            return;
+            return err;
         };
         core.host_codec.freeInput(self.gpa, &item.input);
         while (self.eng.popEffect()) |eff| {
@@ -1133,7 +1152,6 @@ pub const Node = struct {
             if (!self.failed.load(.acquire)) self.dispatch(eff);
             self.eng.commitEffect();
         }
-        self.cur_source = null;
     }
 
     /// Latch the node inert: no further inputs are applied, no further
@@ -1936,4 +1954,75 @@ test "create() unwind: ListenPortInUse after a journal-tail replay (queue path) 
             try std.testing.expectEqual(error.ListenPortInUse, err);
         }
     }
+}
+
+// -- create() under allocation failure -----------------------------------------
+
+/// A crashed node's data_dir: the journal holds 3, 5, 7 and own.log this
+/// node's EXTERNALIZE for 8 (= hwm + 1, so the restore re-emits it).
+fn seedCrashedDir(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, seed: [32]u8, passphrase: []const u8) !void {
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+    var st = try store_mod.Store.open(gpa, io, dir);
+    defer st.deinit();
+    try st.appendExternalized(3, "three");
+    try st.appendExternalized(5, "five");
+    try st.appendExternalized(7, "seven");
+    const env = try buildSignedExternalize(gpa, seed, network_id, 8, "eight");
+    defer gpa.free(env);
+    try st.appendOwn(8, env);
+}
+
+// Non-vacuity: with the restore loop feeding `applyInput` (which turns a
+// pushInput OOM into the runtime inert latch) and no `failed` check before
+// "Go live", an allocation failure inside the own.log restore hands back a
+// successfully-created node with `failed == true` — this sweep counts those
+// (red: "expected 0, found N"), and the latch's err-level log trips the
+// runner's err rule as well.
+test "create() never returns an already-inert node: FailingAllocator sweep over a crashed data_dir" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const passphrase = "inert-at-create v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    try seedCrashedDir(std.testing.allocator, io, data_dir, seed, passphrase);
+
+    // Backed by the page allocator: leak accounting of the engine's own
+    // OOM paths is the engine's business; this pins the create contract.
+    var diag: Diagnostic = .{};
+    var inert_creates: usize = 0;
+    var oks: usize = 0;
+    var errs: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = idx });
+        diag.len = 0;
+        if (Node.create(fa.allocator(), io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = 0,
+            .data_dir = data_dir,
+            .diagnostic = &diag,
+        })) |n| {
+            const inert = n.failed.load(.acquire);
+            n.deinit();
+            oks += 1;
+            if (inert) {
+                inert_creates += 1;
+                std.debug.print("fail_index {d}: create() returned OK but the node is inert\n", .{idx});
+            }
+            if (!fa.has_induced_failure) break; // past every allocation in create
+        } else |err| {
+            errs += 1;
+            if (err != error.OutOfMemory) std.debug.print("fail_index {d}: {t}: {s}\n", .{ idx, err, diag.message() });
+        }
+    }
+    std.debug.print("create() sweep: {d} allocation points, {d} ok, {d} inert-at-create\n", .{ errs + oks, oks, inert_creates });
+    try std.testing.expect(idx < 4096); // the sweep reached a clean create
+    try std.testing.expectEqual(@as(usize, 0), inert_creates);
 }
