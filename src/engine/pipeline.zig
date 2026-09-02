@@ -572,7 +572,15 @@ fn handleRestore(eng: *engine.Engine, bytes: []const u8) engine.EngineError!engi
     };
 
     const latest_env = stored.StoredEnvelope{ .envelope_framed = frame_latest, .statement = owned };
-    const delta = try s.storeLatest(gpa, latest_env);
+    // storeLatest owns latest_env on every path (it frees it on failure),
+    // but frame_own / own_stmt are only handed to the slot below: free them
+    // here and ONLY here (after the hand-off the slot owns them, and
+    // effects.push owns `bcast` even on failure).
+    const delta = s.storeLatest(gpa, latest_env) catch |err| {
+        gpa.free(frame_own);
+        own_stmt.deinit(gpa);
+        return err;
+    };
     eng.stored_statement_bytes = @intCast(@as(isize, @intCast(eng.stored_statement_bytes)) + delta);
 
     const own_env = stored.StoredEnvelope{ .envelope_framed = frame_own, .statement = own_stmt };
@@ -1254,4 +1262,86 @@ test "sticky failure: after an engine error every pushInput fails" {
     eng.failed = true; // simulate a prior §7.2 breach
     try testing.expectError(error.EngineFailed, eng.pushInput(.{ .purge_slots = .{ .max_slot = 1 } }));
     try testing.expectError(error.EngineFailed, eng.pushInput(.{ .timer_fired = .{ .slot = 1, .timer = .ballot } }));
+}
+
+// ---------------------------------------------------------------------------
+// OOM injection over restore_own_envelope (design §12: never leak on any
+// input; S8 review dimension D5).
+// ---------------------------------------------------------------------------
+
+fn restoreOnce(gpa: std.mem.Allocator, own: []const u8) !void {
+    var eng = try makeEngine(gpa, .{});
+    defer eng.deinit();
+    var d = try pushAndDrain(gpa, &eng, .{ .restore_own_envelope = .{ .bytes = own } });
+    defer d.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, d.status);
+}
+
+/// Sweep every allocation made by pushInput(restore_own_envelope) + drain:
+/// each induced failure must surface as error.OutOfMemory with every byte
+/// the failing allocator handed out freed again. Allocation order is
+/// deterministic, so the sweep starts right after Engine.init's own
+/// allocations (init's unwind is not what this test pins).
+fn expectRestoreLeaksNothing(own: []const u8) !void {
+    const gpa = testing.allocator;
+    const init_allocs = blk: {
+        var counting = std.testing.FailingAllocator.init(gpa, .{});
+        var eng = try makeEngine(counting.allocator(), .{});
+        defer eng.deinit();
+        break :blk counting.alloc_index;
+    };
+    var idx = init_allocs;
+    var swept: usize = 0;
+    while (true) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = idx });
+        const r = restoreOnce(fa.allocator(), own);
+        if (!fa.has_induced_failure) {
+            // Past the last allocation: the un-failed run is the plain
+            // restore and must succeed.
+            try r;
+            break;
+        }
+        swept += 1;
+        try testing.expectError(error.OutOfMemory, r);
+        if (fa.allocated_bytes != fa.freed_bytes) {
+            std.debug.print(
+                "restore_own_envelope leaked {d} B when allocation #{d} (the {d}th after Engine.init) failed\n",
+                .{ fa.allocated_bytes - fa.freed_bytes, idx, idx - init_allocs + 1 },
+            );
+            return error.MemoryLeakDetected;
+        }
+    }
+    try testing.expect(swept >= 8); // non-vacuity: the restore path really allocates
+}
+
+// Non-vacuity: handleRestore stores `latest_env` via s.storeLatest (which
+// owns and frees it on failure) while `frame_own` and `own_stmt` are still
+// live locals; reverting the scoped `catch` around that call to a bare
+// `try` leaks both (the framed envelope copy + the decoded statement) at
+// the two allocation points inside storeLatest (map getOrPut, the
+// StoredEnvelope box), and this test reports MemoryLeakDetected.
+test "restore_own_envelope: no leak at any allocation point (nominate + externalize)" {
+    const gpa = testing.allocator;
+
+    // The own log entries: envelopes signed with the ENGINE's own seed —
+    // a NOMINATE (slot 3) and an EXTERNALIZE (slot 8, what own.log holds
+    // after a crash), so both storeLatest maps and both own_* arms run.
+    var eng = try makeEngine(gpa, .{});
+    const local_qset_hash = eng.ctx.local_qset_hash;
+    eng.deinit();
+    const own_nom = try peerEnvelope(gpa, engine_seed, 3, .{ .nominate = .{
+        .qset_hash = local_qset_hash,
+        .votes = &.{"mine"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(own_nom);
+    const own_ext = try peerEnvelope(gpa, engine_seed, 8, .{ .externalize = .{
+        .commit = .{ .counter = 1, .value = "mine" },
+        .n_h = 1,
+        .commit_qset_hash = local_qset_hash,
+    } });
+    defer gpa.free(own_ext);
+
+    try expectRestoreLeaksNothing(own_nom);
+    try expectRestoreLeaksNothing(own_ext);
 }
