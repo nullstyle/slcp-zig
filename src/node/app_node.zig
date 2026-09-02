@@ -16,10 +16,11 @@
 //! comptime — fields in declaration order, big-endian, signed ints
 //! sign-bit-biased — so BYTE ORDER EQUALS NUMERIC ORDER and the §8.4 default
 //! combine (lexicographic max, "highest proposal wins") is semantically
-//! correct over auto-encoded commands. Allowed: ints (any width, rounded up
-//! to whole bytes), bool, exhaustive enums, fixed `[N]T` arrays, nested
-//! structs. Rejected at comptime with the rule spelled out: floats,
-//! pointers/slices, optionals, unions, non-exhaustive enums, anything else.
+//! correct over auto-encoded commands. Allowed: ints (up to 65528 bits,
+//! rounded up to whole bytes), bool, exhaustive enums, fixed `[N]T` arrays,
+//! nested structs. Rejected at comptime with the rule spelled out: floats,
+//! pointers/slices, optionals, unions, non-exhaustive enums, wider ints,
+//! anything else.
 //! Decode is strict-canonical (exact length, no non-canonical high bits,
 //! bool ∈ {0,1}, enum tag must name a variant) so the codec cannot become a
 //! value-malleability source.
@@ -48,8 +49,22 @@ pub const max_encoded_bytes: usize = core.limits.frozen_max_value_bytes_cap;
 // Auto-codec internals
 // ---------------------------------------------------------------------------
 
+/// The widest integer the auto-codec encodes: 65535 is a legal Zig width,
+/// but its whole-byte rounding (65536) is not representable by `@Int`'s
+/// `u16` bit count. `checkEncodable` rejects wider ints with a teaching
+/// error instead of letting `ceilToByteBits` overflow.
+const max_int_bits: u16 = 65528;
+
 fn ceilToByteBits(comptime bits: u16) u16 {
+    comptime std.debug.assert(bits <= max_int_bits);
     return ((bits + 7) / 8) * 8;
+}
+
+fn checkIntWidth(comptime T: type, comptime bits: u16, comptime path: []const u8) void {
+    if (bits > max_int_bits)
+        @compileError("slcp auto-codec: `" ++ path ++ "` (" ++ @typeName(T) ++ ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." ++
+            "\n  Split the field into narrower ints, or provide your own encode/decode." ++
+            "\n  (A single field this wide is 8 KiB of value bytes; commands are VALUES the network agrees on, not payloads.)");
 }
 
 fn unsupportedType(comptime T: type, comptime path: []const u8) noreturn {
@@ -63,9 +78,10 @@ fn unsupportedType(comptime T: type, comptime path: []const u8) noreturn {
 /// Every rejection message teaches the rule it enforces.
 fn checkEncodable(comptime T: type, comptime path: []const u8) void {
     switch (@typeInfo(T)) {
-        .int => {},
+        .int => |i| checkIntWidth(T, i.bits, path),
         .bool => {},
         .@"enum" => |e| {
+            checkIntWidth(e.tag_type, @typeInfo(e.tag_type).int.bits, path);
             if (e.mode == .nonexhaustive)
                 @compileError("slcp auto-codec: `" ++ path ++ "` is a non-exhaustive enum (" ++ @typeName(T) ++
                     ") — `_` admits every tag value, so there is no single canonical spelling; make the enum exhaustive." ++
@@ -93,7 +109,15 @@ fn checkEncodable(comptime T: type, comptime path: []const u8) void {
             "\n  (Tag-prefixed fixed-size union encoding is the first v2 codec target.)"),
         .array => |a| checkEncodable(a.child, path ++ "[i]"),
         .@"struct" => |s| {
-            inline for (s.field_names, s.field_types) |fname, FT| checkEncodable(FT, path ++ "." ++ fname);
+            inline for (s.field_names, s.field_types, s.field_attrs) |fname, FT, attrs| {
+                // A comptime field has an ordinary type, so the leaf rules
+                // would accept it — but decode cannot store a wire value
+                // into it (the compiler would object deep inside decodeValue).
+                if (attrs.@"comptime")
+                    @compileError("slcp auto-codec: `" ++ path ++ "." ++ fname ++ "` is a comptime field — it has one fixed value and no wire representation." ++
+                        "\n  Drop it, or make it a runtime field (decode must be able to store the wire value into it).");
+                checkEncodable(FT, path ++ "." ++ fname);
+            }
         },
         else => unsupportedType(T, path),
     }
@@ -352,7 +376,7 @@ fn validateAppContract(comptime App: type) void {
                 "\n  spelling per command) and numeric order are YOUR job — supply `combine` too.");
         if (@TypeOf(App.encode) != fn (Command, []u8) []u8)
             contractError(App, "encode has the wrong signature." ++
-                "\n  want: fn (Command, []u8) []u8   (write into buf, return the written prefix)" ++
+                "\n  want: fn (Command, []u8) []u8   (write into buf, return the encoded bytes — normally buf[0..n])" ++
                 "\n  got:  " ++ @typeName(@TypeOf(App.encode)));
         if (@TypeOf(App.decode) != fn ([]const u8) ?Command)
             contractError(App, "decode has the wrong signature." ++
@@ -409,12 +433,22 @@ fn isOwnedOptionField(comptime name: []const u8) bool {
     return false;
 }
 
-/// `AppNode.Options`: every `node.Options` field except `driver` and
-/// `delivery`, with the SAME types and defaults — reified from
+/// The field lists of `AppNode.Options`: every `node.Options` field except
+/// `driver` and `delivery`, with the SAME types and defaults — taken from
 /// `node.Options` itself, so a field added to the bytes-level node appears
-/// here automatically. `checkOptionsParity` is the comptime guard that the
-/// mirror really is field-for-field the bytes-level set minus the two.
-fn MirrorOptions() type {
+/// in the mirror automatically. The `@Struct` call itself lives in
+/// `AppNode(App).Options` (not here) so the reified type's `@typeName` is
+/// the public path `…AppNode(App).Options…`, not a private helper's name:
+/// the Stable API snapshot pins that spelling on the `create` line.
+/// `checkOptionsParity` is the comptime guard that the mirror really is
+/// field-for-field the bytes-level set minus the two.
+const MirrorFields = struct {
+    names: []const [:0]const u8,
+    types: []const type,
+    attrs: []const std.builtin.Type.Struct.FieldAttributes,
+};
+
+fn mirrorOptionFields() MirrorFields {
     const info = @typeInfo(node.Options).@"struct";
     comptime var names: []const [:0]const u8 = &.{};
     comptime var types: []const type = &.{};
@@ -425,9 +459,7 @@ fn MirrorOptions() type {
         types = types ++ [_]type{FT};
         attrs = attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{attr};
     }
-    const Mirror = @Struct(.auto, null, names, types, attrs);
-    comptime checkOptionsParity(Mirror);
-    return Mirror;
+    return .{ .names = names, .types = types, .attrs = attrs };
 }
 
 /// Comptime parity: (a) every non-owned `node.Options` field exists in the
@@ -466,8 +498,6 @@ fn checkOptionsParity(comptime Mirror: type) void {
         @compileError("AppNode.Options carries a field node.Options does not have.");
 }
 
-const OptionsMirror = MirrorOptions();
-
 const create_log = std.log.scoped(.slcp_create);
 const log = std.log.scoped(.slcp_app_node);
 
@@ -494,6 +524,12 @@ fn initialSlotWithinTail(s0: u64, tail: ?node.Node.JournalTail) bool {
 /// The teaching text for a journaled value the current `Command` cannot
 /// decode (design §8.5: command evolution is consensus surface).
 const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
+
+/// The teaching text for a `combine` whose result does not self-validate
+/// (§8.5: the composite must be `.valid`, or `.maybe_valid` when this node is
+/// behind); the node goes inert with DriverFault rather than balloting a
+/// value every peer rejects.
+const bad_composite_fmt = "{s}.combine returned a Command that its own validate judges .invalid (slot {d}) — the composite must self-validate (§8.5); the node goes inert (DriverFault) instead of balloting a value every peer would reject.";
 
 /// The typed node (§8.5, §11.2): a comptime adapter that compiles `App` into
 /// the frozen §8.2 `Driver` and a §8.5 delivery hook over the bytes-level
@@ -530,8 +566,16 @@ pub fn AppNode(comptime App: type) type {
         /// true when `apply` uses the large-state shape `fn (*State, Command) void`.
         pub const apply_in_place = @TypeOf(App.apply) == fn (*State, Command) void;
         /// Every `node.Options` field except `driver` and `delivery`
-        /// (same types, same defaults; comptime parity-checked).
-        pub const Options = OptionsMirror;
+        /// (same types, same defaults; comptime parity-checked). Reified
+        /// here so its `@typeName` is this public path (see
+        /// `mirrorOptionFields`).
+        pub const Options = blk: {
+            const f = mirrorOptionFields();
+            break :blk @Struct(.auto, null, f.names, f.types, f.attrs);
+        };
+        comptime {
+            checkOptionsParity(Options);
+        }
         pub const WaitOptions = node.Node.WaitOptions;
         /// One applied slot: the value copy of `State` taken on the engine
         /// thread right after `apply`.
@@ -564,6 +608,11 @@ pub fn AppNode(comptime App: type) type {
         head: usize = 0,
         closed: bool = false,
         halt_err: ?anyerror = null,
+        /// Threads currently inside `waitApplied` (under `mu`). `deinit`
+        /// wakes them and then waits on `drained` for this to reach zero
+        /// BEFORE freeing, so a woken waiter never re-locks a freed `mu`.
+        waiters: usize = 0,
+        drained: std.Io.Condition = .init,
 
         fn initialState() State {
             if (@hasDecl(App, "initialState")) return App.initialState();
@@ -666,12 +715,17 @@ pub fn AppNode(comptime App: type) type {
         }
 
         /// Stop the node (joins the engine thread — no hook call can be in
-        /// flight afterwards), wake `waitApplied` callers with null, free.
+        /// flight afterwards), wake `waitApplied` callers with null, wait
+        /// for every one of them to leave `waitApplied`, then free. A thread
+        /// may therefore be parked in `waitApplied` when `deinit` runs; it
+        /// must not call anything on the adapter after `waitApplied` returns
+        /// null.
         pub fn deinit(self: *Self) void {
             if (self.n) |n| n.deinit();
             self.mu.lockUncancelable(self.io);
             self.closed = true;
             self.cond.broadcast(self.io);
+            while (self.waiters > 0) self.drained.waitUncancelable(self.io, &self.mu);
             self.mu.unlock(self.io);
             const gpa = self.gpa;
             self.queue.deinit(gpa);
@@ -703,6 +757,11 @@ pub fn AppNode(comptime App: type) type {
         pub fn waitApplied(self: *Self, wopts: WaitOptions) WaitError!?Applied {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
+            self.waiters += 1;
+            defer { // runs before the unlock above (reverse order)
+                self.waiters -= 1;
+                if (self.waiters == 0) self.drained.signal(self.io);
+            }
             while (self.head >= self.queue.items.len and !self.closed) {
                 if (wopts.timeout_ms) |ms| {
                     self.cond.waitTimeout(self.io, &self.mu, node.msTimeout(ms)) catch return null;
@@ -763,7 +822,6 @@ pub fn AppNode(comptime App: type) type {
         }
 
         fn driverCombine(ctx: *anyopaque, slot: u64, candidates: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) DriverError!void {
-            _ = slot;
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (candidates.len == 0) return error.DriverFault;
             if (comptime @hasDecl(App, "combine")) {
@@ -779,10 +837,26 @@ pub fn AppNode(comptime App: type) type {
                 }
                 if (n == 0) return error.DriverFault;
                 const best = App.combine(self.state, cmds[0..n]);
+                // §8.5: the composite must self-validate. A `.invalid`
+                // composite would be balloted by this node and rejected by
+                // every peer — a silent stall with only `insane` counters as
+                // evidence — so it is the contract violation DriverFault is
+                // for (docs/determinism.md §6). `.maybe_valid` stays legal:
+                // a node behind on State cannot judge what it combines.
+                if (App.validate(self.state, best) == .invalid) {
+                    if (self.created.load(.acquire)) log.err(bad_composite_fmt, .{ @typeName(App), slot });
+                    return error.DriverFault;
+                }
                 if (comptime codec.is_custom) {
-                    try out.resize(gpa, max_encoded_bytes);
-                    const written = codec.encode(best, out.items);
-                    out.shrinkRetainingCapacity(written.len);
+                    // Ship the slice `encode` RETURNS (what `propose` sends),
+                    // not a prefix of the scratch: an encoder may return a
+                    // window of `buf` or static storage. Sized to the frozen
+                    // cap like `propose`'s scratch.
+                    const scratch = try gpa.alloc(u8, max_encoded_bytes);
+                    defer gpa.free(scratch);
+                    const written = codec.encode(best, scratch);
+                    out.clearRetainingCapacity();
+                    try out.appendSlice(gpa, written);
                 } else {
                     try out.resize(gpa, codec.size);
                     const written = codec.encode(best, out.items);
@@ -1847,4 +1921,259 @@ test "AppNode.create: OutOfMemory writes its own message into a reused Diagnosti
     }));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "STALE") == null);
     try testing.expect(std.mem.indexOf(u8, diag.message(), "out of memory") != null);
+}
+
+// -- deinit vs. a parked waiter (S8 review, D4/D13) ----------------------------
+
+/// A thread parked in `waitApplied` until `deinit` wakes it; records what it
+/// got back.
+const DeinitWaiter = struct {
+    n: *CounterNode,
+    timeout_ms: ?u64,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_null: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *DeinitWaiter) void {
+        const r = self.n.waitApplied(.{ .timeout_ms = self.timeout_ms }) catch null;
+        self.saw_null.store(r == null, .release);
+        self.done.store(true, .release);
+    }
+};
+
+// Non-vacuity: reverting `deinit` to broadcast-then-free (no `waiters`
+// drain) lets the woken waiter re-lock `mu` inside the freed adapter: it
+// never returns (`WaiterHungAfterDeinit` after the 2 s poll) and the testing
+// allocator reports a write after free at teardown. Both the untimed and the
+// timed wait paths park on `cond`, so both are driven.
+test "deinit while another thread is parked in waitApplied: the waiter returns null before the adapter is freed (untimed and timed waits)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const timeouts = [_]?u64{ null, 30_000, null, 30_000 };
+    for (timeouts) |timeout_ms| {
+        const n = try CounterNode.createDetached(gpa, io, 4096);
+        var w: DeinitWaiter = .{ .n = n, .timeout_ms = timeout_ms };
+        const t = try std.Thread.spawn(.{}, DeinitWaiter.run, .{&w});
+        // Let the waiter park (an early deinit is still a valid run).
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+        n.deinit();
+        var waited_ms: u64 = 0;
+        while (!w.done.load(.acquire) and waited_ms < 2000) : (waited_ms += 10) {
+            try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+        }
+        if (!w.done.load(.acquire)) {
+            std.debug.print("\ndeinit/waitApplied(timeout_ms={?d}): waiter never returned 2 s after deinit (parked on the freed mutex)\n", .{timeout_ms});
+            return error.WaiterHungAfterDeinit; // parked for good: it cannot be joined
+        }
+        t.join();
+        try testing.expect(w.saw_null.load(.acquire));
+    }
+}
+
+// -- combine result must self-validate (S8 review, D1) --------------------------
+
+/// The README Counter with a `combine` that violates the §8.5 contract: its
+/// result never self-validates (`{next=0}` is `.invalid` for every State).
+const BadCombine = struct {
+    pub const State = Counter.State;
+    pub const Command = Counter.Command;
+    pub const validate = Counter.validate;
+    pub const apply = Counter.apply;
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        _ = cmds;
+        return .{ .next = 0 };
+    }
+};
+
+/// A lagging node's combine: the composite is ahead of this node's State,
+/// so `validate` says `.maybe_valid` — legitimate, never a fault.
+const AheadCombine = struct {
+    pub const State = Counter.State;
+    pub const Command = Counter.Command;
+    pub const validate = Counter.validate;
+    pub const apply = Counter.apply;
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        _ = cmds;
+        return .{ .next = 5 };
+    }
+};
+
+// Non-vacuity: dropping the `App.validate(self.state, best)` check in
+// `driverCombine` (the shipped M6 code) encodes `{next=0}` and returns
+// success — every peer then rejects the composite as `.invalid` and the
+// network stalls with only `insane` counters as evidence; treating
+// `.maybe_valid` as a fault fails the AheadCombine arm.
+test "driverCombine: a composite that self-validates .invalid is DriverFault, .maybe_valid (lagging node) is not" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var b1: [8]u8 = undefined;
+    const cands = [_][]const u8{CounterNode.codec.encode(.{ .next = 1 }, &b1)};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    const BadNode = AppNode(BadCombine);
+    const bad = try BadNode.createDetached(gpa, io, 4096);
+    defer bad.deinit();
+    const bd = bad.driver();
+    try testing.expectError(error.DriverFault, bd.combine_candidates(bd.ctx, 1, &cands, gpa, &out));
+
+    const AheadNode = AppNode(AheadCombine);
+    const ahead = try AheadNode.createDetached(gpa, io, 4096);
+    defer ahead.deinit();
+    const ad = ahead.driver();
+    out.clearRetainingCapacity();
+    try ad.combine_candidates(ad.ctx, 1, &cands, gpa, &out);
+    try testing.expectEqual(@as(u64, 5), CounterNode.codec.decode(out.items).?.next);
+    try testing.expectEqual(Validity.maybe_valid, ad.validate_value(ad.ctx, 1, out.items, false));
+}
+
+// -- custom encode: propose and combine trust the same bytes (S8 review, D3) ---
+
+/// A custom codec whose `encode` returns a slice into static storage and
+/// ignores `buf` entirely.
+const StaticEncode = struct {
+    pub const State = struct { k: u8 = 0 };
+    pub const Command = struct { k: u8 };
+    const table = [_][2]u8{ "aa".*, "bb".*, "cc".* };
+    pub fn validate(state: State, cmd: Command) Validity {
+        _ = state;
+        return if (cmd.k < 3) .valid else .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        _ = state;
+        return .{ .k = cmd.k };
+    }
+    pub fn encode(cmd: Command, buf: []u8) []u8 {
+        _ = buf;
+        return @constCast(&table[cmd.k]);
+    }
+    pub fn decode(bytes: []const u8) ?Command {
+        if (bytes.len != 2 or bytes[0] != bytes[1] or bytes[0] < 'a' or bytes[0] > 'c') return null;
+        return .{ .k = bytes[0] - 'a' };
+    }
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        var best = cmds[0];
+        for (cmds[1..]) |c| if (c.k > best.k) {
+            best = c;
+        };
+        return best;
+    }
+};
+
+/// A custom codec whose `encode` writes a marker at `buf[0]` and returns
+/// the window `buf[1..3]` (not a prefix of `buf`).
+const OffsetEncode = struct {
+    pub const State = StaticEncode.State;
+    pub const Command = StaticEncode.Command;
+    pub const validate = StaticEncode.validate;
+    pub const apply = StaticEncode.apply;
+    pub const decode = StaticEncode.decode;
+    pub const combine = StaticEncode.combine;
+    pub fn encode(cmd: Command, buf: []u8) []u8 {
+        buf[0] = 0xEE;
+        buf[1] = 'a' + cmd.k;
+        buf[2] = 'a' + cmd.k;
+        return buf[1..3];
+    }
+};
+
+fn combineBytesOf(comptime N: type, gpa: std.mem.Allocator, io: std.Io, cands: []const []const u8, out: *std.ArrayList(u8)) !void {
+    const n = try N.createDetached(gpa, io, 4096);
+    defer n.deinit();
+    const d = n.driver();
+    out.clearRetainingCapacity();
+    try d.combine_candidates(d.ctx, 1, cands, gpa, out);
+}
+
+// Non-vacuity: shipping `out.items[0..written.len]` instead of the slice
+// `encode` returned (the M6 code) makes the static-storage app's composite
+// the scratch buffer's uninitialized bytes (0xAA 0xAA under the testing
+// allocator) and the offset app's `EE 63` — while `propose` sends "cc" for
+// the same winning command.
+test "custom encode: driverCombine ships the slice encode returns, byte-equal to what propose sends, for static-storage and non-prefix encoders" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const cands = [_][]const u8{ "aa", "cc", "bb" };
+
+    const SN = AppNode(StaticEncode);
+    var sbuf: [8]u8 = undefined;
+    const s_propose = SN.codec.encode(.{ .k = 2 }, &sbuf);
+    try testing.expectEqualSlices(u8, "cc", s_propose);
+    try combineBytesOf(SN, gpa, io, &cands, &out);
+    try testing.expectEqualSlices(u8, s_propose, out.items);
+
+    const ON = AppNode(OffsetEncode);
+    var obuf: [8]u8 = undefined;
+    const o_propose = ON.codec.encode(.{ .k = 2 }, &obuf);
+    try testing.expectEqualSlices(u8, "cc", o_propose);
+    try combineBytesOf(ON, gpa, io, &cands, &out);
+    try testing.expectEqualSlices(u8, o_propose, out.items);
+}
+
+// -- per-leaf exhaustive canonicality (S8 review, D3) --------------------------
+
+/// Every byte string of `Codec(struct { x: T }).size` bytes (≤ 2, so the
+/// space is enumerable) either fails to decode or re-encodes byte-identically,
+/// and exactly `cardinality` of them decode — one spelling per value, no
+/// spelling for anything else.
+fn probeExhaustive(comptime T: type, comptime cardinality: usize) !void {
+    const C = Codec(struct { x: T });
+    comptime std.debug.assert(C.size <= 2);
+    const total: usize = @as(usize, 1) << @intCast(8 * C.size);
+    var accepted: usize = 0;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, @intCast(i), .big);
+        const in = bytes[2 - C.size ..];
+        if (C.decode(in)) |v| {
+            accepted += 1;
+            var re: [2]u8 = undefined;
+            const out = C.encode(v, re[0..C.size]);
+            if (!std.mem.eql(u8, in, out)) {
+                std.debug.print("\n{s}: bytes {x} decode -> re-encode {x} (non-canonical spelling accepted)\n", .{ @typeName(T), in, out });
+                return error.NonCanonicalAccepted;
+            }
+        }
+    }
+    try testing.expectEqual(cardinality, accepted);
+}
+
+// Non-vacuity: replacing `std.math.cast` in decodeInt's SIGNED arm with a
+// `@truncate` (the arm no other test reaches: Kitchen/Cmd carry only
+// byte-multiple signed ints, where the cast is a no-op) makes i1 accept
+// 0x02 as 0, i3 accept 0x08, i9 0x0200, i12 0x1000 and enum(i4) 0x10 — every
+// one a second spelling of an in-range value, the malleability §8.5 forbids;
+// the unsigned controls (u3, u12) and the byte-multiple ones (i8, i16) pass
+// under that ablation, which is why the signed sub-byte leaves are listed
+// explicitly. The cardinality check catches a decoder that rejects too much.
+test "codec exhaustive per-leaf canonicality: i1, i3, u3, i8, i9, i12, u12, i16, bool, enum(u2), enum(i4)" {
+    try probeExhaustive(i1, 2);
+    try probeExhaustive(i3, 8);
+    try probeExhaustive(u3, 8);
+    try probeExhaustive(i8, 256);
+    try probeExhaustive(i9, 512);
+    try probeExhaustive(i12, 4096);
+    try probeExhaustive(u12, 4096);
+    try probeExhaustive(i16, 65536);
+    try probeExhaustive(bool, 2);
+    try probeExhaustive(enum(u2) { a, b, c }, 3);
+    try probeExhaustive(enum(i4) { lo = -8, zero = 0, hi = 7 }, 3);
+}
+
+// -- Options is spelled by its public path (S8 review, D10) --------------------
+
+// Non-vacuity: reifying the mirror inside a private helper (`fn
+// MirrorOptions() type { ... @Struct(...) }`, the M6 code) spells the type
+// `node.app_node.MirrorOptions.Mirror` — a private name the Stable API
+// snapshot then pins on the `create` line, so renaming that helper is a
+// "breaking change" with no consumer-visible effect.
+test "AppNode(App).Options: @typeName is the public AppNode(...) path, not a private helper's" {
+    const name = @typeName(CounterNode.Options);
+    try testing.expect(std.mem.indexOf(u8, name, "AppNode(") != null);
+    try testing.expect(std.mem.indexOf(u8, name, "Mirror") == null);
 }

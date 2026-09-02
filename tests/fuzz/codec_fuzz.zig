@@ -25,9 +25,11 @@ const Color = enum(u8) { red, green, blue };
 /// `.neg` spells 0x7B, so an all-zero byte (-128) names no variant.
 const Sign = enum(i8) { neg = -5, zero = 0, pos = 5 };
 
-/// Same leaf coverage as app_node.zig's Kitchen: sub-byte int, signed wide
-/// int, bool, unsigned-tag enum, fixed array, nested struct, signed-tag
-/// enum. Encoded size 23.
+/// app_node.zig's Kitchen leaves (sub-byte int, signed wide int, bool, enum,
+/// fixed array, nested struct) plus two SIGNED non-byte-multiple ints
+/// (`sb: i3`, `sw: i12`) so the sign-bit-biased cast in decodeInt's signed
+/// arm is fuzzed, not only the unsigned one, and a signed-tag enum (its own
+/// codec arm; kept LAST so `minimum` below spells its tag). Encoded size 26.
 const Cmd = struct {
     a: i8,
     b: u3,
@@ -36,6 +38,8 @@ const Cmd = struct {
     e: Color,
     f: [3]u16,
     g: struct { h: u16, i: i16 },
+    sb: i3,
+    sw: i12,
     s: Sign,
 };
 const C = slcp.Codec(Cmd);
@@ -80,7 +84,7 @@ fn fuzzCodecOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 const zeros: [C.size]u8 = @splat(0);
 const ones: [C.size]u8 = @splat(0xff);
-/// Canonical encoding of the all-minimum value: 22 zero bytes, then 0x7B
+/// Canonical encoding of the all-minimum value: 25 zero bytes, then 0x7B
 /// (the biased spelling of `Sign.neg`). The all-zero buffer itself decodes
 /// to null (its last byte unbiases to -128, which names no variant).
 const minimum: [C.size]u8 = @as([C.size - 1]u8, @splat(0)) ++ [_]u8{0x7B};
@@ -99,7 +103,7 @@ const codec_corpus = [_][]const u8{
 };
 
 // Non-vacuity: a decoder without the exact-length check fails (1) on the
-// corpus's 22/24-byte entries; a `@enumFromInt` decode fails (2) on any
+// corpus's 25/27-byte entries; a `@enumFromInt` decode fails (2) on any
 // chunk with tag byte >= 3; encoding the signed tag as its raw unsigned
 // bits (the S1b bug) fails (3) on consecutive chunks that differ only in
 // `s` — the smoke's shape 2 produces those on purpose.

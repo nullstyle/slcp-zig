@@ -53,4 +53,6 @@ pub const cases = [_]Case{
     .{ .stem = "err_unsupported_type", .needle = ", which the auto-codec does not cover. Provide your own encode/decode.", .src = ", which the auto-codec does not cover. Provide your own encode/decode." },
     .{ .stem = "err_zero_size_command", .needle = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field.", .src = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field." },
     .{ .stem = "err_oversized_command", .needle = " bytes, above the frozen 65536-byte value cap (§4.5).", .src = " bytes, above the frozen {d}-byte value cap (§4.5)." },
+    .{ .stem = "err_wide_int", .needle = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode.", .src = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." },
+    .{ .stem = "err_comptime_field", .needle = "` is a comptime field — it has one fixed value and no wire representation.", .src = "` is a comptime field — it has one fixed value and no wire representation." },
 };

@@ -145,7 +145,8 @@ Ship one artifact and follow `docs/driver-upgrade.md` §5.
 | Same externalized bytes everywhere, but `State` differs between nodes | nondeterministic `apply`, or something else writing `State` (rules 6, 9) |
 | Network **halts** after a restart with a flood of `.invalid` verdicts | ops instead of values (rule 10), or `State` rebuilt from a partial journal — remember `State` is `initialState()` + the replayed tail, not persisted |
 | Node **panics** with `slcp: nondeterministic driver: ...` | `Checked` caught rule 1, 4 or 6 in the act |
-| Node goes **inert** with `EngineFailed` / `DriverFault` | `combine` not total, or `DriverFault` returned for a mere invalid value (rule 7) |
+| Node goes **inert** with `EngineFailed` / `DriverFault` | `combine` not total, or `DriverFault` returned for a mere invalid value (rule 7); under `AppNode`, also a `combine` whose result its own `validate` judges `.invalid` — the log line names the App (`... combine returned a Command that its own validate judges .invalid`) |
+| Network **stalls on the first slot**, no halt, no error log, `insane` rising in every node's `stats()` | a bytes-level `combine` whose composite peers reject as invalid (rule 7): each node ballots a value nobody accepts. `AppNode` turns this into `DriverFault` (row above); a hand-written driver must validate its own composite |
 | `AppNode.create` fails with `UndecodableExternalizedValue` | `Command` layout changed under an existing `data_dir` (`docs/driver-upgrade.md` §5) |
 | Verdicts flip when a peer reconnects or after a long idle | verdict depends on call history or a cache (rule 6); note the engine only asks once per value per slot, so a "second" call is a different slot |
 | Slot rate collapses after adding a feature to `apply` | hot-path work that belongs on the user thread (§3) |

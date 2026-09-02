@@ -13,6 +13,7 @@ slcp.AppNode(Counter).closed: field bool = false
 slcp.AppNode(Counter).codec: struct
 slcp.AppNode(Counter).cond: field Io.Condition = <default>
 slcp.AppNode(Counter).created: field atomic.Value(bool) = <default>
+slcp.AppNode(Counter).drained: field Io.Condition = <default>
 slcp.AppNode(Counter).gpa: field mem.Allocator
 slcp.AppNode(Counter).halt_err: field ?anyerror = null
 slcp.AppNode(Counter).head: field usize = 0
@@ -23,6 +24,7 @@ slcp.AppNode(Counter).n: field ?*node.node.Node = null
 slcp.AppNode(Counter).queue: field array_list.Aligned(node.app_node.AppNode(api_snapshot.Counter).Applied,null) = <default>
 slcp.AppNode(Counter).state: field api_snapshot.Counter.State
 slcp.AppNode(Counter).undecodable: field ?node.app_node.AppNode(api_snapshot.Counter)__struct_* = null
+slcp.AppNode(Counter).waiters: field usize = 0
 slcp.DeliveryHook.ctx: field *anyopaque
 slcp.DeliveryHook.on_externalized: field *const fn (*anyopaque, u64, []const u8) anyerror!void
 slcp.DeliveryHook.on_failed: field *const fn (*anyopaque, anyerror) void
@@ -37,8 +39,10 @@ slcp.Node.eng: field engine.engine.Engine
 slcp.Node.engine_thread: field ?Thread = null
 slcp.Node.ext_closed: field bool = false
 slcp.Node.ext_cond: field Io.Condition = <default>
+slcp.Node.ext_drained: field Io.Condition = <default>
 slcp.Node.ext_mu: field Io.Mutex = <default>
 slcp.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <default>
+slcp.Node.ext_waiters: field usize = 0
 slcp.Node.failed: field atomic.Value(bool) = <default>
 slcp.Node.gpa: field mem.Allocator
 slcp.Node.io: field Io
@@ -1150,8 +1154,10 @@ slcp.node.Node.eng: field engine.engine.Engine
 slcp.node.Node.engine_thread: field ?Thread = null
 slcp.node.Node.ext_closed: field bool = false
 slcp.node.Node.ext_cond: field Io.Condition = <default>
+slcp.node.Node.ext_drained: field Io.Condition = <default>
 slcp.node.Node.ext_mu: field Io.Mutex = <default>
 slcp.node.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <default>
+slcp.node.Node.ext_waiters: field usize = 0
 slcp.node.Node.failed: field atomic.Value(bool) = <default>
 slcp.node.Node.gpa: field mem.Allocator
 slcp.node.Node.io: field Io

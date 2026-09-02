@@ -77,10 +77,15 @@ const App = struct {
   ever sees value copies via `waitApplied(.{ .timeout_ms = ... })`, which
   never hangs (null on timeout / `deinit`, `error.NodeHalted` once the node
   latched inert).
-- Auto-codec types: ints (any width), bool, exhaustive enums, fixed `[N]T`
-  arrays, nested structs. Floats, pointers/slices, optionals, unions and
-  non-exhaustive enums are compile errors that name the rule and the
-  workaround.
+- Auto-codec types: ints (up to 65528 bits), bool, exhaustive enums, fixed
+  `[N]T` arrays, nested structs. Floats, pointers/slices, optionals, unions,
+  non-exhaustive enums and wider ints are compile errors that name the rule
+  and the workaround.
+- **`combine` is checked**: `AppNode` runs `validate(state, result)` on
+  every composite. `.invalid` is a `DriverFault` — the node logs the App name
+  at error level and latches inert instead of balloting a value every peer
+  would reject (a silent stall). `.maybe_valid` is fine: a node behind on
+  `State` cannot judge what it combines.
 - **State is not persisted** (v1 limitation, plan R17): after a restart
   `State = initialState()` + `apply` over the replayed journal tail (the last
   ≥ 16 slots). That is why commands must be full values. An app with delta
@@ -231,8 +236,11 @@ pub fn combine(state: State, cmds: []const Command) Command {
 
 `decode` must be **strict-canonical** — exactly one spelling per command
 (exact length, no slack bytes), or the codec becomes a value-malleability
-source. A custom `encode` that returns zero bytes is `ValueEmpty`; more than
-`max_value_bytes` is `ValueTooLarge` (`propose` errors, not silent drops).
+source. `encode` writes into `buf` (64 KiB, the frozen cap) and returns the
+encoded bytes — normally `buf[0..n]`; the slice it returns is what goes on
+the wire, from `propose` and from `combine` alike. A custom `encode` that
+returns zero bytes is `ValueEmpty`; more than `max_value_bytes` is
+`ValueTooLarge` (`propose` errors, not silent drops).
 
 ### The halt-on-undecodable rule
 
