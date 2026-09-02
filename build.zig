@@ -544,8 +544,9 @@ pub fn build(b: *std.Build) void {
         .{ .stem = "err_unsupported_type", .needle = ", which the auto-codec does not cover. Provide your own encode/decode." },
         .{ .stem = "err_zero_size_command", .needle = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field." },
         .{ .stem = "err_oversized_command", .needle = " bytes, above the frozen 65536-byte value cap (§4.5)." },
+        .{ .stem = "err_wide_int", .needle = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." },
     };
-    comptime std.debug.assert(appnode_error_cases.len == 20);
+    comptime std.debug.assert(appnode_error_cases.len == 21);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
         const obj = b.addObject(.{

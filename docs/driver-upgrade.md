@@ -74,10 +74,10 @@ const App = struct {
   ever sees value copies via `waitApplied(.{ .timeout_ms = ... })`, which
   never hangs (null on timeout / `deinit`, `error.NodeHalted` once the node
   latched inert).
-- Auto-codec types: ints (any width), bool, exhaustive enums, fixed `[N]T`
-  arrays, nested structs. Floats, pointers/slices, optionals, unions and
-  non-exhaustive enums are compile errors that name the rule and the
-  workaround.
+- Auto-codec types: ints (up to 65528 bits), bool, exhaustive enums, fixed
+  `[N]T` arrays, nested structs. Floats, pointers/slices, optionals, unions,
+  non-exhaustive enums and wider ints are compile errors that name the rule
+  and the workaround.
 - **`combine` is checked**: `AppNode` runs `validate(state, result)` on
   every composite. `.invalid` is a `DriverFault` — the node logs the App name
   at error level and latches inert instead of balloting a value every peer

@@ -16,10 +16,11 @@
 //! comptime — fields in declaration order, big-endian, signed ints
 //! sign-bit-biased — so BYTE ORDER EQUALS NUMERIC ORDER and the §8.4 default
 //! combine (lexicographic max, "highest proposal wins") is semantically
-//! correct over auto-encoded commands. Allowed: ints (any width, rounded up
-//! to whole bytes), bool, exhaustive enums, fixed `[N]T` arrays, nested
-//! structs. Rejected at comptime with the rule spelled out: floats,
-//! pointers/slices, optionals, unions, non-exhaustive enums, anything else.
+//! correct over auto-encoded commands. Allowed: ints (up to 65528 bits,
+//! rounded up to whole bytes), bool, exhaustive enums, fixed `[N]T` arrays,
+//! nested structs. Rejected at comptime with the rule spelled out: floats,
+//! pointers/slices, optionals, unions, non-exhaustive enums, wider ints,
+//! anything else.
 //! Decode is strict-canonical (exact length, no non-canonical high bits,
 //! bool ∈ {0,1}, enum tag must name a variant) so the codec cannot become a
 //! value-malleability source.
@@ -48,8 +49,22 @@ pub const max_encoded_bytes: usize = core.limits.frozen_max_value_bytes_cap;
 // Auto-codec internals
 // ---------------------------------------------------------------------------
 
+/// The widest integer the auto-codec encodes: 65535 is a legal Zig width,
+/// but its whole-byte rounding (65536) is not representable by `@Int`'s
+/// `u16` bit count. `checkEncodable` rejects wider ints with a teaching
+/// error instead of letting `ceilToByteBits` overflow.
+const max_int_bits: u16 = 65528;
+
 fn ceilToByteBits(comptime bits: u16) u16 {
+    comptime std.debug.assert(bits <= max_int_bits);
     return ((bits + 7) / 8) * 8;
+}
+
+fn checkIntWidth(comptime T: type, comptime bits: u16, comptime path: []const u8) void {
+    if (bits > max_int_bits)
+        @compileError("slcp auto-codec: `" ++ path ++ "` (" ++ @typeName(T) ++ ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." ++
+            "\n  Split the field into narrower ints, or provide your own encode/decode." ++
+            "\n  (A single field this wide is 8 KiB of value bytes; commands are VALUES the network agrees on, not payloads.)");
 }
 
 fn unsupportedType(comptime T: type, comptime path: []const u8) noreturn {
@@ -63,9 +78,10 @@ fn unsupportedType(comptime T: type, comptime path: []const u8) noreturn {
 /// Every rejection message teaches the rule it enforces.
 fn checkEncodable(comptime T: type, comptime path: []const u8) void {
     switch (@typeInfo(T)) {
-        .int => {},
+        .int => |i| checkIntWidth(T, i.bits, path),
         .bool => {},
         .@"enum" => |e| {
+            checkIntWidth(e.tag_type, @typeInfo(e.tag_type).int.bits, path);
             if (e.mode == .nonexhaustive)
                 @compileError("slcp auto-codec: `" ++ path ++ "` is a non-exhaustive enum (" ++ @typeName(T) ++
                     ") — `_` admits every tag value, so there is no single canonical spelling; make the enum exhaustive." ++
