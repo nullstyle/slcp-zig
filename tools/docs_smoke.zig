@@ -132,7 +132,18 @@ pub const forbidden_needles = [_][]const u8{
     "slcp keygen",
     "key create",
     "double-appl",
+    // S8 finding "'A brand-new symbol can never be frozen by accident' is
+    // false under prefix rules": a new `pub` under any `p()` subtree IS
+    // Stable with no new rule (only `check-api`'s red guards it).
+    "frozen by accident",
 };
+/// docs/stability.md AND the tool's module doc (tools/api_snapshot.zig) must
+/// state the tiering rule as it actually behaves: a new declaration under a
+/// `p()` prefix rule is frozen the moment it is committed.
+pub const tier_claim_needles = [_][]const u8{
+    "is Stable the moment it is committed",
+};
+pub const tier_claim_files = [_][]const u8{ "docs/stability.md", "tools/api_snapshot.zig" };
 /// Phrases that must appear in NO active doc, matched across line wraps
 /// (`findWrappedPhrase`: each space matches any whitespace run).
 /// `qset.lint`'s threshold checks (`sub_majority_threshold`,
@@ -1020,6 +1031,12 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             rep.checkFmt(hits.len >= 1, "docs/quorum-recipes.md", 0, "carries at least one `N-of-{{…}}` label", .{}, "found none", .{});
             for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, expect), "docs/quorum-recipes.md", h.line, "label `{s}-of-{{…}}` has the vector's top-level threshold", .{h.version}, "vectors/lint.json `{s}` has threshold {d}", .{ nested_variant_case, sh.threshold });
         }
+    }
+
+    // ---- (9b) the tiering claim, in the doc and in the tool's own header ----
+    for (tier_claim_files) |p| {
+        const text = readFile(arena, io, p) catch "";
+        for (tier_claim_needles) |n| rep.checkFmt(std.mem.indexOf(u8, text, n) != null, p, 0, "contains `{s}`", .{n}, "the prefix-rule freezing statement is missing", .{});
     }
 
     // ---- (10) version needles ----

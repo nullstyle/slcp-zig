@@ -12,8 +12,18 @@ contract the `0.1.x` line keeps. Changing a Stable line is a breaking change
 
 Every `pub` declaration reachable from the `slcp` module is in exactly one of
 two tiers. The categorizer is `stable_rules` in `tools/api_snapshot.zig`; it
-**defaults every path to Experimental**, so a brand-new symbol can never be
-frozen by accident — only by a deliberate rule.
+**defaults every path to Experimental**, so a brand-new symbol *outside* every
+`p()` subtree lands in the Experimental file until someone writes a rule for
+it. The default does **not** protect additions *inside* a prefix rule: a new
+`pub` declaration under a `p()` subtree — a function added to
+`slcp.core.quorum`, a field added to `node.Options`, a member added to
+`Codec(Counter.Command)` — matches the existing rule and
+**is Stable the moment it is committed**, with no new rule and nothing else
+flagging it. The only guard is that `check-api` goes red until
+`docs/api-snapshot.txt` is regenerated; the tool reports such a line as
+`NEW Stable line` and asks whether freezing it is intended. Review every
+added Stable line as a promotion (see "Promoting a symbol"), never as a
+refresh chore.
 
 | Tier | File | Gate |
 |---|---|---|
@@ -218,6 +228,12 @@ Platform-dependent spellings of the same std type are canonicalized by
 Stable file is byte-identical across the matrix.
 
 ## Promoting a symbol
+
+**Additions under an existing prefix rule need no step 1** — they are already
+Stable (see "The two tiers"). `check-api` reports them as `NEW Stable line`;
+apply steps 2 and 3 to them exactly as to a new rule, and if the addition was
+not meant to be frozen, either move it out of the subtree or hold it out with
+an `experimental_overrides` entry, with a comment saying why.
 
 1. Add a rule to `stable_rules` — `p("path")` to freeze a subtree,
    `e("path")` for one symbol — with a comment saying *why* the shape is a
