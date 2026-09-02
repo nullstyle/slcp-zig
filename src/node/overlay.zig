@@ -37,7 +37,13 @@
 //!   * One dialer thread per configured peer (`dialerLoop`) owns exactly one
 //!     outbound connection at a time and reconnects with exponential backoff
 //!     (1s→60s) plus deterministic per-peer jitter (Wyhash over the attempt
-//!     counter — no wall clock, no RNG).
+//!     counter — no wall clock, no RNG). The connect itself is NOT std's
+//!     blocking `IpAddress.connect`: `connectInterruptible` runs a
+//!     non-blocking connect(2) under a `poll` loop that re-checks `stopping`
+//!     every `dial_poll_slice_ms`, so a peer that black-holes SYNs (down,
+//!     firewalled, not up yet) can never hold `stop()` for the kernel's
+//!     SYN-retry timeout (~75 s macOS / ~2 min Linux). Hostnames go through
+//!     `HostName.lookup` and then the same dial, address by address.
 //!   * Every connection, inbound or outbound, runs `runConnection`: register
 //!     the `Conn`, send OUR Hello first, read the peer's first frame and
 //!     require a matching Hello, then start the writer, assign a stable
@@ -64,7 +70,8 @@
 //!     bytes cannot renew the window on every read. Once the Hello exchange
 //!     completes the conn reads untimed again through `Conn.read`.
 //!
-//! Shutdown (`stop`, idempotent): flip `stopping`, wake the dialers' backoff
+//! Shutdown (`stop`, idempotent): flip `stopping` (a dialer mid-connect sees
+//! it within one poll slice and abandons the dial), wake the dialers' backoff
 //! condvar, wake the accept thread WITHOUT invalidating the listener fd
 //! (netShutdown per `Server.accept`'s documented cancellation contract, plus
 //! a loopback self-connect for OSes where shutting down a listening socket is
@@ -144,6 +151,10 @@ var handshake_deadline: std.Io.Timeout = handshake_timeout_s;
 const max_budget_strikes: u32 = 32;
 /// Upper bound on the backoff-window exponent (1s<<6 = 64s, capped to 60s).
 const max_backoff_shift: u6 = 6;
+/// How often a dialer parked in a non-blocking connect re-checks `stopping`
+/// (the poll slice). Bounds the extra latency `stop()` pays for a dialer
+/// whose peer black-holes SYNs — see `connectInterruptible`.
+const dial_poll_slice_ms: i32 = 200;
 
 pub const RecvFn = *const fn (ctx: ?*anyopaque, peer_id: usize, frame: *const wire.OverlayFrame) void;
 pub const PeerEventFn = *const fn (ctx: ?*anyopaque, peer_id: usize) void;
@@ -637,11 +648,14 @@ pub const Overlay = struct {
     }
 
     /// One dial attempt. An IP literal connects directly; anything else is a
-    /// hostname resolved through `std.Io.net.HostName.connect` (the Io's
-    /// resolver: /etc/hosts + DNS under Threaded), so `a.example.com:7311`
-    /// and `localhost:7311` both work (§9 peer specs). `failures` is the
-    /// consecutive-failure count: the unreachable warning fires on the first
-    /// failure and every 8th thereafter, not on every 1..60 s retry.
+    /// hostname resolved through `std.Io.net.HostName.lookup` (the Io's
+    /// resolver: /etc/hosts + DNS under Threaded) and each address is dialed
+    /// in turn, so `a.example.com:7311` and `localhost:7311` both work (§9
+    /// peer specs). Every connect goes through `connectInterruptible`, never
+    /// a blocking connect(2), so `stop()` is never held for the kernel's
+    /// SYN-retry timeout. `failures` is the consecutive-failure count: the
+    /// unreachable warning fires on the first failure and every 8th
+    /// thereafter, not on every 1..60 s retry.
     fn dialOne(self: *Overlay, spec: []const u8, failures: u64) ?*Conn {
         const hp = parseHostPort(spec) catch {
             log.warn("overlay: bad peer spec '{s}'", .{spec});
@@ -650,8 +664,8 @@ pub const Overlay = struct {
         const stream = blk: {
             if (net.IpAddress.parse(hp.host, hp.port)) |parsed| {
                 var addr = parsed;
-                break :blk net.IpAddress.connect(&addr, self.io, .{ .mode = .stream }) catch |err| {
-                    warnUnreachable(spec, failures, err);
+                break :blk self.connectInterruptible(&addr) catch |err| {
+                    if (err != error.Stopping) warnUnreachable(spec, failures, err);
                     return null;
                 };
             } else |_| {
@@ -659,14 +673,153 @@ pub const Overlay = struct {
                     log.warn("overlay: cannot parse peer address '{s}'", .{spec});
                     return null;
                 };
-                break :blk hn.connect(self.io, hp.port, .{ .mode = .stream }) catch |err| {
-                    warnUnreachable(spec, failures, err);
+                break :blk self.connectHostName(hn, hp.port) catch |err| {
+                    if (err != error.Stopping) warnUnreachable(spec, failures, err);
                     return null;
                 };
             }
         };
         setTcpNoDelay(stream.socket.handle);
         return self.makeConn(stream, true);
+    }
+
+    const DialError = error{
+        /// `stop()` was called while the connect was in flight.
+        Stopping,
+        AddressUnavailable,
+        AddressFamilyUnsupported,
+        ConnectionRefused,
+        ConnectionResetByPeer,
+        HostUnreachable,
+        NetworkUnreachable,
+        NetworkDown,
+        Timeout,
+        AccessDenied,
+        ProcessFdQuotaExceeded,
+        SystemFdQuotaExceeded,
+        SystemResources,
+        Unexpected,
+    };
+
+    /// Resolve `hn` and dial its addresses one by one through
+    /// `connectInterruptible`; the first success wins. Lookup errors
+    /// (`UnknownHostName`, ...) surface as-is so the unreachable warning
+    /// still names them.
+    fn connectHostName(self: *Overlay, hn: net.HostName, port: u16) (DialError || net.HostName.LookupError)!net.Stream {
+        var canonical: [net.HostName.max_len]u8 = undefined;
+        var results: [32]net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&results);
+        // Synchronous under Io.Threaded: closes the queue before returning,
+        // and with capacity >= 16 never blocks on the consumer (std's own
+        // `connectMany` uses the same 32-entry buffer).
+        try hn.lookup(self.io, &queue, .{ .port = port, .canonical_name_buffer = &canonical });
+        var last: ?DialError = null;
+        while (queue.getOneUncancelable(self.io)) |result| switch (result) {
+            .address => |resolved| {
+                var addr = resolved;
+                return self.connectInterruptible(&addr) catch |err| switch (err) {
+                    error.Stopping => return err,
+                    else => {
+                        last = err;
+                        continue;
+                    },
+                };
+            },
+            .canonical_name => continue,
+        } else |err| switch (err) {
+            error.Closed => {},
+        }
+        return last orelse error.NoAddressReturned;
+    }
+
+    /// Connect to `addr` WITHOUT parking this thread in a blocking
+    /// connect(2): non-blocking socket + connect, then a `poll` loop in
+    /// `dial_poll_slice_ms` slices that re-checks `stopping`, so `stop()`
+    /// (and therefore `Node.deinit`) never waits for the kernel's SYN-retry
+    /// timeout (~75 s on macOS, ~2 min on Linux) on a configured peer that
+    /// black-holes SYNs — the normal state of a peer that is not up yet.
+    /// std's own `ConnectOptions.timeout` is `@panic("TODO ...")` on this
+    /// toolchain, hence the hand-rolled dial over `std.posix`. The fd is
+    /// handed back blocking and wrapped in a `net.Stream`, after which the
+    /// Io vtable drives it exactly like an accepted socket. (`Stream.socket
+    /// .address` carries the REMOTE address here; nothing reads it for an
+    /// outbound conn.) The SYN keeps being retried while we poll, so a peer
+    /// that comes up mid-attempt still connects on this attempt.
+    fn connectInterruptible(self: *Overlay, addr: *const net.IpAddress) DialError!net.Stream {
+        const posix = std.posix;
+        const Threaded = std.Io.Threaded;
+
+        const family = Threaded.posixAddressFamily(addr);
+        const sock_flags: u32 = posix.SOCK.STREAM | (if (Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC);
+        const sock_rc = posix.system.socket(family, sock_flags, posix.IPPROTO.TCP);
+        const fd: posix.fd_t = switch (posix.errno(sock_rc)) {
+            .SUCCESS => @intCast(sock_rc),
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        };
+        errdefer Threaded.closeFd(fd);
+        if (Threaded.socket_flags_unsupported) {
+            _ = posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC));
+        }
+
+        // Non-blocking for the connect only; the original flags are restored
+        // before the fd is handed to the reader/writer threads.
+        const getfl_rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        if (posix.errno(getfl_rc) != .SUCCESS) return error.Unexpected;
+        const flags: u32 = @intCast(getfl_rc);
+        const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+        if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, flags | nonblock))) != .SUCCESS) return error.Unexpected;
+
+        var storage: Threaded.PosixAddress = undefined;
+        const addr_len = Threaded.addressToPosix(addr, &storage);
+        var connected = switch (posix.errno(posix.system.connect(fd, &storage.any, addr_len))) {
+            .SUCCESS => true,
+            // The handshake continues in the kernel; poll for the outcome.
+            .INPROGRESS, .INTR => false,
+            else => |e| return connectErrnoToError(e),
+        };
+        while (!connected) {
+            if (self.stopping.load(.acquire)) return error.Stopping;
+            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.poll(&fds, dial_poll_slice_ms) catch return error.Unexpected;
+            if (ready == 0) continue; // slice elapsed: re-check `stopping`
+            // Writable or errored: the connect's outcome is in SO_ERROR.
+            var so_err: c_int = 0;
+            var so_len: posix.socklen_t = @sizeOf(c_int);
+            if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len)) != .SUCCESS) {
+                return error.Unexpected;
+            }
+            if (so_err != 0) {
+                const code = std.math.cast(u16, so_err) orelse return error.Unexpected;
+                return connectErrnoToError(@fromBackingInt(@intCast(code)));
+            }
+            connected = true;
+        }
+
+        if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, flags))) != .SUCCESS) return error.Unexpected;
+        return .{ .socket = .{ .handle = fd, .address = addr.* } };
+    }
+
+    /// The connect(2) errno table, mirroring std's `posixConnect` so the
+    /// unreachable warning keeps naming the same errors (`ConnectionRefused`,
+    /// `Timeout`, ...) the docs quote.
+    fn connectErrnoToError(e: std.posix.E) DialError {
+        return switch (e) {
+            .ADDRNOTAVAIL => error.AddressUnavailable,
+            .AFNOSUPPORT => error.AddressFamilyUnsupported,
+            .CONNREFUSED => error.ConnectionRefused,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .HOSTUNREACH => error.HostUnreachable,
+            .NETUNREACH => error.NetworkUnreachable,
+            .NETDOWN => error.NetworkDown,
+            .TIMEDOUT => error.Timeout,
+            .ACCES, .PERM => error.AccessDenied,
+            .AGAIN, .NOBUFS, .NOMEM => error.SystemResources,
+            else => error.Unexpected,
+        };
     }
 
     fn warnUnreachable(spec: []const u8, failures: u64, err: anyerror) void {
@@ -832,7 +985,11 @@ pub const Overlay = struct {
                 continue;
             };
             defer frame.deinit(gpa);
-            if (isRequestFrame(frame) and !self.chargeRequest(conn)) continue;
+            if (isRequestFrame(frame)) switch (self.chargeRequest(conn)) {
+                .accept => {},
+                .drop => continue,
+                .disconnect => return,
+            };
             self.cb.on_recv(self.cb.ctx, conn.id, &frame);
         }
     }
@@ -894,16 +1051,26 @@ pub const Overlay = struct {
         return true;
     }
 
-    /// Charge one inbound request; returns false to drop (drop-and-log) it.
-    fn chargeRequest(self: *Overlay, conn: *Conn) bool {
+    const RequestVerdict = enum { accept, drop, disconnect };
+
+    /// Charge one inbound request. Over budget is a strike and the request
+    /// is dropped (drop-and-log); the strike that reaches
+    /// `max_budget_strikes` disconnects the peer — the same ladder as
+    /// `chargeBytes`, which is what protocol.md §12 / threat-model.md §3
+    /// promise ("32 breaches ⇒ disconnect").
+    fn chargeRequest(self: *Overlay, conn: *Conn) RequestVerdict {
         self.rollWindow(conn);
         conn.win_reqs += 1;
         if (conn.win_reqs > max_outstanding_requests) {
             conn.strikes += 1;
-            log.warn("overlay: peer {d} request-rate breach ({d} in window); dropping request", .{ conn.id, conn.win_reqs });
-            return false;
+            if (conn.strikes >= max_budget_strikes) {
+                log.warn("overlay: peer {d} request-rate breach ({d} in window), strike {d}; exceeded budget strikes, disconnecting", .{ conn.id, conn.win_reqs, conn.strikes });
+                return .disconnect;
+            }
+            log.warn("overlay: peer {d} request-rate breach ({d} in window), strike {d}; dropping request", .{ conn.id, conn.win_reqs, conn.strikes });
+            return .drop;
         }
-        return true;
+        return .accept;
     }
 
     fn monoNs(self: *Overlay) i96 {
@@ -1055,19 +1222,34 @@ fn isRequestFrame(frame: wire.OverlayFrame) bool {
 
 pub const HostPort = struct { host: []const u8, port: u16 };
 
-/// Split a peer spec on its LAST ':' into host and port. One leading '[' and
-/// trailing ']' are stripped from the host, so `[::1]:7311` yields host
-/// `::1`. Port 0 is rejected (nothing listens on port 0). The host is NOT
-/// validated here — see `validatePeerSpec`.
+/// Split a peer spec into its raw host and port TEXT (no validation of
+/// either). A spec starting with '[' is the bracketed-v6 form: the host is
+/// what the brackets enclose and the port must follow as `]:<port>` — the
+/// brackets are looked at BEFORE any ':' so that `[::1]` (no port) reports
+/// `MissingPort`, not a garbled port `1]`. Anything else splits on its LAST
+/// ':' so an unbracketed `::1` never swallows the port.
+fn splitPeerSpec(spec: []const u8) PeerSpecError!struct { host: []const u8, port_text: []const u8 } {
+    if (spec.len > 0 and spec[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, spec, ']') orelse return error.BadHost;
+        const rest = spec[close + 1 ..];
+        if (rest.len == 0 or (rest.len == 1 and rest[0] == ':')) return error.MissingPort;
+        if (rest[0] != ':') return error.BadHost;
+        return .{ .host = spec[1..close], .port_text = rest[1..] };
+    }
+    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.MissingPort;
+    if (idx + 1 >= spec.len) return error.MissingPort;
+    return .{ .host = spec[0..idx], .port_text = spec[idx + 1 ..] };
+}
+
+/// Split a peer spec into host and port. The bracketed form `[::1]:7311`
+/// yields host `::1`. Port 0 is rejected (nothing listens on port 0). The
+/// host is NOT validated here — see `validatePeerSpec`.
 pub fn parseHostPort(spec: []const u8) error{BadPeerSpec}!HostPort {
-    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.BadPeerSpec;
-    if (idx == 0 or idx + 1 >= spec.len) return error.BadPeerSpec;
-    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPeerSpec;
+    const parts = splitPeerSpec(spec) catch return error.BadPeerSpec;
+    if (parts.host.len == 0) return error.BadPeerSpec;
+    const port = std.fmt.parseInt(u16, parts.port_text, 10) catch return error.BadPeerSpec;
     if (port == 0) return error.BadPeerSpec;
-    var host = spec[0..idx];
-    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
-    if (host.len == 0) return error.BadPeerSpec;
-    return .{ .host = host, .port = port };
+    return .{ .host = parts.host, .port = port };
 }
 
 pub const PeerSpecError = error{ MissingPort, EmptyHost, BadPort, BadHost };
@@ -1077,16 +1259,12 @@ pub const PeerSpecError = error{ MissingPort, EmptyHost, BadPort, BadHost };
 /// port is 1..65535. `Node.create` maps a failure to `BadPeerSpec` naming
 /// the index, the spec and which part is wrong.
 pub fn validatePeerSpec(spec: []const u8) PeerSpecError!void {
-    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.MissingPort;
-    if (idx + 1 >= spec.len) return error.MissingPort;
-    if (idx == 0) return error.EmptyHost;
-    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPort;
+    const parts = try splitPeerSpec(spec);
+    if (parts.host.len == 0) return error.EmptyHost;
+    const port = std.fmt.parseInt(u16, parts.port_text, 10) catch return error.BadPort;
     if (port == 0) return error.BadPort;
-    var host = spec[0..idx];
-    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
-    if (host.len == 0) return error.EmptyHost;
-    if (net.IpAddress.parse(host, port)) |_| return else |_| {}
-    net.HostName.validate(host) catch return error.BadHost;
+    if (net.IpAddress.parse(parts.host, port)) |_| return else |_| {}
+    net.HostName.validate(parts.host) catch return error.BadHost;
 }
 
 /// Exponential backoff 1s→60s plus deterministic per-peer jitter (Wyhash over
@@ -1665,6 +1843,15 @@ test "validatePeerSpec / parseHostPort: literals, bracket-v6, hostnames, and eac
     try validatePeerSpec("localhost:65535");
     try testing.expectError(error.MissingPort, validatePeerSpec("nohost"));
     try testing.expectError(error.MissingPort, validatePeerSpec("host:"));
+    // S8 finding "BadPeerSpec gives the wrong reason for a bracketed IPv6
+    // literal without a port": splitting on the LAST ':' before looking at
+    // the brackets turned `[::1]` into host `[:` + port `1]` (BadPort).
+    try testing.expectError(error.MissingPort, validatePeerSpec("[::1]"));
+    try testing.expectError(error.MissingPort, validatePeerSpec("[2001:db8::2]"));
+    try testing.expectError(error.MissingPort, validatePeerSpec("[::1]:"));
+    try testing.expectError(error.BadHost, validatePeerSpec("[::1:7311"));
+    try testing.expectError(error.BadHost, validatePeerSpec("[::1]x:7311"));
+    try testing.expectError(error.BadPort, validatePeerSpec("[::1]:0"));
     try testing.expectError(error.EmptyHost, validatePeerSpec(":7311"));
     try testing.expectError(error.EmptyHost, validatePeerSpec("[]:7311"));
     try testing.expectError(error.BadPort, validatePeerSpec("a.example.com:0"));
@@ -1680,6 +1867,10 @@ test "validatePeerSpec / parseHostPort: literals, bracket-v6, hostnames, and eac
     try testing.expectEqualStrings("a.example.com", host.host);
     try testing.expectError(error.BadPeerSpec, parseHostPort("a.example.com:0"));
     try testing.expectError(error.BadPeerSpec, parseHostPort("[]:7311"));
+    try testing.expectError(error.BadPeerSpec, parseHostPort("[::1]"));
+    try testing.expectError(error.BadPeerSpec, parseHostPort("[::1:7311"));
+    const v6_full = try parseHostPort("[2001:db8::2]:7311");
+    try testing.expectEqualStrings("2001:db8::2", v6_full.host);
 }
 
 // Non-vacuity: this is the M6 hostname path. Reverting `dialOne` to the
@@ -1716,4 +1907,105 @@ test "dialer resolves a hostname peer spec" {
     try waitPeerCount(io, &ov_b, 1);
     try testing.expectEqual(@as(usize, 1), a_rec.peerUpCount());
     try testing.expectEqual(@as(usize, 1), b_rec.peerUpCount());
+}
+
+// Non-vacuity: the S8 pin for "request-rate strikes are counted but never
+// enforced". Reverting `chargeRequest` to a per-frame drop (no
+// `max_budget_strikes` comparison) or making `readLoop` `continue` on a
+// disconnect verdict leaves the flooder connected: `peerCount()` stays 1
+// and the trailing ping is still answered with a pong.
+test "request budget: a getQset flood is disconnected at max_budget_strikes, not merely dropped" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var b_rec: Recorder = .{ .io = io, .gpa = gpa };
+    b_rec.reply_pong = true;
+    defer b_rec.deinit();
+    var ov_b = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xBB), b_rec.callbacks());
+    b_rec.ov = &ov_b;
+    try ov_b.start();
+    defer ov_b.deinit();
+    defer ov_b.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov_b.boundPort());
+    const c = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer c.close(io);
+
+    // Complete a valid Hello so the conn is published and request-charged.
+    const hello = try wire.encode(gpa, .{ .hello = .{
+        .protocol_version = wire.protocol_version,
+        .network_id_prefix = test_prefix,
+        .node_id = @as([32]u8, @splat(0x01)),
+        .current_slot = 0,
+        .listen_port = 0,
+    } });
+    defer gpa.free(hello);
+    try writeAll(io, c.socket.handle, hello);
+    try waitPeerCount(io, &ov_b, 1);
+
+    // One burst of tiny getQset frames: ~12 KiB, far under the 256 KiB/s
+    // byte cap, so the ONLY budget breached is the request budget. Two full
+    // windows plus the strikes are sent so a window roll mid-burst cannot
+    // leave the count short. Writes may fail once B has hung up — that is
+    // the point.
+    const req = try wire.encode(gpa, .{ .get_qset = @as([32]u8, @splat(0xAB)) });
+    defer gpa.free(req);
+    const n_frames = 2 * max_outstanding_requests + max_budget_strikes + 8;
+    var i: usize = 0;
+    while (i < n_frames) : (i += 1) writeAll(io, c.socket.handle, req) catch break;
+
+    // The flooder must be torn down.
+    var tries: usize = 0;
+    while (tries < 500 and ov_b.peerCount() != 0) : (tries += 1) sleepMs(io, 10);
+    try testing.expectEqual(@as(usize, 0), ov_b.peerCount());
+
+    // And the wire is dead: a ping gets EOF/error, never a pong.
+    const ping = try wire.encode(gpa, .{ .ping = 0xFEED });
+    defer gpa.free(ping);
+    writeAll(io, c.socket.handle, ping) catch {};
+    var framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer framer.deinit();
+    var got_pong = false;
+    tries = 0;
+    while (tries < 20 and !got_pong) : (tries += 1) {
+        var rb: [4096]u8 = undefined;
+        const n = readBounded(io, c.socket.handle, &rb, 500) catch break;
+        if (n == 0) break;
+        framer.push(rb[0..n]) catch break;
+        while (framer.popFrame() catch null) |raw| {
+            defer gpa.free(raw);
+            var fr = wire.decode(gpa, raw) catch continue;
+            defer fr.deinit(gpa);
+            if (fr == .pong and fr.pong == 0xFEED) got_pong = true;
+        }
+    }
+    try testing.expect(!got_pong);
+}
+
+// Non-vacuity: the S8 pin for "deinit blocks for the OS TCP connect timeout
+// when a configured peer black-holes SYNs". 203.0.113.1 is TEST-NET-3 (RFC
+// 5737): never routable, so the dialer's SYN gets no answer and a blocking
+// connect(2) parks the dialer thread for the kernel's SYN-retry timeout
+// (~75 s macOS, ~2 min Linux) that `stop()` then has to join. Reverting
+// `dialOne` to std's blocking `IpAddress.connect` makes this red
+// (`ms < 2000` fails at ~74700 ms). On a network that answers TEST-NET-3
+// with an ICMP unreachable the dial fails fast and the test passes
+// trivially — it pins interruptibility, not the black hole itself.
+test "stop returns promptly while a dialer is mid-connect to a black-holed peer" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{"203.0.113.1:7311"}, test_prefix, 0xAA), rec.callbacks());
+    try ov.start();
+    defer ov.deinit();
+
+    sleepMs(io, 300); // let the dialer enter its connect
+    const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
+    ov.stop();
+    const ms = @divTrunc(std.Io.Clock.now(.awake, io).nanoseconds - t0, std.time.ns_per_ms);
+    std.debug.print("\n[s8-fix-15] stop() with a black-holed peer took {d} ms\n", .{ms});
+    try testing.expect(ms < 2000);
+    try testing.expectEqual(@as(usize, 0), ov.peerCount());
 }
