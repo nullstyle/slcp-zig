@@ -271,10 +271,347 @@ const SlotOwn = struct {
     }
 };
 
-const InputItem = struct {
+/// One queued engine input plus the overlay peer it came from (null for
+/// timers, proposals, purges and the own.log restore). Public only because
+/// `HoldBuffer.Entry` carries one (Experimental).
+pub const InputItem = struct {
     input: engine.Input,
     source_peer: ?usize,
 };
+
+/// Host-side per-slot hold buffer (S8 D1, the stellar-core Herder shape —
+/// `processSCPQueueUpToIndex(lcl + 1)` with `PendingEnvelopes` for later
+/// slots). Inbound statements — NOMINATE / PREPARE / CONFIRM **and
+/// EXTERNALIZE** — for slots beyond the delivery frontier + 1 are parked
+/// here, on the engine thread, and fed to the engine only once the frontier
+/// reaches their slot − 1, so for a typed app `apply(N)` has always run
+/// before any `validate` for N + 1 and the engine's per-slot verdict cache
+/// can never be filled with a `.maybe_valid`-because-behind verdict that
+/// then mutes the node for that slot forever (the mute-node halt: n − t + 1
+/// such nodes halt the network; the S8b skeptic showed a lone peer's
+/// EXTERNALIZE(N + 1) does it just as well as a NOMINATE).
+///
+/// Catch-up (`admit` → `.ready`): a held slot is released ahead of the
+/// frontier as soon as its held EXTERNALIZE statements come from a
+/// **v-blocking set** of the local quorum set — SCP's own accept condition,
+/// applied host-side. Under the FBAS assumption a v-blocking set contains an
+/// honest node, so the network finished that slot and this node's vote on
+/// it can never be needed: validating it against a stale state (and going
+/// mute on it) is harmless, while feeding it lets the engine externalize
+/// the slot from those statements alone and the delivery gap-jump (§10)
+/// follow. A single signer — the case that halted — is never v-blocking.
+/// Once released this way a slot is `open`: later statements for it pass
+/// straight through (the engine already holds its EXTERNALIZEs; a third
+/// signer's must not wait for the next re-flood).
+///
+/// Engine-thread-only state (like `pending_ext` / `next_deliver`); the
+/// atomic counters exist for tests and logs. Bounded: `window` slots ahead,
+/// `max_entries` / `max_bytes` in total, one entry per (slot, signer, kind)
+/// — every entry was signature-verified before it was stored, so a spoofed
+/// node id cannot displace a genuine statement, and an honest sender's
+/// re-floods replace rather than accumulate; only signers inside the
+/// transitive quorum graph are held at all (a stranger goes straight to the
+/// engine's §5.4 step-8 relevance filter, which `ignored`s it before any
+/// state — so no stranger can occupy the buffer). Drops are never fatal:
+/// the 3 s anti-entropy re-flood re-delivers anything dropped.
+pub const HoldBuffer = struct {
+    /// Slots more than this far past the delivery frontier are dropped
+    /// (counted `dropped_far`). Equals `Limits.max_live_slots`'s default:
+    /// the engine would refuse to open more live slots anyway.
+    pub const window: u64 = 64;
+    /// Total caps, mirroring the engine's parking caps (§5.4).
+    pub const max_entries: usize = 1024;
+    pub const max_bytes: usize = 8 * 1024 * 1024;
+
+    pub const Kind = enum(u8) { nominate, prepare, confirm, externalize };
+    pub const Entry = struct { node_id: [32]u8, kind: Kind, item: InputItem };
+    const List = std.ArrayList(Entry);
+    pub const PutResult = enum { held, replaced, dropped_full };
+    /// `admit`'s verdict. `.fed`: not consumed — the caller feeds the item
+    /// now. `.ready`: held, and the slot's EXTERNALIZE signers are now
+    /// v-blocking — the caller releases the whole slot (`takeSlot`). The
+    /// rest consumed the item (held, or freed and counted).
+    pub const Admit = enum { fed, held, ready, dropped_far, dropped_full, dropped_badsig };
+
+    slots: std.AutoHashMapUnmanaged(u64, List) = .empty,
+    /// Slots released ahead of the frontier on v-blocking EXTERNALIZE
+    /// evidence: later statements for them pass straight through. Pruned
+    /// below the frontier with the held slots (≤ `window` entries).
+    open: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    count: usize = 0,
+    bytes: usize = 0,
+    /// Entries held right now (= `count`, readable from any thread).
+    held_now: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Entries handed to the engine at the frontier.
+    released: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Entries handed to the engine AHEAD of the frontier (catch-up: the
+    /// slot's EXTERNALIZE signers were v-blocking).
+    released_early: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Statements for a slot above the frontier from a signer outside the
+    /// quorum graph: fed, never held (the engine ignores them statelessly).
+    fed_out_of_graph: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Drops: slot beyond `window`; caps hit; signature failed; slot fell
+    /// below the frontier while held (delivered or gap-jumped past).
+    dropped_far: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dropped_full: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dropped_badsig: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dropped_behind: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn itemBytes(item: *const InputItem) usize {
+        return switch (item.input) {
+            .envelope_received => |a| a.bytes.len,
+            else => 0,
+        };
+    }
+
+    /// Free an entry's owned input (the frame bytes).
+    pub fn freeEntry(gpa: std.mem.Allocator, e: *Entry) void {
+        core.host_codec.freeInput(gpa, &e.item.input);
+    }
+
+    /// Hold `item` (ownership is taken on EVERY path, including the error
+    /// one) for `slot`, keyed by (signer, kind): an existing entry for the
+    /// same key is replaced — removed from its position, the newcomer
+    /// appended, so a slot's list stays in arrival order of its survivors.
+    /// A cap breach drops the INCOMING item (`.dropped_full`): no eviction,
+    /// the nearest slots are the useful ones and the sender's next re-flood
+    /// heals the drop.
+    pub fn put(self: *HoldBuffer, gpa: std.mem.Allocator, slot: u64, node_id: [32]u8, kind: Kind, item: InputItem) std.mem.Allocator.Error!PutResult {
+        var owned = item;
+        const len = itemBytes(&owned);
+        const gop = self.slots.getOrPut(gpa, slot) catch |e| {
+            core.host_codec.freeInput(gpa, &owned.input);
+            return e;
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const list = gop.value_ptr;
+        var dup: ?usize = null;
+        for (list.items, 0..) |*e, i| {
+            if (e.kind == kind and std.mem.eql(u8, &e.node_id, &node_id)) {
+                dup = i;
+                break;
+            }
+        }
+        // Caps are judged on the projected state (a replacement frees its
+        // predecessor first), so a re-flood of an already-held statement
+        // never trips them.
+        const old_len: usize = if (dup) |i| itemBytes(&list.items[i].item) else 0;
+        const projected_count = self.count + 1 - @as(usize, if (dup != null) 1 else 0);
+        const projected_bytes = self.bytes + len - old_len;
+        if (projected_count > max_entries or projected_bytes > max_bytes) {
+            core.host_codec.freeInput(gpa, &owned.input);
+            if (list.items.len == 0) self.removeEmpty(gpa, slot);
+            _ = self.dropped_full.fetchAdd(1, .monotonic);
+            return .dropped_full;
+        }
+        if (dup) |i| {
+            var old = list.orderedRemove(i);
+            self.count -= 1;
+            self.bytes -= old_len;
+            freeEntry(gpa, &old);
+        }
+        list.append(gpa, .{ .node_id = node_id, .kind = kind, .item = owned }) catch |e| {
+            core.host_codec.freeInput(gpa, &owned.input);
+            if (list.items.len == 0) self.removeEmpty(gpa, slot);
+            self.held_now.store(self.count, .release);
+            return e;
+        };
+        self.count += 1;
+        self.bytes += len;
+        self.held_now.store(self.count, .release);
+        return if (dup != null) .replaced else .held;
+    }
+
+    fn removeEmpty(self: *HoldBuffer, gpa: std.mem.Allocator, slot: u64) void {
+        if (self.slots.fetchRemove(slot)) |kv| {
+            var l = kv.value;
+            l.deinit(gpa);
+        }
+    }
+
+    fn dropList(self: *HoldBuffer, gpa: std.mem.Allocator, list: *List) void {
+        for (list.items) |*e| {
+            self.count -= 1;
+            self.bytes -= itemBytes(&e.item);
+            freeEntry(gpa, e);
+        }
+        _ = self.dropped_behind.fetchAdd(list.items.len, .monotonic);
+        list.deinit(gpa);
+    }
+
+    /// Frees every held slot BELOW `frontier` (statements for a slot this
+    /// node already delivered or skipped are useless — `dropped_behind`)
+    /// and forgets `open` slots below it.
+    fn pruneBelow(self: *HoldBuffer, gpa: std.mem.Allocator, frontier: u64) void {
+        while (true) {
+            var doomed: ?u64 = null;
+            var it = self.slots.keyIterator();
+            while (it.next()) |k| {
+                if (k.* < frontier) {
+                    doomed = k.*;
+                    break;
+                }
+            }
+            const key = doomed orelse break;
+            var kv = self.slots.fetchRemove(key).?;
+            self.dropList(gpa, &kv.value);
+        }
+        while (true) {
+            var doomed: ?u64 = null;
+            var it = self.open.keyIterator();
+            while (it.next()) |k| {
+                if (k.* < frontier) {
+                    doomed = k.*;
+                    break;
+                }
+            }
+            const key = doomed orelse break;
+            _ = self.open.remove(key);
+        }
+        self.held_now.store(self.count, .release);
+    }
+
+    /// Remove and hand back the list held for `slot` (the caller owns the
+    /// entries and the list), or null.
+    pub fn takeSlot(self: *HoldBuffer, slot: u64) ?List {
+        const kv = self.slots.fetchRemove(slot) orelse return null;
+        for (kv.value.items) |*e| {
+            self.count -= 1;
+            self.bytes -= itemBytes(&e.item);
+        }
+        self.held_now.store(self.count, .release);
+        return kv.value;
+    }
+
+    /// Frees every held slot BELOW `frontier` (see `pruneBelow`), then
+    /// hands back the list for slot == `frontier` (exactly lcl + 1, Herder
+    /// shape; the caller owns the entries and the list) or null. Nothing
+    /// held is ever returned for a slot at or below the frontier.
+    pub fn takeReleasable(self: *HoldBuffer, gpa: std.mem.Allocator, frontier: u64) ?List {
+        self.pruneBelow(gpa, frontier);
+        return self.takeSlot(frontier);
+    }
+
+    /// Do the EXTERNALIZE statements held for `slot` come from a v-blocking
+    /// set of `qs` (the local quorum set)? OOM ⇒ false (the next EXTERNALIZE
+    /// for the slot re-asks).
+    pub fn extSignersVBlocking(self: *const HoldBuffer, gpa: std.mem.Allocator, slot: u64, qs: *const qset.QuorumSetOwned) bool {
+        const list = self.slots.getPtr(slot) orelse return false;
+        const ids = gpa.alloc([32]u8, list.items.len) catch return false;
+        defer gpa.free(ids);
+        var n: usize = 0;
+        for (list.items) |*e| {
+            if (e.kind != .externalize) continue;
+            ids[n] = e.node_id;
+            n += 1;
+        }
+        return n > 0 and core.local_node.isVBlocking(qs, ids[0..n]);
+    }
+
+    /// The gate for one inbound envelope whose `meta` decoded, given the
+    /// delivery frontier (`next_deliver`), whether the signer is inside the
+    /// transitive quorum graph, and the local quorum set. Ownership of
+    /// `item` is taken on every path except `.fed`. Rules, in order:
+    /// a statement for the frontier slot or anything behind it, from a
+    /// signer outside the graph, or for an `open` slot is fed now; a slot
+    /// more than `window` past the frontier is dropped; a bad signature is
+    /// dropped (a forged signer must not occupy or displace a genuine
+    /// entry); otherwise held — and if it is an EXTERNALIZE that completes
+    /// a v-blocking set for its slot, the slot becomes `open` and `.ready`.
+    pub fn admit(self: *HoldBuffer, gpa: std.mem.Allocator, meta: *const Meta, frontier: u64, in_graph: bool, qs: *const qset.QuorumSetOwned, item: InputItem) Admit {
+        var owned = item;
+        if (meta.slot <= frontier or self.open.contains(meta.slot)) return .fed;
+        if (!in_graph) {
+            _ = self.fed_out_of_graph.fetchAdd(1, .monotonic);
+            return .fed;
+        }
+        if (meta.slot > frontier + window) {
+            core.host_codec.freeInput(gpa, &owned.input);
+            _ = self.dropped_far.fetchAdd(1, .monotonic);
+            return .dropped_far;
+        }
+        if (!crypto.verify(meta.node_id, meta.digest, meta.signature)) {
+            core.host_codec.freeInput(gpa, &owned.input);
+            _ = self.dropped_badsig.fetchAdd(1, .monotonic);
+            return .dropped_badsig;
+        }
+        const r = self.put(gpa, meta.slot, meta.node_id, meta.kind, owned) catch {
+            // OOM: `put` freed the item; count it with the cap drops.
+            _ = self.dropped_full.fetchAdd(1, .monotonic);
+            return .dropped_full;
+        };
+        if (r == .dropped_full) return .dropped_full;
+        if (meta.kind == .externalize and self.extSignersVBlocking(gpa, meta.slot, qs)) {
+            // Best effort: without the mark a later statement for the slot
+            // is held again and the next v-blocking EXTERNALIZE re-releases.
+            self.open.put(gpa, meta.slot, {}) catch {};
+            return .ready;
+        }
+        return .held;
+    }
+
+    pub fn deinit(self: *HoldBuffer, gpa: std.mem.Allocator) void {
+        var it = self.slots.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |*e| freeEntry(gpa, e);
+            list.deinit(gpa);
+        }
+        self.slots.deinit(gpa);
+        self.open.deinit(gpa);
+        self.count = 0;
+        self.bytes = 0;
+        self.held_now.store(0, .release);
+    }
+};
+
+/// What the hold gate needs to know about a framed Envelope, decoded with
+/// the pipeline's validating options (nesting 32, traversal scaled to the
+/// frame / statement caps). `digest` is the signed preimage so the gate can
+/// verify BEFORE holding (a spoofed signer must not displace a genuine
+/// entry); the engine re-verifies whatever it is eventually fed.
+pub const Meta = struct {
+    slot: u64,
+    node_id: [32]u8,
+    kind: HoldBuffer.Kind,
+    digest: [32]u8,
+    signature: [64]u8,
+};
+
+pub fn envelopeMeta(gpa: std.mem.Allocator, network_id: [32]u8, framed_env: []const u8) !Meta {
+    if (framed_env.len > core.limits.frozen_max_frame_bytes) return error.FrameTooLarge;
+    var emsg = try core.capnpc.message.Message.init(gpa, framed_env, .{
+        .nesting_limit = 32,
+        .traversal_limit_words = core.limits.frozen_max_frame_bytes / 8,
+    });
+    defer emsg.deinit();
+    const er = try gen_slcp.Envelope.Reader.init(&emsg);
+    const stmt_bytes = try er.getStatementBytes();
+    if (stmt_bytes.len == 0 or stmt_bytes.len > core.limits.frozen_max_statement_bytes) return error.BadStatementLength;
+    const sig = try er.getSignature();
+    if (sig.len != 64) return error.BadSignatureLength;
+    var smsg = try canonical.decodeFlat(gpa, stmt_bytes, .{
+        .nesting_limit = 32,
+        .traversal_limit_words = core.limits.frozen_max_statement_bytes / 8,
+    });
+    defer smsg.deinit();
+    const sr = try gen_slcp.Statement.Reader.init(&smsg);
+    const nid = try sr.getNodeId();
+    if (nid.len != 32) return error.BadNodeIdLength;
+    const kind: HoldBuffer.Kind = switch (try sr.getPledges().which()) {
+        .nominate => .nominate,
+        .prepare => .prepare,
+        .confirm => .confirm,
+        .externalize => .externalize,
+        .unset => return error.UnsetPledges,
+    };
+    return .{
+        .slot = try sr.getSlotIndex(),
+        .node_id = nid[0..32].*,
+        .kind = kind,
+        .digest = crypto.statementDigest(network_id, stmt_bytes),
+        .signature = sig[0..64].*,
+    };
+}
 
 /// Mutex+condvar FIFO of pending engine inputs. Payloads are owned; the engine
 /// thread frees them after `pushInput` (which copies what it keeps).
@@ -400,6 +737,9 @@ pub const Node = struct {
     /// (values owned), and the next slot to hand the app (§11.2 ordering).
     pending_ext: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     next_deliver: u64,
+    /// Engine-thread-only: inbound NOMINATE / PREPARE / CONFIRM statements
+    /// for slots above `next_deliver`, released at the frontier (S8 D1).
+    hold: HoldBuffer = .{},
     /// Engine-thread-only: the delivered frontier at the last successful log
     /// compaction. Compaction runs whenever the frontier enters a new
     /// 64-slot bucket past this (§10 "every 64 delivered slots") — tracked
@@ -1077,6 +1417,7 @@ pub const Node = struct {
             self.pending_ext.deinit(self.gpa);
         }
         self.req_qsets.deinit(self.gpa);
+        self.hold.deinit(self.gpa);
     }
 
     // -------------------------------------------------------------------
@@ -1219,17 +1560,116 @@ pub const Node = struct {
         }
     }
 
-    /// Feed one input and drain all its effects (engine thread only).
+    /// Feed one input and drain all its effects (engine thread only) — the
+    /// ONLY place inbound envelopes enter the engine, so the hold gate
+    /// lives here: an envelope for a slot beyond the delivery frontier + 1
+    /// is parked (`HoldBuffer`) instead of fed — or, when it completes a
+    /// v-blocking set of EXTERNALIZEs for its slot, released with that
+    /// whole slot ahead of the frontier (catch-up) — and whenever an input
+    /// moved the frontier the parked statements for the new frontier slot
+    /// are fed next, before the next queued input is popped.
     fn applyInput(self: *Node, item: InputItem) void {
+        const before = self.next_deliver;
+        if (item.input == .envelope_received and !self.failed.load(.acquire)) {
+            switch (self.gateEnvelope(item)) {
+                .feed => self.feedOne(item),
+                .consumed => {},
+                .ready => |slot| self.releaseSlot(slot),
+            }
+        } else {
+            self.feedOne(item);
+        }
+        // Release ONLY here — after `feedOne` fully drained the input's
+        // effects — never from dispatch / onExternalized / drainDeliverable:
+        // a re-entrant pushInput would break the engine's one-input-then-
+        // drain contract (§5.1) and its effect-queue ownership.
+        if (self.next_deliver != before) self.releaseHeld();
+    }
+
+    /// `feedInput` with the runtime handling: a push failure latches the
+    /// node inert; a best-effort effect that hit OOM (the catch-up cache, a
+    /// timer arm) is logged — the node keeps running, the cache is refilled
+    /// by the next emission for that slot and the timer re-armed on the next
+    /// heard/round transition (review finding: it was silent).
+    fn feedOne(self: *Node, item: InputItem) void {
         const clean = self.feedInput(item) catch |err| {
             self.markFailed(err);
             return;
         };
-        // Best-effort effects (the catch-up cache, a timer arm) failed on
-        // OOM: the node keeps running — the cache is refilled by the next
-        // emission for that slot and the timer is re-armed on the next
-        // heard/round transition — but say so (review finding: silent).
         if (!clean) log.warn("out of memory dispatching an effect; catch-up cache or a timer is degraded until the next emission", .{});
+    }
+
+    const Gate = union(enum) { feed, consumed, ready: u64 };
+
+    /// The hold gate (S8 D1 / S8b): `HoldBuffer.admit` over the decoded
+    /// envelope, with the logging. `.feed` — the caller feeds it now: a
+    /// statement for the slot in progress or anything behind it (stale /
+    /// purged statements keep going to the engine, which answers as today),
+    /// a signer outside the quorum graph (the engine ignores it
+    /// statelessly), a slot already released for catch-up, or a frame
+    /// `envelopeMeta` cannot read (the engine says `insane`). `.ready` —
+    /// held, and its slot's EXTERNALIZE signers are now v-blocking: release
+    /// the slot. `.consumed` — held or dropped.
+    fn gateEnvelope(self: *Node, item: InputItem) Gate {
+        const bytes = item.input.envelope_received.bytes;
+        const meta = envelopeMeta(self.gpa, self.network_id, bytes) catch return .feed;
+        if (meta.slot <= self.next_deliver) return .feed;
+        const in_graph = self.eng.qsets.inGraph(meta.node_id);
+        switch (self.hold.admit(self.gpa, &meta, self.next_deliver, in_graph, &self.eng.cfg.quorum_set, item)) {
+            .fed => return .feed,
+            .held => log.debug("hold: {t} for slot {d} held (frontier {d}, {d} held)", .{ meta.kind, meta.slot, self.next_deliver, self.hold.count }),
+            .ready => {
+                log.info("catch-up: releasing slot {d} ahead of the delivery frontier {d} — its EXTERNALIZE signers are v-blocking", .{ meta.slot, self.next_deliver });
+                return .{ .ready = meta.slot };
+            },
+            .dropped_far => log.debug("hold: dropped {t} for slot {d}, more than {d} slots past the delivery frontier {d} (the sender's next resync re-sends it)", .{ meta.kind, meta.slot, HoldBuffer.window, self.next_deliver }),
+            .dropped_badsig => log.debug("hold: dropped {t} for slot {d}: bad signature", .{ meta.kind, meta.slot }),
+            .dropped_full => log.debug("hold: dropped {t} for slot {d}: buffer full ({d} entries, {d} bytes; the sender's next resync re-sends it)", .{ meta.kind, meta.slot, self.hold.count, self.hold.bytes }),
+        }
+        return .consumed;
+    }
+
+    /// Feed everything held for `slot` (catch-up release, ahead of the
+    /// frontier). Entries whose slot fell below the frontier meanwhile (an
+    /// earlier entry of the list externalized it and the gap-jump delivered
+    /// it) are dropped, as is everything once the node latched inert.
+    /// Engine thread only; from `applyInput`, never re-entrantly.
+    fn releaseSlot(self: *Node, slot: u64) void {
+        var list = self.hold.takeSlot(slot) orelse return;
+        defer list.deinit(self.gpa);
+        for (list.items) |*e| {
+            if (self.failed.load(.acquire) or slot < self.next_deliver) {
+                HoldBuffer.freeEntry(self.gpa, e);
+                _ = self.hold.dropped_behind.fetchAdd(1, .monotonic);
+                continue;
+            }
+            _ = self.hold.released_early.fetchAdd(1, .monotonic);
+            self.feedOne(e.item);
+        }
+    }
+
+    /// Feed the held statements for the frontier slot (`next_deliver`),
+    /// looping while they keep advancing it (a released CONFIRM can complete
+    /// F + 1, which delivers it and releases F + 2). Entries whose slot
+    /// fell below the frontier meanwhile — an earlier item of the same list
+    /// completed the slot, or a gap-jump skipped it — are dropped, as is
+    /// everything once the node latched inert. Engine thread only; called
+    /// from `applyInput` after a full drain (see the comment there).
+    fn releaseHeld(self: *Node) void {
+        while (self.hold.takeReleasable(self.gpa, self.next_deliver)) |taken| {
+            var list = taken;
+            defer list.deinit(self.gpa);
+            const slot = self.next_deliver;
+            for (list.items) |*e| {
+                if (self.failed.load(.acquire) or slot < self.next_deliver) {
+                    HoldBuffer.freeEntry(self.gpa, e);
+                    _ = self.hold.dropped_behind.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                _ = self.hold.released.fetchAdd(1, .monotonic);
+                self.feedOne(e.item);
+            }
+        }
     }
 
     /// `applyInput` without the latch: a `pushInput` failure is returned to
@@ -1509,13 +1949,14 @@ pub const Node = struct {
         // effects today, but the skip-zero-frames host contract applies here
         // too — never let an empty frame into the catch-up source.
         if (framed_env.len == 0) return;
-        const bucket = envelopeBucket(self.gpa, framed_env) catch |e| switch (e) {
+        const meta = envelopeMeta(self.gpa, self.network_id, framed_env) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 log.warn("could not bucket own envelope for slot {d}: {t}", .{ slot, e });
                 return;
             },
         };
+        const bucket: Bucket = if (meta.kind == .nominate) .nom else .ballot;
         const copy = try self.gpa.dupe(u8, framed_env);
         self.own_mu.lockUncancelable(self.io);
         defer self.own_mu.unlock(self.io);
@@ -1715,19 +2156,9 @@ pub const Node = struct {
 // qset helpers (owned tree ⇄ framed message)
 // -----------------------------------------------------------------------
 
+/// The two own-latest slots per slot index: the latest nomination and the
+/// latest ballot-family statement (prepare / confirm / externalize).
 const Bucket = enum { nom, ballot };
-
-fn envelopeBucket(gpa: std.mem.Allocator, framed_env: []const u8) !Bucket {
-    var emsg = try core.capnpc.message.Message.init(gpa, framed_env, .{});
-    defer emsg.deinit();
-    const er = try gen_slcp.Envelope.Reader.init(&emsg);
-    const stmt_bytes = try er.getStatementBytes();
-    var smsg = try canonical.decodeFlat(gpa, stmt_bytes, .{});
-    defer smsg.deinit();
-    const sr = try gen_slcp.Statement.Reader.init(&smsg);
-    const which = try sr.getPledges().which();
-    return if (which == .nominate) .nom else .ballot;
-}
 
 fn qsetHashOfFramed(gpa: std.mem.Allocator, framed_qset: []const u8) ![32]u8 {
     var msg = try core.capnpc.message.Message.init(gpa, framed_qset, .{});
@@ -1782,6 +2213,7 @@ test "node: every method compiles (forces body analysis without instantiation)" 
         Node.answerGetQset,    Node.answerGetSlotState, Node.onTimerFire,
         Node.drainDeliverable, Node.noteQsetRequested,  Node.consumeQsetRequested,
         Node.resyncLoop,       Node.deliverSlot,        Node.onPeerDown,
+        Node.gateEnvelope,     Node.releaseHeld,        Node.feedOne,
     };
     inline for (fns) |f| {
         const p = &f;
@@ -2698,4 +3130,695 @@ test "deinit while another thread is parked in waitExternalized: the waiter retu
     if (!w.done.load(.acquire)) return error.WaiterHungAfterDeinit;
     t.join();
     try std.testing.expect(w.saw_null.load(.acquire));
+}
+
+// -- S8 D1: the hold buffer (host-side per-slot gate) --------------------------
+
+/// A validly-signed, framed statement by `seed` for `slot`: the peer-side
+/// twins of `buildSignedExternalize` the hold-gate tests need. `qset_hash`
+/// is what the statement advertises (a node's own `local_qset_hash` keeps
+/// the engine from parking it).
+const SignedSpec = union(enum) {
+    nominate: []const u8,
+    prepare: struct { counter: u32, value: []const u8 },
+    confirm: struct { counter: u32, value: []const u8 },
+    externalize: []const u8,
+};
+
+fn buildSignedStatement(gpa: std.mem.Allocator, seed: [32]u8, network_id: [32]u8, qset_hash: [32]u8, slot: u64, spec: SignedSpec) ![]u8 {
+    const node_id = try crypto.publicKeyFromSeed(seed);
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var st = try gen_slcp.Statement.Builder.init(&mb);
+    try st.setNodeId(&node_id);
+    try st.setSlotIndex(slot);
+    var pledges = st.getPledges();
+    switch (spec) {
+        .nominate => |value| {
+            var nom = try pledges.initNominate();
+            try nom.setQuorumSetHash(&qset_hash);
+            const votes = try nom.initVotes(1);
+            try votes.set(0, value);
+        },
+        .prepare => |p| {
+            var prep = try pledges.initPrepare();
+            try prep.setQuorumSetHash(&qset_hash);
+            var ballot = try prep.initBallot();
+            try ballot.setCounter(p.counter);
+            try ballot.setValue(p.value);
+            try prep.setNC(0);
+            try prep.setNH(0);
+        },
+        .confirm => |c| {
+            var conf = try pledges.initConfirm();
+            try conf.setQuorumSetHash(&qset_hash);
+            var ballot = try conf.initBallot();
+            try ballot.setCounter(c.counter);
+            try ballot.setValue(c.value);
+            try conf.setNPrepared(c.counter);
+            try conf.setNCommit(c.counter);
+            try conf.setNH(c.counter);
+        },
+        .externalize => |value| {
+            var ext = try pledges.initExternalize();
+            var commit = try ext.initCommit();
+            try commit.setCounter(1);
+            try commit.setValue(value);
+            try ext.setNH(1);
+            try ext.setCommitQuorumSetHash(&qset_hash);
+        },
+    }
+    const stmt_bytes = try canonical.canonicalFlatFromBuilder(gpa, &mb);
+    defer gpa.free(stmt_bytes);
+    const digest = crypto.statementDigest(network_id, stmt_bytes);
+    const sig = try crypto.sign(seed, digest);
+
+    var emb = MessageBuilder.init(gpa);
+    defer emb.deinit();
+    var env = try gen_slcp.Envelope.Builder.init(&emb);
+    try env.setStatementBytes(stmt_bytes);
+    try env.setSignature(&sig);
+    return @constCast(try emb.toBytes());
+}
+
+/// An owned `envelope_received` InputItem over a copy of `framed`.
+fn envelopeItem(gpa: std.mem.Allocator, framed: []const u8) !InputItem {
+    return .{ .input = .{ .envelope_received = .{ .bytes = try gpa.dupe(u8, framed) } }, .source_peer = null };
+}
+
+fn holdItem(gpa: std.mem.Allocator, payload: []const u8) !InputItem {
+    return envelopeItem(gpa, payload);
+}
+
+fn heldBytes(e: *const HoldBuffer.Entry) []const u8 {
+    return e.item.input.envelope_received.bytes;
+}
+
+// Non-vacuity: dropping the (node_id, kind) dedup scan in `put` makes the
+// second A-nominate a `.held` (count 2, and the released order shows two
+// A-nominates); appending in place instead of remove + append breaks the
+// `{b, p, a3}` order; judging the caps on `count` before subtracting the
+// replaced entry makes the 1024-entry replacement a `.dropped_full`;
+// skipping the below-frontier sweep in `takeReleasable` leaves slots 2 and
+// 3 held (count 3, dropped_behind 0); a missing `deinit` free is reported
+// by the testing allocator.
+test "HoldBuffer: dedup per (signer, kind) replaces and re-appends; caps drop the newcomer; takeReleasable frees below the frontier and hands back exactly the frontier slot" {
+    const gpa = std.testing.allocator;
+    var hb: HoldBuffer = .{};
+    defer hb.deinit(gpa);
+    const a: [32]u8 = @splat(0xa1);
+    const b: [32]u8 = @splat(0xb2);
+
+    try std.testing.expectEqual(HoldBuffer.PutResult.held, try hb.put(gpa, 5, a, .nominate, try holdItem(gpa, "a1")));
+    try std.testing.expectEqual(HoldBuffer.PutResult.replaced, try hb.put(gpa, 5, a, .nominate, try holdItem(gpa, "a2")));
+    try std.testing.expectEqual(HoldBuffer.PutResult.held, try hb.put(gpa, 5, b, .nominate, try holdItem(gpa, "b")));
+    try std.testing.expectEqual(HoldBuffer.PutResult.held, try hb.put(gpa, 5, a, .prepare, try holdItem(gpa, "p")));
+    try std.testing.expectEqual(@as(usize, 3), hb.count);
+    try std.testing.expectEqual(@as(usize, 3), hb.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), hb.bytes); // "a2" + "b" + "p"
+    // A re-flood of A's nomination moves it to the back of the line.
+    try std.testing.expectEqual(HoldBuffer.PutResult.replaced, try hb.put(gpa, 5, a, .nominate, try holdItem(gpa, "a3")));
+    try std.testing.expectEqual(@as(usize, 3), hb.count);
+    {
+        var list = hb.takeReleasable(gpa, 5).?;
+        defer {
+            for (list.items) |*e| HoldBuffer.freeEntry(gpa, e);
+            list.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 3), list.items.len);
+        try std.testing.expectEqualStrings("b", heldBytes(&list.items[0]));
+        try std.testing.expectEqualStrings("p", heldBytes(&list.items[1]));
+        try std.testing.expectEqualStrings("a3", heldBytes(&list.items[2]));
+        try std.testing.expectEqual(@as(usize, 0), hb.count);
+        try std.testing.expectEqual(@as(usize, 0), hb.bytes);
+    }
+
+    // Entry cap: 1024 distinct signers fit, the 1025th is dropped (and
+    // freed); a replacement at the cap is not a drop.
+    var i: usize = 0;
+    while (i < HoldBuffer.max_entries) : (i += 1) {
+        var id: [32]u8 = @splat(0);
+        std.mem.writeInt(u32, id[0..4], @intCast(i), .little);
+        try std.testing.expectEqual(HoldBuffer.PutResult.held, try hb.put(gpa, 7, id, .nominate, try holdItem(gpa, "x")));
+    }
+    try std.testing.expectEqual(HoldBuffer.max_entries, hb.count);
+    try std.testing.expectEqual(HoldBuffer.PutResult.dropped_full, try hb.put(gpa, 8, a, .nominate, try holdItem(gpa, "overflow")));
+    try std.testing.expectEqual(@as(u64, 1), hb.dropped_full.load(.acquire));
+    try std.testing.expectEqual(HoldBuffer.max_entries, hb.count);
+    {
+        const id0: [32]u8 = @splat(0);
+        try std.testing.expectEqual(HoldBuffer.PutResult.replaced, try hb.put(gpa, 7, id0, .nominate, try holdItem(gpa, "y")));
+        try std.testing.expectEqual(HoldBuffer.max_entries, hb.count);
+    }
+    {
+        var list = hb.takeReleasable(gpa, 7).?;
+        for (list.items) |*e| HoldBuffer.freeEntry(gpa, e);
+        list.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), hb.count);
+    }
+    // Byte cap: one oversized item is dropped, nothing is held.
+    {
+        const big = try gpa.alloc(u8, HoldBuffer.max_bytes + 1);
+        try std.testing.expectEqual(HoldBuffer.PutResult.dropped_full, try hb.put(gpa, 9, a, .prepare, .{ .input = .{ .envelope_received = .{ .bytes = big } }, .source_peer = null }));
+        try std.testing.expectEqual(@as(usize, 0), hb.count);
+        try std.testing.expect(hb.takeReleasable(gpa, 9) == null);
+    }
+
+    // Frontier sweep: {2, 3, 20, 21} at frontier 20 → 2 and 3 freed, 20
+    // returned, 21 kept.
+    for ([_]u64{ 2, 3, 20, 21 }) |slot| {
+        try std.testing.expectEqual(HoldBuffer.PutResult.held, try hb.put(gpa, slot, a, .confirm, try holdItem(gpa, "c")));
+    }
+    try std.testing.expectEqual(@as(usize, 4), hb.count);
+    {
+        var list = hb.takeReleasable(gpa, 20).?;
+        defer {
+            for (list.items) |*e| HoldBuffer.freeEntry(gpa, e);
+            list.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    }
+    try std.testing.expectEqual(@as(u64, 2), hb.dropped_behind.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hb.count);
+    try std.testing.expect(hb.takeReleasable(gpa, 20) == null);
+    try std.testing.expect(hb.slots.contains(21));
+    // `deinit` (the defer) frees the remaining slot-21 entry.
+}
+
+/// Peer statements for the gate tests: `a` (seed 0x77) advertises the
+/// node's own qset hash so nothing parks.
+const GateFixture = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tmp: std.testing.TmpDir,
+    dir_buf: [std.fs.max_path_bytes]u8 = undefined,
+    dir_len: usize = 0,
+    seed_a: [32]u8 = @splat(0x77),
+    seed_b: [32]u8 = @splat(0x78),
+    network_id: [32]u8,
+    diag: Diagnostic = .{},
+
+    const passphrase = "hold-gate v1";
+
+    fn init(gpa: std.mem.Allocator, io: std.Io) !GateFixture {
+        var f: GateFixture = .{ .gpa = gpa, .io = io, .tmp = std.testing.tmpDir(.{}), .network_id = crypto.networkIdFromPassphrase(passphrase) };
+        f.dir_len = try f.tmp.dir.realPath(io, &f.dir_buf);
+        return f;
+    }
+
+    fn deinit(self: *GateFixture) void {
+        self.tmp.cleanup();
+    }
+
+    fn dataDir(self: *GateFixture) []const u8 {
+        return self.dir_buf[0..self.dir_len];
+    }
+
+    /// A signed statement by `seed` for `slot`, as an owned InputItem.
+    fn item(self: *GateFixture, n: *Node, seed: [32]u8, slot: u64, spec: SignedSpec) !InputItem {
+        const framed = try buildSignedStatement(self.gpa, seed, self.network_id, n.local_qset_hash, slot, spec);
+        defer self.gpa.free(framed);
+        return envelopeItem(self.gpa, framed);
+    }
+
+    /// Turn the node single-threaded: close the queue and join the engine
+    /// thread, so the TEST thread can drive `applyInput` deterministically
+    /// (timer fires and proposals now land on a closed queue and are freed;
+    /// the tests below feed only envelopes). `deinit` skips the join.
+    fn ownEngineThread(n: *Node) void {
+        n.q.close();
+        if (n.engine_thread) |t| t.join();
+        n.engine_thread = null;
+    }
+};
+
+const GateProbe = struct {
+    fn heldOne(n: *Node) bool {
+        return n.hold.held_now.load(.acquire) >= 1 or n.stats().live_slots >= 1;
+    }
+    fn heldTwo(n: *Node) bool {
+        return n.hold.held_now.load(.acquire) >= 2 or n.stats().live_slots >= 1;
+    }
+    fn liveOne(n: *Node) bool {
+        return n.stats().live_slots >= 1;
+    }
+    fn liveTwo(n: *Node) bool {
+        return n.stats().live_slots >= 2;
+    }
+};
+
+// Pins the S8 D1 finding (state-dependent validate + engine verdict cache +
+// sticky fully_validated: a node one slot behind that sees the next slot's
+// nomination goes mute for that slot). Red before the fix — the ungated
+// engine created slot 3 the moment NOMINATE(3) arrived:
+//   after NOM(3): held_now=0 live_slots=1
+// Ablations: exempting EXTERNALIZE from the gate opens slot 3 on a's lone
+// EXT(3) (held_now stays 3, live_slots 1 one step early — the S8b skeptic's
+// bypass); dropping the v-blocking release leaves live_slots at 0 after b's
+// EXT(3) (the catch-up channel is cut); comparing `slot < next_deliver`
+// instead of `<=` holds NOM(1) (live_slots stays 1 at the end).
+test "hold gate: every statement kind for slot > next_deliver is held; a v-blocking set of EXTERNALIZEs releases its slot early; slot <= next_deliver passes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    try std.testing.expectEqual(@as(u64, 1), n.next_deliver);
+
+    // NOM(3) from a: two slots past the frontier → held, no engine slot.
+    n.q.push(try f.item(n, f.seed_a, 3, .{ .nominate = "x" }));
+    try pollUntil(io, 10_000, n, GateProbe.heldOne);
+    std.debug.print("\nafter NOM(3): held_now={d} live_slots={d}\n", .{ n.hold.held_now.load(.acquire), n.stats().live_slots });
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    // PREPARE(4) and CONFIRM(4) from b: held too (two entries, one slot).
+    n.q.push(try f.item(n, f.seed_b, 4, .{ .prepare = .{ .counter = 1, .value = "x" } }));
+    n.q.push(try f.item(n, f.seed_b, 4, .{ .confirm = .{ .counter = 1, .value = "x" } }));
+    const Three = struct {
+        fn ok(nn: *Node) bool {
+            return nn.hold.held_now.load(.acquire) >= 3 or nn.stats().live_slots >= 1;
+        }
+    };
+    try pollUntil(io, 10_000, n, Three.ok);
+    try std.testing.expectEqual(@as(usize, 3), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+
+    // EXT(3) from a: held like anything else — one signer is not
+    // v-blocking for {me, a, b} at threshold 2.
+    n.q.push(try f.item(n, f.seed_a, 3, .{ .externalize = "x" }));
+    const Four = struct {
+        fn ok(nn: *Node) bool {
+            return nn.hold.held_now.load(.acquire) >= 4 or nn.stats().live_slots >= 1;
+        }
+    };
+    try pollUntil(io, 10_000, n, Four.ok);
+    try std.testing.expectEqual(@as(usize, 4), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    // EXT(3) from b: {a, b} is v-blocking → slot 3 is released ahead of the
+    // frontier (catch-up) → the engine opens slot 3 from a's NOM + both
+    // EXTs (and externalizes it: accept via the v-blocking set, confirm
+    // with the quorum {a, b}); PREPARE/CONFIRM(4) stay held.
+    n.q.push(try f.item(n, f.seed_b, 3, .{ .externalize = "x" }));
+    try pollUntil(io, 10_000, n, GateProbe.liveOne);
+    try std.testing.expectEqual(@as(usize, 1), n.stats().live_slots);
+    try std.testing.expectEqual(@as(usize, 2), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3), n.hold.released_early.load(.acquire)); // NOM(3), EXT(3) a, EXT(3) b
+    try std.testing.expectEqual(@as(u64, 1), n.next_deliver); // no delivery: slot 3 is < 16 past the frontier
+
+    // NOM(1) from a: the slot in progress → passes → slot 1 opens.
+    n.q.push(try f.item(n, f.seed_a, 1, .{ .nominate = "x" }));
+    try pollUntil(io, 10_000, n, GateProbe.liveTwo);
+    try std.testing.expectEqual(@as(usize, 2), n.stats().live_slots);
+    try std.testing.expectEqual(@as(usize, 2), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), n.hold.released.load(.acquire));
+}
+
+// Non-vacuity: removing the `releaseHeld` call from `applyInput` (or
+// releasing lazily on the next pop) leaves the counters at
+//   after EXT(1) x2: released=0 held_now=3 live_slots=1
+// (red on the `released == 2` line — the held statements never reach the
+// engine, which is the mute-node shape). Removing the "slot fell below the
+// frontier" drop in `takeReleasable` feeds NOM(2) after the gap-jump past it
+// (dropped_behind 0, released 3). Releasing from inside `onExternalized`
+// instead of after the drain would re-enter `pushInput` mid-drain (the
+// engine's §5.1 contract); this test cannot see that, the comment in
+// `applyInput` is the guard.
+test "hold gate: released at the frontier inside the same applyInput, ascending; a gap-jump drops what it skipped and releases the new frontier" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const id_a = try crypto.publicKeyFromSeed(f.seed_a);
+    const id_b = try crypto.publicKeyFromSeed(f.seed_b);
+    var hook = RecordingHook{ .gpa = gpa };
+    defer hook.deinit();
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, id_a, id_b }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+        .delivery = hook.hook(),
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    // Held: a's NOMINATE(2), b's PREPARE(2) (arrival order), a's CONFIRM(3).
+    n.applyInput(try f.item(n, f.seed_a, 2, .{ .nominate = "two" }));
+    n.applyInput(try f.item(n, f.seed_b, 2, .{ .prepare = .{ .counter = 1, .value = "two" } }));
+    n.applyInput(try f.item(n, f.seed_a, 3, .{ .confirm = .{ .counter = 1, .value = "three" } }));
+    try std.testing.expectEqual(@as(usize, 3), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+
+    // Slot 1 externalizes from a quorum of EXTERNALIZEs (a + b = 2 of 3):
+    // the hook applies slot 1, next_deliver becomes 2, and — inside this
+    // very applyInput, after the drain — slot 2's two statements are fed.
+    n.applyInput(try f.item(n, f.seed_a, 1, .{ .externalize = "one" }));
+    try std.testing.expectEqual(@as(usize, 3), n.hold.held_now.load(.acquire)); // 1 of 3 said so: nothing moved
+    n.applyInput(try f.item(n, f.seed_b, 1, .{ .externalize = "one" }));
+    std.debug.print("\nafter EXT(1) x2: released={d} held_now={d} live_slots={d}\n", .{ n.hold.released.load(.acquire), n.hold.held_now.load(.acquire), n.stats().live_slots });
+    try std.testing.expectEqualSlices(u64, &[_]u64{1}, hook.slots.items);
+    try std.testing.expectEqual(@as(u64, 2), n.next_deliver);
+    try std.testing.expectEqual(@as(u64, 2), n.hold.released.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire)); // CONFIRM(3) still waits
+    try std.testing.expectEqual(@as(usize, 2), n.stats().live_slots);
+    // The engine's slot 2 holds exactly what was released: a's nomination
+    // and b's ballot statement.
+    const s2 = n.eng.slots.get(2).?;
+    try std.testing.expect(s2.latestFor(id_a, true) != null);
+    try std.testing.expect(s2.latestFor(id_b, false) != null);
+    try std.testing.expect(s2.latestFor(id_b, true) == null);
+
+    // Gap-jump: EXTERNALIZE(19) from a is held (one signer); b's completes
+    // a v-blocking set → slot 19 is released early → the engine
+    // externalizes 19; it sits a full answering window past the frontier
+    // (2 + 16 <= 19), so delivery jumps to 19 → next_deliver 20. The held
+    // CONFIRM(3) is now behind the frontier: dropped, never fed. A
+    // NOMINATE(20) held before the jump is the new frontier's statement:
+    // released.
+    n.applyInput(try f.item(n, f.seed_b, 20, .{ .nominate = "twenty" }));
+    try std.testing.expectEqual(@as(usize, 2), n.hold.held_now.load(.acquire));
+    n.applyInput(try f.item(n, f.seed_a, 19, .{ .externalize = "nineteen" }));
+    try std.testing.expectEqual(@as(usize, 3), n.hold.held_now.load(.acquire)); // one signer: held
+    try std.testing.expectEqual(@as(u64, 2), n.next_deliver);
+    n.applyInput(try f.item(n, f.seed_b, 19, .{ .externalize = "nineteen" }));
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 19 }, hook.slots.items);
+    try std.testing.expectEqual(@as(u64, 20), n.next_deliver);
+    try std.testing.expectEqual(@as(u64, 1), n.hold.dropped_behind.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), n.hold.released_early.load(.acquire)); // EXT(19) a + b
+    try std.testing.expectEqual(@as(u64, 3), n.hold.released.load(.acquire)); // NOM(2), PREPARE(2), NOM(20)
+    try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
+    try std.testing.expect(n.eng.slots.get(3) == null); // CONFIRM(3) never opened a slot
+    try std.testing.expect(n.eng.slots.get(20).?.latestFor(id_b, true) != null);
+}
+
+// Non-vacuity: dropping the window check holds NOM(next_deliver + 65)
+// (held_now 1, dropped_far 0); dropping the pre-hold `crypto.verify` holds
+// the forged NOM(3) (held_now 1, dropped_badsig 0) — it would be rejected
+// only at release, after occupying a genuine signer's entry.
+test "hold gate: beyond the window and bad signatures are dropped, not held" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    n.applyInput(try f.item(n, f.seed_a, n.next_deliver + HoldBuffer.window + 1, .{ .nominate = "far" }));
+    try std.testing.expectEqual(@as(u64, 1), n.hold.dropped_far.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    // Exactly at the window edge: held.
+    n.applyInput(try f.item(n, f.seed_a, n.next_deliver + HoldBuffer.window, .{ .nominate = "edge" }));
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+
+    // A NOMINATE(3) whose signature byte was flipped.
+    {
+        const framed = try buildSignedStatement(gpa, f.seed_a, f.network_id, n.local_qset_hash, 3, .{ .nominate = "forged" });
+        defer gpa.free(framed);
+        const meta = try envelopeMeta(gpa, f.network_id, framed);
+        try std.testing.expect(crypto.verify(meta.node_id, meta.digest, meta.signature));
+        // The signature is the last 64 bytes of the envelope's data section
+        // in this framing; flip the byte that the decoded signature reads
+        // back, found by re-decoding.
+        var flipped = try gpa.dupe(u8, framed);
+        defer gpa.free(flipped);
+        const at = std.mem.lastIndexOf(u8, flipped, &meta.signature).?;
+        flipped[at] ^= 0x01;
+        const meta2 = try envelopeMeta(gpa, f.network_id, flipped);
+        try std.testing.expect(!crypto.verify(meta2.node_id, meta2.digest, meta2.signature));
+        n.applyInput(try envelopeItem(gpa, flipped));
+    }
+    try std.testing.expectEqual(@as(u64, 1), n.hold.dropped_badsig.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+    // The genuine NOMINATE(3) is held.
+    n.applyInput(try f.item(n, f.seed_a, 3, .{ .nominate = "genuine" }));
+    try std.testing.expectEqual(@as(usize, 2), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    // `deinit` → `freeAppBuffers` frees both held entries (leak-checked).
+}
+
+// -- S8b skeptic (liveness lens): the EXTERNALIZE bypass ----------------------
+
+/// A Counter-shaped typed layer over the bytes driver: values are decimal
+/// counts; validate reads the state the delivery hook applies (exactly the
+/// AppNode(Counter) shape: `.maybe_valid` when the value is ahead of count+1).
+const CounterProbe = struct {
+    count: u64 = 0,
+    delivered: std.ArrayList(u64) = .empty,
+    gpa: std.mem.Allocator,
+    maybe_verdicts: u32 = 0,
+
+    fn parse(v: []const u8) ?u64 {
+        return std.fmt.parseInt(u64, v, 10) catch null;
+    }
+    fn validate(ctx: *anyopaque, slot: u64, value: []const u8, is_nom: bool) core.driver.Validity {
+        _ = slot;
+        _ = is_nom;
+        const self: *CounterProbe = @ptrCast(@alignCast(ctx));
+        const next = parse(value) orelse return .invalid;
+        if (next == self.count + 1) return .valid;
+        if (next > self.count + 1) {
+            self.maybe_verdicts += 1;
+            return .maybe_valid;
+        }
+        return .invalid;
+    }
+    fn combine(ctx: *anyopaque, slot: u64, cands: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) core.driver.DriverError!void {
+        _ = ctx;
+        _ = slot;
+        var best = cands[0];
+        for (cands) |c| if ((parse(c) orelse 0) > (parse(best) orelse 0)) {
+            best = c;
+        };
+        try out.appendSlice(gpa, best);
+    }
+    fn onExternalized(ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void {
+        const self: *CounterProbe = @ptrCast(@alignCast(ctx));
+        self.count = parse(value) orelse return error.Undecodable;
+        try self.delivered.append(self.gpa, slot);
+    }
+    fn onFailed(ctx: *anyopaque, err: anyerror) void {
+        _ = ctx;
+        std.debug.print("probe: node failed: {t}\n", .{err});
+    }
+    fn driver(self: *CounterProbe) core.driver.Driver {
+        return .{ .ctx = @ptrCast(self), .validate_value = validate, .combine_candidates = combine };
+    }
+    fn hook(self: *CounterProbe) DeliveryHook {
+        return .{ .ctx = @ptrCast(self), .on_externalized = onExternalized, .on_failed = onFailed };
+    }
+};
+
+// Pins the S8b skeptic's refutation of the first hold buffer ("the gate
+// exempts EXTERNALIZE for slots beyond next_deliver, so a single peer's
+// EXTERNALIZE(next_deliver + 1) still fills the engine's per-slot verdict
+// cache with .maybe_valid-because-behind and clears the sticky
+// fully_validated for that slot"). 3-of-4 {me, a, b, c}; the node is one
+// slot behind (it has a's EXTERNALIZE(1) only — 1 of 3). Red with the
+// EXTERNALIZE bypass (ablation: `if (meta.kind == .externalize) return
+// false` back in the gate):
+//   [poisoned order] after a's EXTERNALIZE(2) at next_deliver=1: slot2 open=true fully_validated=false maybe_verdicts=1 held_now=1
+// — the value was validated against count 0, the verdict cached, slot 2
+// mute for good (own statement never on the wire even after catching up).
+// Fixed: a's EXTERNALIZE(2) is held like any other statement (one signer is
+// not v-blocking), released after slot 1 is applied, validated `.valid`,
+// and the node's own EXTERNALIZE(2) reaches the wire. The control order
+// (b's EXTERNALIZE(1) first) always converged and must keep doing so.
+test "hold gate: an EXTERNALIZE(next_deliver + 1) from one peer is held while the node is behind; released after slot 1 is applied, the node votes for slot 2" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ true, false }) |poisoned_order| {
+        var f = try GateFixture.init(gpa, io);
+        defer f.deinit();
+        const seed_c: [32]u8 = @splat(0x79);
+        const me = try crypto.publicKeyFromSeed(@splat(0x42));
+        var probe = CounterProbe{ .gpa = gpa };
+        defer probe.delivered.deinit(gpa);
+        const n = try Node.create(gpa, io, .{
+            .network = GateFixture.passphrase,
+            .secret_seed = @splat(0x42),
+            .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b), try crypto.publicKeyFromSeed(seed_c) }),
+            .listen_port = 0,
+            .data_dir = f.dataDir(),
+            .diagnostic = &f.diag,
+            .driver = probe.driver(),
+            .delivery = probe.hook(),
+        });
+        defer n.deinit();
+        GateFixture.ownEngineThread(n);
+        try std.testing.expectEqual(@as(u64, 1), n.next_deliver);
+
+        // a's EXTERNALIZE(1): 1 of 3 — the node stays behind.
+        n.applyInput(try f.item(n, f.seed_a, 1, .{ .externalize = "1" }));
+        try std.testing.expectEqual(@as(u64, 1), n.next_deliver);
+        if (poisoned_order) {
+            // a's NOMINATE(2) and EXTERNALIZE(2) arrive while slot 1 is
+            // still open here: BOTH are held.
+            n.applyInput(try f.item(n, f.seed_a, 2, .{ .nominate = "2" }));
+            try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+            n.applyInput(try f.item(n, f.seed_a, 2, .{ .externalize = "2" }));
+            try std.testing.expectEqual(@as(u64, 1), n.next_deliver);
+            const s2_open = n.eng.slots.get(2) != null;
+            std.debug.print("\n[poisoned order] after a's EXTERNALIZE(2) at next_deliver=1: slot2 open={} fully_validated={?} maybe_verdicts={d} held_now={d}\n", .{ s2_open, if (n.eng.slots.get(2)) |s| s.fully_validated else null, probe.maybe_verdicts, n.hold.held_now.load(.acquire) });
+            try std.testing.expectEqual(@as(usize, 2), n.hold.held_now.load(.acquire));
+            try std.testing.expect(!s2_open); // nothing for slot 2 reached the engine
+            try std.testing.expectEqual(@as(u32, 0), probe.maybe_verdicts);
+            // b's EXTERNALIZE(1): v-blocking {a,b} -> accept commit -> quorum -> slot 1 delivered.
+            n.applyInput(try f.item(n, f.seed_b, 1, .{ .externalize = "1" }));
+        } else {
+            n.applyInput(try f.item(n, f.seed_b, 1, .{ .externalize = "1" }));
+            n.applyInput(try f.item(n, f.seed_a, 2, .{ .nominate = "2" }));
+            n.applyInput(try f.item(n, f.seed_a, 2, .{ .externalize = "2" }));
+        }
+        try std.testing.expectEqualSlices(u64, &[_]u64{1}, probe.delivered.items);
+        try std.testing.expectEqual(@as(u64, 2), n.next_deliver);
+        try std.testing.expectEqual(@as(u64, 1), probe.count);
+        const s2 = n.eng.slots.get(2).?;
+        // b's EXTERNALIZE(2): the network finishes slot 2; the node follows.
+        n.applyInput(try f.item(n, f.seed_b, 2, .{ .externalize = "2" }));
+        try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 2 }, probe.delivered.items);
+        const own2 = n.own_latest.get(2);
+        std.debug.print("[{s} order] after catch-up: slot2.fully_validated={} released={d} maybe_verdicts={d} own statement for slot 2 on the wire={}\n", .{ if (poisoned_order) "poisoned" else "control", s2.fully_validated, n.hold.released.load(.acquire), probe.maybe_verdicts, own2 != null });
+        if (poisoned_order) try std.testing.expectEqual(@as(u64, 2), n.hold.released.load(.acquire)); // NOMINATE(2) and EXTERNALIZE(2), at the frontier
+        try std.testing.expectEqual(@as(u32, 0), probe.maybe_verdicts); // no .maybe_valid verdict was ever cached for slot 2
+        try std.testing.expect(s2.fully_validated);
+        try std.testing.expect(own2 != null); // our own EXTERNALIZE(2) is on the wire (re-flood / getSlotState carry it)
+    }
+}
+
+// The catch-up channel after the EXTERNALIZE bypass was closed: a node far
+// behind learns the live frontier from held EXTERNALIZEs the moment a
+// v-blocking set of signers has sent them for a slot. 3-of-4 {me, a, b, c},
+// frontier 1; a's EXT(20..22) alone stay held (one signer is not
+// v-blocking — the S8b skeptic's halt needed exactly that lone EXTERNALIZE
+// to be fed); b's EXT(20) completes the set → slot 20 is released early →
+// the engine externalizes 20 from {a, b} + me → the delivery gap-jump
+// (20 >= 1 + 16) lands on 20 → slot 21 is released at the frontier, and
+// from there every slot is validated AFTER the one before it was applied:
+// the Counter-shaped probe answers .maybe_valid exactly once (slot 20,
+// judged against count 0 — harmless, a v-blocking set had externalized it)
+// and .valid for 21 and 22, so the node's own EXTERNALIZE(21) and (22)
+// reach the wire. Non-vacuity: dropping the v-blocking release (`.ready`)
+// leaves next_deliver at 1 with 4 entries held after b's EXT(20); feeding
+// EXTERNALIZE straight through makes maybe_verdicts 3 and own_latest(21)
+// null (mute on every caught-up slot); dropping the `open` mark makes b's
+// EXT(21) wait in the buffer instead of completing slot 21.
+test "hold gate: catch-up far behind — a v-blocking set of EXTERNALIZEs releases its slot early, the gap-jump follows, later slots validate after apply and the node votes on them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const seed_c: [32]u8 = @splat(0x79);
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    var probe = CounterProbe{ .gpa = gpa };
+    defer probe.delivered.deinit(gpa);
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b), try crypto.publicKeyFromSeed(seed_c) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+        .driver = probe.driver(),
+        .delivery = probe.hook(),
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    // a's re-flood: NOM(20) EXT(20) EXT(21) EXT(22) — all held, nothing fed.
+    n.applyInput(try f.item(n, f.seed_a, 20, .{ .nominate = "20" }));
+    n.applyInput(try f.item(n, f.seed_a, 20, .{ .externalize = "20" }));
+    n.applyInput(try f.item(n, f.seed_a, 21, .{ .externalize = "21" }));
+    n.applyInput(try f.item(n, f.seed_a, 22, .{ .externalize = "22" }));
+    try std.testing.expectEqual(@as(usize, 4), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expectEqual(@as(u64, 1), n.next_deliver);
+    try std.testing.expectEqual(@as(u32, 0), probe.maybe_verdicts);
+
+    // b's EXT(20): {a, b} is v-blocking for 3-of-4 → slot 20 released →
+    // externalized → gap-jump → delivered; slot 21 (a's EXT) is fed at the
+    // new frontier but stays 1 of 3.
+    n.applyInput(try f.item(n, f.seed_b, 20, .{ .externalize = "20" }));
+    std.debug.print("\nafter b's EXT(20): next_deliver={d} delivered={any} held_now={d} released_early={d} released={d} maybe_verdicts={d}\n", .{ n.next_deliver, probe.delivered.items, n.hold.held_now.load(.acquire), n.hold.released_early.load(.acquire), n.hold.released.load(.acquire), probe.maybe_verdicts });
+    try std.testing.expectEqualSlices(u64, &[_]u64{20}, probe.delivered.items);
+    try std.testing.expectEqual(@as(u64, 21), n.next_deliver);
+    try std.testing.expectEqual(@as(u64, 3), n.hold.released_early.load(.acquire)); // NOM(20), EXT(20) a, EXT(20) b
+    try std.testing.expectEqual(@as(u64, 1), n.hold.released.load(.acquire)); // a's EXT(21), at the frontier
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire)); // a's EXT(22)
+    try std.testing.expectEqual(@as(u32, 1), probe.maybe_verdicts); // slot 20 only, judged against count 0
+    try std.testing.expect(n.own_latest.get(20) == null); // mute on 20: harmless, the network finished it
+
+    // b's EXT(21) / EXT(22): frontier slots, fed straight in → each
+    // externalizes and delivers in turn, validated against the count just
+    // applied → .valid → our own EXTERNALIZE reaches the wire.
+    n.applyInput(try f.item(n, f.seed_b, 21, .{ .externalize = "21" }));
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 20, 21 }, probe.delivered.items);
+    try std.testing.expectEqual(@as(u64, 22), n.next_deliver);
+    n.applyInput(try f.item(n, f.seed_b, 22, .{ .externalize = "22" }));
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 20, 21, 22 }, probe.delivered.items);
+    try std.testing.expectEqual(@as(u64, 23), n.next_deliver);
+    try std.testing.expectEqual(@as(u64, 22), probe.count);
+    try std.testing.expectEqual(@as(u32, 1), probe.maybe_verdicts); // still only slot 20
+    try std.testing.expect(n.eng.slots.get(21).?.fully_validated);
+    try std.testing.expect(n.eng.slots.get(22).?.fully_validated);
+    try std.testing.expect(n.own_latest.get(21) != null);
+    try std.testing.expect(n.own_latest.get(22) != null);
+    try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), n.hold.dropped_far.load(.acquire));
+}
+
+// Strangers never occupy the buffer (the S8b catch-up skeptic filled all
+// 1024 entries from one connection with random keys): a signer outside the
+// transitive quorum graph is fed to the engine, which `ignored`s it before
+// any per-slot state, so nothing is held and no slot opens. Non-vacuity:
+// dropping the `in_graph` arm of `admit` holds the stranger's statement
+// (held_now 1, fed_out_of_graph 0).
+test "hold gate: a signer outside the quorum graph is fed straight to the engine's relevance filter, never held" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+    const stranger: [32]u8 = @splat(0x99);
+    const stats_before = n.stats();
+    n.applyInput(try f.item(n, stranger, 5, .{ .nominate = "x" }));
+    n.applyInput(try f.item(n, stranger, 5, .{ .externalize = "x" }));
+    try std.testing.expectEqual(@as(u64, 2), n.hold.fed_out_of_graph.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expectEqual(stats_before.live_slots, n.stats().live_slots);
+    // A member's statement for the same slot is held as usual.
+    n.applyInput(try f.item(n, f.seed_a, 5, .{ .nominate = "x" }));
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
 }

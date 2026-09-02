@@ -45,6 +45,7 @@ slcp.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <de
 slcp.Node.ext_waiters: field usize = 0
 slcp.Node.failed: field atomic.Value(bool) = <default>
 slcp.Node.gpa: field mem.Allocator
+slcp.Node.hold: field node.node.HoldBuffer = <default>
 slcp.Node.io: field Io
 slcp.Node.journal_tail: field ?node.node.Node.JournalTail = null
 slcp.Node.last_compact_frontier: field u64 = 0
@@ -1144,6 +1145,58 @@ slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding, *const e
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
+slcp.node.HoldBuffer.Admit.dropped_badsig: enumerant = 5
+slcp.node.HoldBuffer.Admit.dropped_far: enumerant = 3
+slcp.node.HoldBuffer.Admit.dropped_full: enumerant = 4
+slcp.node.HoldBuffer.Admit.fed: enumerant = 0
+slcp.node.HoldBuffer.Admit.held: enumerant = 1
+slcp.node.HoldBuffer.Admit.ready: enumerant = 2
+slcp.node.HoldBuffer.Admit: enum
+slcp.node.HoldBuffer.Entry.item: field node.node.InputItem
+slcp.node.HoldBuffer.Entry.kind: field node.node.HoldBuffer.Kind
+slcp.node.HoldBuffer.Entry.node_id: field [32]u8
+slcp.node.HoldBuffer.Entry: struct
+slcp.node.HoldBuffer.Kind.confirm: enumerant = 2
+slcp.node.HoldBuffer.Kind.externalize: enumerant = 3
+slcp.node.HoldBuffer.Kind.nominate: enumerant = 0
+slcp.node.HoldBuffer.Kind.prepare: enumerant = 1
+slcp.node.HoldBuffer.Kind: enum
+slcp.node.HoldBuffer.PutResult.dropped_full: enumerant = 2
+slcp.node.HoldBuffer.PutResult.held: enumerant = 0
+slcp.node.HoldBuffer.PutResult.replaced: enumerant = 1
+slcp.node.HoldBuffer.PutResult: enum
+slcp.node.HoldBuffer.admit: fn (*node.node.HoldBuffer, mem.Allocator, *const node.node.Meta, u64, bool, *const engine.qset.QuorumSetOwned, node.node.InputItem) node.node.HoldBuffer.Admit
+slcp.node.HoldBuffer.bytes: field usize = 0
+slcp.node.HoldBuffer.count: field usize = 0
+slcp.node.HoldBuffer.deinit: fn (*node.node.HoldBuffer, mem.Allocator) void
+slcp.node.HoldBuffer.dropped_badsig: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.dropped_behind: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.dropped_far: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.dropped_full: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.extSignersVBlocking: fn (*const node.node.HoldBuffer, mem.Allocator, u64, *const engine.qset.QuorumSetOwned) bool
+slcp.node.HoldBuffer.fed_out_of_graph: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.freeEntry: fn (mem.Allocator, *node.node.HoldBuffer.Entry) void
+slcp.node.HoldBuffer.held_now: field atomic.Value(usize) = <default>
+slcp.node.HoldBuffer.max_bytes: const usize = 8388608
+slcp.node.HoldBuffer.max_entries: const usize = 1024
+slcp.node.HoldBuffer.open: field hash_map.Custom(u64,void,hash_map.AutoContext(u64),80) = <default>
+slcp.node.HoldBuffer.put: fn (*node.node.HoldBuffer, mem.Allocator, u64, [32]u8, node.node.HoldBuffer.Kind, node.node.InputItem) error{OutOfMemory}!node.node.HoldBuffer.PutResult
+slcp.node.HoldBuffer.released: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.released_early: field atomic.Value(u64) = <default>
+slcp.node.HoldBuffer.slots: field hash_map.Custom(u64,array_list.Aligned(node.node.HoldBuffer.Entry,null),hash_map.AutoContext(u64),80) = <default>
+slcp.node.HoldBuffer.takeReleasable: fn (*node.node.HoldBuffer, mem.Allocator, u64) ?array_list.Aligned(node.node.HoldBuffer.Entry,null)
+slcp.node.HoldBuffer.takeSlot: fn (*node.node.HoldBuffer, u64) ?array_list.Aligned(node.node.HoldBuffer.Entry,null)
+slcp.node.HoldBuffer.window: const u64 = 64
+slcp.node.HoldBuffer: struct
+slcp.node.InputItem.input: field engine.engine.Input
+slcp.node.InputItem.source_peer: field ?usize
+slcp.node.InputItem: struct
+slcp.node.Meta.digest: field [32]u8
+slcp.node.Meta.kind: field node.node.HoldBuffer.Kind
+slcp.node.Meta.node_id: field [32]u8
+slcp.node.Meta.signature: field [64]u8
+slcp.node.Meta.slot: field u64
+slcp.node.Meta: struct
 slcp.node.Node.JournalTail.first: field u64
 slcp.node.Node.JournalTail.last: field u64
 slcp.node.Node.JournalTail: struct
@@ -1160,6 +1213,7 @@ slcp.node.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) 
 slcp.node.Node.ext_waiters: field usize = 0
 slcp.node.Node.failed: field atomic.Value(bool) = <default>
 slcp.node.Node.gpa: field mem.Allocator
+slcp.node.Node.hold: field node.node.HoldBuffer = <default>
 slcp.node.Node.io: field Io
 slcp.node.Node.journal_tail: field ?node.node.Node.JournalTail = null
 slcp.node.Node.last_compact_frontier: field u64 = 0
@@ -1189,6 +1243,7 @@ slcp.node.Node.resync_thread: field ?Thread = null
 slcp.node.Node.store: field node.store.Store
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel
+slcp.node.envelopeMeta: fn (mem.Allocator, [32]u8, []const u8) error{BadNodeIdLength,BadSignatureLength,BadStatementLength,EmptyMessage,FrameTooLarge,InvalidEnumValue,InvalidFarPointer,InvalidFlatBytes,InvalidInlineCompositePointer,InvalidMessageSize,InvalidPointer,InvalidRootPointer,InvalidSegmentCount,InvalidSegmentId,ListTooLarge,MessageTooLarge,NestingLimitExceeded,OutOfBounds,OutOfMemory,PointerDepthLimit,SegmentCountLimitExceeded,TraversalLimitExceeded,TruncatedMessage,UnsetPledges}!node.node.Meta
 slcp.node.msTimeout: fn (u64) Io.Timeout
 slcp.node: struct
 slcp.overlay.Callbacks.ctx: field ?*anyopaque = null

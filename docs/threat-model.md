@@ -86,6 +86,29 @@ envelope citing an unknown qset hash parks until the qset arrives —
 4`, FIFO eviction (each eviction is a `phase_event(parked_evicted)`).
 EXTERNALIZE statements never park.
 
+**Hold buffer** (`src/node/node.zig` `HoldBuffer`, M6 S8b; protocol §12):
+inbound statements of every kind (EXTERNALIZE included) for slots beyond
+the delivery frontier + 1 are parked host-side until the node has applied
+the slot before them, or until a v-blocking set of the local quorum set has
+sent EXTERNALIZE for that slot (catch-up). **Only signers inside the
+transitive quorum graph are held**: a stranger's statement goes straight to
+the engine's relevance filter below and is dropped statelessly, so an
+unauthenticated connection with random keys cannot occupy a single entry
+(the S8b review filled the first version's 1024 entries that way). Every
+parked statement was **signature-verified first** (a forged signer cannot
+occupy or displace a genuine member's entry); the buffer is bounded to a
+**64-slot window** past the frontier, **1024 entries / 8 MiB** in total,
+one entry per (slot, signer, kind) — a chatty honest sender replaces its
+own entry, never accumulates — and a cap breach drops the newcomer. What is
+left to fill it is a quorum member's key, and a member can send at most
+(64 slots × 4 kinds) entries; the caps are a backstop, and every drop is
+re-sent by the sender's 3 s anti-entropy re-flood. The catch-up release
+trusts exactly what SCP's accept rule trusts (a v-blocking set), so a
+single byzantine member cannot make a node look ahead of its frontier.
+Held statements are neither relayed nor answered, so a lagging node also
+stops propagating the next slot's statements until it catches up (a slower
+relay in sparse topologies; invisible on the full-mesh deployments).
+
 **Relevance filter** (protocol §4 step 8): statements whose signer is outside
 the transitive quorum graph of your configuration are `ignored` before any
 per-slot state is allocated — a stranger with a valid key cannot make you
@@ -178,6 +201,27 @@ the network stopped for about two hours until nodes returned — the public
 post-mortem is Stellar's "May 15th Network Halt" blog post. That is one
 sentence of history, not a claim about SLCP: the point is that a correctly
 configured FBA network stops rather than forks, and yours will too.
+
+**The mute-node halt class (closed, M6 S8b).** A typed app whose
+`validate` reads `State` (the §0 counter: `.maybe_valid` for "ahead of my
+count") and a node that is one slot behind when the next slot's NOMINATE
+arrives: the engine caches the per-slot verdict and `fully_validated` is
+sticky, so that node would never vote for that slot — and n − t + 1 such
+nodes (two nodes restarting mid-slot on a 2-of-3 deployment) halted the
+network forever with everyone live and caught up. The host now feeds SCP
+only the current slot (protocol §12 hold rule, stellar-core's Herder shape):
+`apply(N)` always precedes every `validate` for N + 1, so the verdict is
+computed against the applied state. The one way a slot is judged early is
+the catch-up release, which needs a v-blocking set of EXTERNALIZEs for it —
+a slot the network has finished and can never need this node's vote on —
+so a node behind by more than one slot is passive only for slots that are
+already decided, never mute on one still in progress. (The S8b review
+refuted the first version, which let any lone EXTERNALIZE through: one
+peer's EXTERNALIZE(N + 1) reaching a node one slot behind muted it for
+N + 1 and, with that peer dead and two others restarting, halted a 3-of-4
+network with three live nodes.) Pinned by `zig build liveness-tests` (the
+double-crash and the lone-EXTERNALIZE schedules halt with the gate off and
+converge with it on) and by the e2e restart scenarios.
 
 **Nomination participation rule** (design §11; the number-one "my network is
 stuck" cause): consensus for a slot advances only while a quorum of

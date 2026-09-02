@@ -515,6 +515,15 @@ host.capnp codec and trace format), `schema/host.capnp`. Vectors:
 **Contract** (§5.1, copied from the `engine.zig` module doc): feed exactly
 ONE input via `pushInput`, then drain ALL effects (`popEffect` →
 `commitEffect` two-phase, borrowed until commit) before the next input.
+**Host obligation (M6 S8b, normative for both languages):** the host feeds
+the engine inbound statements of every kind only for slots at or below its
+delivery frontier + 1; later slots are held host-side and fed once the
+frontier reaches their slot − 1, or — the catch-up exception — as soon as
+the held EXTERNALIZE statements for a slot come from a v-blocking set of
+the local quorum set (§12 "hold rule"). The engine is unchanged by this
+rule — it is what keeps a state-dependent `validate_value` from caching a
+`.maybe_valid`-because-behind verdict that mutes the node for a slot the
+network still needs its vote on.
 Exactly one `input_status` effect per input, always the **final** effect of
 its drain. Effects appear in the normative order — in particular
 `persist_own_envelope` always precedes the `broadcast_envelope` for the same
@@ -724,7 +733,39 @@ most `max_slot_state_envelopes = 64` envelopes.
 §9.2's request_qset bullet):
 
 - `broadcast_envelope` → send to **all** connected peers.
-- Inbound `envelope` → `envelope_received` input → the engine emits
+- Inbound `envelope` → **gated by the delivery frontier** (M6 S8b,
+  `node.zig` `HoldBuffer.admit` / `releaseHeld` / `releaseSlot` — the
+  stellar-core Herder shape, `processSCPQueueUpToIndex(lcl + 1)`): a
+  statement of **any kind, EXTERNALIZE included,** for a slot above
+  `next_deliver` (the delivered frontier + 1) is **held**, not fed —
+  signature-verified first, one entry per (slot, signer, kind) with the
+  last-arrived replacing the earlier one (arrival order, not statement
+  freshness: a reordered older PREPARE can displace a newer held one; the
+  engine's freshness order applies at release and the sender's next
+  re-flood heals it), window 64 slots past the frontier (further ⇒
+  dropped), 1024 entries / 8 MiB in total (a cap breach drops the newcomer;
+  no eviction). Only signers inside the transitive quorum graph are held;
+  a stranger's statement is fed and `ignored` by the engine's step-8
+  relevance filter before any state, so it never occupies the buffer. Held
+  envelopes are neither relayed nor answered. Whenever an input moves
+  `next_deliver` the held statements for the new frontier slot are fed,
+  ascending by slot and in arrival order within a slot, after that input's
+  effects are fully drained and before the next queued input; held
+  statements for slots the frontier passed (delivered, or skipped by the
+  gap-jump of §13) are dropped. Every drop is healed by the sender's next
+  anti-entropy re-flood (≤ 3 s). **Catch-up release:** the moment the held
+  EXTERNALIZE statements for a slot come from a **v-blocking set** of the
+  local quorum set (SCP's own accept condition, applied host-side), that
+  whole slot is fed ahead of the frontier and later statements for it pass
+  straight through — the engine externalizes it from those statements
+  alone and the gap-jump of §13 follows. A v-blocking set contains an
+  honest node under the FBAS assumption, so the network finished that slot
+  and this node's vote on it can never be needed: judging it against a
+  stale state is harmless. A lone signer's EXTERNALIZE — the case that
+  halted a 3-of-4 network in the S8b review — is never v-blocking and waits
+  like everything else. Statements for the frontier slot and anything
+  behind it are always fed.
+- Fed `envelope` → `envelope_received` input → the engine emits
   `forward_envelope` iff the envelope advanced per-node freshness (§10) →
   relay to all peers **except the source**. Engine freshness *is* the dedup;
   hosts keep no seen-cache.
@@ -842,7 +883,8 @@ compacts both logs to `slot >= F − 15` (atomic temp-file + fsync +
 rename-over). So between compactions a log holds between 16 and ~80 slots,
 and a restart replays all of them (dedup by slot in the app, design §8.5).
 A catch-up gap wider than the window is declared unrecoverable and skipped
-loudly.
+loudly; held statements (§12) for the skipped range are dropped with it,
+and the new frontier slot's held statements are released.
 
 **Qset cache**: `qsets/<lower-case hex of qsetHash>.bin` holds the framed
 `QuorumSet` message bytes; best-effort, no fsync, written only for hashes the

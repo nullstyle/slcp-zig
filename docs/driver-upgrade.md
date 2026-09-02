@@ -70,6 +70,15 @@ const App = struct {
   returns it for `cmd.next > state.count + 1` because *this node may be
   behind*. It is not `.invalid`; returning `.invalid` for values you merely
   have not caught up to would make a lagging node vote against the network.
+  Ordering guarantee (M6 S8b): the node holds every inbound statement for
+  slot F + 2 and beyond until slot F + 1 is applied, so `apply(F)` always
+  runs before any `validate` for F + 1 — in normal operation `validate`
+  sees a value exactly one slot ahead of `State` and answers `.valid` /
+  `.invalid`. `.maybe_valid` stays the right answer for values further
+  ahead: during catch-up the node releases a slot early only once a
+  v-blocking set of peers has externalized it (a decided slot, where its
+  vote is never needed), and a bytes-level driver without a delivery hook
+  can lag the engine at any time.
 - **Where each runs**: `validate` and `apply` both execute **on the engine
   thread** — `apply` at the externalize effect, before any later input
   reaches the driver — reading and writing the one `State` without a lock.

@@ -89,6 +89,34 @@ pub fn build(b: *std.Build) void {
     const node_tests_step = b.step("node-tests", "Run the native node-layer unit tests");
     node_tests_step.dependOn(&run_node_tests.step);
 
+    // liveness-tests: the S8 D1 liveness pin (tests/liveness_test.zig) —
+    // real engines through the real AppNode driver on a deterministic bus,
+    // with the real `slcp.node.HoldBuffer` gate modelled in front of each
+    // engine; the double-crash schedules that halted the network before
+    // S8b, asserted halting with the gate off (control) and converging with
+    // it on. Part of `test`. No undeclared file reads, but the harness prints
+    // its evidence and must never be answered from cache.
+    const liveness_filter = b.option([]const u8, "liveness-filter", "liveness-tests: run only the tests whose name contains this");
+    const liveness_tests = b.addTest(.{
+        .name = "slcp-liveness-tests",
+        .filters = if (liveness_filter) |f| &.{f} else &.{},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/liveness_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "slcp", .module = slcp_mod },
+                .{ .name = "slcp-core", .module = slcp_core_native },
+                .{ .name = "capnpc-zig", .module = capnpc_full },
+            },
+        }),
+    });
+    const run_liveness_tests = b.addRunArtifact(liveness_tests);
+    run_liveness_tests.setCwd(b.path("."));
+    run_liveness_tests.has_side_effects = true;
+    const liveness_tests_step = b.step("liveness-tests", "Run the S8 D1 liveness pin: double-crash schedules halt without the hold gate and converge with it (part of `test`)");
+    liveness_tests_step.dependOn(&run_liveness_tests.step);
+
     const core_tests = b.addTest(.{
         .name = "slcp-core-tests",
         .root_module = slcp_core,
@@ -321,6 +349,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_framing_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
     test_step.dependOn(&run_node_tests.step);
+    test_step.dependOn(&run_liveness_tests.step);
     test_step.dependOn(abi_step);
     test_step.dependOn(&run_sim_tests.step);
     test_step.dependOn(fuzz_smoke_step);

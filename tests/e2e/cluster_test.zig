@@ -2,12 +2,18 @@
 //! `slcp.Node`s in one process over real loopback TCP, 3-of-4 quorum:
 //!
 //!   1. happy path — 200 slots externalized, agreement + validity;
-//!   2. kill/restart — a node is killed -9 mid-run, restarted from its
-//!      own.log, catches up, agreement preserved (no stale-vs-self);
+//!   2. kill/restart — a node is killed mid-run, restarted from its own.log
+//!      only once the others are more than an answering window ahead (so it
+//!      must gap-jump past what nobody can answer any more), catches up,
+//!      agreement preserved (no stale-vs-self) — and then REJOINS VOTING: a
+//!      survivor is killed so 3-of-4 needs the restarted node (S8b: a
+//!      restarted node that stayed mute would halt the cluster here);
 //!   3. partition/heal — the cluster is split 2/2 (no half has quorum → it
 //!      halts, which is CORRECT FBA behavior), then healed → progress resumes;
 //!   4. equivocator — a quorum member floods two contradictory PREPAREs;
-//!      the honest nodes still agree.
+//!      the honest nodes still agree;
+//!   5. double restart — two of four restart together, three times; the
+//!      network resumes every time (the S8 D1 shape over real sockets).
 //!
 //! Partition uses `slcp.overlay.setTestLinkFilter` — a test-only seam that
 //! gates frame delivery by (local nodeId, peer nodeId) without touching the
@@ -32,6 +38,9 @@ const HAPPY_SLOTS: u64 = 200;
 const RESTART_SLOTS: u64 = 60;
 const PARTITION_SLOTS: u64 = 50;
 const EQUIV_SLOTS: u64 = 40;
+const DOUBLE_RESTART_SLOTS: u64 = 45;
+/// node.zig `purge_window`: peers answer at most this many slots back.
+const ANSWERING_WINDOW: u64 = 16;
 
 // Deterministic identities (seed i = all-byte i+1). Index N is the
 // equivocator's key (only used by scenario 4's 5-node config).
@@ -185,6 +194,42 @@ const Cluster = struct {
             if (self.consumers[i].highestSlot() < target) return false;
         }
         return true;
+    }
+
+    /// Wait until every LIVE node reaches `target` (a killed node does not
+    /// count — `waitAllReached` needs all four), or `deadline_ms` elapses.
+    fn waitLiveReached(self: *Cluster, target: u64, deadline_ms: u64) !void {
+        const step: u64 = 100;
+        var waited: u64 = 0;
+        while (waited < deadline_ms) : (waited += step) {
+            if (self.minHighestLive() >= target) return;
+            sleepMs(self.io, step);
+        }
+        return error.ConsensusTimeout;
+    }
+
+    /// The lowest slot `consumers[i]` recorded ABOVE `floor` (0 if none):
+    /// what a restarted node's stream resumes at, after the journal replay.
+    fn lowestRecordedAbove(self: *Cluster, i: usize, floor: u64) u64 {
+        const c = &self.consumers[i];
+        c.mu.lockUncancelable(self.io);
+        defer c.mu.unlock(self.io);
+        var lowest: u64 = 0;
+        var it = c.records.keyIterator();
+        while (it.next()) |k| {
+            if (k.* > floor and (lowest == 0 or k.* < lowest)) lowest = k.*;
+        }
+        return lowest;
+    }
+
+    /// Re-queue a restarted node's proposal fuel (the queue died with the
+    /// process; values are per-node).
+    fn refuel(self: *Cluster, i: usize, prefix: []const u8, upto: u64) !void {
+        var vbuf: [48]u8 = undefined;
+        for (1..upto + 8 + 1) |s| {
+            const v = try std.fmt.bufPrint(&vbuf, "{s}-{d}-n{d}", .{ prefix, s, i });
+            try self.nodes[i].?.propose(v);
+        }
     }
 
     fn minHighestLive(self: *Cluster) u64 {
@@ -341,7 +386,14 @@ test "e2e: 4 nodes externalize 200 slots with agreement" {
     try assertAgreement(&cl, HAPPY_SLOTS);
 }
 
-test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
+// S8b (D1 pass-through pin on real nodes): the restart happens only once the
+// survivors are more than an answering window ahead, so node 3 must learn the
+// live frontier from EXTERNALIZE statements alone (they bypass the hold gate),
+// gap-jump past the slots nobody answers any more (its held statements for
+// the skipped range are dropped), release the new frontier's statements and
+// vote again — proven by killing node 0 afterwards: 3-of-4 then needs node
+// 3, and a mute node 3 leaves 2 of 4 → the final wait times out.
+test "e2e: kill and restart a node mid-run; it gap-jumps, catches up, rejoins voting; agreement holds" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -371,28 +423,47 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
             return c.minHighestLive() >= @max(4, RESTART_SLOTS / 4);
         }
     }.ok);
+    const hwm_at_kill = cl.consumers[3].highestSlot();
     cl.killNode(3);
 
-    // Cluster keeps going with 3 of 4 (still a quorum).
-    try waitFor(io, 120_000, &cl, struct {
-        fn ok(c: *Cluster) bool {
-            return c.consumers[0].highestSlot() >= @max(8, RESTART_SLOTS / 2);
+    // Cluster keeps going with 3 of 4 (still a quorum) — until it is more
+    // than an answering window past where node 3 died, so the restart below
+    // cannot be answered slot by slot (a guaranteed gap of >= 8 slots).
+    const restart_when = @max(40, hwm_at_kill + ANSWERING_WINDOW + 8);
+    {
+        var waited: u64 = 0;
+        while (cl.consumers[0].highestSlot() < restart_when) : (waited += 100) {
+            if (waited >= 120_000) return error.ProgressTimeout;
+            sleepMs(io, 100);
         }
-    }.ok);
+    }
 
     // Restart node 3 from its own.log; it must catch up. Re-queue its
     // proposals (the queue died with the process; values are per-node fuel).
     wd.mark(); // everything from here on is post-restart
     try cl.spawnNode(3);
-    {
-        var vbuf: [48]u8 = undefined;
-        for (1..target + 8 + 1) |s| {
-            const v = try std.fmt.bufPrint(&vbuf, "rr-{d}-n3", .{s});
-            try cl.nodes[3].?.propose(v);
-        }
-    }
+    try cl.refuel(3, "rr", target);
 
-    try cl.waitAllReached(target, 180_000);
+    // Node 3 rejoins the live frontier ...
+    try waitFor(io, 120_000, &cl, struct {
+        fn ok(c: *Cluster) bool {
+            return c.consumers[3].highestSlot() >= 50;
+        }
+    }.ok);
+    // ... by gap-jumping: the restart replays its journal tail (which can
+    // run past what the consumer had drained before the kill), and nothing
+    // in (tail, resume) was recoverable — its live stream resumed strictly
+    // past the slot after the last one it journaled.
+    const tail_last = cl.nodes[3].?.journal_tail.?.last;
+    const resumed_at = cl.lowestRecordedAbove(3, tail_last);
+    std.debug.print("restart: node 3 died at consumer slot {d} (journal tail ends at {d}), resumed its stream at slot {d}\n", .{ hwm_at_kill, tail_last, resumed_at });
+    try std.testing.expect(tail_last >= hwm_at_kill);
+    try std.testing.expect(resumed_at > tail_last + 1);
+
+    // Now make node 3 NECESSARY: kill node 0, so 3-of-4 is {1, 2, 3}. A
+    // restarted node that stayed mute (the S8 D1 finding) halts here.
+    cl.killNode(0);
+    try cl.waitLiveReached(target, 90_000);
     try assertAgreement(&cl, target);
 
     // Watchdog verdict: node 3 was observed BOTH overall and after the
@@ -400,6 +471,71 @@ test "e2e: kill and restart a node mid-run; it catches up, agreement holds" {
     try std.testing.expect(wd.seen.load(.acquire) > 0);
     try std.testing.expect(wd.checked_after_mark.load(.acquire) > 0);
     try std.testing.expectEqual(@as(u32, 0), wd.violations.load(.acquire));
+}
+
+// The S8 D1 shape over real sockets: two of four go down together mid-run
+// (in-process `Node.deinit` — the persisted state is what a crash leaves,
+// persist-before-broadcast) and come back a second later, three times.
+// Each round must resume progress; with the bytes-level default driver the
+// mute-node mechanism itself cannot trigger, so this is the regression
+// scenario for the hold / release / catch-up path under a real restart
+// storm: a release bug (statements held and never fed, or fed for the
+// wrong frontier) stalls a round and the 60 s wait fails.
+test "e2e: two of four restart together, three times; the network always resumes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cl = Cluster{
+        .gpa = gpa,
+        .io = io,
+        .base_port = 39500,
+        .data_root = scratch_root ++ "/double-restart",
+    };
+    removeTree(io, cl.data_root);
+    defer cl.deinit();
+
+    for (0..N) |i| try cl.spawnNode(i);
+    try cl.waitMesh(20_000);
+    const target: u64 = DOUBLE_RESTART_SLOTS;
+    try cl.proposeAll("d", target);
+
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        // Let it run a little past the last checkpoint, then take 2 and 3
+        // down together.
+        const before = cl.minHighestLive();
+        try waitFor(io, 60_000, &cl, struct {
+            fn ok(c: *Cluster) bool {
+                return c.minHighestLive() >= 4 and c.consumers[0].highestSlot() >= 4;
+            }
+        }.ok);
+        const at_kill = cl.consumers[0].highestSlot();
+        cl.killNode(2);
+        cl.killNode(3);
+        sleepMs(io, 1_000);
+        try cl.spawnNode(2);
+        try cl.spawnNode(3);
+        var pbuf: [16]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&pbuf, "dr{d}", .{round});
+        try cl.refuel(2, prefix, target);
+        try cl.refuel(3, prefix, target);
+        try cl.waitMesh(20_000);
+        // The network resumes: every node, the two restarted ones included,
+        // moves at least 5 slots past where the survivors were at the kill.
+        const goal = at_kill + 5;
+        var waited: u64 = 0;
+        while (cl.minHighestLive() < goal) : (waited += 100) {
+            if (waited >= 60_000) {
+                std.debug.print("double restart round {d}: stalled at min-live {d} (goal {d}, before {d})\n", .{ round, cl.minHighestLive(), goal, before });
+                return error.ProgressTimeout;
+            }
+            sleepMs(io, 100);
+        }
+        std.debug.print("double restart round {d}: killed at {d}, resumed to {d}\n", .{ round, at_kill, cl.minHighestLive() });
+    }
+
+    try cl.waitAllReached(target, 120_000);
+    try assertAgreement(&cl, target);
 }
 
 test "e2e: partition halts without quorum, heals on reconnect" {

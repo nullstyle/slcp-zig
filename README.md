@@ -135,7 +135,10 @@ What the program relies on:
   floor); values survive both.
 - **`apply` runs on the engine thread**, after the journal append and before
   the next input; `waitApplied` hands the user thread a value copy of the
-  state. Keep `apply` fast and pure.
+  state. Keep `apply` fast and pure. The node holds the next slot's votes
+  until it has applied the slot before them, so `validate` always judges a
+  value exactly one slot ahead of `State`; `.maybe_valid` is for anything
+  further ahead (a node still catching up).
 - **A restart replays the journal**: `State` is `initialState()` plus the
   replayed tail of `slcp-data/externalized.log`, so the process resumes at
   the count it last saw and its first (stale) proposal is simply judged
@@ -317,7 +320,8 @@ mise exec -- zig build test
 |---|---|
 | `zig build test` | The gate: engine unit tests, conformance-vector replay, framing vectors, engine end-to-end, node-layer tests, ABI conformance, sim smoke matrix, fuzz smoke, the wasm differential (when the artifact is present), CLI tests, the AppNode expected-fail compiles, the example's in-tree compile, and the docs gate below. |
 | `zig build docs-smoke` | The docs gate (part of `test`): README and `docs/` snippets byte-equal to the files they quote, recipe outputs byte-equal to the real CLI, every documented build step / recipe / CLI verb exists, enum arms and version pins match the source. Prints `[docs-smoke] checks=N failures=M`. |
-| `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart, partition/heal, one equivocator. About two minutes. |
+| `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
+| `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
