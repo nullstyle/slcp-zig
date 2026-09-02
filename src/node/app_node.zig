@@ -782,9 +782,13 @@ pub fn AppNode(comptime App: type) type {
 // ---------------------------------------------------------------------------
 
 const Color = enum(u8) { red, green, blue };
+/// Signed-tag enum: its own codec arm (the tag biases like a signed int);
+/// `.neg` spells 0x7B, `.zero` 0x80, `.pos` 0x85.
+const Sign = enum(i8) { neg = -5, zero = 0, pos = 5 };
 
 /// Kitchen-sink Command: every allowed leaf kind, a sub-byte int, a signed
-/// wide int, a fixed array and a nested struct. Encoded size 22.
+/// wide int, a fixed array, a nested struct and a trailing signed-tag enum.
+/// Encoded size 23.
 const Kitchen = struct {
     a: i8,
     b: u3,
@@ -793,6 +797,7 @@ const Kitchen = struct {
     e: Color,
     f: [3]u16,
     g: struct { h: u16, i: i16 },
+    s: Sign,
 };
 const KitchenCodec = Codec(Kitchen);
 
@@ -816,12 +821,15 @@ fn randomValue(comptime T: type, rand: std.Random) T {
 }
 
 const kitchen_extremes = [_]Kitchen{
-    .{ .a = -128, .b = 0, .c = std.math.minInt(i64), .d = false, .e = .red, .f = .{ 0, 0, 0 }, .g = .{ .h = 0, .i = -32768 } },
-    .{ .a = 127, .b = 7, .c = std.math.maxInt(i64), .d = true, .e = .blue, .f = .{ 65535, 65535, 65535 }, .g = .{ .h = 65535, .i = 32767 } },
-    .{ .a = 0, .b = 0, .c = 0, .d = false, .e = .red, .f = .{ 0, 0, 0 }, .g = .{ .h = 0, .i = 0 } },
-    .{ .a = -1, .b = 7, .c = -1, .d = true, .e = .green, .f = .{ 0, 65535, 0 }, .g = .{ .h = 1, .i = -1 } },
-    .{ .a = 1, .b = 1, .c = 1, .d = false, .e = .green, .f = .{ 1, 0, 65535 }, .g = .{ .h = 0, .i = 1 } },
-    .{ .a = -128, .b = 7, .c = std.math.maxInt(i64), .d = true, .e = .blue, .f = .{ 65535, 0, 0 }, .g = .{ .h = 65535, .i = -32768 } },
+    .{ .a = -128, .b = 0, .c = std.math.minInt(i64), .d = false, .e = .red, .f = .{ 0, 0, 0 }, .g = .{ .h = 0, .i = -32768 }, .s = .neg },
+    .{ .a = 127, .b = 7, .c = std.math.maxInt(i64), .d = true, .e = .blue, .f = .{ 65535, 65535, 65535 }, .g = .{ .h = 65535, .i = 32767 }, .s = .pos },
+    .{ .a = 0, .b = 0, .c = 0, .d = false, .e = .red, .f = .{ 0, 0, 0 }, .g = .{ .h = 0, .i = 0 }, .s = .zero },
+    .{ .a = -1, .b = 7, .c = -1, .d = true, .e = .green, .f = .{ 0, 65535, 0 }, .g = .{ .h = 1, .i = -1 }, .s = .neg },
+    .{ .a = 1, .b = 1, .c = 1, .d = false, .e = .green, .f = .{ 1, 0, 65535 }, .g = .{ .h = 0, .i = 1 }, .s = .pos },
+    .{ .a = -128, .b = 7, .c = std.math.maxInt(i64), .d = true, .e = .blue, .f = .{ 65535, 0, 0 }, .g = .{ .h = 65535, .i = -32768 }, .s = .zero },
+    // Same prefix as the first entry, differing only in the trailing signed
+    // tag: the order of this pair is decided by the enum arm alone.
+    .{ .a = -128, .b = 0, .c = std.math.minInt(i64), .d = false, .e = .red, .f = .{ 0, 0, 0 }, .g = .{ .h = 0, .i = -32768 }, .s = .zero },
 };
 
 // Non-vacuity: dropping the sign-bit bias in `encodeInt` (or flipping the
@@ -837,12 +845,14 @@ test "codec golden bytes: u64 big-endian, i8 sign-bit-biased" {
     try std.testing.expectEqualSlices(u8, &[_]u8{0x00}, I.encode(.{ .v = -128 }, &b1));
     try std.testing.expectEqualSlices(u8, &[_]u8{0x80}, I.encode(.{ .v = 0 }, &b1));
     try std.testing.expectEqualSlices(u8, &[_]u8{0xFF}, I.encode(.{ .v = 127 }, &b1));
-    try std.testing.expectEqual(@as(usize, 22), KitchenCodec.size);
+    try std.testing.expectEqual(@as(usize, 23), KitchenCodec.size);
 }
 
 // Non-vacuity: removing the bias (signed ints encode as two's complement)
 // makes a (-1, 1) pair order .gt in bytes while the oracle says .lt; the
-// observed-set assertion goes red if the PRNG pairs never disagree.
+// observed-set assertion goes red if the PRNG pairs never disagree; encoding
+// the signed enum tag as raw unsigned bits goes red on the quarter of the
+// pairs that share every field but `s` (and on the extremes' last pair).
 test "codec order-preservation: byte order == numeric order over 10000 PRNG pairs + extremes" {
     var prng = std.Random.DefaultPrng.init(0x0c0d_ec0d_e0c0_de01);
     const rand = prng.random();
@@ -858,6 +868,13 @@ test "codec order-preservation: byte order == numeric order over 10000 PRNG pair
             b.a = a.a;
             b.b = a.b;
             b.c = a.c;
+            // A quarter share everything but the trailing signed-tag enum.
+            if (rand.boolean()) {
+                b.d = a.d;
+                b.e = a.e;
+                b.f = a.f;
+                b.g = a.g;
+            }
         }
         const want = KitchenCodec.order(a, b);
         const got = std.mem.order(u8, KitchenCodec.encode(a, &ba), KitchenCodec.encode(b, &bb));
@@ -899,6 +916,7 @@ test "codec round-trip: decode(encode(a)) == a and encode(decode(b)) == b" {
             raw[1] &= 0x07;
             raw[10] &= 0x01;
             raw[11] %= 3;
+            raw[22] = ([_]u8{ 0x7B, 0x80, 0x85 })[raw[22] % 3];
         }
         if (KitchenCodec.decode(&raw)) |v| {
             decoded_random += 1;
@@ -913,9 +931,11 @@ test "codec round-trip: decode(encode(a)) == a and encode(decode(b)) == b" {
 
 // Non-vacuity: dropping the `bytes.len != size` check accepts the ±1
 // lengths; dropping `std.math.cast` accepts u3 byte 0x08; a bool decoded as
-// `!= 0` accepts 2; `@enumFromInt` instead of `enums.fromInt` accepts 200.
+// `!= 0` accepts 2; `@enumFromInt` instead of `enums.fromInt` accepts 200;
+// a signed tag decoded as raw unsigned bits makes 0x7B (-5 biased) name no
+// variant (123) and 0x81 (biased 1) decode instead of being rejected.
 test "codec strict rejections, each paired with a one-byte-fixed sibling that decodes" {
-    const base_v = Kitchen{ .a = 3, .b = 5, .c = -9, .d = true, .e = .green, .f = .{ 1, 2, 3 }, .g = .{ .h = 4, .i = -5 } };
+    const base_v = Kitchen{ .a = 3, .b = 5, .c = -9, .d = true, .e = .green, .f = .{ 1, 2, 3 }, .g = .{ .h = 4, .i = -5 }, .s = .zero };
     var base: [KitchenCodec.size]u8 = undefined;
     _ = KitchenCodec.encode(base_v, &base);
     try std.testing.expect(KitchenCodec.decode(&base) != null);
@@ -948,13 +968,21 @@ test "codec strict rejections, each paired with a one-byte-fixed sibling that de
     try std.testing.expect(KitchenCodec.decode(&m) == null);
     m[11] = 2;
     try std.testing.expectEqual(Color.blue, KitchenCodec.decode(&m).?.e);
+
+    // signed enum tag at offset 22: 0x81 unbiases to 1, which names no
+    // variant; 0x7B is the biased spelling of .neg (-5).
+    m = base;
+    m[22] = 0x81;
+    try std.testing.expect(KitchenCodec.decode(&m) == null);
+    m[22] = 0x7B;
+    try std.testing.expectEqual(Sign.neg, KitchenCodec.decode(&m).?.s);
 }
 
 // Non-vacuity: encoding the tag as its raw unsigned bits (instead of with the
 // tag type's own signedness) makes the negative tag decode to null and orders
 // its byte .gt while the oracle says .lt.
 test "codec signed-tag enum: negative tags round-trip and order like their backing int" {
-    const S = enum(i8) { neg = -5, zero = 0, pos = 5 };
+    const S = Sign;
     const C = Codec(struct { s: S });
     var b1: [1]u8 = undefined;
     var b2: [1]u8 = undefined;
