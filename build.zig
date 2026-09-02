@@ -68,6 +68,8 @@ pub fn build(b: *std.Build) void {
         .root_module = slcp_core,
     });
     const run_core_tests = b.addRunArtifact(core_tests);
+    const core_tests_step = b.step("core-tests", "Run the sans-io engine unit tests (slcp-core)");
+    core_tests_step.dependOn(&run_core_tests.step);
 
     const vector_tests = b.addTest(.{
         .name = "slcp-vector-tests",

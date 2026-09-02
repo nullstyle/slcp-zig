@@ -34,4 +34,7 @@ pub const host_codec = @import("engine/host_codec.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    // pipeline.zig is reached only through the @import inside
+    // Engine.pushInput's body, which never collects its tests.
+    _ = @import("engine/pipeline.zig");
 }
