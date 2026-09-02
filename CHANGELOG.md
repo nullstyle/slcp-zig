@@ -109,8 +109,11 @@ slcp-0.1.0-p1Kf2mJnEwBKcaQ_OIRLIUCqCheAsWHROjZeUtKJkUfQ
   cached `.maybe_valid` and went mute on that slot forever: two nodes
   restarting mid-slot at 2-of-3 halted the network with everyone live.
   Pinned by `tests/liveness_test.zig` and an e2e scenario.
-- `.paths` is `build.zig`, `build.zig.zon`, `src`, `schema` — the package
-  ships the checked-in generated code and the schemas, nothing else.
+- `.paths` is `build.zig`, `build.zig.zon`, `src`, `schema` plus the one
+  `tests/appnode_errors/cases.zig` that `build.zig` imports — the package
+  ships the checked-in generated code and the schemas, nothing else
+  (`just package-preflight` rebuilds a real tarball consumer to prove it;
+  it caught `build.zig` importing an unpackaged file before this tag).
   `minimum_zig_version` is `0.17.0-dev.1786`, enforced by `build.zig` at
   comptime (the build runner never compares the zon floor).
 - capnp-zig is pinned at v0.16.0 by tag URL; `src/gen` is regenerated only
@@ -191,7 +194,13 @@ test; and a dozen documentation claims that disagreed with the code
   `canonicalBytes` entry points are held out of the Stable tier: their
   inferred error sets resolve to `anyerror` through capnp-zig's builders.
 - Long fuzzing is advisory: the release ran what `RELEASING.md`'s run log
-  says it ran, nothing more.
+  says it ran, nothing more. The 200K-iteration run before this tag found
+  one **unconfirmed** input-sequence fuzz failure
+  (`error.OwnStatementNotMonotonic`, the §13.1 harness invariant; the
+  input is preserved) that is either a known harness false positive — the
+  engine re-emits EXTERNALIZE with a grown `nH`, which `isNewerStatement`
+  does not rank — or a real own-statement ordering bug; it is a v0.1.x
+  ticket, not classified here.
 - A watcher (no key) skips the identity node-id comparison; `Hello.listenPort`
   is sent but never used for dialing.
 - No license is granted.

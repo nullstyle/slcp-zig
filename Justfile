@@ -186,9 +186,22 @@ gen-check-pinned:
     rm -rf "$prefix"
 
 # Advisory long fuzz (R21): the limit is ITERATIONS (K/M/G suffixes), not
-# minutes. Record the outcome in RELEASING.md's run log; it never blocks.
+# minutes. Record the outcome in RELEASING.md's run log; it never blocks the
+# tag. `zig build --fuzz` exits 0 even when a target FAILS (it prints
+# `failed with error.X`, `exited with code 1; input saved to
+# .zig-cache/f/crash` and still reports) — the v0.1.0 run found
+# error.OwnStatementNotMonotonic that way — so the log is grepped here.
 fuzz-long ITERS="1M":
-    zig build fuzz --fuzz={{ITERS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log=$(mktemp "${TMPDIR:-/tmp}/slcp-fuzz-long.XXXXXX")
+    zig build fuzz --fuzz={{ITERS}} 2>&1 | tee "$log"
+    if grep -qE '^failed with |exited with code [0-9]+; input saved to|^\+- run test .* failure$' "$log"; then
+        echo "fuzz-long: a fuzz target FAILED (see above; the input is under .zig-cache/f/crash)"
+        rm -f "$log"; exit 1
+    fi
+    rm -f "$log"
+    echo "fuzz-long: {{ITERS}} iterations, no failure"
 
 # The package hash of HEAD, the value README's pin block and CHANGELOG.md
 # record BEFORE the tag (both files are outside `.paths`, so recording it is
