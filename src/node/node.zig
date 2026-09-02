@@ -386,6 +386,12 @@ pub const Node = struct {
     /// (values owned), and the next slot to hand the app (§11.2 ordering).
     pending_ext: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     next_deliver: u64,
+    /// Engine-thread-only: the delivered frontier at the last successful log
+    /// compaction. Compaction runs whenever the frontier enters a new
+    /// 64-slot bucket past this (§10 "every 64 delivered slots") — tracked
+    /// rather than tested with `frontier % 64 == 0`, because one drain can
+    /// step over a boundary when out-of-order catch-up slots are buffered.
+    last_compact_frontier: u64 = 0,
     /// Slots below this are purged; the timer wheel drops stale fires for
     /// them (read on the wheel thread).
     purge_floor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1029,9 +1035,14 @@ pub const Node = struct {
         return self.ext_queue.orderedRemove(0);
     }
 
+    /// Observability snapshot (racy counters). `.failed` is true when EITHER
+    /// the engine latched (§7.2 DriverFault/EngineFailed) or the node itself
+    /// went inert (`markFailed`: a hook refusal, a failed write-ahead append,
+    /// a buffering OOM) — a halted node must not report itself healthy.
     pub fn stats(self: *Node) engine.Stats {
-        // Read-only snapshot; safe enough for observability (racy counters).
-        return self.eng.stats();
+        var s = self.eng.stats();
+        s.failed = s.failed or self.failed.load(.acquire);
+        return s;
     }
 
     pub fn boundPort(self: *Node) u16 {
@@ -1291,10 +1302,17 @@ pub const Node = struct {
             self.pruneOwnLatest(max_slot);
             self.q.push(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
             // §10 "and compacts": rewrite the logs occasionally so they do
-            // not grow without bound (every 64 delivered slots).
-            if (frontier % 64 == 0) {
-                self.store.compact(max_slot) catch |e|
+            // not grow without bound (every 64 delivered slots). A drain may
+            // deliver several buffered slots at once and land past a
+            // multiple of 64, so compare 64-slot buckets against the last
+            // compaction instead of testing the frontier itself; a failed
+            // compaction leaves the mark alone so the next drain retries.
+            if (frontier / 64 > self.last_compact_frontier / 64) {
+                if (self.store.compact(max_slot)) |_| {
+                    self.last_compact_frontier = frontier;
+                } else |e| {
                     log.warn("log compaction failed (will retry later): {s}", .{@errorName(e)});
+                }
             }
         }
     }
@@ -1845,4 +1863,129 @@ test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount dro
     b_live = false;
     try pollUntil(io, 10_000, a, Probe.down);
     try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
+}
+
+// -- S8 D2: compaction cadence vs. multi-slot drains ---------------------------
+
+/// Journal slots 1..62 into a fresh data_dir, create a hooked Node (the tail
+/// replay delivers 1..62 and sets next_deliver = 63), seed `pending_ext` with
+/// `seed_slots` (an out-of-order catch-up batch), drain ONCE, and report what
+/// externalized.log holds afterward.
+fn probeDrainCompaction(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, seed_slots: []const u64) !struct { records: usize, min_slot: u64, delivered: usize } {
+    const passphrase = "s8 compaction cadence probe";
+    const seed: [32]u8 = @splat(0x51);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x52);
+    const peer_b: [32]u8 = @splat(0x53);
+    {
+        var st = try store_mod.Store.open(gpa, io, data_dir);
+        defer st.deinit();
+        var s: u64 = 1;
+        while (s <= 62) : (s += 1) {
+            var vbuf: [8]u8 = undefined;
+            try st.appendExternalized(s, try std.fmt.bufPrint(&vbuf, "v{d}", .{s}));
+        }
+    }
+    var diag: Diagnostic = .{};
+    var hook = RecordingHook{ .gpa = gpa };
+    defer hook.deinit();
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+        .delivery = hook.hook(),
+    });
+    defer n.deinit();
+    try std.testing.expectEqual(@as(u64, 63), n.next_deliver);
+    try std.testing.expectEqual(@as(usize, 62), hook.slots.items.len);
+
+    for (seed_slots) |s| {
+        const v = try gpa.dupe(u8, "x");
+        try n.pending_ext.put(gpa, s, v);
+    }
+    n.drainDeliverable();
+    try std.testing.expectEqual(@as(usize, 0), n.pending_ext.count());
+
+    var rec = try n.store.recover(gpa);
+    defer store_mod.Store.deinitRecovery(gpa, &rec);
+    var min_slot: u64 = std.math.maxInt(u64);
+    for (rec.ext_tail) |r| min_slot = @min(min_slot, r.slot);
+    return .{ .records = rec.ext_tail.len, .min_slot = min_slot, .delivered = hook.slots.items.len };
+}
+
+// Non-vacuity: reverting the compaction trigger to `frontier % 64 == 0`
+// (tested once per drain, after the loop) leaves arm B — a single drain
+// that steps 63 → 65 over the 64 boundary, the out-of-order catch-up case
+// `pending_ext` exists for — with all 62 pre-existing journal records
+// (min slot 1) instead of the 13 records >= 50 the §10 "every 64 delivered
+// slots" cadence promises; arm A (a drain ending exactly on 64) passes
+// either way and pins the steady-state cadence. Dropping the
+// `last_compact_frontier` update after a successful compaction would
+// compact on every later drain — not caught here, but harmless.
+test "compaction cadence: a drain that ends on 64 compacts, and so does a drain that steps over 64 (63 -> 65) in one go" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&a_buf, "{s}/a", .{root});
+    const dir_b = try std.fmt.bufPrint(&b_buf, "{s}/b", .{root});
+
+    // Arm A: frontier 64 → compact(64 - 15 = 49): records 49..62 survive.
+    const a = try probeDrainCompaction(gpa, io, dir_a, &.{ 63, 64 });
+    try std.testing.expectEqual(@as(usize, 64), a.delivered);
+    try std.testing.expectEqual(@as(usize, 14), a.records);
+    try std.testing.expectEqual(@as(u64, 49), a.min_slot);
+    // Arm B: frontier 65 crossed the 64 boundary inside one drain →
+    // compact(65 - 15 = 50): records 50..62 survive.
+    const b = try probeDrainCompaction(gpa, io, dir_b, &.{ 63, 64, 65 });
+    try std.testing.expectEqual(@as(usize, 65), b.delivered);
+    try std.testing.expectEqual(@as(usize, 13), b.records);
+    try std.testing.expectEqual(@as(u64, 50), b.min_slot);
+}
+
+// -- S8 D2: stats().failed reflects the node-level inert latch ------------------
+
+// Non-vacuity: `Node.stats()` returning `self.eng.stats()` verbatim (the
+// engine's own DriverFault/EngineFailed latch only) leaves `.failed` false
+// after the NODE latch is set — the second assertion goes red. The latch is
+// set directly here (the same atomic `markFailed` swaps to true on a hook
+// refusal, a failed own.log/externalized.log append, or a buffering OOM)
+// because `markFailed` logs at err level, which this test runner counts as
+// a failure; the live path is covered by the S8 d2-restart harness
+// (waitApplied -> NodeHalted, then `raw().stats()`).
+test "stats: .failed is true once the node latched inert, not only on an engine failure" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x5a);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x5b);
+    const peer_b: [32]u8 = @splat(0x5c);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "stats inert latch v1",
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    try std.testing.expect(!n.stats().failed);
+    try std.testing.expect(!n.eng.failed);
+    n.failed.store(true, .seq_cst); // the inert latch, with the engine itself healthy
+    try std.testing.expect(!n.eng.failed);
+    try std.testing.expect(n.stats().failed);
 }

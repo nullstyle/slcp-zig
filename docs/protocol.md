@@ -835,12 +835,14 @@ cannot persist must go silent. `externalized` → append + fsync
 `externalized.log` → deliver to the app.
 
 **GC / answering window**: `purge_window = 16`. When the delivered frontier
-`F >= 16`, the node issues `purge_slots(F − 15)` on every drain that advances
-`F`; only when a drain ends with `F` a multiple of 64 does it also compact
-both logs to `slot >= F − 15` (atomic temp-file + fsync + rename-over). So
-between compactions a log holds between 16 and ~80 slots, and a restart
-replays all of them (dedup by slot in the app, design §8.5). A catch-up gap
-wider than the window is declared unrecoverable and skipped loudly.
+`F >= 16`, the node issues `purge_slots(F − 15)` on every delivery and, each
+time `F` enters a new 64-slot bucket since the last compaction (so a
+multi-slot catch-up drain that steps over a multiple of 64 still counts),
+compacts both logs to `slot >= F − 15` (atomic temp-file + fsync +
+rename-over). So between compactions a log holds between 16 and ~80 slots,
+and a restart replays all of them (dedup by slot in the app, design §8.5).
+A catch-up gap wider than the window is declared unrecoverable and skipped
+loudly.
 
 **Qset cache**: `qsets/<lower-case hex of qsetHash>.bin` holds the framed
 `QuorumSet` message bytes; best-effort, no fsync, written only for hashes the
