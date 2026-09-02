@@ -737,8 +737,10 @@ pub const Node = struct {
     /// (values owned), and the next slot to hand the app (§11.2 ordering).
     pending_ext: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     next_deliver: u64,
-    /// Engine-thread-only: inbound NOMINATE / PREPARE / CONFIRM statements
-    /// for slots above `next_deliver`, released at the frontier (S8 D1).
+    /// Engine-thread-only: inbound statements of every kind (EXTERNALIZE
+    /// included) for slots above `next_deliver`, released at the frontier —
+    /// or early, once a v-blocking set has externalized their slot (S8 D1 /
+    /// S8b).
     hold: HoldBuffer = .{},
     /// Engine-thread-only: the delivered frontier at the last successful log
     /// compaction. Compaction runs whenever the frontier enters a new

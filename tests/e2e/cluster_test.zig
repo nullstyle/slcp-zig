@@ -386,9 +386,11 @@ test "e2e: 4 nodes externalize 200 slots with agreement" {
     try assertAgreement(&cl, HAPPY_SLOTS);
 }
 
-// S8b (D1 pass-through pin on real nodes): the restart happens only once the
+// S8b (D1 catch-up pin on real nodes): the restart happens only once the
 // survivors are more than an answering window ahead, so node 3 must learn the
-// live frontier from EXTERNALIZE statements alone (they bypass the hold gate),
+// live frontier from EXTERNALIZE statements alone (held like everything else
+// until a v-blocking set of signers has sent them for a slot, then released
+// ahead of the frontier — `HoldBuffer.admit` → `.ready`),
 // gap-jump past the slots nobody answers any more (its held statements for
 // the skipped range are dropped), release the new frontier's statements and
 // vote again — proven by killing node 0 afterwards: 3-of-4 then needs node
