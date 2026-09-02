@@ -283,6 +283,25 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_decode.step);
     fuzz_step.dependOn(&run_fuzz_seq.step);
 
+    // fuzz-replay: replay saved input-seq fuzz inputs (the bytes the fuzzer
+    // writes to .zig-cache/f/crash) through the target's own run path with
+    // a per-input trace. `zig build fuzz-replay -- <file.bin>…`; with no
+    // args it replays the S9 crash inputs embedded from tests/fuzz/crash/.
+    // The exe imports the fuzz target's module so both share one code path.
+    const fuzz_replay_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/input_seq_replay.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{.{ .name = "input_seq_fuzz", .module = fuzz_seq_mod }},
+    });
+    const fuzz_replay_exe = b.addExecutable(.{ .name = "slcp-fuzz-input-seq-replay", .root_module = fuzz_replay_mod });
+    const run_fuzz_replay = b.addRunArtifact(fuzz_replay_exe);
+    run_fuzz_replay.addPassthruArgs(); // forwards everything after `--`
+    run_fuzz_replay.setCwd(b.path(".")); // relative .bin paths resolve against the repo root
+    run_fuzz_replay.has_side_effects = true;
+    const fuzz_replay_step = b.step("fuzz-replay", "Replay saved input-seq fuzz inputs with a trace: -- [file.bin ...] (default: tests/fuzz/crash/*)");
+    fuzz_replay_step.dependOn(&run_fuzz_replay.step);
+
     // -----------------------------------------------------------------
     // WASM host-ABI conformance suite (design §7.2/§7.3, §14-M4), run
     // WITHOUT a wasm runtime so it is part of plain `zig build test`.
