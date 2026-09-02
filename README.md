@@ -287,7 +287,10 @@ same binary through `slcp_dep.artifact("slcp")`, as the example's
 ## Building and testing
 
 The toolchain is pinned in `mise.toml` to one exact Zig nightly,
-`0.17.0-dev.1786+75044cb04` (`build.zig.zon` carries only a floor). With
+`0.17.0-dev.1786+75044cb04` (`build.zig.zon` carries only a floor, which
+`build.zig` enforces at comptime — an older Zig stops with a one-line
+message naming the floor instead of failing somewhere inside `std.Io`).
+With
 [mise](https://mise.jdx.dev) installed:
 
 ```sh

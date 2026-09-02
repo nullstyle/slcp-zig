@@ -476,6 +476,28 @@ pub fn parseMiseZig(toml: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Does build.zig enforce build.zig.zon's `minimum_zig_version` itself?
+/// Zig's build runner parses the field but never compares it against the
+/// running compiler (S8 D9), so the floor is real only if build.zig reads
+/// the manifest back and `@compileError`s on an older `builtin.zig_version`.
+/// Comment-only mentions do not count.
+pub fn enforcesZigFloor(build_zig: []const u8) bool {
+    var reads_manifest = false;
+    var names_floor = false;
+    var compares = false;
+    var errors = false;
+    var it = std.mem.splitScalar(u8, build_zig, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "//")) continue;
+        if (std.mem.indexOf(u8, line, "@import(\"build.zig.zon\")") != null) reads_manifest = true;
+        if (std.mem.indexOf(u8, line, "minimum_zig_version") != null) names_floor = true;
+        if (std.mem.indexOf(u8, line, "builtin.zig_version.order(") != null) compares = true;
+        if (std.mem.indexOf(u8, line, "@compileError(") != null) errors = true;
+    }
+    return reads_manifest and names_floor and compares and errors;
+}
+
 pub const PinHit = struct { version: []const u8, line: usize };
 
 /// Every `refs/tags/v<version>.tar.gz` in `text` (the stale-pin scan).
@@ -755,6 +777,10 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const hits = try scanZigPins(arena, doc.text);
             for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, zig_pin), doc.path, h.line, "zig pin `{s}` matches mise.toml", .{h.version}, "mise.toml says {s}", .{zig_pin});
         }
+        // The zon floor is advisory on this toolchain (the build runner never
+        // compares it): build.zig must enforce it, or an older Zig fails deep
+        // inside std.Io instead of at the floor.
+        rep.checkFmt(enforcesZigFloor(build_zig), "build.zig", 0, "build.zig enforces build.zig.zon's minimum_zig_version at comptime", .{}, "no non-comment `@import(\"build.zig.zon\")` + `minimum_zig_version` + `builtin.zig_version.order(` + `@compileError(` — the build runner never compares the zon floor", .{});
     }
     // ---- (12) path dep ----
     {
@@ -979,6 +1005,28 @@ test "version scanner: refs/tags/v0.0.9.tar.gz vs 0.1.0 is flagged; real manifes
     try testing.expectEqual(@as(usize, 2), zhits.len);
     try testing.expectEqualStrings("0.17.0-dev.1786+75044cb04", zhits[0].version);
     try testing.expectEqualStrings("0.17.0-dev.1786", zhits[1].version);
+}
+
+// Non-vacuity (S8 D9): Zig's build runner parses `minimum_zig_version` but
+// never compares it, so the zon floor alone is advisory; the REAL build.zig
+// must carry the comptime assert. A build.zig that mentions the pieces only
+// in a comment, or reads the manifest without comparing, is rejected.
+test "zig floor: the real build.zig enforces minimum_zig_version; comment-only and compare-less fixtures are rejected" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const build_zig = try std.Io.Dir.cwd().readFileAlloc(io, "build.zig", gpa, read_limit);
+    defer gpa.free(build_zig);
+    try testing.expect(enforcesZigFloor(build_zig));
+    try testing.expect(!enforcesZigFloor("// @import(\"build.zig.zon\").minimum_zig_version builtin.zig_version.order( @compileError(\n"));
+    try testing.expect(!enforcesZigFloor("const m = @import(\"build.zig.zon\");\nconst floor = m.minimum_zig_version;\n"));
+    try testing.expect(enforcesZigFloor(
+        \\const manifest = @import("build.zig.zon");
+        \\comptime {
+        \\    const required = std.SemanticVersion.parse(manifest.minimum_zig_version) catch unreachable;
+        \\    if (builtin.zig_version.order(required) == .lt) @compileError("too old");
+        \\}
+        \\
+    ));
 }
 
 // Non-vacuity: `option_fields` is the comptime field list of the live
