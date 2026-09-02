@@ -22,8 +22,10 @@ const slcp = @import("slcp");
 
 const Color = enum(u8) { red, green, blue };
 
-/// Same leaf coverage as app_node.zig's Kitchen: sub-byte int, signed wide
-/// int, bool, enum, fixed array, nested struct. Encoded size 22.
+/// app_node.zig's Kitchen leaves (sub-byte int, signed wide int, bool, enum,
+/// fixed array, nested struct) plus two SIGNED non-byte-multiple ints
+/// (`sb: i3`, `sw: i12`) so the sign-bit-biased cast in decodeInt's signed
+/// arm is fuzzed, not only the unsigned one. Encoded size 25.
 const Cmd = struct {
     a: i8,
     b: u3,
@@ -32,6 +34,8 @@ const Cmd = struct {
     e: Color,
     f: [3]u16,
     g: struct { h: u16, i: i16 },
+    sb: i3,
+    sw: i12,
 };
 const C = slcp.Codec(Cmd);
 
@@ -72,22 +76,22 @@ fn fuzzCodecOne(_: void, smith: *std.testing.Smith) anyerror!void {
 // zig build fuzz — corpus-driven std.testing.fuzz target
 // ---------------------------------------------------------------------------
 
-const zeros22: [C.size]u8 = @splat(0);
-const ones22: [C.size]u8 = @splat(0xff);
+const zeros: [C.size]u8 = @splat(0);
+const ones: [C.size]u8 = @splat(0xff);
 
 /// Seeds: empty, a canonical all-zero encoding (decodes: every field at its
 /// minimum), an all-0xff buffer (u3 high bits ⇒ null), off-by-one lengths.
 const codec_corpus = [_][]const u8{
     &.{},
-    &zeros22,
-    &ones22,
-    zeros22[0 .. C.size - 1],
-    &(zeros22 ++ [_]u8{0}),
-    &(zeros22 ++ ones22),
+    &zeros,
+    &ones,
+    zeros[0 .. C.size - 1],
+    &(zeros ++ [_]u8{0}),
+    &(zeros ++ ones),
 };
 
 // Non-vacuity: a decoder without the exact-length check fails (1) on the
-// corpus's 21/23-byte entries; a `@enumFromInt` decode fails (2) on any
+// corpus's 24/26-byte entries; a `@enumFromInt` decode fails (2) on any
 // chunk with tag byte >= 3.
 test "fuzz: Codec strict length, canonical re-encode, order-preserving" {
     try std.testing.fuzz({}, fuzzCodecOne, .{ .corpus = &codec_corpus });

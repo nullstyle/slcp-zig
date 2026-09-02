@@ -1793,3 +1793,54 @@ test "custom encode: driverCombine ships the slice encode returns, byte-equal to
     try combineBytesOf(ON, gpa, io, &cands, &out);
     try testing.expectEqualSlices(u8, o_propose, out.items);
 }
+
+// -- per-leaf exhaustive canonicality (S8 review, D3) --------------------------
+
+/// Every byte string of `Codec(struct { x: T }).size` bytes (≤ 2, so the
+/// space is enumerable) either fails to decode or re-encodes byte-identically,
+/// and exactly `cardinality` of them decode — one spelling per value, no
+/// spelling for anything else.
+fn probeExhaustive(comptime T: type, comptime cardinality: usize) !void {
+    const C = Codec(struct { x: T });
+    comptime std.debug.assert(C.size <= 2);
+    const total: usize = @as(usize, 1) << @intCast(8 * C.size);
+    var accepted: usize = 0;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, @intCast(i), .big);
+        const in = bytes[2 - C.size ..];
+        if (C.decode(in)) |v| {
+            accepted += 1;
+            var re: [2]u8 = undefined;
+            const out = C.encode(v, re[0..C.size]);
+            if (!std.mem.eql(u8, in, out)) {
+                std.debug.print("\n{s}: bytes {x} decode -> re-encode {x} (non-canonical spelling accepted)\n", .{ @typeName(T), in, out });
+                return error.NonCanonicalAccepted;
+            }
+        }
+    }
+    try testing.expectEqual(cardinality, accepted);
+}
+
+// Non-vacuity: replacing `std.math.cast` in decodeInt's SIGNED arm with a
+// `@truncate` (the arm no other test reaches: Kitchen/Cmd carry only
+// byte-multiple signed ints, where the cast is a no-op) makes i1 accept
+// 0x02 as 0, i3 accept 0x08, i9 0x0200, i12 0x1000 and enum(i4) 0x10 — every
+// one a second spelling of an in-range value, the malleability §8.5 forbids;
+// the unsigned controls (u3, u12) and the byte-multiple ones (i8, i16) pass
+// under that ablation, which is why the signed sub-byte leaves are listed
+// explicitly. The cardinality check catches a decoder that rejects too much.
+test "codec exhaustive per-leaf canonicality: i1, i3, u3, i8, i9, i12, u12, i16, bool, enum(u2), enum(i4)" {
+    try probeExhaustive(i1, 2);
+    try probeExhaustive(i3, 8);
+    try probeExhaustive(u3, 8);
+    try probeExhaustive(i8, 256);
+    try probeExhaustive(i9, 512);
+    try probeExhaustive(i12, 4096);
+    try probeExhaustive(u12, 4096);
+    try probeExhaustive(i16, 65536);
+    try probeExhaustive(bool, 2);
+    try probeExhaustive(enum(u2) { a, b, c }, 3);
+    try probeExhaustive(enum(i4) { lo = -8, zero = 0, hi = 7 }, 3);
+}
