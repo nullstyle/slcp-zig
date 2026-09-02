@@ -4,7 +4,8 @@
 //! argv/stdout/stderr/exit around it.
 //!
 //! Exit codes: 0 clean (or warnings only); 1 lint errors / key operation
-//! failed; 2 usage, unreadable or unparseable input (message on stderr).
+//! failed; 2 usage, unreadable or unparseable input (message on stderr), or
+//! output that could not be written to stdout (`runAndFlush`).
 
 const std = @import("std");
 const slcp = @import("slcp");
@@ -39,6 +40,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *s
         },
         error.WriteFailed => 2,
     };
+}
+
+/// `run` plus the final flush of both writers: what `main.zig` turns into the
+/// exit status. Everything a command prints sits in the caller's buffer until
+/// this flush, so this is the only place a small report's delivery can fail —
+/// and an undelivered report is exit 2 like any other `WriteFailed` (with a
+/// note on stderr), never the code the report would have carried. A stderr
+/// that cannot be flushed turns a would-be 0 into 2 and leaves 1/2 alone.
+pub fn runAndFlush(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.Io.Writer, err_out: *std.Io.Writer) u8 {
+    var code = run(gpa, io, args, out, err_out);
+    out.flush() catch {
+        code = 2;
+        err_out.writeAll("slcp: cannot write to stdout\n") catch {};
+    };
+    err_out.flush() catch {
+        if (code == 0) code = 2;
+    };
+    return code;
 }
 
 const RunError = std.mem.Allocator.Error || std.Io.Writer.Error;
@@ -380,4 +399,65 @@ test "cli key new / key show: mint once, refuse to overwrite, show, missing file
     try testing.expectEqual(@as(u8, 2), c.code);
     c.exec(gpa, io, &.{ "key", "burn", key_path });
     try testing.expectEqual(@as(u8, 2), c.code);
+}
+
+// Non-vacuity: restoring `out.flush() catch {}` in `runAndFlush` (the S8
+// finding "exit 0 when the report was never written") makes the two broken-
+// stdout cases red. The 4096-byte buffer is larger than any of these reports,
+// so nothing reaches the sink before the final flush — exactly main.zig's
+// situation with a closed or full stdout.
+test "cli runAndFlush: a failed stdout flush is exit 2 with a note on stderr; a delivered report keeps its code" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.json", .data = two_of_three_json });
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    const two = try tmpPath(io, &tmp, &b1, "two.json");
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = try tmpPath(io, &tmp, &b2, "node.key");
+
+    // A stdout whose sink is gone: buffers like main.zig's, fails on drain.
+    var out_buf: [4096]u8 = undefined;
+    var broken_out: std.Io.Writer = .{ .vtable = &.{ .drain = std.Io.Writer.failingDrain }, .buffer = &out_buf };
+    var err = std.Io.Writer.Allocating.init(gpa);
+    defer err.deinit();
+
+    var code = runAndFlush(gpa, io, &.{ "lint-quorum", two }, &broken_out, &err.writer);
+    // The whole report was produced into the buffer; only its delivery failed.
+    try testing.expect(std.mem.indexOf(u8, out_buf[0..broken_out.end], two_of_three_hash) != null);
+    try testing.expectEqual(@as(u8, 2), code);
+    try testing.expectEqualStrings("slcp: cannot write to stdout\n", err.written());
+
+    // `key new` mints the key (recoverable via `key show`) but the public key
+    // was never shown, so the exit status must say so.
+    broken_out.end = 0;
+    err.clearRetainingCapacity();
+    code = runAndFlush(gpa, io, &.{ "key", "new", key_path }, &broken_out, &err.writer);
+    try testing.expectEqual(@as(u8, 2), code);
+    try testing.expect(std.mem.startsWith(u8, out_buf[0..broken_out.end], "public key: "));
+    try testing.expectEqualStrings("slcp: cannot write to stdout\n", err.written());
+    _ = try keys.load(io, key_path);
+
+    // Control: the same commands with a working stdout keep 0, and a usage
+    // error keeps 2 with its message when stderr flushes fine.
+    var c = Captured.init(gpa);
+    defer c.deinit();
+    c.code = runAndFlush(gpa, io, &.{ "lint-quorum", two }, &c.out.writer, &c.err.writer);
+    try testing.expectEqual(@as(u8, 0), c.code);
+    try testing.expect(std.mem.indexOf(u8, c.stdout(), two_of_three_hash) != null);
+    try testing.expectEqualStrings("", c.stderr());
+    c.exec(gpa, io, &.{ "key", "show", key_path });
+    try testing.expectEqual(@as(u8, 0), c.code);
+    c.code = runAndFlush(gpa, io, &.{"frobnicate"}, &c.out.writer, &c.err.writer);
+    try testing.expectEqual(@as(u8, 2), c.code);
+
+    // A stderr that cannot be flushed never turns a failure into success:
+    // the usage error stays 2 even though its message is lost.
+    var err_buf: [4096]u8 = undefined;
+    var broken_err: std.Io.Writer = .{ .vtable = &.{ .drain = std.Io.Writer.failingDrain }, .buffer = &err_buf };
+    c.out.clearRetainingCapacity();
+    code = runAndFlush(gpa, io, &.{"frobnicate"}, &c.out.writer, &broken_err);
+    try testing.expectEqual(@as(u8, 2), code);
+    try testing.expect(std.mem.indexOf(u8, err_buf[0..broken_err.end], "unknown command") != null);
 }
