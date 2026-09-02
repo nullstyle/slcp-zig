@@ -148,9 +148,11 @@ pub const Store = struct {
 
     /// Open (creating if needed) the data dir and both logs. Takes the
     /// data_dir's exclusive lock first: `Busy` if another live Store holds it.
+    /// A filesystem error is returned as is (not collapsed into `IoFailed`)
+    /// so the node can tell "permission denied" from "read-only" from
+    /// "disk full" (review finding).
     pub fn open(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) !Store {
-        const dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch
-            return Error.IoFailed;
+        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{});
         errdefer dir.close(io);
 
         // One live process per data_dir (design §10; threat-model §7): the
@@ -159,8 +161,7 @@ pub const Store = struct {
         // write-ahead log. flock is per open file description, so a second
         // open in the SAME process is refused too; the OS drops the lock when
         // the process dies, so a leftover `lock` file after a crash is inert.
-        const lock_file = dir.createFile(io, lock_name, .{ .truncate = false }) catch
-            return Error.IoFailed;
+        const lock_file = try dir.createFile(io, lock_name, .{ .truncate = false });
         errdefer lock_file.close(io);
         const locked = lock_file.tryLock(io, .exclusive) catch |err| switch (err) {
             error.FileLocksUnsupported => blk: {
@@ -171,15 +172,13 @@ pub const Store = struct {
         };
         if (!locked) return Error.Busy;
 
-        dir.createDirPath(io, qsets_dir_name) catch return Error.IoFailed;
+        try dir.createDirPath(io, qsets_dir_name);
 
         // truncate=false: preserve an existing log across a restart (recovery).
         // read=true: compact() re-reads each log through its open handle.
-        const own_file = dir.createFile(io, own_log_name, .{ .truncate = false, .read = true }) catch
-            return Error.IoFailed;
+        const own_file = try dir.createFile(io, own_log_name, .{ .truncate = false, .read = true });
         errdefer own_file.close(io);
-        const ext_file = dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true }) catch
-            return Error.IoFailed;
+        const ext_file = try dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true });
         errdefer ext_file.close(io);
 
         const dd = try gpa.dupe(u8, data_dir);

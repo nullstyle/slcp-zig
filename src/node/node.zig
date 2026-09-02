@@ -288,7 +288,22 @@ const InputQueue = struct {
     head: usize = 0,
     closed: bool = false,
 
+    /// Enqueue, or drop on OOM (freeing the input, one err-level log line):
+    /// for producers with nothing to retry — timer fires, received frames,
+    /// purges. The engine degrades, it does not corrupt.
     fn push(self: *InputQueue, item: InputItem) void {
+        self.tryPush(item) catch {
+            var in = item.input;
+            core.host_codec.freeInput(self.gpa, &in);
+            log.err("input queue OOM; dropped one input", .{});
+        };
+    }
+
+    /// Enqueue; on OOM the caller still owns `item` (nothing is freed or
+    /// logged) so it can roll back — `maybeStartNomination` re-queues the
+    /// proposal instead of losing it (review finding). A closed queue frees
+    /// the input and reports success (the node is shutting down).
+    fn tryPush(self: *InputQueue, item: InputItem) std.mem.Allocator.Error!void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.closed) {
@@ -296,14 +311,7 @@ const InputQueue = struct {
             core.host_codec.freeInput(self.gpa, &in);
             return;
         }
-        self.items.append(self.gpa, item) catch {
-            // OOM enqueuing: drop the input (freeing it) rather than crash;
-            // the engine degrades, it does not corrupt.
-            var in = item.input;
-            core.host_codec.freeInput(self.gpa, &in);
-            log.err("input queue OOM; dropped one input", .{});
-            return;
-        };
+        try self.items.append(self.gpa, item);
         self.cond.signal(self.io);
     }
 
@@ -449,8 +457,20 @@ pub const Node = struct {
     /// Build and start a node. Fail-fast: every misconfiguration is checked
     /// in a fixed order (passphrase → identity → limits → peers → quorum →
     /// data_dir → engine → store/recovery → listener → threads) and reported
-    /// as ONE `CreateError` member with a message in `options.diagnostic`.
+    /// as ONE `CreateError` member with a message in `options.diagnostic` —
+    /// `OutOfMemory` included, and a reused buffer never keeps a previous
+    /// failure's text (it is cleared first; a success leaves it empty).
     pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
+        if (options.diagnostic) |d| d.len = 0;
+        return createChecked(gpa, io, options) catch |e| switch (e) {
+            // The one member no check site writes (every `try` allocation
+            // can raise it): give it the paragraph here (review finding).
+            error.OutOfMemory => fail(options.diagnostic, error.OutOfMemory, "out of memory while creating the node; nothing was started — free memory or raise the process limit and try again.", .{}),
+            else => e,
+        };
+    }
+
+    fn createChecked(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
         const opts = options;
         const diag = opts.diagnostic;
 
@@ -563,6 +583,11 @@ pub const Node = struct {
         // are most useful; `validateAndNormalize` is the authority and its
         // errors map 1:1 to the same members as a fallback.
         if (lint_report.firstBadThreshold(&owned)) |bad| {
+            // An empty level has no threshold in range by construction:
+            // report the level, not a "[1, 0]" range (review finding).
+            if (bad.members == 0) {
+                return fail(diag, error.QuorumEmpty, ".quorum has a level with no members (threshold {d} of 0); every level needs at least one validator or inner set.", .{bad.threshold});
+            }
             return fail(diag, error.QuorumThresholdOutOfRange, ".quorum threshold {d} is outside [1, {d}] for a level with {d} members; use slcp.Quorum.twoThirdsOf (the blessed default) or a threshold within range.", .{ bad.threshold, bad.members, bad.members });
         }
         if (try lint_report.firstDuplicate(gpa, &owned)) |dup| {
@@ -660,6 +685,12 @@ pub const Node = struct {
             .delivery = opts.delivery,
             .max_value_bytes = opts.max_value_bytes,
         };
+        // Registered FIRST so it runs LAST on the unwind (after the thread
+        // joins and the ov/wheel stops below): the journal-tail replay and
+        // the own.log restore populate ext_queue / own_latest / pending_ext
+        // BEFORE the listen and the thread spawns can still fail (review
+        // finding: ListenPortInUse on a restart leaked the replayed tail).
+        errdefer self.freeAppBuffers();
 
         // Engine.init does NOT free cfg.quorum_set on failure; we still own
         // it until this succeeds.
@@ -668,13 +699,18 @@ pub const Node = struct {
             else => return fail(diag, error.EngineFailed, "the consensus engine could not be initialized: {t}; this is a bug in slcp or an exotic limit — please report it with your options.", .{e}),
         };
         owned_live = false;
-        errdefer self.eng.deinit();
+        // False only inside the corrupt-own.log watcher re-init below, while
+        // the first engine is torn down and the second not yet up (review
+        // finding: the unguarded errdefer ran deinit on an undefined Engine).
+        var eng_live = true;
+        errdefer if (eng_live) self.eng.deinit();
 
         // ---- store + recovery ----
         self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Busy => return fail(diag, error.DataDirBusy, ".data_dir \"{s}\" is in use by another live slcp node (the lock file {s}/lock is held); one identity must never run twice — stop the other process, or point this node at its own data_dir.", .{ opts.data_dir, opts.data_dir }),
-            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the logs could not be opened ({t}); check the path, the filesystem and free space.", .{ opts.data_dir, e }),
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\": a write-ahead log cannot be opened for writing (permission denied); fix the ownership/permissions of its files (own.log, externalized.log, qsets/) — a restart as a different user than the one that created them is the usual cause — or point .data_dir at a directory this user owns.", .{opts.data_dir}),
+            else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the write-ahead logs could not be opened ({t}); check the path, the filesystem (read-only?) and free space.", .{ opts.data_dir, e }),
         };
         errdefer self.store.deinit();
 
@@ -682,6 +718,7 @@ pub const Node = struct {
         self.store.putQset(local_hash, framed_local);
 
         self.wheel = timers_mod.Wheel.init(gpa, io, onTimerFire, self);
+        errdefer self.wheel.deinit(); // stop() is idempotent; frees the timer list
 
         // Own the peer specs: the overlay's dialers re-parse them on every
         // reconnect for the node's lifetime; never borrow the caller's.
@@ -707,6 +744,7 @@ pub const Node = struct {
             .on_peer_up = onPeerUp,
             .on_peer_down = onPeerDown, // M6:example logs
         });
+        errdefer self.ov.deinit(); // after ov.stop() below on the unwind
 
         // ---- Restart recovery (§10), synchronous, pre-threads ----
         var rec = self.store.recover(gpa) catch |e| switch (e) {
@@ -736,22 +774,30 @@ pub const Node = struct {
             log.warn("torn log tail repaired on recovery (normal after a crash)", .{});
         }
         if (rec.own_log_corrupt and !self.watcher) {
-            log.err("own.log integrity failure — falling back to WATCHER mode " ++
+            // warn, not err: the node starts (degraded) — and the test
+            // runner fails any test that logs at err, which would leave
+            // this fallback path untestable through a live create().
+            log.warn("own.log integrity failure — falling back to WATCHER mode " ++
                 "for the node's lifetime (safe: a watcher never emits, so it " ++
                 "cannot emit stale-vs-self). Slots up to the externalized " ++
                 "high-water mark + 1 were at risk.", .{});
             // Rebuild the engine as a watcher (secret_seed cleared). The old
             // engine owns a normalized qset clone; give the new one a fresh
-            // clone.
+            // clone. Engine.init does not free cfg.quorum_set on failure.
             const qs_clone = try qset.clone(gpa, &self.eng.cfg.quorum_set);
             self.eng.deinit();
+            eng_live = false;
             var wcfg = cfg;
             wcfg.secret_seed = null;
             wcfg.quorum_set = qs_clone;
-            self.eng = engine.Engine.init(gpa, wcfg, drv) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return fail(diag, error.EngineFailed, "the consensus engine could not be re-initialized in watcher mode: {t}; please report this.", .{e}),
+            self.eng = engine.Engine.init(gpa, wcfg, drv) catch |e| {
+                wcfg.quorum_set.deinit(gpa);
+                switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return fail(diag, error.EngineFailed, "the consensus engine could not be re-initialized in watcher mode: {t}; please report this.", .{e}),
+                }
             };
+            eng_live = true;
             self.watcher = true;
         }
 
@@ -787,11 +833,25 @@ pub const Node = struct {
         }
         if (!rec.own_log_corrupt) {
             for (rec.own_latest) |r| {
-                self.applyInput(.{
+                const clean = self.feedInput(.{
                     .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
                     .source_peer = null,
-                });
+                }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return fail(diag, error.EngineFailed, "the own.log restore of {s} failed for slot {d}: {t}; the data_dir's own.log may be damaged — move it aside to start fresh, or report this.", .{ opts.data_dir, r.slot, e }),
+                };
+                // A restored statement that never made it into the catch-up
+                // cache would be re-sent to nobody: OOM here is a create
+                // failure, not a degraded start.
+                if (!clean) return error.OutOfMemory;
             }
+        }
+        // An effect dispatched during the restore can latch the node inert
+        // (a failed write-ahead append, OOM buffering an externalization).
+        // Every create failure is a CreateError (§11.2): never hand back a
+        // node that is already dead (review finding).
+        if (self.failed.load(.acquire)) {
+            return fail(diag, error.EngineFailed, "the node failed while restoring its state from {s} (see the preceding log line) and cannot start; check the filesystem and free space, or move the data_dir aside to start fresh.", .{opts.data_dir});
         }
 
         // ---- Go live ----
@@ -974,10 +1034,22 @@ pub const Node = struct {
         for (self.peer_specs) |s| self.gpa.free(s);
         self.gpa.free(self.peer_specs);
 
-        self.q.deinit();
         self.store.deinit();
         self.eng.deinit();
+        self.freeAppBuffers();
 
+        const gpa = self.gpa;
+        self.* = undefined;
+        gpa.destroy(self);
+    }
+
+    /// Free every buffer the replay/restore inside `create` and the engine
+    /// thread populate: the input queue's leftovers, own_latest, the
+    /// proposal queue, last_ext_value, ext_queue, pending_ext, req_qsets.
+    /// Shared by `deinit` and `create`'s unwind; safe on the zero state.
+    /// Callers must have joined every thread that pushes or dispatches.
+    fn freeAppBuffers(self: *Node) void {
+        self.q.deinit();
         {
             var it = self.own_latest.iterator();
             while (it.next()) |e| e.value_ptr.free(self.gpa);
@@ -994,10 +1066,6 @@ pub const Node = struct {
             self.pending_ext.deinit(self.gpa);
         }
         self.req_qsets.deinit(self.gpa);
-
-        const gpa = self.gpa;
-        self.* = undefined;
-        gpa.destroy(self);
     }
 
     // -------------------------------------------------------------------
@@ -1019,7 +1087,21 @@ pub const Node = struct {
             return e;
         };
         self.prop_mu.unlock(self.io);
-        self.maybeStartNomination();
+        self.maybeStartNomination() catch |e| {
+            // Not accepted: take OUR value back out (an older head that
+            // failed to nominate is already back at the head) so the
+            // caller's OutOfMemory means exactly "propose it again".
+            self.prop_mu.lockUncancelable(self.io);
+            defer self.prop_mu.unlock(self.io);
+            for (self.proposal_queue.items, 0..) |v, i| {
+                if (v.ptr == copy.ptr) {
+                    _ = self.proposal_queue.orderedRemove(i);
+                    self.gpa.free(v);
+                    break;
+                }
+            }
+            return e;
+        };
     }
 
     /// Bounds of the journal tail replayed at `create` (ascending slots).
@@ -1116,43 +1198,58 @@ pub const Node = struct {
             since_ms = 0;
             if (self.failed.load(.acquire)) continue;
 
-            // Borrow envelopes under own_mu; the overlay copies on enqueue.
-            self.own_mu.lockUncancelable(self.io);
-            var it = self.own_latest.iterator();
-            while (it.next()) |e| {
-                if (e.value_ptr.nom) |b| self.emitEnvelope("resync-nom", .all, b);
-                if (e.value_ptr.ballot) |b| self.emitEnvelope("resync-ballot", .all, b);
-            }
-            self.own_mu.unlock(self.io);
+            self.sendOwnLatest(.all, "resync");
             self.ov.broadcast(.{ .get_slot_state = 0 });
         }
     }
 
     /// Feed one input and drain all its effects (engine thread only).
-    fn applyInput(self: *Node, item_in: InputItem) void {
+    fn applyInput(self: *Node, item: InputItem) void {
+        const clean = self.feedInput(item) catch |err| {
+            self.markFailed(err);
+            return;
+        };
+        // Best-effort effects (the catch-up cache, a timer arm) failed on
+        // OOM: the node keeps running — the cache is refilled by the next
+        // emission for that slot and the timer is re-armed on the next
+        // heard/round transition — but say so (review finding: silent).
+        if (!clean) log.warn("out of memory dispatching an effect; catch-up cache or a timer is degraded until the next emission", .{});
+    }
+
+    /// `applyInput` without the latch: a `pushInput` failure is returned to
+    /// the caller (the input is freed either way); the result says whether
+    /// every effect was dispatched cleanly (false = a best-effort effect hit
+    /// OOM — see `dispatch`). `create` uses this for the own.log restore so
+    /// an allocation failure there is a create failure (`OutOfMemory`),
+    /// never a successfully-created inert or degraded node (review
+    /// findings); the engine thread wraps it in `markFailed` / a warning.
+    fn feedInput(self: *Node, item_in: InputItem) engine.PushError!bool {
         var item = item_in;
         if (self.failed.load(.acquire)) {
             // Inert: consume and free inputs without touching the engine.
             core.host_codec.freeInput(self.gpa, &item.input);
-            return;
+            return true;
         }
         self.cur_source = item.source_peer;
+        defer self.cur_source = null;
         self.eng.pushInput(item.input) catch |err| {
             core.host_codec.freeInput(self.gpa, &item.input);
-            self.markFailed(err);
-            return;
+            return err;
         };
         core.host_codec.freeInput(self.gpa, &item.input);
+        var clean = true;
         while (self.eng.popEffect()) |eff| {
             // A dispatch that trips markFailed (a failed write-ahead append)
             // must suppress every LATER effect of this input — most
             // importantly the broadcast paired with a failed persist (§10:
             // never send what is not durable). The remaining effects are
             // still committed so their payloads are freed.
-            if (!self.failed.load(.acquire)) self.dispatch(eff);
+            if (!self.failed.load(.acquire)) self.dispatch(eff) catch {
+                clean = false;
+            };
             self.eng.commitEffect();
         }
-        self.cur_source = null;
+        return clean;
     }
 
     /// Latch the node inert: no further inputs are applied, no further
@@ -1172,7 +1269,12 @@ pub const Node = struct {
         }
     }
 
-    fn dispatch(self: *Node, eff: *const engine.Effect) void {
+    /// Dispatch one effect. Returns `OutOfMemory` only for the two
+    /// best-effort effects (the catch-up cache copy, a timer arm) — after
+    /// doing everything else the effect asks for; the fatal ones (a failed
+    /// write-ahead append, OOM buffering an externalization) latch inert
+    /// inside, per §10.
+    fn dispatch(self: *Node, eff: *const engine.Effect) std.mem.Allocator.Error!void {
         switch (eff.*) {
             .persist_own_envelope => |sb| {
                 // CRITICAL invariant (§5.3/§10): this append+fsync must
@@ -1187,8 +1289,9 @@ pub const Node = struct {
             .broadcast_envelope => |sb| {
                 // Always record as our latest for on-connect catch-up, even
                 // during restore; only touch the network once live.
-                self.recordOwnLatest(sb.slot, sb.bytes);
+                const recorded = self.recordOwnLatest(sb.slot, sb.bytes);
                 if (self.live) self.emitEnvelope("dispatch-broadcast", .all, sb.bytes);
+                try recorded;
             },
             .forward_envelope => |sb| {
                 if (!self.live) return;
@@ -1198,10 +1301,7 @@ pub const Node = struct {
                     self.emitEnvelope("dispatch-forward-all", .all, sb.bytes);
                 }
             },
-            .arm_timer => |a| {
-                self.wheel.arm(a.slot, @backingInt(a.timer), a.delay_ms) catch |e|
-                    log.err("timer arm failed: {s}", .{@errorName(e)});
-            },
+            .arm_timer => |a| try self.wheel.arm(a.slot, @backingInt(a.timer), a.delay_ms),
             .cancel_timer => |c| self.wheel.cancel(c.slot, @backingInt(c.timer)),
             .request_qset => |r| {
                 if (!self.live) return;
@@ -1235,7 +1335,11 @@ pub const Node = struct {
         }
         self.nominating = false;
         self.prop_mu.unlock(self.io);
-        self.maybeStartNomination();
+        self.maybeStartNomination() catch {
+            // The proposal is back at the head and `nominating` is clear:
+            // the next propose() or externalization retries it.
+            log.warn("out of memory starting the next nomination; retried on the next proposal or externalization", .{});
+        };
 
         // App delivery is IN SLOT ORDER (§11.2's stream semantics): buffer
         // out-of-order externalizations (catch-up delivers slots in arbitrary
@@ -1350,47 +1454,58 @@ pub const Node = struct {
     }
 
     /// If idle and a proposal is queued, nominate the head for current_slot.
-    fn maybeStartNomination(self: *Node) void {
+    /// OOM anywhere (the prev copy, the input enqueue) is rolled back — the
+    /// value goes back to the head and `nominating` stays clear — and
+    /// returned, so no proposal is ever silently dropped and the node never
+    /// latches "nominating" with nothing in flight (review finding).
+    fn maybeStartNomination(self: *Node) std.mem.Allocator.Error!void {
         if (self.watcher) return;
+        // Held across the enqueue (q.mu is a leaf lock, never taken before
+        // prop_mu) so the rollback's re-insert is into the same list state
+        // the pop left: the capacity is still there.
         self.prop_mu.lockUncancelable(self.io);
-        if (self.nominating or self.proposal_queue.items.len == 0) {
-            self.prop_mu.unlock(self.io);
-            return;
-        }
+        defer self.prop_mu.unlock(self.io);
+        if (self.nominating or self.proposal_queue.items.len == 0) return;
         const value = self.proposal_queue.orderedRemove(0);
         const slot = self.current_slot;
-        const prev = self.gpa.dupe(u8, self.last_ext_value) catch {
-            // put it back on OOM
-            self.proposal_queue.insert(self.gpa, 0, value) catch self.gpa.free(value);
-            self.prop_mu.unlock(self.io);
-            return;
+        const prev = self.gpa.dupe(u8, self.last_ext_value) catch |e| {
+            self.proposal_queue.insertAssumeCapacity(0, value);
+            return e;
+        };
+        // value + prev are owned; the input carries them, freed after push.
+        self.q.tryPush(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null }) catch |e| {
+            self.gpa.free(prev);
+            self.proposal_queue.insertAssumeCapacity(0, value);
+            return e;
         };
         self.nominating = true;
-        self.prop_mu.unlock(self.io);
-
-        // value + prev are owned; the input carries them, freed after push.
-        self.q.push(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null });
     }
 
     // -------------------------------------------------------------------
     // own_latest (catch-up source)
     // -------------------------------------------------------------------
 
-    fn recordOwnLatest(self: *Node, slot: u64, framed_env: []const u8) void {
+    /// Record our own envelope as the catch-up source for `slot`. OOM is
+    /// returned (the cache then lacks this slot until the next emission for
+    /// it); an envelope that does not decode is logged and skipped.
+    fn recordOwnLatest(self: *Node, slot: u64, framed_env: []const u8) std.mem.Allocator.Error!void {
         // Zero-frame placeholders (engine lagger self-records) never reach
         // effects today, but the skip-zero-frames host contract applies here
         // too — never let an empty frame into the catch-up source.
         if (framed_env.len == 0) return;
-        const bucket = envelopeBucket(self.gpa, framed_env) catch {
-            log.warn("could not bucket own envelope for slot {d}", .{slot});
-            return;
+        const bucket = envelopeBucket(self.gpa, framed_env) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("could not bucket own envelope for slot {d}: {t}", .{ slot, e });
+                return;
+            },
         };
-        const copy = self.gpa.dupe(u8, framed_env) catch return;
+        const copy = try self.gpa.dupe(u8, framed_env);
         self.own_mu.lockUncancelable(self.io);
         defer self.own_mu.unlock(self.io);
-        const gop = self.own_latest.getOrPut(self.gpa, slot) catch {
+        const gop = self.own_latest.getOrPut(self.gpa, slot) catch |e| {
             self.gpa.free(copy);
-            return;
+            return e;
         };
         if (!gop.found_existing) gop.value_ptr.* = .{};
         switch (bucket) {
@@ -1420,6 +1535,40 @@ pub const Node = struct {
         }
     }
 
+    /// The catch-up cache's slots, ascending (own_mu held by the caller;
+    /// caller frees). `own_latest` is a hash map, and bucket order put
+    /// N+1 before N for consecutive slots often enough that a rejoining
+    /// peer saw NOMINATE(N+1) before EXTERNALIZE(N) on the same stream
+    /// (review finding); every sender goes through this instead.
+    fn ownSlotsAscending(self: *Node) std.mem.Allocator.Error![]u64 {
+        var slots = try self.gpa.alloc(u64, self.own_latest.count());
+        var i: usize = 0;
+        var it = self.own_latest.keyIterator();
+        while (it.next()) |k| : (i += 1) slots[i] = k.*;
+        std.mem.sort(u64, slots, {}, std.sort.asc(u64));
+        return slots;
+    }
+
+    /// Re-flood our latest own envelopes to `target` in ascending slot
+    /// order, nomination before ballot per slot (the on-connect catch-up
+    /// and the anti-entropy backstop, §9.2). Borrowed under own_mu; the
+    /// overlay copies on enqueue. OOM skips this round (the next resync
+    /// retries).
+    fn sendOwnLatest(self: *Node, target: EmitTarget, comptime site: []const u8) void {
+        self.own_mu.lockUncancelable(self.io);
+        defer self.own_mu.unlock(self.io);
+        const slots = self.ownSlotsAscending() catch {
+            log.warn("out of memory re-flooding own statements ({s}); the next resync retries", .{site});
+            return;
+        };
+        defer self.gpa.free(slots);
+        for (slots) |slot| {
+            const e = self.own_latest.getPtr(slot).?;
+            if (e.nom) |b| self.emitEnvelope(site ++ "-nom", target, b);
+            if (e.ballot) |b| self.emitEnvelope(site ++ "-ballot", target, b);
+        }
+    }
+
     // -------------------------------------------------------------------
     // Overlay callbacks (reader threads)
     // -------------------------------------------------------------------
@@ -1446,13 +1595,7 @@ pub const Node = struct {
         log.info("peer {d} up ({d} live connection(s); {d} peer(s) configured)", .{ peer_id, live, self.peer_specs.len });
         // Catch-up (§9.2): send our latest own envelopes, then ask for the
         // peer's externalized state.
-        self.own_mu.lockUncancelable(self.io);
-        var it = self.own_latest.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.nom) |b| self.emitEnvelope("peerup-nom", .{ .one = peer_id }, b);
-            if (e.value_ptr.ballot) |b| self.emitEnvelope("peerup-ballot", .{ .one = peer_id }, b);
-        }
-        self.own_mu.unlock(self.io);
+        self.sendOwnLatest(.{ .one = peer_id }, "peerup");
         self.ov.send(peer_id, .{ .get_slot_state = 0 });
     }
 
@@ -1520,11 +1663,15 @@ pub const Node = struct {
         var highest: u64 = 0;
 
         self.own_mu.lockUncancelable(self.io);
-        var it = self.own_latest.iterator();
-        while (it.next()) |e| {
-            const slot = e.key_ptr.*;
+        defer self.own_mu.unlock(self.io);
+        // Ascending, so the receiver sees N before N+1 and the 64-envelope
+        // cap drops the newest slots, deterministically (review finding).
+        const slots = self.ownSlotsAscending() catch return; // the peer's next resync re-asks
+        defer self.gpa.free(slots);
+        for (slots) |slot| {
             if (req_slot != 0 and slot != req_slot) continue;
-            const env = e.value_ptr.ballot orelse e.value_ptr.nom orelse continue;
+            const e = self.own_latest.getPtr(slot).?;
+            const env = e.ballot orelse e.nom orelse continue;
             if (list.items.len >= wire.max_slot_state_envelopes) break;
             list.append(self.gpa, env) catch break;
             if (slot > highest) highest = slot;
@@ -1532,7 +1679,6 @@ pub const Node = struct {
         // Send while holding own_mu so the borrowed env slices stay valid
         // through encode (overlay copies them).
         self.ov.send(peer_id, .{ .slot_state = .{ .slot = highest, .envelopes = list.items } });
-        self.own_mu.unlock(self.io);
     }
 
     // -------------------------------------------------------------------
@@ -1999,4 +2145,490 @@ test "stats: .failed is true once the node latched inert, not only on an engine 
     n.failed.store(true, .seq_cst); // the inert latch, with the engine itself healthy
     try std.testing.expect(!n.eng.failed);
     try std.testing.expect(n.stats().failed);
+}
+
+// -- create() unwind after a restart replay ------------------------------------
+
+/// Hold an ephemeral port with a plain listener (no SO_REUSEPORT) so a
+/// `create` on that port fails at the listen step — AFTER the journal-tail
+/// replay and the own.log restore have run.
+fn holdEphemeralPort(io: std.Io) !std.Io.net.Server {
+    const net = std.Io.net;
+    const bind: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    return try net.IpAddress.listen(&bind, io, .{ .mode = .stream, .reuse_address = false });
+}
+
+fn portOfServer(server: *const std.Io.net.Server) u16 {
+    return switch (server.socket.address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+}
+
+// Non-vacuity: removing `errdefer self.freeAppBuffers()` from create() (or
+// registering it after the thread-join errdefers so it runs before them)
+// leaks the three replayed tail values + the ext_queue backing on the queue
+// path, and the own_latest map + envelope copy on the own.log path — the
+// testing allocator reports the leaks and the test goes red. On a host
+// where a held port can still be bound (SO_REUSEPORT sandbox) the test
+// skips rather than pass vacuously.
+test "create() unwind: ListenPortInUse after a journal-tail replay (queue path) and after an own.log restore leaks nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_q_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_o_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_q = try std.fmt.bufPrint(&dir_q_buf, "{s}/queue", .{root});
+    const dir_o = try std.fmt.bufPrint(&dir_o_buf, "{s}/own", .{root});
+
+    const passphrase = "create-unwind v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+
+    // Queue path: the journal holds 3, 5, 7 (replayed into ext_queue).
+    {
+        var st = try store_mod.Store.open(gpa, io, dir_q);
+        defer st.deinit();
+        try st.appendExternalized(3, "three");
+        try st.appendExternalized(5, "five");
+        try st.appendExternalized(7, "seven");
+    }
+    // Own.log path: journal 7 + this node's EXTERNALIZE for 8 (restored
+    // into own_latest through the engine's re-emitted broadcast).
+    {
+        var st = try store_mod.Store.open(gpa, io, dir_o);
+        defer st.deinit();
+        try st.appendExternalized(7, "seven");
+        const env = try buildSignedExternalize(gpa, seed, network_id, 8, "eight");
+        defer gpa.free(env);
+        try st.appendOwn(8, env);
+    }
+
+    var server = try holdEphemeralPort(io);
+    defer server.deinit(io);
+    const port = portOfServer(&server);
+    try std.testing.expect(port != 0);
+
+    var diag: Diagnostic = .{};
+    for ([_][]const u8{ dir_q, dir_o }) |dir| {
+        diag.len = 0;
+        if (Node.create(gpa, io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = port,
+            .data_dir = dir,
+            .diagnostic = &diag,
+        })) |n| {
+            n.deinit();
+            std.debug.print("\nnode bound port {d} while a test listener held it (SO_REUSEPORT sandbox?); skipping\n", .{port});
+            return error.SkipZigTest;
+        } else |err| {
+            try std.testing.expectEqual(error.ListenPortInUse, err);
+        }
+    }
+}
+
+// -- create() under allocation failure -----------------------------------------
+
+/// A crashed node's data_dir: the journal holds 3, 5, 7 and own.log this
+/// node's EXTERNALIZE for 8 (= hwm + 1, so the restore re-emits it).
+fn seedCrashedDir(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, seed: [32]u8, passphrase: []const u8) !void {
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+    var st = try store_mod.Store.open(gpa, io, dir);
+    defer st.deinit();
+    try st.appendExternalized(3, "three");
+    try st.appendExternalized(5, "five");
+    try st.appendExternalized(7, "seven");
+    const env = try buildSignedExternalize(gpa, seed, network_id, 8, "eight");
+    defer gpa.free(env);
+    try st.appendOwn(8, env);
+}
+
+// Non-vacuity: with the restore loop feeding `applyInput` (which turns a
+// pushInput OOM into the runtime inert latch) and no `failed` check before
+// "Go live", an allocation failure inside the own.log restore hands back a
+// successfully-created node with `failed == true` — this sweep counts those
+// (red: "expected 0, found N"), and the latch's err-level log trips the
+// runner's err rule as well.
+test "create() never returns an already-inert node: FailingAllocator sweep over a crashed data_dir" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const passphrase = "inert-at-create v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    try seedCrashedDir(std.testing.allocator, io, data_dir, seed, passphrase);
+
+    // Backed by the page allocator: leak accounting of the engine's own
+    // OOM paths is the engine's business; this pins the create contract.
+    var diag: Diagnostic = .{};
+    var inert_creates: usize = 0;
+    var oks: usize = 0;
+    var errs: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = idx });
+        diag.len = 0;
+        if (Node.create(fa.allocator(), io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = 0,
+            .data_dir = data_dir,
+            .diagnostic = &diag,
+        })) |n| {
+            const inert = n.failed.load(.acquire);
+            n.deinit();
+            oks += 1;
+            if (inert) {
+                inert_creates += 1;
+                std.debug.print("fail_index {d}: create() returned OK but the node is inert\n", .{idx});
+            }
+            if (!fa.has_induced_failure) break; // past every allocation in create
+        } else |err| {
+            errs += 1;
+            if (err != error.OutOfMemory) std.debug.print("fail_index {d}: {t}: {s}\n", .{ idx, err, diag.message() });
+        }
+    }
+    std.debug.print("create() sweep: {d} allocation points, {d} ok, {d} inert-at-create\n", .{ errs + oks, oks, inert_creates });
+    try std.testing.expect(idx < 4096); // the sweep reached a clean create
+    try std.testing.expectEqual(@as(usize, 0), inert_creates);
+}
+
+// Non-vacuity: `recordOwnLatest`'s bare `catch return` on the envelope copy /
+// map insert (or a `catch` that only logs on the arm_timer effect) makes an
+// induced allocation failure inside the own.log restore return a
+// successfully-created node whose catch-up cache lacks the restored slot —
+// this sweep counts creates that succeeded WITH an induced failure (red:
+// "expected 0, found N"; the design's D5 bar is checkAllAllocationFailures
+// over Node.create).
+test "create() swallows no allocation failure: every induced OOM in the sweep is an OutOfMemory return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const passphrase = "swallowed-oom v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    try seedCrashedDir(std.testing.allocator, io, data_dir, seed, passphrase);
+
+    var diag: Diagnostic = .{};
+    var swallowed: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = idx });
+        diag.len = 0;
+        if (Node.create(fa.allocator(), io, .{
+            .network = passphrase,
+            .secret_seed = seed,
+            .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+            .listen_port = 0,
+            .data_dir = data_dir,
+            .diagnostic = &diag,
+        })) |n| {
+            const induced = fa.has_induced_failure;
+            const has_8 = blk: {
+                n.own_mu.lockUncancelable(io);
+                defer n.own_mu.unlock(io);
+                break :blk n.own_latest.contains(8);
+            };
+            n.deinit();
+            if (induced) {
+                swallowed += 1;
+                std.debug.print("fail_index {d}: create() returned OK although an allocation failed (own_latest has slot 8: {})\n", .{ idx, has_8 });
+            } else {
+                try std.testing.expect(has_8); // the clean create restored slot 8 into the catch-up cache
+                break;
+            }
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try std.testing.expect(idx < 4096);
+    try std.testing.expectEqual(@as(usize, 0), swallowed);
+}
+
+// -- propose under allocation failure ------------------------------------------
+
+/// Fails exactly ONE allocation — the `n`-th made by the arming thread after
+/// `arm(n)` — and passes everything else through, so a live Node's other
+/// threads (engine, wheel, overlay, resync) are never touched. The std
+/// FailingAllocator fails every allocation after its index on every thread,
+/// which would confound "one transient failure" with "the engine went OOM".
+const ThreadFailOnce = struct {
+    backing: std.mem.Allocator,
+    tid: std.Thread.Id,
+    armed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    remaining: usize = 0,
+    fired: bool = false,
+
+    fn arm(self: *ThreadFailOnce, n: usize) void {
+        self.tid = std.Thread.getCurrentId();
+        self.remaining = n;
+        self.fired = false;
+        self.armed.store(true, .release);
+    }
+
+    fn disarm(self: *ThreadFailOnce) void {
+        self.armed.store(false, .release);
+    }
+
+    fn allocator(self: *ThreadFailOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        if (self.armed.load(.acquire) and std.Thread.getCurrentId() == self.tid) {
+            if (self.remaining == 0) {
+                self.fired = true;
+                self.armed.store(false, .release);
+                return null;
+            }
+            self.remaining -= 1;
+        }
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ThreadFailOnce = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+// Non-vacuity: with `InputQueue.push` swallowing the enqueue OOM (drop +
+// log) and `maybeStartNomination` having already popped the value and set
+// `nominating = true`, the index that lands on the queue append makes
+// propose() return success while nothing is ever nominated — the first
+// waitExternalized times out (red: NominationDropped) and `nominating`
+// stays latched so the retry is never nominated either; the push's err-level
+// log trips the runner too. The `prev` dupe index shows the same
+// propose-succeeded-but-not-nominated shape.
+test "propose: one allocation failure on the calling thread is either OutOfMemory or a nomination — never a silently dropped proposal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const seed: [32]u8 = @splat(0x51);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    var tfo = ThreadFailOnce{ .backing = std.testing.allocator, .tid = std.Thread.getCurrentId() };
+    const gpa = tfo.allocator();
+
+    // The calling thread allocates at most a handful of times inside
+    // propose (value copy, queue append, prev copy, input enqueue); sweep
+    // past that so the last iterations are the no-failure control.
+    var n: usize = 0;
+    while (n < 6) : (n += 1) {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "{s}/n{d}", .{ root, n });
+        const node = try Node.create(gpa, io, .{
+            .network = "propose-oom v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}), // 1-of-1 self quorum: a nomination externalizes
+            .listen_port = 0,
+            .data_dir = dir,
+            .diagnostic = &diag,
+        });
+        defer node.deinit();
+
+        tfo.arm(n);
+        const res = node.propose("first");
+        tfo.disarm();
+        if (res) |_| {
+            const e = node.waitExternalized(.{ .timeout_ms = 10_000 }) orelse {
+                std.debug.print("\nfail #{d}: propose() succeeded but nothing externalized (fired={})\n", .{ n, tfo.fired });
+                return error.NominationDropped;
+            };
+            gpa.free(e.value);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(tfo.fired);
+            node.prop_mu.lockUncancelable(io);
+            const nominating = node.nominating;
+            const queued = node.proposal_queue.items.len;
+            node.prop_mu.unlock(io);
+            try std.testing.expect(!nominating); // no latch without a nomination in flight
+            try std.testing.expectEqual(@as(usize, 0), queued); // the refused value is not held either
+        }
+        // The node is never stuck: the next proposal always goes through.
+        try node.propose("second");
+        const e2 = node.waitExternalized(.{ .timeout_ms = 10_000 }) orelse return error.NodeStuckAfterOom;
+        gpa.free(e2.value);
+    }
+}
+
+// -- catch-up re-flood order ---------------------------------------------------
+
+/// The slot index of a framed Envelope (test helper for the order pins).
+fn slotOfFramedEnvelope(gpa: std.mem.Allocator, framed_env: []const u8) !u64 {
+    var emsg = try core.capnpc.message.Message.init(gpa, framed_env, .{});
+    defer emsg.deinit();
+    const er = try gen_slcp.Envelope.Reader.init(&emsg);
+    const stmt_bytes = try er.getStatementBytes();
+    var smsg = try canonical.decodeFlat(gpa, stmt_bytes, .{});
+    defer smsg.deinit();
+    const sr = try gen_slcp.Statement.Reader.init(&smsg);
+    return sr.getSlotIndex();
+}
+
+/// A bare overlay peer (no Node behind it) that records the slot of every
+/// envelope it receives, in arrival order, plus the envelope order of the
+/// first slotState answer.
+const OrderProbe = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mu: std.Io.Mutex = .init,
+    peer: ?usize = null,
+    flood: std.ArrayList(u64) = .empty,
+    answer: std.ArrayList(u64) = .empty,
+    answered: bool = false,
+
+    fn onRecv(ctx: ?*anyopaque, peer_id: usize, frame: *const wire.OverlayFrame) void {
+        const self: *OrderProbe = @ptrCast(@alignCast(ctx.?));
+        _ = peer_id;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        switch (frame.*) {
+            .envelope => |bytes| {
+                const slot = slotOfFramedEnvelope(self.gpa, bytes) catch return;
+                self.flood.append(self.gpa, slot) catch {};
+            },
+            .slot_state => |ss| {
+                if (self.answered) return;
+                self.answered = true;
+                for (ss.envelopes) |env| {
+                    const slot = slotOfFramedEnvelope(self.gpa, env) catch continue;
+                    self.answer.append(self.gpa, slot) catch {};
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn onPeerUp(ctx: ?*anyopaque, peer_id: usize) void {
+        const self: *OrderProbe = @ptrCast(@alignCast(ctx.?));
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.peer = peer_id;
+    }
+
+    fn floodCount(self: *OrderProbe) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.flood.items.len;
+    }
+
+    fn hasAnswer(self: *OrderProbe) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.answered;
+    }
+
+    fn hasPeer(self: *OrderProbe) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.peer != null;
+    }
+
+    fn deinit(self: *OrderProbe) void {
+        self.flood.deinit(self.gpa);
+        self.answer.deinit(self.gpa);
+    }
+};
+
+// Non-vacuity: iterating `own_latest` with `.iterator()` (bucket order) in
+// onPeerUp / answerGetSlotState instead of by ascending slot sends the
+// eight restored slots as {7, 1, 8, 4, 6, 5, 2, 3} on this std — both
+// `expectEqualSlices` go red (a rejoining peer then sees NOMINATE(N+1)
+// before EXTERNALIZE(N), the amplifier behind the 2-of-3 rejoin stall).
+test "catch-up: onPeerUp's re-flood and the getSlotState answer send own statements in ascending slot order" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const passphrase = "reflood-order v1";
+    const seed: [32]u8 = @splat(0x42);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+    var diag: Diagnostic = .{};
+
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    // Eight consecutive slots in the catch-up cache, inserted ascending —
+    // exactly what a node holds after externalizing 1..8 (or restoring
+    // them from own.log).
+    const want = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    for (want) |slot| {
+        const env = try buildSignedExternalize(gpa, seed, network_id, slot, "v");
+        defer gpa.free(env);
+        try n.recordOwnLatest(slot, env);
+    }
+
+    // A bare overlay peer dials the node: its Hello completes, the node's
+    // onPeerUp re-floods, then we ask for the slot state ourselves.
+    var probe = OrderProbe{ .gpa = gpa, .io = io };
+    defer probe.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{n.boundPort()});
+    var ov = try overlay_mod.Overlay.init(gpa, io, .{
+        .listen_port = 0,
+        .peers = &.{spec},
+        .network_id_prefix = network_id[0..8].*,
+        .node_id = peer_a,
+    }, .{ .ctx = &probe, .on_recv = OrderProbe.onRecv, .on_peer_up = OrderProbe.onPeerUp });
+    defer ov.deinit();
+    try ov.start();
+    defer ov.stop();
+
+    try pollUntil(io, 10_000, &probe, OrderProbe.hasPeer);
+    const Wait = struct {
+        fn flooded(p: *OrderProbe) bool {
+            return p.floodCount() >= 8;
+        }
+    };
+    try pollUntil(io, 10_000, &probe, Wait.flooded);
+    ov.send(probe.peer.?, .{ .get_slot_state = 0 });
+    try pollUntil(io, 10_000, &probe, OrderProbe.hasAnswer);
+
+    probe.mu.lockUncancelable(io);
+    defer probe.mu.unlock(io);
+    std.debug.print("\nre-flood order: {any}\nslotState order: {any}\n", .{ probe.flood.items[0..8], probe.answer.items });
+    try std.testing.expectEqualSlices(u64, &want, probe.flood.items[0..8]);
+    try std.testing.expectEqualSlices(u64, &want, probe.answer.items);
 }

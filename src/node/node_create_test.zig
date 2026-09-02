@@ -725,8 +725,9 @@ test "I/O members: NotDir key path is KeyFileIoFailed, a malformed marker is Dat
     try expectContains(g.diag.message(), "delete that file");
 
     // OutOfMemory: the very first allocation fails. The member surfaces
-    // unchanged and the diagnostic stays empty (there is no offending value
-    // to name; `explain` carries the sentence).
+    // unchanged and the diagnostic carries create()'s own "out of memory"
+    // sentence (S8 fix-1: a reused buffer never keeps a previous failure's
+    // text — see "create(): OutOfMemory writes its own message" below).
     var b3: [std.fs.max_path_bytes]u8 = undefined;
     var oom = g.options();
     oom.data_dir = try g.sub(&b3, "oom");
@@ -734,5 +735,122 @@ test "I/O members: NotDir key path is KeyFileIoFailed, a malformed marker is Dat
     g.diag.len = 0;
     try testing.expectError(error.OutOfMemory, Node.create(failing.allocator(), io, oom));
     try testing.expect(failing.has_induced_failure);
+    try expectContains(g.diag.message(), "out of memory");
+}
+
+// Non-vacuity: without the `eng_live` guard on create()'s `errdefer
+// self.eng.deinit()`, an allocation failure inside the watcher re-init
+// (Engine.init after the corrupt-own.log fallback tore the first engine
+// down) runs Engine.deinit on an already-deinit'd engine — the sweep dies
+// with "panic: integer overflow" (Debug) instead of reporting; with the
+// guard but without freeing the qset clone on that failure the testing
+// allocator reports one leaked clone per failing index. recover() truncates
+// the corrupt record on disk, so the corrupt own.log is re-seeded before
+// every iteration (a once-seeded sweep never reaches the fallback twice).
+test "corrupt own.log + allocation failure at the watcher re-init: every index is OutOfMemory or a watcher, no panic, no leak" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+    {
+        var st = try store.Store.open(testing.allocator, io, g.dataDir());
+        defer st.deinit();
+        try st.appendOwn(1, "not-an-envelope");
+    }
+    // Flip the last byte (the crc trailer): structurally complete, bad crc
+    // = the §10 "corrupt" verdict (a torn tail would merely be repaired).
+    const corrupt = try g.tmp.dir.readFileAlloc(io, "own.log", testing.allocator, .unlimited);
+    defer testing.allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 0xff;
+
+    var watchers: usize = 0;
+    var idx: usize = 0;
+    while (idx < 4096) : (idx += 1) {
+        {
+            var f = try g.tmp.dir.createFile(io, "own.log", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, corrupt);
+        }
+        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        g.diag.len = 0;
+        if (Node.create(fa.allocator(), io, g.options())) |n| {
+            const is_watcher = n.watcher;
+            const induced = fa.has_induced_failure;
+            n.deinit();
+            try testing.expect(is_watcher); // the fallback always ends as a watcher
+            watchers += 1;
+            if (!induced) break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try testing.expect(idx < 4096);
+    try testing.expect(watchers >= 1);
+}
+
+// Non-vacuity: with only the top-level `memberCount() == 0` guard, an empty
+// INNER level reaches `firstBadThreshold` first (no threshold fits [1, 0])
+// and create() reports QuorumThresholdOutOfRange with the nonsense range
+// "[1, 0]" — the expectFail's member check goes red (WrongCreateError); the
+// design (§12, S12 (a)) names an empty level QuorumEmpty.
+test "quorum: an empty INNER level is QuorumEmpty, not a threshold outside [1, 0]" {
+    var g = try Golden.init();
+    defer g.deinit();
+
+    const empty_inner = [_]Quorum{Quorum.of(1, &.{})};
+    var nested = g.options();
+    nested.quorum = Quorum.ofSets(1, &empty_inner);
+    try g.expectFail(nested, error.QuorumEmpty, "a level with no members");
+    try testing.expect(std.mem.indexOf(u8, g.diag.message(), "[1, 0]") == null);
+
+    // Threshold 0 on the empty level is the same misconfiguration.
+    const zero_inner = [_]Quorum{Quorum.of(0, &.{})};
+    var zero = g.options();
+    zero.quorum = Quorum.ofSets(1, &zero_inner);
+    try g.expectFail(zero, error.QuorumEmpty, "a level with no members");
+}
+
+// Non-vacuity: without the reset at the top of create() and the OOM
+// mapping through `fail`, an allocation failure returns OutOfMemory with
+// the Diagnostic untouched — the reused buffer still says "STALE ..."
+// (red on the indexOf check) and a fresh one stays empty; a successful
+// create would keep a previous failure's text as well.
+test "create(): OutOfMemory writes its own message into a reused Diagnostic, and success clears it" {
+    var g = try Golden.init();
+    defer g.deinit();
+
+    g.diag.set("STALE MESSAGE FROM A PREVIOUS FAILURE", .{});
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Node.create(fa.allocator(), testing.io, g.options()));
+    try testing.expect(std.mem.indexOf(u8, g.diag.message(), "STALE") == null);
+    try expectContains(g.diag.message(), "out of memory");
+
+    g.diag.set("STALE MESSAGE FROM A PREVIOUS FAILURE", .{});
+    const n = try Node.create(testing.allocator, testing.io, g.options());
+    n.deinit();
     try testing.expectEqualStrings("", g.diag.message());
+}
+
+// Non-vacuity: with Store.open collapsing every log-open failure into
+// `IoFailed`, a log this user cannot write is reported as DataDirUnusable
+// with "(IoFailed); check the path, the filesystem and free space" — the
+// expectFail's member check goes red (WrongCreateError); every earlier
+// data_dir check already maps AccessDenied to DataDirAccessDenied.
+test "data_dir: an existing log without write permission is DataDirAccessDenied, not DataDirUnusable(IoFailed)" {
+    if (isRoot()) return error.SkipZigTest; // root ignores mode bits
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var first = g.options();
+    first.data_dir = try g.sub(&b1, "ro-log");
+    {
+        const n = try Node.create(testing.allocator, io, first);
+        n.deinit();
+    }
+    try g.tmp.dir.setFilePermissions(io, "ro-log/own.log", std.Io.File.Permissions.fromMode(0o400), .{});
+    defer g.tmp.dir.setFilePermissions(io, "ro-log/own.log", std.Io.File.Permissions.fromMode(0o600), .{}) catch {};
+
+    try g.expectFail(first, error.DataDirAccessDenied, "permission denied");
+    try expectContains(g.diag.message(), "own.log");
 }
