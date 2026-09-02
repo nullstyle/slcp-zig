@@ -188,8 +188,6 @@ just verify-release-hash X.Y.Z   # fetches the published tarball as a consumer
 
 Machine: the author's Mac (Darwin 25.6.0, 18 cores), Zig
 `0.17.0-dev.1786+75044cb04` via mise, `capnp` 1.5.0 (brew), `just` 1.49.0.
-Branch `m6/s9-release` from `main` @ `7fe0fe8`; `preflight`/recipes commit
-`a8425a3`.
 
 Branch `m6/s9-release` from `main` @ `7fe0fe8`. Commits: `a8425a3` (preflight
 step + recipes), `d850028` (packaging fix, below), `7dc6e24` (hash into
