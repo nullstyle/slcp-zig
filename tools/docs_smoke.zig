@@ -1016,3 +1016,32 @@ test "report: failure line shape and the evidence line" {
     try testing.expectEqual(@as(usize, 1), rep.failures);
     try testing.expectEqualStrings("[FAIL] README.md:42: snippet examples/bytes_node.zig is byte-equal to the file (first difference at body offset 7)\n[docs-smoke] checks=2 failures=1\n", aw.written());
 }
+
+// Non-vacuity: reads the REAL src/node/app_node.zig against the appnode-errors
+// case table (tests/appnode_errors/cases.zig). Adding a teaching error site
+// (`contractError(App, "…")` or `@compileError("slcp auto-codec: …")`) with no
+// table row — or deleting a site while its row stays — breaks the count;
+// rewording a message without its `src` breaks the fragment check. Proven by
+// the S8 ablation: an unpinned `frobnicate` contractError kept `zig build
+// test` green before this test existed.
+test "appnode-errors liveness: every case fragment is in app_node.zig and the site count equals the table length" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const cases = @import("appnode_error_cases");
+    const src = try std.Io.Dir.cwd().readFileAlloc(io, "src/node/app_node.zig", gpa, read_limit);
+    defer gpa.free(src);
+
+    for (cases.cases) |c| {
+        if (std.mem.indexOf(u8, src, c.src) == null) {
+            std.debug.print("appnode-errors: case `{s}` fragment not found in src/node/app_node.zig: {s}\n", .{ c.stem, c.src });
+            return error.AppNodeErrorCaseNotLive;
+        }
+    }
+    const contract = std.mem.count(u8, src, cases.contract_site);
+    const codec = std.mem.count(u8, src, cases.codec_site);
+    if (contract + codec != cases.cases.len) {
+        std.debug.print("appnode-errors: {d} contractError + {d} auto-codec sites in src/node/app_node.zig, but the case table has {d} rows — pin the new rule in tests/appnode_errors/ and cases.zig\n", .{ contract, codec, cases.cases.len });
+        return error.AppNodeErrorSiteUnpinned;
+    }
+    try testing.expect(cases.cases.len >= 20);
+}

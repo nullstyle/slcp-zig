@@ -534,28 +534,11 @@ pub fn build(b: *std.Build) void {
     // rendering (plan R12): `matchCompileError` tries endsWith first, so the
     // needle holds from any cwd (the `/?/`+path form does not). Message text
     // and needle change together. Compile-only: no setCwd/has_side_effects.
-    const appnode_error_cases = [_]struct { stem: []const u8, needle: []const u8 }{
-        .{ .stem = "err_missing_state", .needle = "): missing `pub const State` — the replicated state type." },
-        .{ .stem = "err_missing_command", .needle = "): missing `pub const Command` — the value type the network agrees on." },
-        .{ .stem = "err_missing_validate", .needle = "): missing `pub fn validate(state: State, cmd: Command) slcp.Validity`." },
-        .{ .stem = "err_bad_validate_signature", .needle = "): validate has the wrong signature." },
-        .{ .stem = "err_missing_apply", .needle = "): missing `pub fn apply(state: State, cmd: Command) State`." },
-        .{ .stem = "err_bad_apply_signature", .needle = "): apply has the wrong signature." },
-        .{ .stem = "err_bad_combine_signature", .needle = "): combine has the wrong signature." },
-        .{ .stem = "err_bad_initial_state_signature", .needle = "): initialState has the wrong signature." },
-        .{ .stem = "err_lone_encode", .needle = "): a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." },
-        .{ .stem = "err_bad_encode_signature", .needle = "): encode has the wrong signature." },
-        .{ .stem = "err_bad_decode_signature", .needle = "): decode has the wrong signature." },
-        .{ .stem = "err_no_default", .needle = "): State field `owner` has no default value." },
-        .{ .stem = "err_float_command", .needle = " — floats are NONDETERMINISTIC across nodes (NaN payloads, ±0, platform math differences)." },
-        .{ .stem = "err_pointer_command", .needle = " is a pointer/slice ([]const u8)." },
-        .{ .stem = "err_optional_command", .needle = " is optional (?u8)." },
-        .{ .stem = "err_union_command", .needle = ") — the v1 auto-codec does not encode unions." },
-        .{ .stem = "err_nonexhaustive_enum", .needle = ") — `_` admits every tag value, so there is no single canonical spelling; make the enum exhaustive." },
-        .{ .stem = "err_unsupported_type", .needle = ", which the auto-codec does not cover. Provide your own encode/decode." },
-        .{ .stem = "err_zero_size_command", .needle = " encodes to 0 bytes; the engine rejects empty values (§8.4) — add a field." },
-        .{ .stem = "err_oversized_command", .needle = " bytes, above the frozen 65536-byte value cap (§4.5)." },
-    };
+    // The table lives in tests/appnode_errors/cases.zig, shared with the
+    // docs-smoke "appnode-errors liveness" unit test that counts the error
+    // sites in app_node.zig against it — an unpinned 21st rule goes red
+    // there, not here (S8 review: this loop only pins the rows it has).
+    const appnode_error_cases = @import("tests/appnode_errors/cases.zig").cases;
     comptime std.debug.assert(appnode_error_cases.len == 20);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
@@ -668,7 +651,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/docs_smoke.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+        .imports = &.{
+            .{ .name = "slcp", .module = slcp_mod },
+            // The appnode-errors case table (M6:appnode) for the liveness test.
+            .{ .name = "appnode_error_cases", .module = b.createModule(.{
+                .root_source_file = b.path("tests/appnode_errors/cases.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+        },
     });
     const docs_smoke = b.addExecutable(.{ .name = "docs-smoke", .root_module = docs_smoke_mod });
     const run_docs_smoke = b.addRunArtifact(docs_smoke);
