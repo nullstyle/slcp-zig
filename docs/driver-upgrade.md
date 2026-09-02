@@ -33,8 +33,10 @@ legal value; nothing relates one slot's value to the previous slot's.
   §8.5). Your typed `validate` supplies the meaning the default lacks.
 - Rule of thumb from §11.2: **agree on VALUES, not OPS.** "count becomes 3"
   survives highest-wins combine and journal replay; "add 1" does not (two
-  proposers both adding 1 collapse to one increment, and a replayed op
-  double-applies).
+  proposers both adding 1 collapse to one increment, and a restarted node
+  re-applies only the journal tail onto `initialState()`, so every increment
+  before the compaction floor is lost — while a snapshot restored from
+  `initialState()` gets that tail applied a second time).
 - For a bytes-level `Node` where any non-empty value is acceptable and "the
   biggest one wins" is a fine tie-break — a counter of big-endian integers,
   a monotone version stamp — the default is enough as it is.

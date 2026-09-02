@@ -111,13 +111,18 @@ pub const threat_model_needles = [_][]const u8{
     "WireGuard",
     "quorum intersection",
 };
-/// Spellings that must appear in NO active doc (stale designs, wrong verbs).
+/// Spellings that must appear in NO active doc (stale designs, wrong verbs,
+/// wrong failure modes). `double-appl` (S8 D2-restart): AppNode re-applies
+/// the journal tail exactly once onto `initialState()` (`applied_hwm`), so
+/// a delta command UNDER-applies on restart; "double-apply" names a failure
+/// mode the node cannot produce on its own.
 pub const forbidden_needles = [_][]const u8{
     "SO_RCVTIMEO",
     "@nullstyle/slcp",
     "slcp-zig.git#v",
     "slcp keygen",
     "key create",
+    "double-appl",
 };
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
@@ -1002,6 +1007,30 @@ test "option rows: table rows parse; names are checked against slcp.NodeOptions"
     try testing.expect(isOptionField("diagnostic"));
     try testing.expect(!isOptionField("no_such_option"));
     try testing.expect(option_fields.len >= 10);
+}
+
+// Non-vacuity (S8 D2-restart): reads the REAL README.md, docs/driver-upgrade.md
+// and examples/counter/README.md. Restoring the old sentence "operations
+// double-apply under combine and under journal replay" to any of them goes
+// red here (the node under-applies a delta command on restart: the tail is
+// applied exactly once onto initialState()); dropping the needle from
+// `forbidden_needles` fails the first expectation.
+test "forbidden needles: no active doc calls the replay failure mode double-apply" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var listed = false;
+    for (forbidden_needles) |n| {
+        if (std.mem.eql(u8, n, "double-appl")) listed = true;
+    }
+    try testing.expect(listed);
+    for ([_][]const u8{ "README.md", "docs/driver-upgrade.md", "examples/counter/README.md" }) |p| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, read_limit);
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, "double-appl")) |at| {
+            std.debug.print("{s}:{d}: contains `double-appl`\n", .{ p, lineOf(text, at) });
+            return error.ForbiddenSpelling;
+        }
+    }
 }
 
 // Non-vacuity: the evidence line is what `just preflight` greps and the
