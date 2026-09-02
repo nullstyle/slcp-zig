@@ -26,10 +26,15 @@ code. It never appears in either file.
 Three further gates keep the frozen file honest:
 
 - `zig build api-closure` (inside `test`) fails when a Stable **function
-  signature** mentions an Experimental type. A frozen entry point that takes
-  an unfrozen type is only nominally frozen — the type can change shape under
-  it while `check-api` stays green — and if no Stable API can construct the
-  type, the entry point is unusable on its own terms.
+  signature** mentions an Experimental type, or a non-`pub` (Internal) type
+  the walk never reached. A frozen entry point that takes an unfrozen type
+  is only nominally frozen — the type can change shape under it while
+  `check-api` stays green — and if no Stable API can construct the type, the
+  entry point is unusable on its own terms. Types are seen through pointers,
+  optionals, error unions, arrays, vectors and function-pointer types
+  (`[2]T`, `*const fn (T) void` count); std, builtin and capnp-zig types are
+  exempt. The one blind spot is `anytype`: a signature with a generic
+  parameter is skipped, not cleared.
 - A comptime **rule-liveness assertion**: a `stable_rules` or
   `experimental_overrides` entry that matches no declaration is a compile
   error. A rule for a renamed symbol cannot silently document a contract
@@ -134,12 +139,21 @@ frozen; "exact" means the one symbol only (its fields stay Experimental).
   `canonicalBytes` are **held out** (below).
 
 **The wasm host ABI (`slcp-abi.*`, design §7)**
-- Every `export fn`, every `extern "slcp_driver"` import, and the four
-  negotiation constants by value: `abi_version`, `abi_min_version`,
-  `abi_max_version`, `feature_flags`. These lines are rendered from the TEXT
-  of `src/wasm/slcp_host_abi.zig` (the module pins `std.heap.wasm_allocator`
-  and cannot be imported natively), and the runtime half of the liveness
-  assertion checks the `slcp-abi` rule against the parsed file.
+- Every `export fn` (with or without `pub`), every `extern "slcp_driver"`
+  import, and the four negotiation constants by value: `abi_version`,
+  `abi_min_version`, `abi_max_version`, `feature_flags`. These lines are
+  rendered from the TEXT of `src/wasm/slcp_host_abi.zig` (the module pins
+  `std.heap.wasm_allocator` and cannot be imported natively), and the runtime
+  half of the liveness assertion checks the `slcp-abi` rule against the
+  parsed file. The parser cross-checks itself against the Zig tokenizer:
+  every `export` keyword in the file must open a `fn` it rendered, and
+  `@export(...)` or `export var` in that file is a hard `check-api` error —
+  an export the text parser cannot render is never a silently unfrozen one.
+  Cosmetic shape is not contract: a trailing `// comment` on one of these
+  lines, or a signature `zig fmt` split one-parameter-per-line (a trailing
+  comma does that), renders the same `slcp-abi` line as the plain one-line
+  spelling; a signature that never closes is a `check-api` error naming the
+  file line and the declaration.
 
 ## Held out: entry points whose error set is `anyerror` today
 

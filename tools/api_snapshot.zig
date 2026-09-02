@@ -674,6 +674,11 @@ comptime {
 // no Stable API can construct that type, the frozen entry point is unusable
 // on its own terms. `zig build api-closure` fails when one does.
 //
+// Every nominal type a signature mentions is checked — through pointers,
+// optionals, error unions, arrays, vectors and function-pointer types — and a
+// container the walk never reached (a non-`pub` type) is a violation too:
+// it would otherwise render, unfrozen and unlisted, into the Stable line.
+//
 // KNOWN BLIND SPOT: a generic parameter (`anytype`) has no type to resolve, so
 // such signatures are SKIPPED rather than cleared.
 // ---------------------------------------------------------------------------
@@ -716,30 +721,118 @@ const type_tiers: []const TypeTier = blk: {
     break :blk out;
 };
 
-/// Strip the wrappers a signature puts around a nominal type.
-fn peel(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .pointer => |pi| peel(pi.child),
-        .optional => |oi| peel(oi.child),
-        .error_union => |eu| peel(eu.payload),
-        else => T,
-    };
-}
+/// The tier of a nominal type as the closure check sees it. `unlisted` is a
+/// container the walk never reached — a non-`pub` (Internal) type, which
+/// stability.md says "never appears in either file", yet would be rendered
+/// into the Stable line that mentions it.
+const Tier = enum { stable, experimental, unlisted };
 
-/// `null` when the type is not one of ours (std type, primitive, capnp-zig).
-fn tierOfType(comptime T: type) ?bool {
-    const P = peel(T);
-    var found: ?bool = null;
+fn tierOfType(comptime T: type) Tier {
+    var found: Tier = .unlisted;
     for (type_tiers) |entry| {
-        if (entry.ty == P) {
-            if (entry.stable) return true; // any Stable path wins
-            found = false;
+        if (entry.ty == T) {
+            if (entry.stable) return .stable; // any Stable path wins
+            found = .experimental;
         }
     }
     return found;
 }
 
-const Violation = struct { decl: []const u8, offender: []const u8, role: []const u8 };
+/// Is `T` the declaration `root.<@typeName(T)>`? On this toolchain
+/// `@typeName` renders std types module-relative (`Io`, `mem.Allocator`,
+/// `Io.Writer`, `math.Order`), so a name prefix cannot tell a std type from
+/// one of ours; resolving the dotted path under `root` and comparing the
+/// TYPE can. A generic instantiation (`array_list.Aligned(u8,null)`) resolves
+/// to the generic `fn` that made it.
+fn declaredUnder(comptime root: type, comptime T: type) bool {
+    const name = @typeName(T);
+    comptime var cur: type = root;
+    comptime var pos: usize = 0;
+    inline while (true) {
+        const end = std.mem.indexOfScalarPos(u8, name, pos, '.') orelse name.len;
+        const seg = name[pos..end];
+        const paren = std.mem.indexOfScalar(u8, seg, '(');
+        const ident = if (paren) |at| seg[0..at] else seg;
+        if (ident.len == 0 or !@hasDecl(cur, ident)) return false;
+        const D = @field(cur, ident);
+        if (paren != null) return @typeInfo(@TypeOf(D)) == .@"fn";
+        if (@TypeOf(D) != type) return false;
+        if (end == name.len) return D == T;
+        if (!isContainer(D)) return false;
+        cur = D;
+        pos = end + 1;
+    }
+}
+
+/// A nominal type that is not ours to freeze: std, builtin, `anyopaque`, or
+/// capnp-zig's (frozen by upstream's own gate).
+fn isForeignNominal(comptime T: type) bool {
+    return T == anyopaque or foreignType(T) or
+        declaredUnder(std, T) or declaredUnder(slcp.core.capnpc, T);
+}
+
+const Violation = struct { decl: []const u8, offender: []const u8, role: []const u8, why: []const u8 };
+
+/// Check every nominal type `T` mentions — through pointers, optionals,
+/// error unions, arrays, vectors and function-pointer types — against the
+/// tiers. (S8 D10 finding: the old top-level `peel` saw `[2]LintFinding`,
+/// `*const fn (LintFinding) void` and a non-pub struct as "foreign, ignore".)
+fn checkType(
+    comptime T: type,
+    comptime Self: ?type,
+    comptime decl_path: []const u8,
+    comptime role: []const u8,
+    comptime out: *[]const Violation,
+) void {
+    switch (@typeInfo(T)) {
+        .pointer => |pi| checkType(pi.child, Self, decl_path, role, out),
+        .optional => |oi| checkType(oi.child, Self, decl_path, role, out),
+        .error_union => |eu| checkType(eu.payload, Self, decl_path, role, out),
+        .array => |ai| checkType(ai.child, Self, decl_path, role, out),
+        .vector => |vi| checkType(vi.child, Self, decl_path, role, out),
+        .@"fn" => |fi| {
+            for (fi.param_types) |maybe_pt| {
+                const PT = maybe_pt orelse continue;
+                checkType(PT, Self, decl_path, role, out);
+            }
+            if (fi.return_type) |RT| checkType(RT, Self, decl_path, role, out);
+        },
+        .@"struct", .@"enum", .@"union", .@"opaque" => {
+            if (Self != null and T == Self.?) return;
+            if (isForeignNominal(T)) return;
+            const why: ?[]const u8 = switch (tierOfType(T)) {
+                .stable => null,
+                .experimental => "Experimental",
+                .unlisted => "not pub — Internal, never walked into either snapshot",
+            };
+            if (why) |w| out.* = out.* ++ [_]Violation{.{
+                .decl = decl_path,
+                .offender = @typeName(T),
+                .role = role,
+                .why = w,
+            }};
+        },
+        else => {},
+    }
+}
+
+/// The violations one Stable function signature carries. `Self` is the
+/// enclosing type: a method that takes or returns its OWN enclosing type is
+/// not a closure violation — `Node.propose(self: *Node, ...)` is the frozen
+/// method of a type deliberately frozen only at its entry points; the
+/// receiver is the same declaration cluster, not an unfrozen dependency a
+/// consumer must obtain elsewhere.
+fn signatureViolations(comptime FnType: type, comptime Self: ?type, comptime decl_path: []const u8) []const Violation {
+    const fn_info = @typeInfo(FnType).@"fn";
+    if (fn_info.is_generic) return &.{};
+    var out: []const Violation = &.{};
+    for (fn_info.param_types) |maybe_pt| {
+        const PT = maybe_pt orelse continue;
+        checkType(PT, Self, decl_path, "parameter", &out);
+    }
+    if (fn_info.return_type) |RT| checkType(RT, Self, decl_path, "return", &out);
+    return out;
+}
 
 /// Walk again, this time checking each Stable function's signature. The check
 /// has to happen inside the walk: that is the only place a declaration and its
@@ -768,37 +861,7 @@ fn collectClosure(
         }
         if (@typeInfo(DType) != .@"fn") continue;
         if (!tierIsStable(decl_path)) continue;
-
-        const fn_info = @typeInfo(DType).@"fn";
-        if (fn_info.is_generic) continue;
-
-        // A method that takes or returns its OWN enclosing type is not a
-        // closure violation: `Node.propose(self: *Node, ...)` is the frozen
-        // method of a type deliberately frozen only at its entry points — the
-        // receiver is the same declaration cluster, not an unfrozen
-        // dependency a consumer must obtain elsewhere.
-        for (fn_info.param_types) |maybe_pt| {
-            const PT = maybe_pt orelse continue;
-            if (peel(PT) == T) continue;
-            if (tierOfType(PT)) |is_stable| {
-                if (!is_stable) out.* = out.* ++ [_]Violation{.{
-                    .decl = decl_path,
-                    .offender = @typeName(peel(PT)),
-                    .role = "parameter",
-                }};
-            }
-        }
-        if (fn_info.return_type) |RT| {
-            if (peel(RT) != T) {
-                if (tierOfType(RT)) |is_stable| {
-                    if (!is_stable) out.* = out.* ++ [_]Violation{.{
-                        .decl = decl_path,
-                        .offender = @typeName(peel(RT)),
-                        .role = "return",
-                    }};
-                }
-            }
-        }
+        out.* = out.* ++ signatureViolations(DType, T, decl_path);
     }
 }
 
@@ -844,18 +907,104 @@ const experimental_lines: []const []const u8 = blk: {
 // (`slcp-abi.import.<module>.<name>: fn (...) <ret>`), plus the negotiation
 // constants (`slcp-abi.abi_version: const u32 = <n>`, `abi_min_version`,
 // `abi_max_version`, `feature_flags` — `abi_pinned_consts`). The parser is
-// deliberately line-oriented and strict: an export or import whose signature
-// does not close on the line that opens it is an error, never a silently
-// truncated line — a truncated signature would freeze the wrong contract.
+// line-oriented and strict about one thing: a signature renders only once
+// its parentheses balance and its terminator (`{` / `;`) has been seen —
+// otherwise it is an error naming the source line, never a silently
+// truncated line, which would freeze the wrong contract. Cosmetic shape is
+// not contract: trailing `//` comments are stripped, an optional `pub` is
+// accepted, and a signature `zig fmt` split one-parameter-per-line (a
+// trailing comma does that) is joined and renders byte-identically to its
+// one-line spelling (S8 D10 "line-shape fragile" finding).
 // ---------------------------------------------------------------------------
 
-const AbiParseError = error{ AbiSignatureSpansLines, AbiVersionMissing, OutOfMemory };
+const AbiParseError = error{
+    /// An `export fn` / `extern` signature whose parentheses never balance
+    /// or whose terminator never comes within `max_signature_lines`.
+    AbiSignatureUnterminated,
+    /// An `extern "…"` or pinned-const line the parser cannot split.
+    AbiLineMalformed,
+    AbiVersionMissing,
+    /// `@export(...)` in the ABI source: a real wasm export whose name the
+    /// text never spells next to a signature, so the line parser cannot
+    /// render it. Spell it `export fn` instead.
+    AbiExportViaBuiltin,
+    /// `export var` / `export const`: a data symbol, not part of the §7 fn
+    /// surface and not renderable as a `fn` line.
+    AbiExportNotFn,
+    /// The tokenizer counted more `export fn` than the line parser rendered:
+    /// a spelling the parser does not know. Never a silent miss.
+    AbiExportUnparsed,
+    OutOfMemory,
+};
 
-/// The signature must open and close on this line and end with `terminator`
-/// (`{` for an export body, `;` for an extern prototype). Returns it with the
-/// terminator and surrounding whitespace stripped.
-fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureSpansLines}![]const u8 {
-    if (text.len == 0 or text[text.len - 1] != terminator) return error.AbiSignatureSpansLines;
+/// A signature may continue over at most this many source lines before the
+/// parser gives up (zig fmt puts one parameter per line; the widest ABI
+/// signature has six).
+const max_signature_lines = 32;
+
+/// `pub export fn` / `pub extern "…"` are the same exports as the bare
+/// spellings: `pub` only widens the Zig-side visibility. Strip it so both
+/// render (S8 D10 finding: a `pub export fn` shipped unfrozen and unlisted).
+fn stripPub(line: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, line, "pub ")) line["pub ".len..] else line;
+}
+
+/// Drop a trailing `// comment` (outside string literals) and the whitespace
+/// before it. A comment-only edit must not be a Stable drift.
+fn stripLineComment(line: []const u8) []const u8 {
+    var in_string = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return std.mem.trimEnd(u8, line[0..i], " \t");
+        }
+    }
+    return line;
+}
+
+/// The line parser's self-check: tokenize the source (comments and string
+/// literals fall away) and count every `export` keyword that opens a
+/// function. Any other export shape is refused outright: `@export(...)`
+/// (`AbiExportViaBuiltin`) and `export var`/`export const`
+/// (`AbiExportNotFn`). The caller compares the count against the lines it
+/// rendered, so a spelling the line parser does not know can never ship as a
+/// silently unfrozen export.
+fn countExportFns(gpa: std.mem.Allocator, src: []const u8) error{ OutOfMemory, AbiExportViaBuiltin, AbiExportNotFn }!usize {
+    const z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(z);
+    var tok = std.zig.Tokenizer.init(z);
+    var count: usize = 0;
+    var after_export = false;
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        if (after_export) {
+            if (t.tag != .keyword_fn) return error.AbiExportNotFn;
+            count += 1;
+        }
+        after_export = t.tag == .keyword_export;
+        if (t.tag == .builtin and std.mem.eql(u8, z[t.loc.start..t.loc.end], "@export")) {
+            return error.AbiExportViaBuiltin;
+        }
+    }
+    return count;
+}
+
+/// A complete signature ends with `terminator` (`{` for an export body, `;`
+/// for an extern prototype), opens a parenthesis, and balances it. Returns
+/// the text with the terminator and surrounding whitespace stripped, or
+/// `AbiSignatureUnterminated` when more lines are needed.
+fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureUnterminated}![]const u8 {
+    if (text.len == 0 or text[text.len - 1] != terminator) return error.AbiSignatureUnterminated;
     const sig = std.mem.trim(u8, text[0 .. text.len - 1], " \t");
     var depth: isize = 0;
     var saw_open = false;
@@ -867,8 +1016,65 @@ fn oneLineSignature(text: []const u8, terminator: u8) error{AbiSignatureSpansLin
             depth -= 1;
         }
     }
-    if (!saw_open or depth != 0) return error.AbiSignatureSpansLines;
+    if (!saw_open or depth != 0) return error.AbiSignatureUnterminated;
     return sig;
+}
+
+/// The joined spelling of a signature must equal its one-line spelling:
+/// `( ` → `(`, and `, )` / ` )` (zig fmt's trailing comma before the closing
+/// paren on its own line) → `)`. A well-formed one-line signature is
+/// unchanged.
+fn normalizeSignature(gpa: std.mem.Allocator, sig: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (sig) |c| {
+        if (c == ' ' and out.items.len > 0 and out.items[out.items.len - 1] == '(') continue;
+        if (c == ')') {
+            while (out.items.len > 0 and (out.items[out.items.len - 1] == ' ' or out.items[out.items.len - 1] == ',')) {
+                out.items.len -= 1;
+            }
+        }
+        try out.append(gpa, c);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Gather a signature that opens with `first` and may continue on the lines
+/// `it` yields (zig fmt's one-parameter-per-line form) until it closes.
+/// `line_no` is the source line of `first` and is advanced past every line
+/// consumed. A signature that never closes is an error that names the file
+/// line and the declaration — the caller's `try` alone would not.
+fn collectSignature(
+    gpa: std.mem.Allocator,
+    first: []const u8,
+    terminator: u8,
+    it: *std.mem.SplitIterator(u8, .scalar),
+    line_no: *usize,
+) AbiParseError![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, first);
+    const start_line = line_no.*;
+    var lines_used: usize = 1;
+    while (true) {
+        if (oneLineSignature(buf.items, terminator)) |sig| {
+            return normalizeSignature(gpa, sig);
+        } else |_| {}
+        if (lines_used >= max_signature_lines) break;
+        const raw = it.next() orelse break;
+        line_no.* += 1;
+        lines_used += 1;
+        const cont = stripLineComment(std.mem.trim(u8, raw, " \t\r"));
+        if (cont.len == 0) continue;
+        try buf.append(gpa, ' ');
+        try buf.appendSlice(gpa, cont);
+    }
+    const name_end = std.mem.indexOfScalar(u8, first, '(') orelse first.len;
+    std.debug.print(
+        "api-snapshot: {s}:{d}: `{s}` — signature does not close (unbalanced parentheses or no `{c}` within {d} lines)\n",
+        .{ abi_source_path, start_line, std.mem.trim(u8, first[0..name_end], " \t"), terminator, max_signature_lines },
+    );
+    return error.AbiSignatureUnterminated;
 }
 
 /// Render the frozen ABI surface from the module's source text. Lines come
@@ -880,23 +1086,30 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
         out.deinit(gpa);
     }
     var saw_version = false;
+    var exports_rendered: usize = 0;
+    var line_no: usize = 0;
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (std.mem.startsWith(u8, line, "export fn ")) {
-            const sig = try oneLineSignature(line["export fn ".len..], '{');
-            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiSignatureSpansLines;
+        line_no += 1;
+        const line = stripLineComment(std.mem.trim(u8, raw, " \t\r"));
+        const decl = stripPub(line);
+        if (std.mem.startsWith(u8, decl, "export fn ")) {
+            const sig = try collectSignature(gpa, decl["export fn ".len..], '{', &it, &line_no);
+            defer gpa.free(sig);
+            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.export.{s}: fn {s}", .{
                 abi_prefix, sig[0..name_len], sig[name_len..],
             }));
-        } else if (std.mem.startsWith(u8, line, "extern \"")) {
-            const rest = line["extern \"".len..];
-            const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.AbiSignatureSpansLines;
+            exports_rendered += 1;
+        } else if (std.mem.startsWith(u8, decl, "extern \"")) {
+            const rest = decl["extern \"".len..];
+            const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.AbiLineMalformed;
             const module = rest[0..q];
             const after = rest[q + 1 ..];
-            if (!std.mem.startsWith(u8, after, " fn ")) return error.AbiSignatureSpansLines;
-            const sig = try oneLineSignature(after[" fn ".len..], ';');
-            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiSignatureSpansLines;
+            if (!std.mem.startsWith(u8, after, " fn ")) return error.AbiLineMalformed;
+            const sig = try collectSignature(gpa, after[" fn ".len..], ';', &it, &line_no);
+            defer gpa.free(sig);
+            const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.import.{s}.{s}: fn {s}", .{
                 abi_prefix, module, sig[0..name_len], sig[name_len..],
             }));
@@ -904,7 +1117,7 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
             // `pub const abi_version: u32 = 1;` → `slcp-abi.abi_version: const u32 = 1`
             // (same shape for abi_min_version / abi_max_version / feature_flags).
             const body = std.mem.trim(u8, raw_body, "; \t");
-            const colon = std.mem.indexOf(u8, body, ": ") orelse return error.AbiSignatureSpansLines;
+            const colon = std.mem.indexOf(u8, body, ": ") orelse return error.AbiLineMalformed;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.{s}: const {s}", .{
                 abi_prefix, body[0..colon], body[colon + 2 ..],
             }));
@@ -912,6 +1125,14 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
         }
     }
     if (!saw_version) return error.AbiVersionMissing;
+    const exports_in_source = try countExportFns(gpa, src);
+    if (exports_in_source != exports_rendered) {
+        std.debug.print(
+            "api-snapshot: {s}: the tokenizer sees {d} `export fn` but the line parser rendered {d} — an export spelling the parser does not know\n",
+            .{ abi_source_path, exports_in_source, exports_rendered },
+        );
+        return error.AbiExportUnparsed;
+    }
     return out.toOwnedSlice(gpa);
 }
 
@@ -1157,16 +1378,17 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         std.debug.print(
-            "api-closure: {d} Stable declaration(s) mention an Experimental type.\n" ++
+            "api-closure: {d} Stable declaration(s) mention an Experimental or non-pub type.\n" ++
                 "Each is an API decision: promote the type, or narrow the entry point.\n\n",
             .{closure_violations.len},
         );
         for (closure_violations) |v| {
-            std.debug.print("  {s}\n    {s}: {s}\n", .{ v.decl, v.role, v.offender });
+            std.debug.print("  {s}\n    {s}: {s} ({s})\n", .{ v.decl, v.role, v.offender, v.why });
         }
         std.debug.print(
-            "\nNOTE: signatures with an `anytype` parameter are skipped — there is no\n" ++
-                "type to resolve until instantiation.\n",
+            "\nNOTE: types are checked through pointers, optionals, error unions, arrays,\n" ++
+                "vectors and function-pointer types; only signatures with an `anytype`\n" ++
+                "parameter are skipped — there is no type to resolve until instantiation.\n",
             .{},
         );
         return error.StableSurfaceNotClosed;
@@ -1361,20 +1583,122 @@ test "ABI text parser pins only the four negotiation consts" {
     try std.testing.expectEqualStrings("slcp-abi.feature_flags: const u64 = 0b101", lines[1]);
 }
 
-// Non-vacuity: removing the terminator check in `oneLineSignature` makes the
-// parser emit a truncated `slcp_multi(` line instead of erroring.
-test "ABI text parser refuses a signature that spans lines" {
+// Non-vacuity (S8 D10 "ABI text parser is line-shape fragile"): before the
+// fix a trailing `// comment` on the abi_version line rendered INTO the
+// frozen line (`const u32 = 1; // bump with care`), so a comment-only edit
+// was a Stable drift whose printed remedy would freeze the comment; and the
+// zig-fmt one-param-per-line spelling (a trailing comma is all it takes) was
+// `AbiSignatureSpansLines` with no file line and no export name. Dropping
+// `stripLineComment` makes the first expect red; dropping the continuation
+// join in `collectSignature` makes the second fixture error again.
+test "ABI text parser ignores trailing comments and renders a zig-fmt split signature like the one-line form" {
+    const gpa = std.testing.allocator;
+    const commented =
+        \\pub const abi_version: u32 = 1; // bump with care
+        \\pub const feature_flags: u64 = 0b101; // "//" in a comment is fine
+        \\export fn slcp_alloc(len: u32) u32 { // returns 0 on OOM
+        \\    return 0;
+        \\}
+        \\const imports = struct {
+        \\    extern "slcp_driver" fn validate_value(slot_lo: u32, ptr: u32) u32; // §7.3
+        \\};
+        \\
+    ;
+    const lines = try renderAbiLines(gpa, commented);
+    defer freeAbiLines(gpa, lines);
+    try std.testing.expectEqual(@as(usize, 4), lines.len);
+    try std.testing.expectEqualStrings("slcp-abi.abi_version: const u32 = 1", lines[0]);
+    try std.testing.expectEqualStrings("slcp-abi.feature_flags: const u64 = 0b101", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.export.slcp_alloc: fn (len: u32) u32", lines[2]);
+    try std.testing.expectEqualStrings("slcp-abi.import.slcp_driver.validate_value: fn (slot_lo: u32, ptr: u32) u32", lines[3]);
+
+    // `zig fmt` output for the same two declarations with a trailing comma.
+    const split =
+        \\pub const abi_version: u32 = 1;
+        \\export fn slcp_engine_pop_effect(
+        \\    handle: u32,
+        \\    out_ptr_ptr: u32, // where the frame goes
+        \\    out_len_ptr: u32,
+        \\) u32 {
+        \\    return 0;
+        \\}
+        \\const imports = struct {
+        \\    extern "slcp_driver" fn combine_candidates(
+        \\        slot_lo: u32,
+        \\        slot_hi: u32,
+        \\    ) u32;
+        \\};
+        \\
+    ;
+    const joined = try renderAbiLines(gpa, split);
+    defer freeAbiLines(gpa, joined);
+    try std.testing.expectEqual(@as(usize, 3), joined.len);
+    try std.testing.expectEqualStrings(
+        "slcp-abi.export.slcp_engine_pop_effect: fn (handle: u32, out_ptr_ptr: u32, out_len_ptr: u32) u32",
+        joined[1],
+    );
+    try std.testing.expectEqualStrings(
+        "slcp-abi.import.slcp_driver.combine_candidates: fn (slot_lo: u32, slot_hi: u32) u32",
+        joined[2],
+    );
+}
+
+// Non-vacuity: removing the terminator/paren-depth check in
+// `oneLineSignature` lets `collectSignature` accept the first line and emit a
+// truncated `slcp_open(` line instead of erroring with the file line.
+test "ABI text parser refuses a signature that never closes" {
     const gpa = std.testing.allocator;
     const fixture =
         \\pub const abi_version: u32 = 1;
-        \\export fn slcp_multi(
+        \\export fn slcp_open(
         \\    a: u32,
-        \\) u32 {
-        \\    return a;
+        \\
+    ;
+    try std.testing.expectError(error.AbiSignatureUnterminated, renderAbiLines(gpa, fixture));
+}
+
+// Non-vacuity (S8 D10 "ABI text parser misses `pub export fn` and
+// `@export`"): before the fix the first fixture rendered ONE line (the const)
+// — a `pub export fn` shipped in slcp_core.wasm unfrozen and unlisted while
+// check-api stayed green — and the second returned OK instead of an error.
+// Dropping `stripPub` makes the length expect red (1 ≠ 3); dropping the
+// tokenizer cross-check lets the `@export` fixture render.
+test "ABI text parser accepts `pub export fn` / `pub extern` and refuses `@export` and `export var`" {
+    const gpa = std.testing.allocator;
+    const pub_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\pub export fn slcp_pub_export(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\const imports = struct {
+        \\    pub extern "slcp_driver" fn pub_import(a: u32) u32;
+        \\};
+        \\
+    ;
+    const lines = try renderAbiLines(gpa, pub_fixture);
+    defer freeAbiLines(gpa, lines);
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
+    try std.testing.expectEqualStrings("slcp-abi.export.slcp_pub_export: fn (x: u32) u32", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.import.slcp_driver.pub_import: fn (a: u32) u32", lines[2]);
+
+    const builtin_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\fn hidden() callconv(.c) u32 {
+        \\    return 0;
+        \\}
+        \\comptime {
+        \\    @export(&hidden, .{ .name = "slcp_hidden" });
         \\}
         \\
     ;
-    try std.testing.expectError(error.AbiSignatureSpansLines, renderAbiLines(gpa, fixture));
+    try std.testing.expectError(error.AbiExportViaBuiltin, renderAbiLines(gpa, builtin_fixture));
+
+    const var_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\export var slcp_counter: u32 = 0;
+        \\
+    ;
+    try std.testing.expectError(error.AbiExportNotFn, renderAbiLines(gpa, var_fixture));
 }
 
 // Non-vacuity: removing the `saw_version` requirement lets a source with no
@@ -1417,6 +1741,49 @@ test "real src/wasm/slcp_host_abi.zig renders 23 exports + 3 imports + the 4 neg
     // Every ABI line is Stable under `p("slcp-abi")`, and the rule is live.
     for (lines) |line| try std.testing.expect(tierIsStable(abiLinePath(line)));
     try checkAbiRuleLiveness(lines);
+}
+
+// Non-vacuity (S8 D10 "api-closure passes silently for array,
+// function-pointer and private-type signatures"): before the fix `peel`
+// stripped only pointer/optional/error-union wrappers and an unlisted type
+// was "foreign, ignore", so a Stable fn taking `[2]LintFinding`, returning
+// `*const fn (LintFinding) void`, or taking a non-pub struct passed
+// `api-closure` while `api-snapshot` wrote the Experimental/Internal type
+// into docs/api-snapshot.txt. Reverting `checkType` to top-level `peel` makes
+// the array, fn-pointer and hidden expects red (0 ≠ 1); treating unlisted
+// types as foreign again makes the hidden expect red; dropping the `Self`
+// exemption makes the receiver expect red; dropping the std resolution in
+// `isForeignNominal` makes the std-types expect red (Io, Io.Writer,
+// mem.Allocator and math.Order render module-relative, so a name prefix
+// cannot tell them from ours).
+test "closure check sees through arrays and fn pointers, flags non-pub types, exempts std and the receiver" {
+    const LF = slcp.core.qset.LintFinding; // Experimental
+    const Hidden = struct { x: u32 }; // never walked: Internal
+    const n = comptime blk: {
+        @setEvalBranchQuota(8_000_000);
+        break :blk .{
+            .slice = signatureViolations(fn ([]const LF) void, null, "t.slice").len, // control: caught before too
+            .arr = signatureViolations(fn ([2]LF) void, null, "t.arr").len,
+            .fnptr = signatureViolations(fn () *const fn (LF) void, null, "t.fnptr").len,
+            .hidden = signatureViolations(fn (Hidden) void, null, "t.hidden").len,
+            .hidden_ret = signatureViolations(fn () ?*const Hidden, null, "t.hidden_ret").len,
+            .std = signatureViolations(
+                fn (std.mem.Allocator, std.Io, *std.Io.Writer, *std.ArrayList(u8), *anyopaque) std.math.Order,
+                null,
+                "t.std",
+            ).len,
+            .stable = signatureViolations(fn (slcp.core.quorum.Quorum) *slcp.node.Node, null, "t.stable").len,
+            .self = signatureViolations(fn (*Hidden, []const Hidden) ?Hidden, Hidden, "t.self").len,
+        };
+    };
+    try std.testing.expectEqual(@as(usize, 1), n.slice);
+    try std.testing.expectEqual(@as(usize, 1), n.arr);
+    try std.testing.expectEqual(@as(usize, 1), n.fnptr);
+    try std.testing.expectEqual(@as(usize, 1), n.hidden);
+    try std.testing.expectEqual(@as(usize, 1), n.hidden_ret);
+    try std.testing.expectEqual(@as(usize, 0), n.std);
+    try std.testing.expectEqual(@as(usize, 0), n.stable);
+    try std.testing.expectEqual(@as(usize, 0), n.self);
 }
 
 // Non-vacuity: the comptime walk must reach the frozen declarations —
