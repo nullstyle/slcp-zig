@@ -1228,7 +1228,7 @@ slcp.overlay.parseHostPort: fn ([]const u8) error{BadPeerSpec}!node.overlay.Host
 slcp.overlay.setTestLinkFilter: fn (?*const fn ([32]u8, [32]u8) bool) void
 slcp.overlay.validatePeerSpec: fn ([]const u8) error{BadHost,BadPort,EmptyHost,MissingPort}!void
 slcp.overlay: struct
-slcp.store.Error: type = error{BadRecord,IoFailed,OutOfMemory}
+slcp.store.Error: type = error{BadRecord,Busy,IoFailed,OutOfMemory}
 slcp.store.ExtRecord.slot: field u64
 slcp.store.ExtRecord.value: field []u8
 slcp.store.ExtRecord: struct
@@ -1241,21 +1241,22 @@ slcp.store.Recovery.own_latest: field []node.store.OwnRecord
 slcp.store.Recovery.own_log_corrupt: field bool
 slcp.store.Recovery.torn_tail_repaired: field bool
 slcp.store.Recovery: struct
-slcp.store.Store.appendExternalized: fn (*node.store.Store, u64, []const u8) error{BadRecord,IoFailed,OutOfMemory}!void
-slcp.store.Store.appendOwn: fn (*node.store.Store, u64, []const u8) error{BadRecord,IoFailed,OutOfMemory}!void
-slcp.store.Store.compact: fn (*node.store.Store, u64) error{BadRecord,IoFailed,OutOfMemory}!void
+slcp.store.Store.appendExternalized: fn (*node.store.Store, u64, []const u8) error{BadRecord,Busy,IoFailed,OutOfMemory}!void
+slcp.store.Store.appendOwn: fn (*node.store.Store, u64, []const u8) error{BadRecord,Busy,IoFailed,OutOfMemory}!void
+slcp.store.Store.compact: fn (*node.store.Store, u64) error{BadRecord,Busy,IoFailed,OutOfMemory}!void
 slcp.store.Store.data_dir: field []u8
 slcp.store.Store.deinit: fn (*node.store.Store) void
 slcp.store.Store.deinitRecovery: fn (mem.Allocator, *node.store.Recovery) void
 slcp.store.Store.dir: field Io.Dir
 slcp.store.Store.ext_file: field Io.File
-slcp.store.Store.getQset: fn (*node.store.Store, mem.Allocator, [32]u8) error{BadRecord,IoFailed,OutOfMemory}!?[]u8
+slcp.store.Store.getQset: fn (*node.store.Store, mem.Allocator, [32]u8) error{BadRecord,Busy,IoFailed,OutOfMemory}!?[]u8
 slcp.store.Store.gpa: field mem.Allocator
 slcp.store.Store.io: field Io
-slcp.store.Store.open: fn (mem.Allocator, Io, []const u8) error{BadRecord,IoFailed,OutOfMemory}!node.store.Store
+slcp.store.Store.lock_file: field Io.File
+slcp.store.Store.open: fn (mem.Allocator, Io, []const u8) error{BadRecord,Busy,IoFailed,OutOfMemory}!node.store.Store
 slcp.store.Store.own_file: field Io.File
 slcp.store.Store.putQset: fn (*node.store.Store, [32]u8, []const u8) void
-slcp.store.Store.recover: fn (*node.store.Store, mem.Allocator) error{BadRecord,IoFailed,OutOfMemory}!node.store.Recovery
+slcp.store.Store.recover: fn (*node.store.Store, mem.Allocator) error{BadRecord,Busy,IoFailed,OutOfMemory}!node.store.Recovery
 slcp.store.Store: struct
 slcp.store: struct
 slcp.timers.FireFn: type = *const fn (?*anyopaque, u64, u16) void

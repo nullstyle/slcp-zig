@@ -86,6 +86,7 @@ pub const CreateError = error{
     DataDirUnusable,
     DataDirOtherNetwork,
     DataDirOtherNode,
+    DataDirBusy,
     ListenPortInUse,
     ListenPortPrivileged,
     ListenFailed,
@@ -134,6 +135,7 @@ fn explainCreateError(err: CreateError) []const u8 {
         error.DataDirUnusable => ".data_dir cannot be used (I/O error); check the path, the filesystem and free space.",
         error.DataDirOtherNetwork => ".data_dir was created for a different network; use a fresh data_dir per network, or fix .network.",
         error.DataDirOtherNode => ".data_dir belongs to another node's key; restore the original key file or start a fresh data_dir.",
+        error.DataDirBusy => ".data_dir is held by another live slcp node (its lock file is locked); one identity must never run twice — stop the other process, or give this node its own data_dir.",
         error.ListenPortInUse => ".listen_port is already in use on this machine; stop the other process or pick another port.",
         error.ListenPortPrivileged => ".listen_port is a privileged port (< 1024) this process may not bind; use a port >= 1024.",
         error.ListenFailed => "the listener could not be bound (socket error); check the port and the network stack.",
@@ -660,6 +662,7 @@ pub const Node = struct {
         // ---- store + recovery ----
         self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Busy => return fail(diag, error.DataDirBusy, ".data_dir \"{s}\" is in use by another live slcp node (the lock file {s}/lock is held); one identity must never run twice — stop the other process, or point this node at its own data_dir.", .{ opts.data_dir, opts.data_dir }),
             else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the logs could not be opened ({t}); check the path, the filesystem and free space.", .{ opts.data_dir, e }),
         };
         errdefer self.store.deinit();

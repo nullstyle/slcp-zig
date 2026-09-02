@@ -56,6 +56,11 @@ halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
   signatures protect statements, not the port. Run nodes on a private
   network or a WireGuard mesh — read `docs/threat-model.md` before you open a
   listen port.
+- **One identity, one process.** A node locks its `.data_dir` while it runs
+  (a second start on the same directory is `DataDirBusy`) and the directory
+  is bound to its key on first start (`DataDirOtherNode`) — but nothing can
+  stop a *copied* key file from signing on two machines. Never copy
+  `slcp.key` or `slcp-data/`; mint one key per machine with `slcp key new`.
 
 ## Quickstart: the typed counter
 

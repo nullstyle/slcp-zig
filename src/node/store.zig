@@ -2,6 +2,10 @@
 //! languages (shared fixtures test cross-language identity later).
 //!
 //!   slcp-data/
+//!     lock               exclusive advisory lock (flock) held for the Store's
+//!                        lifetime: one live process per data_dir, so one
+//!                        identity can never sign from two processes over one
+//!                        own.log. Dies with the process; a leftover is harmless.
 //!     own.log            append-only: (u64 slot, u32 len, envelope bytes,
 //!                        u32 crc32); fsync'd. The write-ahead record.
 //!     externalized.log   append-only: (u64 slot, u32 len, value, u32 crc32);
@@ -71,8 +75,11 @@ const core = @import("slcp-core");
 
 const Crc32 = std.hash.Crc32;
 
-pub const Error = error{ BadRecord, IoFailed } || std.mem.Allocator.Error;
+/// `Busy`: another live Store (process) holds this data_dir's lock.
+pub const Error = error{ BadRecord, IoFailed, Busy } || std.mem.Allocator.Error;
 
+/// Held exclusively (flock) from open() to deinit(); see the header.
+const lock_name = "lock";
 const own_log_name = "own.log";
 const ext_log_name = "externalized.log";
 /// Scratch names compact() writes before the atomic rename-over. A leftover
@@ -131,17 +138,38 @@ pub const Store = struct {
     io: std.Io,
     /// Handle to the data directory; qset files and log reads resolve against it.
     dir: std.Io.Dir,
+    /// `lock`, held exclusively for the Store's lifetime (released on close).
+    lock_file: std.Io.File,
     /// Append handles for the two write-ahead logs (write-only, kept open).
     own_file: std.Io.File,
     ext_file: std.Io.File,
     /// Owned copy of the data-dir path (diagnostics only).
     data_dir: []u8,
 
-    /// Open (creating if needed) the data dir and both logs.
+    /// Open (creating if needed) the data dir and both logs. Takes the
+    /// data_dir's exclusive lock first: `Busy` if another live Store holds it.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) !Store {
         const dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch
             return Error.IoFailed;
         errdefer dir.close(io);
+
+        // One live process per data_dir (design §10; threat-model §7): the
+        // identity marker only refuses a DIFFERENT key, so without this the
+        // same key could run twice over one own.log — two signers, one
+        // write-ahead log. flock is per open file description, so a second
+        // open in the SAME process is refused too; the OS drops the lock when
+        // the process dies, so a leftover `lock` file after a crash is inert.
+        const lock_file = dir.createFile(io, lock_name, .{ .truncate = false }) catch
+            return Error.IoFailed;
+        errdefer lock_file.close(io);
+        const locked = lock_file.tryLock(io, .exclusive) catch |err| switch (err) {
+            error.FileLocksUnsupported => blk: {
+                std.log.warn("store: {s}: this filesystem has no file locks; a second live node on this data_dir cannot be refused", .{data_dir});
+                break :blk true;
+            },
+            else => return Error.IoFailed,
+        };
+        if (!locked) return Error.Busy;
 
         dir.createDirPath(io, qsets_dir_name) catch return Error.IoFailed;
 
@@ -160,6 +188,7 @@ pub const Store = struct {
             .gpa = gpa,
             .io = io,
             .dir = dir,
+            .lock_file = lock_file,
             .own_file = own_file,
             .ext_file = ext_file,
             .data_dir = dd,
@@ -169,6 +198,9 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.own_file.close(self.io);
         self.ext_file.close(self.io);
+        // Closing the handle releases the flock: the data_dir is free for a
+        // restart the moment the Store is gone.
+        self.lock_file.close(self.io);
         self.dir.close(self.io);
         self.gpa.free(self.data_dir);
         self.* = undefined;
@@ -1043,6 +1075,36 @@ test "store: recover frees everything at every allocation failure (journal tail)
     }
 
     try testing.checkAllAllocationFailures(gpa, recoverUnderOom, .{ io, data_dir });
+}
+
+// Non-vacuity (S8 review, D12): nothing locked a data_dir, so the same
+// identity could run twice over one own.log (two signers, one write-ahead
+// log). open() now holds an exclusive advisory lock on `lock` for the
+// Store's lifetime; a second open of the same dir is `Busy` until the first
+// closes. Dropping the tryLock turns this red (the second open succeeds).
+test "store: a live Store holds the data_dir; a second open is Busy until the first closes" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try tmpDataDir(&tmp, &path_buf);
+
+    var first = try Store.open(gpa, io, data_dir);
+    try testing.expectError(error.Busy, Store.open(gpa, io, data_dir));
+    // Still Busy on a retry: the lock is held for the Store's lifetime, not
+    // just across open().
+    try testing.expectError(error.Busy, Store.open(gpa, io, data_dir));
+    first.deinit();
+
+    // Released with the first handle: a restart (the reopen path) succeeds
+    // and the logs are intact.
+    var second = try Store.open(gpa, io, data_dir);
+    defer second.deinit();
+    try second.appendExternalized(1, "after-restart");
+    var rec = try second.recover(gpa);
+    defer Store.deinitRecovery(gpa, &rec);
+    try testing.expectEqual(@as(?u64, 1), rec.externalized_hwm);
 }
 
 test "store: compact keeps only slots >= keep_from_slot and stays appendable" {
