@@ -1153,6 +1153,22 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const hits = try scanTagPins(arena, doc.text);
             for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, version), doc.path, h.line, "tag pin v{s} is current", .{h.version}, "build.zig.zon says {s}", .{version});
         }
+        // The package hash README's pin block records (S9; `just
+        // release-hash`) must name THIS version and be the one CHANGELOG.md
+        // carries — the release-tag check and release.yml grep the same
+        // needle, so a stale hash after a .version bump is red here first.
+        const readme_text = for (docs) |d| (if (std.mem.eql(u8, d.path, "README.md")) break d.text) else "";
+        const hash_prefix = try std.fmt.allocPrint(arena, "slcp-{s}-", .{version});
+        const hash_at = std.mem.indexOf(u8, readme_text, hash_prefix);
+        rep.checkFmt(hash_at != null, "README.md", 0, "package hash line `{s}<hash>` present", .{hash_prefix}, "the pin block must record the hash `just release-hash` prints", .{});
+        if (hash_at) |at| {
+            var end = at + hash_prefix.len;
+            while (end < readme_text.len and (std.ascii.isAlphanumeric(readme_text[end]) or readme_text[end] == '_' or readme_text[end] == '-')) end += 1;
+            const hash = readme_text[at..end];
+            rep.checkFmt(hash.len >= hash_prefix.len + 20, "README.md", 0, "package hash `{s}` is a full hash", .{hash}, "truncated or placeholder", .{});
+            const changelog = readFile(arena, io, "CHANGELOG.md") catch "";
+            rep.checkFmt(std.mem.indexOf(u8, changelog, hash) != null, "CHANGELOG.md", 0, "carries README's package hash `{s}`", .{hash}, "README.md and CHANGELOG.md must record the same hash", .{});
+        }
     }
     // ---- (11) zig pin ----
     {
