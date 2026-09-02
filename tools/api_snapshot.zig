@@ -39,9 +39,15 @@
 //! Stability tiers live in docs/stability.md, which is authoritative for the
 //! categorization below. Categorizer contract: `tierIsStable` DEFAULTS every
 //! path to Experimental. A declaration is Stable ONLY when its path matches an
-//! explicit rule in `stable_rules`. This makes "accidentally freezing
-//! something new" a non-event: a brand-new symbol lands in the Experimental
-//! file until someone deliberately adds a Stable rule for it.
+//! explicit rule in `stable_rules`. So a brand-new symbol OUTSIDE every `p()`
+//! subtree lands in the Experimental file until someone deliberately adds a
+//! rule for it — but a new `pub` declaration INSIDE a `p()` subtree (a new
+//! function in `slcp.core.quorum`, a new field on `slcp.node.Options`, a new
+//! member of `Codec(Counter.Command)`) matches the existing prefix rule and
+//! is Stable the moment it is committed, with no new rule. The only guard is
+//! `check-api` going red until docs/api-snapshot.txt is regenerated; that is
+//! why `--check` classifies drift (NEW / CHANGED / REMOVED) instead of dumping
+//! a positional cascade, and why a NEW Stable line is reviewed as a promotion.
 //!
 //! The rule list below is the v0.1.0 freeze (M6 stage S6). Generic entry
 //! points (`AppNode`, `Codec`) are pinned through REFERENCE INSTANTIATIONS
@@ -1062,13 +1068,81 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try file.writeStreamingAll(io, contents);
 }
 
+const DriftKind = enum { added, changed, removed };
+const DriftLine = struct { kind: DriftKind, snapshot: ?[]const u8, live: ?[]const u8 };
+
+/// The declaration path of a snapshot line: the text left of the first ": "
+/// (the whole line when there is none, e.g. a header line).
+fn linePath(line: []const u8) []const u8 {
+    return if (std.mem.indexOf(u8, line, ": ")) |i| line[0..i] else line;
+}
+
+/// Classify the drift between the on-disk snapshot and the live rendering.
+/// Both are `renderSnapshot` output — the same header followed by lines
+/// sorted by `lessThan` — so a merge walk yields the exact set of inserted
+/// and deleted lines instead of the positional cascade a line-by-line
+/// compare produces after one insertion. A deletion and an insertion that
+/// share a declaration PATH are paired into one `.changed` entry (a
+/// signature, default or error-set change). Result order: snapshot order
+/// for removed/changed lines, live order for added lines, interleaved by
+/// the walk. Caller frees the slice; the strings alias the inputs.
+fn classifyDrift(allocator: std.mem.Allocator, existing: []const u8, rendered: []const u8) ![]DriftLine {
+    var raw: std.ArrayList(DriftLine) = .empty;
+    defer raw.deinit(allocator);
+
+    var a_it = std.mem.splitScalar(u8, existing, '\n');
+    var b_it = std.mem.splitScalar(u8, rendered, '\n');
+    var a = a_it.next();
+    var b = b_it.next();
+    while (a != null or b != null) {
+        if (a != null and b != null and std.mem.eql(u8, a.?, b.?)) {
+            a = a_it.next();
+            b = b_it.next();
+        } else if (b == null or (a != null and lessThan({}, a.?, b.?))) {
+            try raw.append(allocator, .{ .kind = .removed, .snapshot = a.?, .live = null });
+            a = a_it.next();
+        } else {
+            try raw.append(allocator, .{ .kind = .added, .snapshot = null, .live = b.? });
+            b = b_it.next();
+        }
+    }
+
+    // Pair a removed line with an added line of the same path → one change.
+    var out: std.ArrayList(DriftLine) = .empty;
+    errdefer out.deinit(allocator);
+    const consumed = try allocator.alloc(bool, raw.items.len);
+    defer allocator.free(consumed);
+    @memset(consumed, false);
+    for (raw.items, 0..) |d, i| {
+        if (consumed[i]) continue;
+        if (d.kind == .removed) {
+            const path = linePath(d.snapshot.?);
+            for (raw.items[i + 1 ..], i + 1..) |other, j| {
+                if (consumed[j] or other.kind != .added) continue;
+                if (std.mem.eql(u8, linePath(other.live.?), path)) {
+                    consumed[j] = true;
+                    try out.append(allocator, .{ .kind = .changed, .snapshot = d.snapshot, .live = other.live });
+                    break;
+                }
+            } else try out.append(allocator, d);
+        } else {
+            try out.append(allocator, d);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const Tier = enum { stable, experimental };
+
 /// Diff `rendered` against the on-disk `path`; on mismatch print every
-/// drifting line (capped). Returns true when they match.
+/// drifting line (capped), classified as NEW / CHANGED / REMOVED so the red
+/// reads as an API decision. Returns true when they match.
 fn diffAndReport(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     rendered: []const u8,
+    tier: Tier,
 ) !bool {
     const existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
         std.debug.print(
@@ -1081,36 +1155,39 @@ fn diffAndReport(
 
     if (std.mem.eql(u8, existing, rendered)) return true;
 
-    var existing_it = std.mem.splitScalar(u8, existing, '\n');
-    var rendered_it = std.mem.splitScalar(u8, rendered, '\n');
-    var line_no: usize = 1;
+    const drift = try classifyDrift(allocator, existing, rendered);
+    defer allocator.free(drift);
     // Report EVERY drifting line (capped), not just the first: platform-
     // render drifts are same-line substitutions scattered through the file,
-    // and first-only reporting costs one full CI round trip per line. An
-    // insertion/deletion makes every later line "drift"; the cap keeps that
-    // cascade readable.
-    var drifts: usize = 0;
+    // and first-only reporting costs one full CI round trip per line.
     const max_reported = 25;
-    while (true) : (line_no += 1) {
-        const a = existing_it.next();
-        const b = rendered_it.next();
-        if (a == null and b == null) break;
-        const a_line = a orelse "<end of snapshot>";
-        const b_line = b orelse "<end of live surface>";
-        if (!std.mem.eql(u8, a_line, b_line)) {
-            drifts += 1;
-            if (drifts <= max_reported) {
-                std.debug.print(
-                    "api-snapshot: drift in {s} at line {}:\n  snapshot: {s}\n  live:     {s}\n",
-                    .{ path, line_no, a_line, b_line },
-                );
-            }
+    const label: []const u8 = if (tier == .stable) "Stable" else "experimental";
+    var added: usize = 0;
+    for (drift, 0..) |d, i| {
+        if (d.kind == .added) added += 1;
+        if (i >= max_reported) continue;
+        switch (d.kind) {
+            .added => std.debug.print(
+                "api-snapshot: NEW {s} line (absent from {s}):\n  live:     {s}\n",
+                .{ label, path, d.live.? },
+            ),
+            .removed => std.debug.print(
+                "api-snapshot: REMOVED {s} line (present in {s}, gone from the tree):\n  snapshot: {s}\n",
+                .{ label, path, d.snapshot.? },
+            ),
+            .changed => std.debug.print(
+                "api-snapshot: CHANGED {s} line in {s}:\n  snapshot: {s}\n  live:     {s}\n",
+                .{ label, path, d.snapshot.?, d.live.? },
+            ),
         }
     }
-    if (drifts > max_reported) {
+    if (drift.len > max_reported) {
+        std.debug.print("api-snapshot: ... and {} more drifting lines\n", .{drift.len - max_reported});
+    }
+    if (tier == .stable and added > 0) {
         std.debug.print(
-            "api-snapshot: ... and {} more drifting lines (an insertion or deletion cascades; regenerate to resolve)\n",
-            .{drifts - max_reported},
+            "api-snapshot: {} NEW Stable line(s). A declaration under an existing `p()` prefix rule is frozen the moment it is committed — no rule is added and nothing else flags it. Review each as a promotion (docs/stability.md, \"Promoting a symbol\"): is freezing it intended?\n",
+            .{added},
         );
     }
     return false;
@@ -1221,7 +1298,7 @@ pub fn main(init: std.process.Init) !void {
                 // stale and platform-dependent renderings slip through
                 // unnoticed. Drift is RED with a refresh instruction, not a
                 // review one.
-                const experimental_ok = try diffAndReport(allocator, io, experimental_path, experimental_rendered);
+                const experimental_ok = try diffAndReport(allocator, io, experimental_path, experimental_rendered, .experimental);
                 if (!experimental_ok) {
                     std.debug.print(
                         "api-snapshot: EXPERIMENTAL surface drifted from the committed {s}. Not a frozen contract — refresh it: run `zig build api-snapshot` and commit the result.\n",
@@ -1249,10 +1326,10 @@ pub fn main(init: std.process.Init) !void {
             }
 
             // The Stable file is the frozen contract: drift here is RED.
-            const stable_ok = try diffAndReport(allocator, io, stable_path, stable_rendered);
+            const stable_ok = try diffAndReport(allocator, io, stable_path, stable_rendered, .stable);
             if (!stable_ok) {
                 std.debug.print(
-                    "api-snapshot: STABLE public API surface changed. This is a frozen contract. Review against docs/stability.md, then run `zig build api-snapshot` and commit the result.\n",
+                    "api-snapshot: STABLE public API surface changed. This is a frozen contract. Review each line above against docs/stability.md (a NEW line is a promotion, a CHANGED or REMOVED line is a breaking change); only then run `zig build api-snapshot` and commit the result.\n",
                     .{},
                 );
                 return error.ApiSnapshotDrift;
@@ -1271,6 +1348,51 @@ pub fn main(init: std.process.Init) !void {
 
 // Non-vacuity: ablating the insertion sort in `renderErrorSet` renders the
 // declaration order (`Zed,Alpha,Mid`) and this fails.
+// Non-vacuity (S8 finding "'A brand-new symbol can never be frozen by
+// accident' is false under prefix rules"): a positional line-by-line diff
+// reports one inserted line as N cascading substitutions and tells the
+// developer to "regenerate to resolve" — an accidental freeze under a `p()`
+// rule reads as a refresh chore. The classifier must name the single NEW
+// line, and a same-path signature change as CHANGED, a dropped line as
+// REMOVED. Swapping the merge to positional compare fails the `len == 1`
+// expectations; dropping the path pairing turns the CHANGED case into
+// one removed + one added.
+test "classifyDrift names a single added, changed or removed line instead of a positional cascade" {
+    const gpa = std.testing.allocator;
+    const header = "# header line\n# second header line\n";
+    const base = header ++ "a.x: fn () void\nb.y: u32 = 1\nc.z: fn () void\n";
+    {
+        const drift = try classifyDrift(gpa, base, header ++ "a.x: fn () void\nb.y: u32 = 1\nb.y2: u8\nc.z: fn () void\n");
+        defer gpa.free(drift);
+        try std.testing.expectEqual(@as(usize, 1), drift.len);
+        try std.testing.expectEqual(DriftKind.added, drift[0].kind);
+        try std.testing.expectEqualStrings("b.y2: u8", drift[0].live.?);
+        try std.testing.expect(drift[0].snapshot == null);
+    }
+    {
+        const drift = try classifyDrift(gpa, base, header ++ "a.x: fn () void\nb.y: u32 = 2\nc.z: fn () void\n");
+        defer gpa.free(drift);
+        try std.testing.expectEqual(@as(usize, 1), drift.len);
+        try std.testing.expectEqual(DriftKind.changed, drift[0].kind);
+        try std.testing.expectEqualStrings("b.y: u32 = 1", drift[0].snapshot.?);
+        try std.testing.expectEqualStrings("b.y: u32 = 2", drift[0].live.?);
+    }
+    {
+        const drift = try classifyDrift(gpa, base, header ++ "a.x: fn () void\nc.z: fn () void\n");
+        defer gpa.free(drift);
+        try std.testing.expectEqual(@as(usize, 1), drift.len);
+        try std.testing.expectEqual(DriftKind.removed, drift[0].kind);
+        try std.testing.expectEqualStrings("b.y: u32 = 1", drift[0].snapshot.?);
+        try std.testing.expect(drift[0].live == null);
+    }
+    {
+        // Identical inputs: no drift at all.
+        const drift = try classifyDrift(gpa, base, base);
+        defer gpa.free(drift);
+        try std.testing.expectEqual(@as(usize, 0), drift.len);
+    }
+}
+
 test "renderErrorSet sorts error names regardless of declaration order" {
     try std.testing.expectEqualStrings(
         "error{Alpha,Mid,Zed}",

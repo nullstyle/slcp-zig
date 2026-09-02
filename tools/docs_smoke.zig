@@ -115,7 +115,18 @@ pub const forbidden_needles = [_][]const u8{
     "slcp-zig.git#v",
     "slcp keygen",
     "key create",
+    // S8 finding "'A brand-new symbol can never be frozen by accident' is
+    // false under prefix rules": a new `pub` under any `p()` subtree IS
+    // Stable with no new rule (only `check-api`'s red guards it).
+    "frozen by accident",
 };
+/// docs/stability.md AND the tool's module doc (tools/api_snapshot.zig) must
+/// state the tiering rule as it actually behaves: a new declaration under a
+/// `p()` prefix rule is frozen the moment it is committed.
+pub const tier_claim_needles = [_][]const u8{
+    "is Stable the moment it is committed",
+};
+pub const tier_claim_files = [_][]const u8{ "docs/stability.md", "tools/api_snapshot.zig" };
 
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
 /// in a docs option table must be one of these, and README's table must
@@ -729,6 +740,12 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
         }
+    }
+
+    // ---- (9b) the tiering claim, in the doc and in the tool's own header ----
+    for (tier_claim_files) |p| {
+        const text = readFile(arena, io, p) catch "";
+        for (tier_claim_needles) |n| rep.checkFmt(std.mem.indexOf(u8, text, n) != null, p, 0, "contains `{s}`", .{n}, "the prefix-rule freezing statement is missing", .{});
     }
 
     // ---- (10) version needles ----
