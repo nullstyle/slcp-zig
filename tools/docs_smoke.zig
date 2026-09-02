@@ -152,6 +152,22 @@ pub const recipes_needles = [_][]const u8{
     "applies only to the top level",
 };
 
+/// examples/counter/README.md "Common stalls" table: every `Startup error`
+/// row names `slcp.node.CreateError` members only, and the row that names
+/// each error below must describe THAT error's cause — the needle is a
+/// phrase of `slcp.node.explain(err)`, and the gate checks both containments
+/// (code side and doc side), so a needle can drift from neither. S8 review:
+/// one row paired `UnsafeQuorum` with `QuorumThresholdOutOfRange` under the
+/// fork-machine cause, which only ever raises the former.
+pub const StallNeedle = struct { err: slcp.node.CreateError, needle: []const u8 };
+pub const stall_cause_needles = [_]StallNeedle{
+    .{ .err = error.UnsafeQuorum, .needle = "fork machine" },
+    .{ .err = error.QuorumThresholdOutOfRange, .needle = "outside [1, member count]" },
+};
+pub const min_stall_rows: usize = 3;
+/// The members of `slcp.node.CreateError`, at comptime.
+pub const create_error_names = std.meta.fieldNames(slcp.node.CreateError);
+
 /// The field names of `slcp.NodeOptions`, at comptime: every `.option` row
 /// in a docs option table must be one of these, and README's table must
 /// list every one of them.
@@ -636,6 +652,43 @@ pub fn scanNestedLabels(gpa: std.mem.Allocator, text: []const u8) ![]PinHit {
     return out.toOwnedSlice(gpa);
 }
 
+/// One `| Startup error … | cause | fix |` row of a "Common stalls" table.
+pub const StallRow = struct { line: usize, errors: []const []const u8, cause: []const u8 };
+
+/// Rows whose symptom cell starts with `Startup error`: `errors` are the
+/// backticked names of that cell, `cause` is the second cell, trimmed.
+pub fn scanStallRows(gpa: std.mem.Allocator, text: []const u8) ![]StallRow {
+    var out: std.ArrayList(StallRow) = .empty;
+    errdefer out.deinit(gpa);
+    var line_no: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        line_no += 1;
+        if (!std.mem.startsWith(u8, line, "| Startup error")) continue;
+        var cells = std.mem.splitScalar(u8, line, '|');
+        _ = cells.next(); // the empty cell before the leading `|`
+        const symptom = cells.next() orelse continue;
+        const cause = std.mem.trim(u8, cells.next() orelse "", " ");
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer names.deinit(gpa);
+        var rest = symptom;
+        while (std.mem.indexOfScalar(u8, rest, '`')) |open| {
+            const after = rest[open + 1 ..];
+            const close = std.mem.indexOfScalar(u8, after, '`') orelse break;
+            try names.append(gpa, after[0..close]);
+            rest = after[close + 1 ..];
+        }
+        try out.append(gpa, .{ .line = line_no, .errors = try names.toOwnedSlice(gpa), .cause = cause });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// True when `name` spells a member of `slcp.node.CreateError`.
+pub fn isCreateErrorName(name: []const u8) bool {
+    inline for (create_error_names) |m| if (std.mem.eql(u8, m, name)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
@@ -937,6 +990,29 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         rep.checkFmt(std.mem.indexOf(u8, zon, ".path = \"../..\"") != null, "examples/counter/build.zig.zon", 0, "depends on the repo by path", .{}, "`.path = \"../..\"` missing", .{});
         rep.checkFmt(std.mem.indexOf(u8, zon, "refs/tags/") == null, "examples/counter/build.zig.zon", 0, "is not tag-pinned", .{}, "the in-tree example must build against the working tree", .{});
     }
+    // ---- (13) counter README stall table vs Node.create's error contract ----
+    {
+        const path = "examples/counter/README.md";
+        const text = for (docs) |d| (if (std.mem.eql(u8, d.path, path)) break d.text) else "";
+        const rows = try scanStallRows(arena, text);
+        rep.checkFmt(rows.len >= min_stall_rows, path, 0, "at least {d} `Startup error` rows in the stall table", .{min_stall_rows}, "found {d}", .{rows.len});
+        for (rows) |r| {
+            rep.checkFmt(r.errors.len > 0, path, r.line, "stall row names at least one backticked error", .{}, "no `Name` in the symptom cell", .{});
+            for (r.errors) |name| rep.checkFmt(isCreateErrorName(name), path, r.line, "`{s}` is a slcp.node.CreateError member", .{name}, "no such error; Node.create cannot fail with it", .{});
+        }
+        for (stall_cause_needles) |sc| {
+            const name = @errorName(sc.err);
+            const explained = slcp.node.explain(sc.err);
+            rep.checkFmt(std.mem.indexOf(u8, explained, sc.needle) != null, "src/node/node.zig", 0, "Node.explain({s}) says `{s}`", .{ name, sc.needle }, "the doc needle must be a phrase of the code's own explanation", .{});
+            var named = false;
+            for (rows) |r| for (r.errors) |n| {
+                if (!std.mem.eql(u8, n, name)) continue;
+                named = true;
+                rep.checkFmt(std.mem.indexOf(u8, r.cause, sc.needle) != null, path, r.line, "the `{s}` row's cause says `{s}`", .{ name, sc.needle }, "the row must describe the error it names — Node.explain: {s}", .{explained});
+            };
+            rep.checkFmt(named, path, 0, "`{s}` has a stall-table row", .{name}, "a startup error users hit needs a row", .{});
+        }
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1198,6 +1274,37 @@ test "forbidden needles: no active doc calls the replay failure mode double-appl
             return error.ForbiddenSpelling;
         }
     }
+}
+
+// Non-vacuity: the merged row is the S8 finding verbatim (both errors under
+// the fork-machine cause): its `QuorumThresholdOutOfRange` needle is absent,
+// so a scanner that dropped the second backticked name, or a needle table
+// whose phrase is not in `Node.explain`, turns this red. `NoSuchError`
+// pins the membership check.
+test "stall rows: backticked names and cause cells parse; needles are phrases of Node.explain; the merged fork-machine row lacks the range needle" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const table =
+        "| Symptom | Cause | Fix |\n" ++
+        "|---|---|---|\n" ++
+        "| `slot` lines stop | Only one node is up. | Start another. |\n" ++
+        "| Startup error `UnsafeQuorum` / `QuorumThresholdOutOfRange` | The quorum shape is a fork machine (e.g. 1-of-3). | List all three keys. |\n" ++
+        "| Startup error `NoSuchError` | whatever | whatever |\n";
+    const rows = try scanStallRows(arena, table);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqual(@as(usize, 4), rows[0].line);
+    try testing.expectEqual(@as(usize, 2), rows[0].errors.len);
+    try testing.expectEqualStrings("UnsafeQuorum", rows[0].errors[0]);
+    try testing.expectEqualStrings("QuorumThresholdOutOfRange", rows[0].errors[1]);
+    try testing.expectEqualStrings("The quorum shape is a fork machine (e.g. 1-of-3).", rows[0].cause);
+    try testing.expect(isCreateErrorName("UnsafeQuorum"));
+    try testing.expect(isCreateErrorName("QuorumThresholdOutOfRange"));
+    try testing.expect(!isCreateErrorName(rows[1].errors[0]));
+    for (stall_cause_needles) |sc| try testing.expect(std.mem.indexOf(u8, slcp.node.explain(sc.err), sc.needle) != null);
+    // The finding: the merged row satisfies UnsafeQuorum's needle and not the other's.
+    try testing.expect(std.mem.indexOf(u8, rows[0].cause, stall_cause_needles[0].needle) != null);
+    try testing.expect(std.mem.indexOf(u8, rows[0].cause, stall_cause_needles[1].needle) == null);
 }
 
 // Non-vacuity: the evidence line is what `just preflight` greps and the
