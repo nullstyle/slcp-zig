@@ -354,7 +354,8 @@ test` keeps the split honest:
 - **Experimental** — `docs/api-snapshot-experimental.txt`, everything else
   that is `pub` (overlay, store, timers, wire, lint report, generated code,
   engine internals). It may change at any `0.x` bump; the file is refreshed
-  by `check-api` and checked for staleness on Linux CI.
+  by `check-api` and checked for staleness on both CI test legs (ubuntu and
+  macOS run `-Dstrict-experimental=true`).
 
 `zig build api-closure` (also inside `test`) refuses a Stable function whose
 signature mentions an Experimental type. The tiers, the held-out entry points

@@ -75,6 +75,7 @@ pub const required_paths = active_docs ++ required_snippets ++ [_][]const u8{
     "src/engine/statement.zig",
     "src/engine/engine.zig",
     "src/engine/qset.zig",
+    ci_workflow,
 };
 
 /// Build steps / Justfile recipes that must exist even if no doc names them.
@@ -115,7 +116,17 @@ pub const forbidden_needles = [_][]const u8{
     "slcp-zig.git#v",
     "slcp keygen",
     "key create",
+    // Stale since fc351a5 (R20): the Experimental snapshot is strict on both
+    // CI test legs, not only the ubuntu one.
+    "staleness on Linux CI",
 };
+
+/// docs/stability.md says the Experimental snapshot is checked strictly on
+/// BOTH CI test legs (R20, fc351a5): the workflow must carry the flag once
+/// per leg, or the docs are describing a gate that does not exist.
+pub const ci_workflow = ".github/workflows/ci.yml";
+pub const ci_strict_experimental = "strict_experimental: -Dstrict-experimental=true";
+pub const ci_test_legs: usize = 2;
 
 /// `Node.explain` takes `node.CreateError`; `AppNode(App).CreateError` adds
 /// these two members, which it has no arm for — `Node.explain(err)` on an
@@ -770,6 +781,13 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             const at = std.mem.indexOf(u8, doc.text, n);
             rep.checkFmt(at == null, doc.path, if (at) |a| lineOf(doc.text, a) else 0, "does not contain `{s}`", .{n}, "forbidden spelling", .{});
         }
+    }
+
+    // ---- (9a) the CI legs the docs describe ----
+    {
+        const ci = readFile(arena, io, ci_workflow) catch "";
+        const legs = std.mem.count(u8, ci, ci_strict_experimental);
+        rep.checkFmt(legs == ci_test_legs, ci_workflow, 0, "`{s}` appears once per test leg ({d})", .{ ci_strict_experimental, ci_test_legs }, "found {d}; docs/stability.md says the Experimental snapshot is strict on both OSes", .{legs});
     }
 
     // ---- (9b) the explain caveat ----
