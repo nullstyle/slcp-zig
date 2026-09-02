@@ -213,10 +213,14 @@ slcp.core.qset.max_depth: const comptime_int = 4
 slcp.core.qset.max_total_validators: const comptime_int = 255
 slcp.core.quorum.NodeId: type = [32]u8
 slcp.core.quorum.ParseNodeIdError: type = error{BadNodeIdHex,BadNodeIdLength}
-slcp.core.quorum.Quorum.JsonError: type = error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}
+slcp.core.quorum.Quorum.JsonDiagnostic.unknown_key: field []const u8 = <default>
+slcp.core.quorum.Quorum.JsonDiagnostic: struct
+slcp.core.quorum.Quorum.JsonError: type = error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep,UnknownField}
 slcp.core.quorum.Quorum.containsNode: fn (quorum.Quorum, [32]u8) bool
-slcp.core.quorum.Quorum.fromJson: fn (mem.Allocator, []const u8) error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep}!quorum.Quorum
+slcp.core.quorum.Quorum.fromJson: fn (mem.Allocator, []const u8) error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep,UnknownField}!quorum.Quorum
+slcp.core.quorum.Quorum.fromJsonDiag: fn (mem.Allocator, []const u8, ?*quorum.Quorum.JsonDiagnostic) error{BadInnerSets,BadJson,BadNodeIdHex,BadNodeIdLength,BadThreshold,BadValidator,MissingField,OutOfMemory,TooDeep,UnknownField}!quorum.Quorum
 slcp.core.quorum.Quorum.inner_sets: field []const quorum.Quorum = <default>
+slcp.core.quorum.Quorum.json_keys: const [3][]const u8
 slcp.core.quorum.Quorum.majorityOf: fn ([]const [32]u8) quorum.Quorum
 slcp.core.quorum.Quorum.memberCount: fn (quorum.Quorum) usize
 slcp.core.quorum.Quorum.of: fn (u32, []const [32]u8) quorum.Quorum

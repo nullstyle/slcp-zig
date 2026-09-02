@@ -21,8 +21,11 @@ CLI, the tests and the vector generator share):
 ```
 
 A level is satisfied when `T` of its members agree, where a member is a
-validator *or* an inner set (which counts when it is itself satisfied). The
-same shape in Zig is `slcp.Quorum`:
+validator *or* an inner set (which counts when it is itself satisfied).
+`innerSets` is optional; **any other key is rejected** (`slcp lint-quorum`
+exits 2 naming it, with a `did you mean` hint) — a tolerated typo such as
+`innersets` or `inner_sets` would silently drop every nested org and lint a
+flatter quorum as OK. The same shape in Zig is `slcp.Quorum`:
 
 ```zig
 slcp.Quorum.twoThirdsOf(&.{ pk_a, pk_b, pk_c })   // ceil(2n/3)-of-n — the blessed default

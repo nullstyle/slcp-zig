@@ -101,9 +101,10 @@ frozen; "exact" means the one symbol only (its fields stay Experimental).
 **Quorum UX (`slcp.core.quorum`, re-exported as `slcp.Quorum` /
 `slcp.NodeId` / `slcp.nodeId` / `slcp.parseNodeId`, design §12)**
 - The whole module (prefix): `Quorum` with `twoThirdsOf`, `majorityOf`, `of`,
-  `ofSets`, `twoThirdsOfSets`, `fromJson`, `writeJson`, `toOwned`,
-  `containsNode`, `memberCount`, `JsonError`; `nodeId`, `nodeIdHex`,
-  `parseNodeId`, `ParseNodeIdError`, `NodeId`.
+  `ofSets`, `twoThirdsOfSets`, `fromJson`, `fromJsonDiag`, `writeJson`,
+  `toOwned`, `containsNode`, `memberCount`, `JsonError`, `JsonDiagnostic`,
+  `json_keys`; `nodeId`, `nodeIdHex`, `parseNodeId`, `ParseNodeIdError`,
+  `NodeId`.
 
 **Keys (`slcp.keys`, design §11)**
 - `KeyPair` (prefix), `loadOrCreate`, `load`, `createNew`, `ephemeral`, and
