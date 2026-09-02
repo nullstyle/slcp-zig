@@ -134,12 +134,16 @@ frozen; "exact" means the one symbol only (its fields stay Experimental).
   `canonicalBytes` are **held out** (below).
 
 **The wasm host ABI (`slcp-abi.*`, design §7)**
-- Every `export fn`, every `extern "slcp_driver"` import, and the four
-  negotiation constants by value: `abi_version`, `abi_min_version`,
-  `abi_max_version`, `feature_flags`. These lines are rendered from the TEXT
-  of `src/wasm/slcp_host_abi.zig` (the module pins `std.heap.wasm_allocator`
-  and cannot be imported natively), and the runtime half of the liveness
-  assertion checks the `slcp-abi` rule against the parsed file.
+- Every `export fn` (with or without `pub`), every `extern "slcp_driver"`
+  import, and the four negotiation constants by value: `abi_version`,
+  `abi_min_version`, `abi_max_version`, `feature_flags`. These lines are
+  rendered from the TEXT of `src/wasm/slcp_host_abi.zig` (the module pins
+  `std.heap.wasm_allocator` and cannot be imported natively), and the runtime
+  half of the liveness assertion checks the `slcp-abi` rule against the
+  parsed file. The parser cross-checks itself against the Zig tokenizer:
+  every `export` keyword in the file must open a `fn` it rendered, and
+  `@export(...)` or `export var` in that file is a hard `check-api` error —
+  an export the text parser cannot render is never a silently unfrozen one.
 
 ## Held out: entry points whose error set is `anyerror` today
 

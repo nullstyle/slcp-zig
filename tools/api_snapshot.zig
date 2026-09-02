@@ -849,7 +849,56 @@ const experimental_lines: []const []const u8 = blk: {
 // truncated line — a truncated signature would freeze the wrong contract.
 // ---------------------------------------------------------------------------
 
-const AbiParseError = error{ AbiSignatureSpansLines, AbiVersionMissing, OutOfMemory };
+const AbiParseError = error{
+    AbiSignatureSpansLines,
+    AbiVersionMissing,
+    /// `@export(...)` in the ABI source: a real wasm export whose name the
+    /// text never spells next to a signature, so the line parser cannot
+    /// render it. Spell it `export fn` instead.
+    AbiExportViaBuiltin,
+    /// `export var` / `export const`: a data symbol, not part of the §7 fn
+    /// surface and not renderable as a `fn` line.
+    AbiExportNotFn,
+    /// The tokenizer counted more `export fn` than the line parser rendered:
+    /// a spelling the parser does not know. Never a silent miss.
+    AbiExportUnparsed,
+    OutOfMemory,
+};
+
+/// `pub export fn` / `pub extern "…"` are the same exports as the bare
+/// spellings: `pub` only widens the Zig-side visibility. Strip it so both
+/// render (S8 D10 finding: a `pub export fn` shipped unfrozen and unlisted).
+fn stripPub(line: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, line, "pub ")) line["pub ".len..] else line;
+}
+
+/// The line parser's self-check: tokenize the source (comments and string
+/// literals fall away) and count every `export` keyword that opens a
+/// function. Any other export shape is refused outright: `@export(...)`
+/// (`AbiExportViaBuiltin`) and `export var`/`export const`
+/// (`AbiExportNotFn`). The caller compares the count against the lines it
+/// rendered, so a spelling the line parser does not know can never ship as a
+/// silently unfrozen export.
+fn countExportFns(gpa: std.mem.Allocator, src: []const u8) error{ OutOfMemory, AbiExportViaBuiltin, AbiExportNotFn }!usize {
+    const z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(z);
+    var tok = std.zig.Tokenizer.init(z);
+    var count: usize = 0;
+    var after_export = false;
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        if (after_export) {
+            if (t.tag != .keyword_fn) return error.AbiExportNotFn;
+            count += 1;
+        }
+        after_export = t.tag == .keyword_export;
+        if (t.tag == .builtin and std.mem.eql(u8, z[t.loc.start..t.loc.end], "@export")) {
+            return error.AbiExportViaBuiltin;
+        }
+    }
+    return count;
+}
 
 /// The signature must open and close on this line and end with `terminator`
 /// (`{` for an export body, `;` for an extern prototype). Returns it with the
@@ -880,17 +929,20 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
         out.deinit(gpa);
     }
     var saw_version = false;
+    var exports_rendered: usize = 0;
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
-        if (std.mem.startsWith(u8, line, "export fn ")) {
-            const sig = try oneLineSignature(line["export fn ".len..], '{');
+        const decl = stripPub(line);
+        if (std.mem.startsWith(u8, decl, "export fn ")) {
+            const sig = try oneLineSignature(decl["export fn ".len..], '{');
             const name_len = std.mem.indexOfScalar(u8, sig, '(') orelse return error.AbiSignatureSpansLines;
             try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}.export.{s}: fn {s}", .{
                 abi_prefix, sig[0..name_len], sig[name_len..],
             }));
-        } else if (std.mem.startsWith(u8, line, "extern \"")) {
-            const rest = line["extern \"".len..];
+            exports_rendered += 1;
+        } else if (std.mem.startsWith(u8, decl, "extern \"")) {
+            const rest = decl["extern \"".len..];
             const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.AbiSignatureSpansLines;
             const module = rest[0..q];
             const after = rest[q + 1 ..];
@@ -912,6 +964,14 @@ fn renderAbiLines(gpa: std.mem.Allocator, src: []const u8) AbiParseError![][]u8 
         }
     }
     if (!saw_version) return error.AbiVersionMissing;
+    const exports_in_source = try countExportFns(gpa, src);
+    if (exports_in_source != exports_rendered) {
+        std.debug.print(
+            "api-snapshot: {s}: the tokenizer sees {d} `export fn` but the line parser rendered {d} — an export spelling the parser does not know\n",
+            .{ abi_source_path, exports_in_source, exports_rendered },
+        );
+        return error.AbiExportUnparsed;
+    }
     return out.toOwnedSlice(gpa);
 }
 
@@ -1375,6 +1435,50 @@ test "ABI text parser refuses a signature that spans lines" {
         \\
     ;
     try std.testing.expectError(error.AbiSignatureSpansLines, renderAbiLines(gpa, fixture));
+}
+
+// Non-vacuity (S8 D10 "ABI text parser misses `pub export fn` and
+// `@export`"): before the fix the first fixture rendered ONE line (the const)
+// — a `pub export fn` shipped in slcp_core.wasm unfrozen and unlisted while
+// check-api stayed green — and the second returned OK instead of an error.
+// Dropping `stripPub` makes the length expect red (1 ≠ 3); dropping the
+// tokenizer cross-check lets the `@export` fixture render.
+test "ABI text parser accepts `pub export fn` / `pub extern` and refuses `@export` and `export var`" {
+    const gpa = std.testing.allocator;
+    const pub_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\pub export fn slcp_pub_export(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\const imports = struct {
+        \\    pub extern "slcp_driver" fn pub_import(a: u32) u32;
+        \\};
+        \\
+    ;
+    const lines = try renderAbiLines(gpa, pub_fixture);
+    defer freeAbiLines(gpa, lines);
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
+    try std.testing.expectEqualStrings("slcp-abi.export.slcp_pub_export: fn (x: u32) u32", lines[1]);
+    try std.testing.expectEqualStrings("slcp-abi.import.slcp_driver.pub_import: fn (a: u32) u32", lines[2]);
+
+    const builtin_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\fn hidden() callconv(.c) u32 {
+        \\    return 0;
+        \\}
+        \\comptime {
+        \\    @export(&hidden, .{ .name = "slcp_hidden" });
+        \\}
+        \\
+    ;
+    try std.testing.expectError(error.AbiExportViaBuiltin, renderAbiLines(gpa, builtin_fixture));
+
+    const var_fixture =
+        \\pub const abi_version: u32 = 1;
+        \\export var slcp_counter: u32 = 0;
+        \\
+    ;
+    try std.testing.expectError(error.AbiExportNotFn, renderAbiLines(gpa, var_fixture));
 }
 
 // Non-vacuity: removing the `saw_version` requirement lets a source with no
