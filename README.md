@@ -41,8 +41,7 @@ halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
 
 ## Status
 
-- **v0.1.0 is being prepared** — see the notice above. Nothing here is
-  supported.
+- **v0.1.0 is tagged** — see the notice above. Nothing here is supported.
 - The engine (`slcp-core`) has run a deterministic 1000-seed simulation
   matrix with Byzantine actors, a fuzz suite, a native-vs-wasm differential
   replay, and a real-socket 4-node end-to-end cluster with kill/restart and
@@ -323,6 +322,7 @@ mise exec -- zig build test
 | `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
 | `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
+| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three registry nodes over loopback through its CLI — conflicting claims, `set` / `transfer` / `release`, identical heads, a `SIGKILL` + restart of one node. Not part of `test` (which runs `registry-tests`, the example's own tests). |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
 | `zig build sim-matrix` / `zig build byz-matrix` | The full 1000-seed simulation and Byzantine matrices (long). |
@@ -413,6 +413,11 @@ in [`docs/stability.md`](docs/stability.md).
 - `docs/stability.md` — the Stable / Experimental tiers and how the API
   snapshot enforces them.
 - `examples/counter/README.md` — the three-VPS deployment walkthrough.
+- `examples/registry/README.md` — the second example: signed transactions
+  with sequence numbers, transaction sets as the value (custom codec +
+  `combine`), a ledger header hash chain, snapshots, a localhost RPC and a
+  CLI — the first step of an examples track that grows toward a
+  stellar-core-shaped application without money.
 - `vectors/` — the cross-implementation conformance vectors; when prose and
   vectors disagree, the vectors win.
 
@@ -433,9 +438,10 @@ src/
 sim/                       deterministic multi-node simulator with Byzantine actors
 tests/                     vector replay, framing vectors, engine e2e, fuzz, ABI, cluster e2e,
                            AppNode expected-fail compiles
-tools/                     vector generator, API snapshot, example-smoke, docs-smoke
+tools/                     vector generator, API snapshot, example-smoke, registry-smoke, docs-smoke
 vectors/                   conformance vectors (the definition; prose is commentary)
-examples/                  counter/ (the §0 program as a consumer package), bytes_node.zig
+examples/                  counter/ (the §0 program as a consumer package), bytes_node.zig,
+                           registry/ (signed transactions, tx sets, a header chain; a consumer package)
 docs/                      the documents listed above + the API snapshots
 ```
 

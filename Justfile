@@ -63,6 +63,19 @@ example-smoke *ARGS:
 example-build:
     zig build example-build
 
+# Build examples/registry once as a consumer package, run three registry
+# nodes over loopback (listen 47411-47413, RPC 47421-47423) through the real
+# CLI: a conflicting claim, set / transfer / release, head agreement, kill -9
+# + restart of node2 and a tx through the restarted node. Runs ALONE (fixed
+# ports). Evidence line: `[registry-smoke] nodes=3 txs=7 slots=N head=<hex16>`.
+# Extra args pass through: `just registry-smoke --keep --deadline-s 600`.
+registry-smoke *ARGS:
+    zig build registry-smoke -- {{ARGS}}
+
+# Only the nested consumer build of examples/registry (exit 0 iff it builds).
+registry-build:
+    zig build registry-build
+
 # ===== M6:docs =====
 # M6 stage anchor (docs): docs-smoke recipe goes here.
 
@@ -110,7 +123,7 @@ check-api:
 
 # The cold pre-tag gate (design §13.9; RELEASING.md step 1). Runs the
 # `preflight` aggregate step (test, e2e, wasm-diff, byz-matrix, sim-matrix,
-# example-smoke) from a FRESH --cache-dir so nothing is answered from cache,
+# example-smoke, registry-smoke) from a FRESH --cache-dir so nothing is answered from cache,
 # keeps the `--summary all` log in preflight.log (gitignored), then greps the
 # evidence line of every gate out of it — a gate that was skipped, cached or
 # printed nothing is red here even if the build exited 0. Prefixes only:
@@ -145,6 +158,7 @@ preflight:
     need '\[wasm-diff\] traces=4 '
     need '\[wasm-diff\] fuzz iters=300 '
     need '\[example-smoke\] nodes=3 slots='
+    need '\[registry-smoke\] nodes=3 txs='
     need '\[docs-smoke\] checks=[0-9]+ failures=0'
     need 'api-snapshot: OK \('
     # The summary block is everything from `Build Summary:` on; a ` cached`

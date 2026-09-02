@@ -59,7 +59,7 @@ just preflight               # ~15 min; keeps preflight.log (gitignored)
 ```
 
 `just preflight` runs `zig build preflight` (test, e2e, wasm-diff,
-byz-matrix, sim-matrix, example-smoke) from a **fresh `--cache-dir`**, then
+byz-matrix, sim-matrix, example-smoke, registry-smoke) from a **fresh `--cache-dir`**, then
 greps each gate's evidence line out of the `--summary all` log, then runs
 `just fmt-check`, `just ci-lint`, `just gen-check-pinned`,
 `just pkg-hash-check` and `just package-preflight`. It is red when any gate
@@ -73,6 +73,7 @@ reads ` cached`. What it greps (prefixes only, deliberately):
 | `byz-matrix: 1000 seeds x 2 actors green` | |
 | `[wasm-diff] traces=4 ` / `[wasm-diff] fuzz iters=300 ` | |
 | `[example-smoke] nodes=3 slots=` | `count=` may exceed `slots=` on a fast box |
+| `[registry-smoke] nodes=3 txs=` | `txs=` is the count of distinct transactions (7 in the script; a lost race can add one), `slots=` and `head=` vary per run |
 | `[docs-smoke] checks=N failures=0` | N grows |
 | `api-snapshot: OK (` | the tail reads `refreshed)` locally and `verified)` under `-Dstrict-experimental=true` |
 

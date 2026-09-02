@@ -9,3 +9,7 @@ examples/counter/.zig-cache/
 examples/counter/slcp.key
 examples/counter/slcp-data/
 examples/counter/counter.json
+examples/registry/zig-out/
+examples/registry/.zig-cache/
+examples/registry/*.key
+examples/registry/data/

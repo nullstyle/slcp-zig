@@ -132,6 +132,13 @@ jobs:
       - name: Three consumer builds + loopback run with SIGKILL/restart
         run: zig build example-smoke --summary all
 
+      # examples/registry (roadmap E1): one more nested consumer build (the
+      # same path-dependency shape, nothing new fetched) and a loopback run of
+      # three registry nodes driven through the CLI, with a SIGKILL + restart
+      # of node2. Sequential after the counter smoke: both use fixed ports.
+      - name: Registry — consumer build + loopback run with SIGKILL/restart
+        run: zig build registry-smoke --summary all
+
   fmt-check:
     name: Format check
     runs-on: ubuntu-latest

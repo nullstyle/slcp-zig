@@ -724,6 +724,95 @@ pub fn build(b: *std.Build) void {
     example_smoke_tests_step.dependOn(&run_example_smoke_tests.step);
     test_step.dependOn(&run_example_smoke_tests.step);
 
+    // ===== E1:registry =====
+    // Examples-track stage anchor (registry; examples-roadmap.md E1 §3.12):
+    // registry-intree compile, registry-tests, the registry_smoke tool and
+    // its run steps. Insert under this anchor only; never above it.
+    // Keep the blank line between anchors so parallel stages merge cleanly.
+
+    // registry-intree: the E1 program (examples/registry/src/main.zig)
+    // compiled against the in-tree `slcp` module. NOT installed and never
+    // run here (it listens, dials its peers and serves an RPC): `zig build
+    // test` proves the published program still compiles.
+    const registry_intree = b.addExecutable(.{
+        .name = "registry-intree",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/registry/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+        }),
+    });
+    test_step.dependOn(&registry_intree.step);
+
+    // registry-tests: the example's own tests, rooted at app.zig — the pure
+    // state machine (registry.zig) and the in-process 2-of-2 AppNode restart
+    // test. They write scratch data dirs and read undeclared files: cwd
+    // pinned + side effects. Part of `test`.
+    const registry_tests = b.addTest(.{
+        .name = "slcp-registry-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/registry/src/app.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+        }),
+    });
+    const run_registry_tests = b.addRunArtifact(registry_tests);
+    run_registry_tests.setCwd(b.path("."));
+    run_registry_tests.has_side_effects = true;
+    const registry_tests_step = b.step("registry-tests", "Run examples/registry's own tests: the pure state machine + the in-process 2-of-2 restart test (part of `test`)");
+    registry_tests_step.dependOn(&run_registry_tests.step);
+    test_step.dependOn(&run_registry_tests.step);
+
+    // registry-smoke: ONE nested consumer build of examples/registry (a
+    // scratch copy under .zig-cache/registry-smoke/build, the repo as a path
+    // dependency), then three `registry node`s over loopback (listen
+    // 47411-47413, RPC 47421-47423) driven through the real CLI: a
+    // conflicting claim, set / transfer / release, head agreement, SIGKILL +
+    // restart of node2 and a transaction through the restarted node. Prints
+    // `[registry-smoke] nodes=3 txs=N slots=M head=<hex16>`. Minutes-scale
+    // and port-bound (it runs ALONE, like e2e and example-smoke): its own
+    // step, not part of `test` — `test` only compiles the tool and runs its
+    // unit tests. The tool reads examples/registry/* and writes
+    // .zig-cache/registry-smoke/, none of it declared to the build graph:
+    // cwd pinned + side effects.
+    const registry_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("tools/registry_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+    });
+    const registry_smoke = b.addExecutable(.{ .name = "registry-smoke", .root_module = registry_smoke_mod });
+    test_step.dependOn(&registry_smoke.step);
+
+    const run_registry_smoke = b.addRunArtifact(registry_smoke);
+    run_registry_smoke.addArgs(&.{ "--zig", b.graph.zig_exe });
+    run_registry_smoke.addPassthruArgs();
+    run_registry_smoke.setCwd(b.path("."));
+    run_registry_smoke.has_side_effects = true;
+    const registry_smoke_step = b.step("registry-smoke", "Build examples/registry as a consumer, run 3 loopback registry nodes through the CLI (conflicting claim, set/transfer/release, kill -9 + restart node2) (`-- --keep --deadline-s S`)");
+    registry_smoke_step.dependOn(&run_registry_smoke.step);
+
+    const run_registry_build = b.addRunArtifact(registry_smoke);
+    run_registry_build.addArgs(&.{ "--zig", b.graph.zig_exe, "--build-only" });
+    run_registry_build.addPassthruArgs();
+    run_registry_build.setCwd(b.path("."));
+    run_registry_build.has_side_effects = true;
+    const registry_build_step = b.step("registry-build", "Nested consumer build of examples/registry only (exit 0 iff it builds)");
+    registry_build_step.dependOn(&run_registry_build.step);
+
+    // The tool's unit tests (the RPC reply parsers, the zon rewriter against
+    // the REAL examples/registry/build.zig.zon, the evidence line): an
+    // undeclared file read, hence cwd + side effects. Part of `test`.
+    const registry_smoke_tests = b.addTest(.{ .name = "slcp-registry-smoke-tests", .root_module = registry_smoke_mod });
+    const run_registry_smoke_tests = b.addRunArtifact(registry_smoke_tests);
+    run_registry_smoke_tests.setCwd(b.path("."));
+    run_registry_smoke_tests.has_side_effects = true;
+    const registry_smoke_tests_step = b.step("registry-smoke-tests", "Run the registry-smoke tool's unit tests (part of `test`)");
+    registry_smoke_tests_step.dependOn(&run_registry_smoke_tests.step);
+    test_step.dependOn(&run_registry_smoke_tests.step);
+
     // ===== M6:docs =====
     // M6 stage anchor (docs): docs_smoke tool + run step, bytes_node example
     // compile, the docs-smoke step. Insert under this anchor only.
@@ -887,13 +976,14 @@ pub fn build(b: *std.Build) void {
     // run_byz_matrix carry no has_side_effects on purpose (a 7-minute step
     // must stay cache-answerable in an ordinary `zig build`), so a warm
     // `zig build preflight` may legitimately print ` cached` for them.
-    const preflight_step = b.step("preflight", "Every mandatory pre-tag gate: test, e2e, wasm-diff, byz-matrix, sim-matrix, example-smoke (run via `just preflight`: fresh cache + evidence greps)");
+    const preflight_step = b.step("preflight", "Every mandatory pre-tag gate: test, e2e, wasm-diff, byz-matrix, sim-matrix, example-smoke, registry-smoke (run via `just preflight`: fresh cache + evidence greps)");
     preflight_step.dependOn(test_step);
     preflight_step.dependOn(e2e_step);
     preflight_step.dependOn(wasm_diff_step);
     preflight_step.dependOn(byz_matrix_step);
     preflight_step.dependOn(sim_matrix_step);
     preflight_step.dependOn(example_smoke_step);
+    preflight_step.dependOn(registry_smoke_step);
 }
 
 /// `.version = "<v>"` of build.zig.zon, the one place the version lives.

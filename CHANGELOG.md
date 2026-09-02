@@ -13,6 +13,29 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/registry`** — the second example and step E1 of the examples
+  roadmap: a replicated name registry with stellar-core's shape and no
+  money. Ed25519-signed transactions with per-account sequence numbers,
+  transaction sets as the consensus value (a custom codec and a `combine`
+  that unions candidates), a ledger header hash chain, an atomically
+  written snapshot after every applied slot (`initialState` +
+  `initialSlot`), a localhost line-protocol RPC (`head`, `get`, `account`,
+  `submit`) and a CLI (`registry node | submit | get | account | head`).
+  Library-neutral: it uses only the v0.1.0 Stable API and records the gaps
+  it hits (no transaction flooding, the fixed 16-slot answering window, the
+  typed layer's per-slot state copy) for the next step.
+- `zig build registry-tests` (in `test`): the example's pure state machine,
+  its RPC, and a live 2-of-2 pair with a restart from a snapshot;
+  `registry-intree` compiles the program against the in-tree module.
+- `zig build registry-smoke` / `registry-build` (`tools/registry_smoke.zig`;
+  CI on ubuntu + macOS in the `example-smoke` job): one nested consumer
+  build, three nodes over loopback (ports 47411–47413, RPC 47421–47423),
+  conflicting claims, `set` / `transfer` / `release`, identical heads,
+  `SIGKILL` + restart of one node and a transaction through the restarted
+  node. Evidence: `[registry-smoke] nodes=3 txs=7 slots=N head=<hex16>`.
+
 ## [0.1.0] - 2026-09-01
 
 The first tag. Everything below is new to a reader who has never seen the

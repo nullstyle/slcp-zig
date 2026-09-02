@@ -50,6 +50,7 @@ pub const active_docs = [_][]const u8{
     "docs/determinism.md",
     "docs/stability.md",
     "examples/counter/README.md",
+    "examples/registry/README.md",
 };
 
 pub const recipe_files = [_][]const u8{
