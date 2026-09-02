@@ -272,6 +272,17 @@ test "peers: bad specs name index and spec, duplicates, and the node's own addre
         o.peers = &.{ "a.example.com:7311", "nohost" };
         try g.expectFail(o, error.BadPeerSpec, ".peers[1] = \"nohost\"");
     }
+    // The reason names the part that is wrong: a bracketed v6 literal that
+    // forgot its port is "(no port)", exactly like "nohost" — not a port
+    // complaint about the `1]` after the last ':' (S8 finding).
+    {
+        var o = g.options();
+        o.peers = &.{"[::1]"};
+        try g.expectFail(o, error.BadPeerSpec, "\"[::1]\" is not host:port (no port)");
+        var o2 = g.options();
+        o2.peers = &.{"nohost"};
+        try g.expectFail(o2, error.BadPeerSpec, "\"nohost\" is not host:port (no port)");
+    }
 
     var dup = g.options();
     dup.peers = &.{ "x:1", "x:1" };

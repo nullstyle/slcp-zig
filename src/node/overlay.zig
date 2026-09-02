@@ -1055,19 +1055,34 @@ fn isRequestFrame(frame: wire.OverlayFrame) bool {
 
 pub const HostPort = struct { host: []const u8, port: u16 };
 
-/// Split a peer spec on its LAST ':' into host and port. One leading '[' and
-/// trailing ']' are stripped from the host, so `[::1]:7311` yields host
-/// `::1`. Port 0 is rejected (nothing listens on port 0). The host is NOT
-/// validated here — see `validatePeerSpec`.
+/// Split a peer spec into its raw host and port TEXT (no validation of
+/// either). A spec starting with '[' is the bracketed-v6 form: the host is
+/// what the brackets enclose and the port must follow as `]:<port>` — the
+/// brackets are looked at BEFORE any ':' so that `[::1]` (no port) reports
+/// `MissingPort`, not a garbled port `1]`. Anything else splits on its LAST
+/// ':' so an unbracketed `::1` never swallows the port.
+fn splitPeerSpec(spec: []const u8) PeerSpecError!struct { host: []const u8, port_text: []const u8 } {
+    if (spec.len > 0 and spec[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, spec, ']') orelse return error.BadHost;
+        const rest = spec[close + 1 ..];
+        if (rest.len == 0 or (rest.len == 1 and rest[0] == ':')) return error.MissingPort;
+        if (rest[0] != ':') return error.BadHost;
+        return .{ .host = spec[1..close], .port_text = rest[1..] };
+    }
+    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.MissingPort;
+    if (idx + 1 >= spec.len) return error.MissingPort;
+    return .{ .host = spec[0..idx], .port_text = spec[idx + 1 ..] };
+}
+
+/// Split a peer spec into host and port. The bracketed form `[::1]:7311`
+/// yields host `::1`. Port 0 is rejected (nothing listens on port 0). The
+/// host is NOT validated here — see `validatePeerSpec`.
 pub fn parseHostPort(spec: []const u8) error{BadPeerSpec}!HostPort {
-    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.BadPeerSpec;
-    if (idx == 0 or idx + 1 >= spec.len) return error.BadPeerSpec;
-    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPeerSpec;
+    const parts = splitPeerSpec(spec) catch return error.BadPeerSpec;
+    if (parts.host.len == 0) return error.BadPeerSpec;
+    const port = std.fmt.parseInt(u16, parts.port_text, 10) catch return error.BadPeerSpec;
     if (port == 0) return error.BadPeerSpec;
-    var host = spec[0..idx];
-    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
-    if (host.len == 0) return error.BadPeerSpec;
-    return .{ .host = host, .port = port };
+    return .{ .host = parts.host, .port = port };
 }
 
 pub const PeerSpecError = error{ MissingPort, EmptyHost, BadPort, BadHost };
@@ -1077,16 +1092,12 @@ pub const PeerSpecError = error{ MissingPort, EmptyHost, BadPort, BadHost };
 /// port is 1..65535. `Node.create` maps a failure to `BadPeerSpec` naming
 /// the index, the spec and which part is wrong.
 pub fn validatePeerSpec(spec: []const u8) PeerSpecError!void {
-    const idx = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.MissingPort;
-    if (idx + 1 >= spec.len) return error.MissingPort;
-    if (idx == 0) return error.EmptyHost;
-    const port = std.fmt.parseInt(u16, spec[idx + 1 ..], 10) catch return error.BadPort;
+    const parts = try splitPeerSpec(spec);
+    if (parts.host.len == 0) return error.EmptyHost;
+    const port = std.fmt.parseInt(u16, parts.port_text, 10) catch return error.BadPort;
     if (port == 0) return error.BadPort;
-    var host = spec[0..idx];
-    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
-    if (host.len == 0) return error.EmptyHost;
-    if (net.IpAddress.parse(host, port)) |_| return else |_| {}
-    net.HostName.validate(host) catch return error.BadHost;
+    if (net.IpAddress.parse(parts.host, port)) |_| return else |_| {}
+    net.HostName.validate(parts.host) catch return error.BadHost;
 }
 
 /// Exponential backoff 1s→60s plus deterministic per-peer jitter (Wyhash over
@@ -1665,6 +1676,15 @@ test "validatePeerSpec / parseHostPort: literals, bracket-v6, hostnames, and eac
     try validatePeerSpec("localhost:65535");
     try testing.expectError(error.MissingPort, validatePeerSpec("nohost"));
     try testing.expectError(error.MissingPort, validatePeerSpec("host:"));
+    // S8 finding "BadPeerSpec gives the wrong reason for a bracketed IPv6
+    // literal without a port": splitting on the LAST ':' before looking at
+    // the brackets turned `[::1]` into host `[:` + port `1]` (BadPort).
+    try testing.expectError(error.MissingPort, validatePeerSpec("[::1]"));
+    try testing.expectError(error.MissingPort, validatePeerSpec("[2001:db8::2]"));
+    try testing.expectError(error.MissingPort, validatePeerSpec("[::1]:"));
+    try testing.expectError(error.BadHost, validatePeerSpec("[::1:7311"));
+    try testing.expectError(error.BadHost, validatePeerSpec("[::1]x:7311"));
+    try testing.expectError(error.BadPort, validatePeerSpec("[::1]:0"));
     try testing.expectError(error.EmptyHost, validatePeerSpec(":7311"));
     try testing.expectError(error.EmptyHost, validatePeerSpec("[]:7311"));
     try testing.expectError(error.BadPort, validatePeerSpec("a.example.com:0"));
@@ -1680,6 +1700,10 @@ test "validatePeerSpec / parseHostPort: literals, bracket-v6, hostnames, and eac
     try testing.expectEqualStrings("a.example.com", host.host);
     try testing.expectError(error.BadPeerSpec, parseHostPort("a.example.com:0"));
     try testing.expectError(error.BadPeerSpec, parseHostPort("[]:7311"));
+    try testing.expectError(error.BadPeerSpec, parseHostPort("[::1]"));
+    try testing.expectError(error.BadPeerSpec, parseHostPort("[::1:7311"));
+    const v6_full = try parseHostPort("[2001:db8::2]:7311");
+    try testing.expectEqualStrings("2001:db8::2", v6_full.host);
 }
 
 // Non-vacuity: this is the M6 hostname path. Reverting `dialOne` to the
