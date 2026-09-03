@@ -13,6 +13,7 @@ is recommended, and no license is granted.
 |---|---|---|
 | Released | `v0.1.0` at `916907a` (2026-09-01) | First engine, native node, typed application layer, CLI, examples/counter, protocol docs, conformance and release gates. |
 | Pre-sprint `main` baseline | `cf3b84b` (2026-09-02), two commits after the tag | Post-tag documentation corrections plus E1 of the examples track: `examples/registry`. |
+| Hardening implementation baseline | `9d21b00` (2026-09-03) | Exact qset lifecycle, bounded native ingress, restart/purge hardening, stronger fuzz/E2E evidence, and canonical project state. |
 | Package manifest | version `0.1.0` | The post-tag work is Unreleased; no newer release has been cut. |
 
 The v0.1.0 evidence and limitations are recorded in
@@ -66,9 +67,9 @@ and reviewed for the new diagnostics.
 ## Current verification ledger
 
 These fields intentionally describe the integrated sprint tree, not historical
-release runs. The final fresh-cache `just preflight` ran immediately before the
-local implementation commit and completed in 863 seconds: 100/100 build steps
-succeeded and 475/476 tests passed, with one expected platform skip.
+release runs. The final fresh-cache `just preflight` ran immediately before
+implementation commit `9d21b00` and completed in 863 seconds: 100/100 build
+steps succeeded and 475/476 tests passed, with one expected platform skip.
 
 | Gate | Current sprint result |
 |---|---|
@@ -84,7 +85,7 @@ succeeded and 475/476 tests passed, with one expected platform skip.
 | Counter consumer smoke | PASS — 3 nodes, 20 slots, final count 20, including restart |
 | Registry consumer smoke | PASS — 3 nodes, 7 transactions, 32 slots, including restart catch-up |
 | Long fuzz run | PASS — input sequence 1,014,851 runs; decoder 1,000,392; codec 1,000,064 new runs (2,000,101 cumulative); no failure |
-| Release/package preflight | PENDING on a clean sprint `HEAD`; the earlier archived-package check covered the pre-sprint baseline because packaging intentionally excludes dirty-worktree changes |
+| Release/package preflight | PASS — clean committed archive, extracted consumer build, and restart smoke green; `slcp-0.1.0-p1Kf2tpbFQAjYQFqdjjC0NT_u_O6GO-dKZbH1TlyKCWD` |
 | Three-machine deployment acceptance | NOT RUN — requires external machines |
 
 The first fresh-cache run exposed a real restart race: a priority purge could
