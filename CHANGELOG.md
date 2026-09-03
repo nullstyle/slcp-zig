@@ -35,6 +35,33 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   conflicting claims, `set` / `transfer` / `release`, identical heads,
   `SIGKILL` + restart of one node and a transaction through the restarted
   node. Evidence: `[registry-smoke] nodes=3 txs=7 slots=N head=<hex16>`.
+- Experimental native-node ingress statistics, a bounded priority purge lane,
+  and `-De2e-filter` for focused real-socket regression runs.
+- Canonical `CONTEXT.md`, `DESIGN.md`, `STATUS.md`, and
+  `docs/examples-roadmap.md` project-state documents.
+
+### Changed
+
+- Quorum-set evaluation now follows the exact qset advertised by each live
+  non-EXTERNALIZE statement. Live-statement references, the permanent local
+  pin, and short-lived fetched-response replay leases make cache residency
+  explicit; graph reachability is checkpointed across bounded generations.
+  EXTERNALIZE continues to use its protocol-defined sender singleton.
+- Native Engine ingress is bounded to 1,024 items / 16 MiB with reserved local
+  capacity. Purges overtake ordinary work, stale work is rejected again at
+  application time, and restart reconstructs a monotonic floor before replay.
+- Engine-derived node statistics publish only at complete input/effect-drain
+  boundaries. Input-sequence fuzzing now generates diverse valid typed streams,
+  and restart E2E evidence requires fresh post-restart participation.
+
+### Fixed
+
+- Prevented an overtaken local nomination, retained journal prefix, lowered
+  explicit start floor, or metadata-decoding OOM from recreating retired slots.
+- Rejecting an incompatible newer peer ballot no longer destroys that peer's
+  previous valid statement or releases its qset reference.
+- Quorum-set responses are correlated to outstanding requests and remain
+  retryable when native ingress is under pressure.
 
 ## [0.1.0] - 2026-09-01
 

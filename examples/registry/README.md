@@ -230,7 +230,8 @@ mesh — see *Security*). On every box:
 
 ## Limits — what E1 does not do
 
-These are the gaps this step records for E2 (examples-roadmap.md §2.1);
+These are the gaps this step records for E2
+(`docs/examples-roadmap.md`, "Gaps recorded by E1");
 each one is deliberate:
 
 - **No transaction flooding.** A transaction is known only to the node it

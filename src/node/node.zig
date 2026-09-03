@@ -41,6 +41,12 @@ const log = std.log.scoped(.slcp_node);
 /// GC window: keep 16 externalized slots answerable to laggards (§10).
 const purge_window: u64 = 16;
 
+/// First slot in the retained answering window for a delivered frontier.
+/// Zero means no slot has aged out yet.
+fn purgeFloorForFrontier(frontier: u64) u64 {
+    return if (frontier >= purge_window) frontier - (purge_window - 1) else 0;
+}
+
 /// Anti-entropy period (§9.2 host policy; see the resync_thread field).
 const resync_interval_ms: u64 = 3_000;
 
@@ -277,6 +283,21 @@ const SlotOwn = struct {
 pub const InputItem = struct {
     input: engine.Input,
     source_peer: ?usize,
+};
+
+/// Native host ingress pressure. Experimental: queue budgets may be tuned in
+/// later 0.x releases. `queued_items` includes the optional coalesced purge
+/// barrier in addition to the bounded ordinary FIFO; `queued_bytes` covers
+/// payload bytes in that FIFO. Queue size is one coherent lock snapshot; the
+/// drop counter is an independent monotonic atomic total. A network drop is a
+/// transport-accepted envelope or a valid, requested qset response lost to
+/// queue-capacity or host allocation pressure (including metadata parsing at
+/// the hold gate). Intentional shutdown and malformed or unsolicited qset
+/// frames are not drops.
+pub const IngressStats = struct {
+    queued_items: usize,
+    queued_bytes: usize,
+    dropped_network_inputs: usize,
 };
 
 /// Host-side per-slot hold buffer (S8 D1, the stellar-core Herder shape —
@@ -619,54 +640,165 @@ pub fn envelopeMeta(gpa: std.mem.Allocator, network_id: [32]u8, framed_env: []co
 /// (cancellation is a no-op on our raw std.Thread workers, so the
 /// *Uncancelable variants are used to avoid the error union).
 const InputQueue = struct {
+    const max_items: usize = 1024;
+    /// The ordinary FIFO may retain at most one additional cap-sized consumed
+    /// prefix. Compacting only at that threshold makes the copies amortized
+    /// while bounding both physical list length and allocated element
+    /// capacity to twice the live-item cap.
+    const max_backing_items: usize = max_items * 2;
+    const reserved_progress_items: usize = 64;
+    const max_bytes: usize = 16 * 1024 * 1024;
+    const reserved_progress_bytes: usize = 1024 * 1024;
+    const PushError = std.mem.Allocator.Error || error{ InputQueueFull, QueueClosed };
+
     gpa: std.mem.Allocator,
     io: std.Io,
     mu: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     items: std.ArrayList(InputItem) = .empty,
     head: usize = 0,
+    bytes: usize = 0,
+    /// A non-allocating control lane outside the ordinary FIFO budget. Purges
+    /// are monotonic, so one maximum watermark represents any number of
+    /// pending purge inputs without losing work.
+    pending_purge: ?u64 = null,
+    dropped_network: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     closed: bool = false,
 
-    /// Enqueue, or drop on OOM (freeing the input, one err-level log line):
-    /// for producers with nothing to retry — timer fires, received frames,
-    /// purges. The engine degrades, it does not corrupt.
+    /// Owning, fire-and-forget enqueue for timer fires and received frames.
+    /// Failed admission always consumes the input; pressure is counted/logged
+    /// while intentional shutdown is quiet.
     fn push(self: *InputQueue, item: InputItem) void {
-        self.tryPush(item) catch {
+        const network_input = inputItemIsNetwork(&item);
+        self.tryPush(item) catch |err| {
             var in = item.input;
             core.host_codec.freeInput(self.gpa, &in);
-            log.err("input queue OOM; dropped one input", .{});
+            switch (err) {
+                error.InputQueueFull => if (network_input) {
+                    self.recordNetworkDrop();
+                } else {
+                    log.warn("input queue full; dropped one progress input", .{});
+                },
+                error.OutOfMemory => if (network_input) {
+                    self.recordNetworkDrop();
+                } else {
+                    log.err("input queue OOM; dropped one progress input", .{});
+                },
+                error.QueueClosed => {},
+            }
         };
     }
 
-    /// Enqueue; on OOM the caller still owns `item` (nothing is freed or
-    /// logged) so it can roll back — `maybeStartNomination` re-queues the
-    /// proposal instead of losing it (review finding). A closed queue frees
-    /// the input and reports success (the node is shutting down).
-    fn tryPush(self: *InputQueue, item: InputItem) std.mem.Allocator.Error!void {
+    /// Purge is a barrier for all already-queued network work: it updates the
+    /// Engine's pending/live-slot state before a qset response can unpark a
+    /// statement below the host's newly published purge floor. Its monotonic
+    /// watermark is stored outside the ordinary item/byte budgets so pressure
+    /// cannot drop the barrier; repeated purges coalesce to the highest floor.
+    /// Engine-owner only: unlike external pushes, this remains admissible after
+    /// `close` while the engine drains work that was already in the FIFO.
+    fn pushPriority(self: *InputQueue, item: InputItem) void {
+        const max_slot = switch (item.input) {
+            .purge_slots => |p| p.max_slot,
+            else => unreachable,
+        };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        if (self.closed) {
-            var in = item.input;
-            core.host_codec.freeInput(self.gpa, &in);
-            return;
-        }
-        try self.items.append(self.gpa, item);
+        self.pending_purge = if (self.pending_purge) |old| @max(old, max_slot) else max_slot;
         self.cond.signal(self.io);
+    }
+
+    fn recordNetworkDrop(self: *InputQueue) void {
+        const dropped = self.dropped_network.fetchAdd(1, .monotonic) + 1;
+        if (dropped == 1 or dropped & (dropped - 1) == 0) {
+            log.warn("network ingress pressure; dropped {d} input(s)", .{dropped});
+        }
+    }
+
+    /// Copy an already-classified network input into Node ownership. Callers
+    /// decide admissibility first (notably qset correlation); this helper
+    /// makes copy pressure accounting consistent across ingress paths. If the
+    /// allocation fails after shutdown has closed the queue, the loss is
+    /// intentional and stays out of the pressure counter.
+    fn copyNetworkBytes(self: *InputQueue, bytes: []const u8) ?[]u8 {
+        return self.gpa.dupe(u8, bytes) catch {
+            self.mu.lockUncancelable(self.io);
+            const closed = self.closed;
+            self.mu.unlock(self.io);
+            if (!closed) self.recordNetworkDrop();
+            return null;
+        };
+    }
+
+    /// Transactional enqueue: on every error the caller still owns `item`
+    /// (nothing is freed or logged). This lets nomination roll back queue
+    /// pressure and qset ingress release a request claim on shutdown instead
+    /// of committing an input which never reached the Engine.
+    fn tryPush(self: *InputQueue, item: InputItem) PushError!void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.closed) return error.QueueClosed;
+        const pending = self.items.items.len - self.head;
+        const network_input = inputItemIsNetwork(&item);
+        const item_bytes = inputItemBytes(&item);
+        const next_bytes = std.math.add(usize, self.bytes, item_bytes) catch return error.InputQueueFull;
+        if (pending >= max_items or
+            next_bytes > max_bytes or
+            (network_input and (pending >= max_items - reserved_progress_items or
+                next_bytes > max_bytes - reserved_progress_bytes)))
+        {
+            return error.InputQueueFull;
+        }
+        if (self.head >= max_items) self.compactConsumed();
+        try self.appendBounded(item);
+        self.bytes = next_bytes;
+        self.cond.signal(self.io);
+    }
+
+    /// ArrayList's default geometric growth may reserve ~1.5x beyond the
+    /// requested length. Preserve amortized growth but clamp the allocation
+    /// to the same explicit bound as the retained consumed prefix.
+    fn appendBounded(self: *InputQueue, item: InputItem) std.mem.Allocator.Error!void {
+        if (self.items.items.len == self.items.capacity) {
+            const needed = self.items.items.len + 1;
+            const grown = std.ArrayList(InputItem).growCapacity(needed);
+            const bounded = @min(grown, max_backing_items);
+            std.debug.assert(bounded >= needed);
+            try self.items.ensureTotalCapacityPrecise(self.gpa, bounded);
+        }
+        self.items.appendAssumeCapacity(item);
     }
 
     /// Block for the next item; null once closed and drained.
     fn pop(self: *InputQueue) ?InputItem {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        while (self.head >= self.items.items.len and !self.closed) self.cond.waitUncancelable(self.io, &self.mu);
+        while (self.head >= self.items.items.len and self.pending_purge == null and !self.closed) {
+            self.cond.waitUncancelable(self.io, &self.mu);
+        }
+        if (self.pending_purge) |max_slot| {
+            self.pending_purge = null;
+            return .{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null };
+        }
         if (self.head >= self.items.items.len) return null;
         const it = self.items.items[self.head];
+        self.bytes -= inputItemBytes(&it);
         self.head += 1;
         if (self.head == self.items.items.len) {
             self.items.clearRetainingCapacity();
             self.head = 0;
         }
         return it;
+    }
+
+    /// Discard the already-consumed prefix without touching ownership of the
+    /// live suffix. Called under `mu` only after at least `max_items` pops, so
+    /// copying at most `max_items - 1` live entries is amortized O(1).
+    fn compactConsumed(self: *InputQueue) void {
+        std.debug.assert(self.head > 0);
+        const pending = self.items.items.len - self.head;
+        std.mem.copyForwards(InputItem, self.items.items[0..pending], self.items.items[self.head..]);
+        self.items.shrinkRetainingCapacity(pending);
+        self.head = 0;
     }
 
     fn close(self: *InputQueue) void {
@@ -676,9 +808,174 @@ const InputQueue = struct {
         self.cond.broadcast(self.io);
     }
 
+    fn snapshot(self: *InputQueue) IngressStats {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return .{
+            .queued_items = self.items.items.len - self.head + @intFromBool(self.pending_purge != null),
+            .queued_bytes = self.bytes,
+            .dropped_network_inputs = self.dropped_network.load(.acquire),
+        };
+    }
+
     fn deinit(self: *InputQueue) void {
         for (self.items.items[self.head..]) |*it| core.host_codec.freeInput(self.gpa, &it.input);
         self.items.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
+fn inputItemBytes(item: *const InputItem) usize {
+    return switch (item.input) {
+        .envelope_received => |v| v.bytes.len,
+        .qset_received => |v| v.bytes.len,
+        .restore_own_envelope => |v| v.bytes.len,
+        .nominate => |v| v.value.len +| v.prev_value.len,
+        .timer_fired, .purge_slots => 0,
+    };
+}
+
+fn inputItemIsNetwork(item: *const InputItem) bool {
+    return switch (item.input) {
+        .envelope_received, .qset_received => true,
+        else => false,
+    };
+}
+
+/// Bounded correlation between Engine `request_qset` effects and overlay
+/// responses. The engine owner reconciles this index to the exact pending
+/// hashes after every input, so evictions and purges cannot leave stale tokens
+/// that crowd out a still-live request.
+const QsetRequests = struct {
+    const Phase = enum { available, claimed, queued };
+    const State = struct {
+        phase: Phase = .available,
+        seen_generation: u64 = 0,
+    };
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mu: std.Io.Mutex = .init,
+    states: std.AutoHashMapUnmanaged([32]u8, State) = .empty,
+    order: std.ArrayList([32]u8) = .empty,
+    generation: u64 = 0,
+    /// One transient request may be dispatched after Pending has evicted back
+    /// to its configured cap but before the end-of-input reconciliation.
+    max_hashes: usize,
+
+    fn init(gpa: std.mem.Allocator, io: std.Io, max_pending_envelopes: u32) !QsetRequests {
+        const max_hashes = @as(usize, @intCast(max_pending_envelopes)) + 1;
+        var self = QsetRequests{ .gpa = gpa, .io = io, .max_hashes = max_hashes };
+        errdefer self.deinit();
+        const map_capacity = std.math.cast(u32, max_hashes) orelse return error.OutOfMemory;
+        try self.states.ensureTotalCapacity(gpa, map_capacity);
+        try self.order.ensureTotalCapacity(gpa, max_hashes);
+        return self;
+    }
+
+    fn note(self: *QsetRequests, hash: [32]u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+
+        if (self.states.get(hash) != null) {
+            const index = self.indexOf(hash) orelse unreachable;
+            const existing = self.order.orderedRemove(index);
+            self.order.appendAssumeCapacity(existing);
+            return;
+        }
+
+        if (self.order.items.len >= self.max_hashes) {
+            const oldest = self.order.orderedRemove(0);
+            _ = self.states.remove(oldest);
+        }
+        self.states.putAssumeCapacity(hash, .{ .seen_generation = self.generation });
+        self.order.appendAssumeCapacity(hash);
+    }
+
+    /// Atomically reserve one requested hash for a reader thread. A second
+    /// peer racing the same response is rejected while the first owns it.
+    fn claim(self: *QsetRequests, hash: [32]u8) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const state = self.states.getPtr(hash) orelse return false;
+        if (state.phase != .available) return false;
+        state.phase = .claimed;
+        return true;
+    }
+
+    /// Mark the response queued. The token remains present (and rejects
+    /// duplicates) until reconciliation observes that Engine Pending no
+    /// longer contains the hash.
+    fn commit(self: *QsetRequests, hash: [32]u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const state = self.states.getPtr(hash) orelse return;
+        if (state.phase == .claimed) state.phase = .queued;
+    }
+
+    /// Failed queue admission (pressure or shutdown) releases the same
+    /// in-place token for retry; no allocation is needed on this path.
+    fn release(self: *QsetRequests, hash: [32]u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const state = self.states.getPtr(hash) orelse return;
+        if (state.phase == .claimed) state.phase = .available;
+    }
+
+    /// Engine-owner only. `parked` is the post-input Pending FIFO. Mark its
+    /// distinct hashes in O(pending), then compact the unique order in O(n),
+    /// preserving any claim/queued phase for hashes that remain live.
+    fn reconcile(self: *QsetRequests, parked: anytype) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+
+        self.generation +%= 1;
+        if (self.generation == 0) {
+            // Avoid a stale generation match after the theoretical u64 wrap.
+            self.generation = 1;
+            var values = self.states.valueIterator();
+            while (values.next()) |state| state.seen_generation = 0;
+        }
+        const generation = self.generation;
+        for (parked) |entry| {
+            if (self.states.getPtr(entry.needed_hash)) |state| {
+                state.seen_generation = generation;
+            } else {
+                // Every pending hash first emitted request_qset in the same
+                // feedInput, so preallocated capacity is sufficient even if
+                // an earlier defensive bound evicted its transient token.
+                if (self.order.items.len >= self.max_hashes) {
+                    const oldest = self.order.orderedRemove(0);
+                    _ = self.states.remove(oldest);
+                }
+                self.states.putAssumeCapacity(entry.needed_hash, .{ .seen_generation = generation });
+                self.order.appendAssumeCapacity(entry.needed_hash);
+            }
+        }
+
+        var write: usize = 0;
+        for (self.order.items) |hash| {
+            const state = self.states.get(hash) orelse continue;
+            if (state.seen_generation == generation) {
+                self.order.items[write] = hash;
+                write += 1;
+            } else {
+                _ = self.states.remove(hash);
+            }
+        }
+        self.order.shrinkRetainingCapacity(write);
+    }
+
+    fn indexOf(self: *const QsetRequests, hash: [32]u8) ?usize {
+        for (self.order.items, 0..) |candidate, i| {
+            if (std.mem.eql(u8, &candidate, &hash)) return i;
+        }
+        return null;
+    }
+
+    fn deinit(self: *QsetRequests) void {
+        self.states.deinit(self.gpa);
+        self.order.deinit(self.gpa);
         self.* = undefined;
     }
 };
@@ -700,6 +997,18 @@ pub const Node = struct {
 
     engine_thread: ?std.Thread = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Last Engine stats observed at a completed input/drain boundary. The
+    /// engine thread publishes it; callers read only this copy, never the
+    /// live Engine containers owned by that thread.
+    stats_mu: std.Io.Mutex = .init,
+    stats_snapshot: engine.Stats = .{
+        .live_slots = 0,
+        .parked = 0,
+        .cached_qsets = 0,
+        .effects_queued = 0,
+        .stored_statement_bytes = 0,
+        .failed = false,
+    },
     /// False during synchronous restart replay (before the overlay binds);
     /// true once the node is serving the network. Effect dispatch suppresses
     /// network sends while false — restore rebroadcasts only need to populate
@@ -757,13 +1066,9 @@ pub const Node = struct {
     /// them (read on the wheel thread).
     purge_floor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// qset hashes this node actually asked the network for (bounded).
-    /// Guards the on-disk qset cache: unsolicited qset frames are still fed
-    /// to the engine (it validates + bounds its own memory cache) but are
-    /// never persisted — otherwise any peer could fill the disk (review
-    /// finding, §9.1 trust model).
-    qset_mu: std.Io.Mutex = .init,
-    req_qsets: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    /// Correlates requested qset responses before either queue admission or
+    /// persistence, with an Engine-pending-sized bound.
+    qset_requests: QsetRequests,
 
     /// Node-owned copies of the peer dial specs. The overlay's dialer threads
     /// re-parse these on every reconnect for the node's whole lifetime, so
@@ -1024,6 +1329,7 @@ pub const Node = struct {
             .watcher = opts.watcher or secret_seed == null,
             .eng = undefined,
             .q = .{ .gpa = gpa, .io = io },
+            .qset_requests = try QsetRequests.init(gpa, io, limits.max_pending_envelopes),
             .store = undefined,
             .wheel = undefined,
             .ov = undefined,
@@ -1164,6 +1470,14 @@ pub const Node = struct {
             // Consensus delivery resumes after the journal high-water mark.
             if (hwm + 1 > self.next_deliver) self.next_deliver = hwm + 1;
         }
+        // Rebuild the same host admission floor live delivery would have
+        // published. Recovery can contain up to 79 slots just before the next
+        // 64-slot compaction; restoring them all oldest-first would fill the
+        // Engine's 64-slot budget before reaching current state. An explicit
+        // start_slot also declares all earlier slots out of scope, including
+        // when the journal is empty or ends below it.
+        const recovery_floor = @max(opts.start_slot, purgeFloorForFrontier(self.next_deliver - 1));
+        self.purge_floor.store(recovery_floor, .release);
         // §10: externalized.log is the app-visible journal. A crash can land
         // between journal append and app consumption, so REPLAY the (compaction
         // -bounded) journal tail into the app stream — the app dedups by slot
@@ -1181,6 +1495,7 @@ pub const Node = struct {
         }
         if (!rec.own_log_corrupt) {
             for (rec.own_latest) |r| {
+                if (r.slot < recovery_floor) continue;
                 const clean = self.feedInput(.{
                     .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
                     .source_peer = null,
@@ -1201,6 +1516,7 @@ pub const Node = struct {
         if (self.failed.load(.acquire)) {
             return fail(diag, error.EngineFailed, "the node failed while restoring its state from {s} (see the preceding log line) and cannot start; check the filesystem and free space, or move the data_dir aside to start fresh.", .{opts.data_dir});
         }
+        self.publishStats();
 
         // ---- Go live ----
         self.ov.start() catch |e| switch (e) {
@@ -1398,7 +1714,7 @@ pub const Node = struct {
 
     /// Free every buffer the replay/restore inside `create` and the engine
     /// thread populate: the input queue's leftovers, own_latest, the
-    /// proposal queue, last_ext_value, ext_queue, pending_ext, req_qsets.
+    /// proposal queue, last_ext_value, ext_queue, pending_ext, qset requests.
     /// Shared by `deinit` and `create`'s unwind; safe on the zero state.
     /// Callers must have joined every thread that pushes or dispatches.
     fn freeAppBuffers(self: *Node) void {
@@ -1418,7 +1734,7 @@ pub const Node = struct {
             while (it.next()) |v| self.gpa.free(v.*);
             self.pending_ext.deinit(self.gpa);
         }
-        self.req_qsets.deinit(self.gpa);
+        self.qset_requests.deinit();
         self.hold.deinit(self.gpa);
     }
 
@@ -1487,14 +1803,32 @@ pub const Node = struct {
         return self.ext_queue.orderedRemove(0);
     }
 
-    /// Observability snapshot (racy counters). `.failed` is true when EITHER
-    /// the engine latched (§7.2 DriverFault/EngineFailed) or the node itself
-    /// went inert (`markFailed`: a hook refusal, a failed write-ahead append,
-    /// a buffering OOM) — a halted node must not report itself healthy.
+    /// Coherent observability snapshot published by the engine thread after
+    /// each complete input/effect drain. `.failed` is true when EITHER the
+    /// engine latched (§7.2 DriverFault/EngineFailed) or the node itself went
+    /// inert (`markFailed`: a hook refusal, a failed write-ahead append, a
+    /// buffering OOM) — a halted node must not report itself healthy.
     pub fn stats(self: *Node) engine.Stats {
-        var s = self.eng.stats();
+        self.stats_mu.lockUncancelable(self.io);
+        var s = self.stats_snapshot;
+        self.stats_mu.unlock(self.io);
         s.failed = s.failed or self.failed.load(.acquire);
         return s;
+    }
+
+    /// Native ingress pressure and drops. Experimental in v0.1.x; the
+    /// consensus Engine's Stable stats remain a separate snapshot.
+    pub fn ingressStats(self: *Node) IngressStats {
+        return self.q.snapshot();
+    }
+
+    /// Engine-owner only (or the creating thread before `engine_thread`
+    /// starts): take the live Engine snapshot, then publish the POD copy.
+    fn publishStats(self: *Node) void {
+        const s = self.eng.stats();
+        self.stats_mu.lockUncancelable(self.io);
+        self.stats_snapshot = s;
+        self.stats_mu.unlock(self.io);
     }
 
     pub fn boundPort(self: *Node) u16 {
@@ -1570,7 +1904,20 @@ pub const Node = struct {
     /// whole slot ahead of the frontier (catch-up) — and whenever an input
     /// moved the frontier the parked statements for the new frontier slot
     /// are fed next, before the next queued input is popped.
-    fn applyInput(self: *Node, item: InputItem) void {
+    fn applyInput(self: *Node, item_in: InputItem) void {
+        var item = item_in;
+        defer self.publishStats();
+        // A purge runs on the priority control lane and can therefore pass a
+        // local nomination that was already waiting in the ordinary FIFO.
+        // Re-check the monotonic host floor at apply-time: feeding that old
+        // nomination would recreate a slot the Engine has just purged and
+        // could make this node sign a fresh, incomparable statement for it.
+        if (item.input == .nominate and
+            item.input.nominate.slot < self.purge_floor.load(.acquire))
+        {
+            core.host_codec.freeInput(self.gpa, &item.input);
+            return;
+        }
         const before = self.next_deliver;
         if (item.input == .envelope_received and !self.failed.load(.acquire)) {
             switch (self.gateEnvelope(item)) {
@@ -1605,8 +1952,8 @@ pub const Node = struct {
 
     /// The hold gate (S8 D1 / S8b): `HoldBuffer.admit` over the decoded
     /// envelope, with the logging. `.feed` — the caller feeds it now: a
-    /// statement for the slot in progress or anything behind it (stale /
-    /// purged statements keep going to the engine, which answers as today),
+    /// statement for the slot in progress or anything behind it that remains
+    /// inside the answering window (purged statements are consumed here),
     /// a signer outside the quorum graph (the engine ignores it
     /// statelessly), a slot already released for catch-up, or a frame
     /// `envelopeMeta` cannot read (the engine says `insane`). `.ready` —
@@ -1614,7 +1961,26 @@ pub const Node = struct {
     /// the slot. `.consumed` — held or dropped.
     fn gateEnvelope(self: *Node, item: InputItem) Gate {
         const bytes = item.input.envelope_received.bytes;
-        const meta = envelopeMeta(self.gpa, self.network_id, bytes) catch return .feed;
+        const meta = envelopeMeta(self.gpa, self.network_id, bytes) catch |err| switch (err) {
+            // The engine can authoritatively classify malformed metadata, but
+            // allocation failure must not bypass the host's purge floor. It is
+            // pressure at network admission: consume the owned input and make
+            // the loss observable instead of giving a stale slot a second
+            // allocation attempt inside Engine.
+            error.OutOfMemory => {
+                var input = item.input;
+                core.host_codec.freeInput(self.gpa, &input);
+                self.q.recordNetworkDrop();
+                return .consumed;
+            },
+            else => return .feed,
+        };
+        if (meta.slot < self.purge_floor.load(.acquire)) {
+            var input = item.input;
+            core.host_codec.freeInput(self.gpa, &input);
+            _ = self.hold.dropped_behind.fetchAdd(1, .monotonic);
+            return .consumed;
+        }
         if (meta.slot <= self.next_deliver) return .feed;
         const in_graph = self.eng.qsets.inGraph(meta.node_id);
         switch (self.hold.admit(self.gpa, &meta, self.next_deliver, in_graph, &self.eng.cfg.quorum_set, item)) {
@@ -1640,7 +2006,10 @@ pub const Node = struct {
         var list = self.hold.takeSlot(slot) orelse return;
         defer list.deinit(self.gpa);
         for (list.items) |*e| {
-            if (self.failed.load(.acquire) or slot < self.next_deliver) {
+            if (self.failed.load(.acquire) or
+                slot < self.next_deliver or
+                slot < self.purge_floor.load(.acquire))
+            {
                 HoldBuffer.freeEntry(self.gpa, e);
                 _ = self.hold.dropped_behind.fetchAdd(1, .monotonic);
                 continue;
@@ -1663,7 +2032,10 @@ pub const Node = struct {
             defer list.deinit(self.gpa);
             const slot = self.next_deliver;
             for (list.items) |*e| {
-                if (self.failed.load(.acquire) or slot < self.next_deliver) {
+                if (self.failed.load(.acquire) or
+                    slot < self.next_deliver or
+                    slot < self.purge_floor.load(.acquire))
+                {
                     HoldBuffer.freeEntry(self.gpa, e);
                     _ = self.hold.dropped_behind.fetchAdd(1, .monotonic);
                     continue;
@@ -1688,6 +2060,7 @@ pub const Node = struct {
             core.host_codec.freeInput(self.gpa, &item.input);
             return true;
         }
+        defer self.qset_requests.reconcile(self.eng.pending.items.items);
         self.cur_source = item.source_peer;
         defer self.cur_source = null;
         self.eng.pushInput(item.input) catch |err| {
@@ -1869,11 +2242,15 @@ pub const Node = struct {
         // GC (§10): keep a 16-slot answering window behind the DELIVERED
         // frontier (never purge a slot the app has not consumed).
         const frontier = self.next_deliver - 1;
-        if (frontier >= purge_window) {
-            const max_slot = frontier - (purge_window - 1);
+        const window_floor = purgeFloorForFrontier(frontier);
+        if (window_floor != 0) {
+            // `start_slot` may establish a later permanent floor than the
+            // ordinary 16-slot calculation. GC can advance that declaration,
+            // never lower it after the first delivery.
+            const max_slot = @max(self.purge_floor.load(.acquire), window_floor);
             self.purge_floor.store(max_slot, .release);
             self.pruneOwnLatest(max_slot);
-            self.q.push(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
+            self.q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
             // §10 "and compacts": rewrite the logs occasionally so they do
             // not grow without bound (every 64 delivered slots). A drain may
             // deliver several buffered slots at once and land past a
@@ -1912,10 +2289,10 @@ pub const Node = struct {
     }
 
     /// If idle and a proposal is queued, nominate the head for current_slot.
-    /// OOM anywhere (the prev copy, the input enqueue) is rolled back — the
-    /// value goes back to the head and `nominating` stays clear — and
-    /// returned, so no proposal is ever silently dropped and the node never
-    /// latches "nominating" with nothing in flight (review finding).
+    /// Allocation/queue pressure is rolled back — the value goes back to the
+    /// head and `nominating` stays clear — and returned, so no proposal is ever
+    /// silently dropped or latched with nothing in flight. Queue closure is
+    /// the one exception: shutdown consumes the owned proposal quietly.
     fn maybeStartNomination(self: *Node) std.mem.Allocator.Error!void {
         if (self.watcher) return;
         // Held across the enqueue (q.mu is a leaf lock, never taken before
@@ -1933,8 +2310,18 @@ pub const Node = struct {
         // value + prev are owned; the input carries them, freed after push.
         self.q.tryPush(.{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = prev } }, .source_peer = null }) catch |e| {
             self.gpa.free(prev);
+            if (e == error.QueueClosed) {
+                // Shutdown consumes fire-and-forget local work quietly. The
+                // transactional queue left both allocations with us.
+                self.gpa.free(value);
+                return;
+            }
             self.proposal_queue.insertAssumeCapacity(0, value);
-            return e;
+            return switch (e) {
+                error.InputQueueFull => error.OutOfMemory,
+                error.OutOfMemory => error.OutOfMemory,
+                error.QueueClosed => unreachable,
+            };
         };
         self.nominating = true;
     }
@@ -2070,38 +2457,41 @@ pub const Node = struct {
     }
 
     fn enqueueEnvelope(self: *Node, framed_env: []const u8, source: usize) void {
-        const copy = self.gpa.dupe(u8, framed_env) catch return;
+        const copy = self.q.copyNetworkBytes(framed_env) orelse return;
         self.q.push(.{ .input = .{ .envelope_received = .{ .bytes = copy } }, .source_peer = source });
     }
 
-    /// Record a hash the engine asked the network for (engine thread).
-    /// Bounded: a full set is cleared — crude, but the set only ever holds
-    /// in-flight fetches and correctness never depends on membership.
+    /// Record or refresh a hash the engine asked the network for.
     fn noteQsetRequested(self: *Node, hash: [32]u8) void {
-        self.qset_mu.lockUncancelable(self.io);
-        defer self.qset_mu.unlock(self.io);
-        if (self.req_qsets.count() >= 256) self.req_qsets.clearRetainingCapacity();
-        self.req_qsets.put(self.gpa, hash, {}) catch {};
+        self.qset_requests.note(hash);
     }
 
     /// True (once) iff we asked for this hash (reader threads).
     fn consumeQsetRequested(self: *Node, hash: [32]u8) bool {
-        self.qset_mu.lockUncancelable(self.io);
-        defer self.qset_mu.unlock(self.io);
-        return self.req_qsets.remove(hash);
+        if (!self.qset_requests.claim(hash)) return false;
+        self.qset_requests.commit(hash);
+        return true;
     }
 
     fn onQsetFrame(self: *Node, framed_qset: []const u8) void {
-        // Persist for future getQset answers — but ONLY qsets we actually
-        // requested (disk-fill DoS otherwise: any peer could push unlimited
-        // unsolicited qsets into the cache). The engine is always fed; it
-        // validates and bounds its own in-memory cache.
-        const h = qsetHashOfFramed(self.gpa, framed_qset) catch null;
-        if (h) |hash| {
-            if (self.consumeQsetRequested(hash)) self.store.putQset(hash, framed_qset);
-        }
-        const copy = self.gpa.dupe(u8, framed_qset) catch return;
-        self.q.push(.{ .input = .{ .qset_received = .{ .bytes = copy } }, .source_peer = null });
+        // A qset frame is a response to request_qset, never an unsolicited
+        // advertisement. Correlate before either persistence or Engine
+        // admission so reader traffic cannot churn disk, memory or the input
+        // queue with values no current statement asked us to resolve.
+        const hash = qsetHashOfFramed(self.gpa, framed_qset) catch return;
+        if (!self.qset_requests.claim(hash)) return;
+        const copy = self.q.copyNetworkBytes(framed_qset) orelse {
+            self.qset_requests.release(hash);
+            return;
+        };
+        self.q.tryPush(.{ .input = .{ .qset_received = .{ .bytes = copy } }, .source_peer = null }) catch |err| {
+            self.gpa.free(copy);
+            if (err == error.InputQueueFull or err == error.OutOfMemory) self.q.recordNetworkDrop();
+            self.qset_requests.release(hash);
+            return;
+        };
+        self.qset_requests.commit(hash);
+        self.store.putQset(hash, framed_qset);
     }
 
     fn answerGetQset(self: *Node, peer_id: usize, hash: [32]u8) void {
@@ -2168,9 +2558,8 @@ fn qsetHashOfFramed(gpa: std.mem.Allocator, framed_qset: []const u8) ![32]u8 {
     const r = try gen_slcp.QuorumSet.Reader.init(&msg);
     var qs = try qset.fromReader(gpa, r);
     defer qs.deinit(gpa);
-    const flat = try qset.canonicalBytes(gpa, &qs);
-    defer gpa.free(flat);
-    return crypto.qsetHash(flat);
+    try qset.validateAndNormalize(gpa, &qs);
+    return qset.hashNormalized(gpa, &qs);
 }
 
 fn ownedQsetToFramed(gpa: std.mem.Allocator, qs: *const qset.QuorumSetOwned) ![]u8 {
@@ -2224,8 +2613,9 @@ test "node: every method compiles (forces body analysis without instantiation)" 
 }
 
 test "InputQueue: push, pop, and close over std.Io primitives" {
+    const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var q = InputQueue{ .gpa = std.testing.allocator, .io = io };
+    var q = InputQueue{ .gpa = gpa, .io = io };
     defer q.deinit();
 
     q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 5 } }, .source_peer = null });
@@ -2237,7 +2627,434 @@ test "InputQueue: push, pop, and close over std.Io primitives" {
     try std.testing.expectEqual(@as(u64, 6), b.input.purge_slots.max_slot);
 
     q.close();
+    // The transactional API must tell its caller that admission did not
+    // happen and leave ownership untouched. This is what lets qset ingress
+    // release its request claim instead of committing/persisting a response
+    // which never reached the Engine.
+    const closing_bytes = try gpa.dupe(u8, "closing");
+    try std.testing.expectError(error.QueueClosed, q.tryPush(.{
+        .input = .{ .qset_received = .{ .bytes = closing_bytes } },
+        .source_peer = null,
+    }));
+    gpa.free(closing_bytes);
+
+    // The fire-and-forget wrapper still consumes ownership quietly during
+    // shutdown and does not misclassify intentional closure as pressure.
+    const ignored_bytes = try gpa.dupe(u8, "ignored");
+    q.push(.{ .input = .{ .envelope_received = .{ .bytes = ignored_bytes } }, .source_peer = 1 });
+    try std.testing.expectEqual(@as(usize, 0), q.snapshot().dropped_network_inputs);
+
+    // `close` stops external producers but the engine owner may still emit a
+    // purge while draining the items that were already queued. That barrier
+    // must run before `pop` finally reports the closed queue empty.
+    q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 7 } }, .source_peer = null });
+    const closing_purge = q.pop() orelse return error.MissingClosingPurge;
+    try std.testing.expectEqual(@as(u64, 7), closing_purge.input.purge_slots.max_slot);
     try std.testing.expect(q.pop() == null); // closed + drained
+}
+
+// Allocation failure while extending the queue is ingress pressure just like
+// hitting its explicit item/byte caps. The payload has already been accepted
+// from the network and must be consumed and counted exactly once.
+test "InputQueue: network allocation pressure is counted and consumes ownership" {
+    const io = std.testing.io;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const gpa = failing.allocator();
+    var q = InputQueue{ .gpa = gpa, .io = io };
+    defer q.deinit();
+
+    const bytes = try gpa.dupe(u8, "x");
+    q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
+
+    const ingress = q.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), ingress.queued_items);
+    try std.testing.expectEqual(@as(usize, 0), ingress.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 1), ingress.dropped_network_inputs);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "InputQueue: network copy allocation pressure is counted" {
+    const io = std.testing.io;
+    var storage: [0]u8 = .{};
+    var fba = std.heap.FixedBufferAllocator.init(&storage);
+    {
+        var closed_q = InputQueue{ .gpa = fba.allocator(), .io = io };
+        defer closed_q.deinit();
+        closed_q.close();
+        try std.testing.expect(closed_q.copyNetworkBytes("frame") == null);
+        try std.testing.expectEqual(@as(usize, 0), closed_q.snapshot().dropped_network_inputs);
+    }
+
+    var open_q = InputQueue{ .gpa = fba.allocator(), .io = io };
+    defer open_q.deinit();
+    try std.testing.expect(open_q.copyNetworkBytes("frame") == null);
+    try std.testing.expectEqual(@as(usize, 1), open_q.snapshot().dropped_network_inputs);
+}
+
+// Network work may occupy at most 960 of the queue's 1024 item budget. The
+// remaining 64 entries are reserved for local proposals and timers so a full
+// set of reader threads cannot starve progress work (purges use their own
+// coalesced control lane). The 961st network input must be dropped.
+test "InputQueue: network inputs leave reserved capacity for progress work" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = InputQueue{ .gpa = gpa, .io = io };
+    defer q.deinit();
+
+    for (0..961) |_| {
+        const bytes = try gpa.dupe(u8, "x");
+        q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
+    }
+
+    try std.testing.expectEqual(@as(usize, 960), q.items.items.len - q.head);
+    try std.testing.expectEqual(@as(usize, 1), q.dropped_network.load(.acquire));
+    const ingress = q.snapshot();
+    try std.testing.expectEqual(@as(usize, 960), ingress.queued_items);
+    try std.testing.expectEqual(@as(usize, 960), ingress.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 1), ingress.dropped_network_inputs);
+
+    q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 7 } }, .source_peer = null });
+    try std.testing.expectEqual(@as(usize, 961), q.items.items.len - q.head);
+}
+
+// The byte budget has the same reservation rule: network frames may occupy
+// 15 MiB of the 16 MiB aggregate queue, leaving 1 MiB for progress inputs.
+test "InputQueue: network bytes are bounded independently of item count" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = InputQueue{ .gpa = gpa, .io = io };
+    defer q.deinit();
+
+    for (0..15) |_| {
+        const bytes = try gpa.alloc(u8, 1024 * 1024);
+        q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
+    }
+    const overflow = try gpa.dupe(u8, "x");
+    q.push(.{ .input = .{ .envelope_received = .{ .bytes = overflow } }, .source_peer = 1 });
+
+    try std.testing.expectEqual(@as(usize, 15), q.items.items.len - q.head);
+    const local_value = try gpa.alloc(u8, 1024 * 1024);
+    const local_prev = try gpa.dupe(u8, "");
+    q.push(.{ .input = .{ .nominate = .{ .slot = 8, .value = local_value, .prev_value = local_prev } }, .source_peer = null });
+    try std.testing.expectEqual(@as(usize, 16), q.items.items.len - q.head);
+}
+
+// A head-index FIFO is not bounded merely because its live suffix is bounded:
+// if the queue never becomes empty, consumed prefix cells otherwise accumulate
+// forever while every replacement appends at the physical end.
+test "InputQueue: sustained non-empty churn bounds live and backing item storage" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = InputQueue{ .gpa = gpa, .io = io };
+    defer q.deinit();
+
+    const network_limit = InputQueue.max_items - InputQueue.reserved_progress_items;
+    for (0..network_limit) |_| {
+        const bytes = try gpa.dupe(u8, "x");
+        q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
+    }
+    var observed_backing_items = q.items.items.len;
+    for (0..InputQueue.max_items * 4) |_| {
+        var consumed = q.pop().?;
+        core.host_codec.freeInput(gpa, &consumed.input);
+        const bytes = try gpa.dupe(u8, "x");
+        q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
+        observed_backing_items = @max(observed_backing_items, q.items.items.len);
+    }
+
+    const ingress = q.snapshot();
+    try std.testing.expectEqual(network_limit, ingress.queued_items);
+    try std.testing.expectEqual(network_limit, ingress.queued_bytes);
+    try std.testing.expect(observed_backing_items <= InputQueue.max_backing_items);
+    try std.testing.expect(q.items.capacity <= InputQueue.max_backing_items);
+    try std.testing.expect(q.head < InputQueue.max_items);
+}
+
+// The host raises purge_floor while dispatching an externalization, then
+// queues the matching Engine purge. It must be admitted even when ordinary
+// ingress has filled every item slot, and must overtake already queued qset
+// responses; otherwise one can unpark a now-expired statement in the gap.
+test "InputQueue: purge work is coalesced outside a full ordinary backlog and overtakes it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = InputQueue{ .gpa = gpa, .io = io };
+    defer q.deinit();
+
+    for (0..InputQueue.max_items - InputQueue.reserved_progress_items) |_| {
+        const env = try gpa.dupe(u8, "e");
+        q.push(.{ .input = .{ .envelope_received = .{ .bytes = env } }, .source_peer = 1 });
+    }
+    for (0..InputQueue.reserved_progress_items) |i| {
+        q.push(.{ .input = .{ .timer_fired = .{ .slot = i, .timer = .nomination } }, .source_peer = null });
+    }
+    try std.testing.expectEqual(InputQueue.max_items, q.snapshot().queued_items);
+
+    q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 9 } }, .source_peer = null });
+    q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 7 } }, .source_peer = null });
+    q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 11 } }, .source_peer = null });
+    try std.testing.expectEqual(InputQueue.max_items + 1, q.snapshot().queued_items);
+
+    var first = q.pop().?;
+    defer core.host_codec.freeInput(gpa, &first.input);
+    try std.testing.expect(first.input == .purge_slots);
+    try std.testing.expectEqual(@as(u64, 11), first.input.purge_slots.max_slot);
+    try std.testing.expectEqual(InputQueue.max_items, q.snapshot().queued_items);
+}
+
+test "QsetRequests: bounded LRU preserves refreshed work and releases claims" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const max_pending = (core.limits.Limits{}).max_pending_envelopes;
+    const max_hashes = @as(usize, @intCast(max_pending)) + 1;
+    var requests = try QsetRequests.init(gpa, io, max_pending);
+    defer requests.deinit();
+
+    const active: [32]u8 = @splat(0xff);
+    requests.note(active);
+    for (0..max_hashes - 1) |i| {
+        var hash: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, hash[0..8], @intCast(i + 1), .little);
+        requests.note(hash);
+    }
+    try std.testing.expectEqual(max_hashes, requests.states.count());
+
+    // A repeated Engine request represents newly parked work and refreshes
+    // the hash before one more distinct request forces an eviction.
+    requests.note(active);
+    var newest: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, newest[0..8], max_hashes + 1, .little);
+    requests.note(newest);
+    try std.testing.expectEqual(max_hashes, requests.states.count());
+    try std.testing.expect(requests.claim(active));
+    try std.testing.expect(!requests.claim(active));
+    requests.release(active);
+    try std.testing.expect(requests.claim(active));
+    requests.commit(active);
+    try std.testing.expect(!requests.claim(active));
+}
+
+test "QsetRequests: pending reconciliation removes stale purge tokens" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const max_pending = (core.limits.Limits{}).max_pending_envelopes;
+    const max_hashes = @as(usize, @intCast(max_pending)) + 1;
+    var requests = try QsetRequests.init(gpa, io, max_pending);
+    defer requests.deinit();
+
+    const Parked = struct { needed_hash: [32]u8 };
+    const active: [32]u8 = @splat(0xfe);
+    requests.note(active);
+
+    // Model repeated low-slot work being purged while one older high-slot
+    // envelope remains parked. Without exact reconciliation, those stale
+    // request tokens eventually evict the live hash from a bounded LRU.
+    for (0..max_hashes * 2) |i| {
+        var churn: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, churn[0..8], @intCast(i + 1), .little);
+        requests.note(churn);
+        const parked = [_]Parked{
+            .{ .needed_hash = active },
+            .{ .needed_hash = churn },
+        };
+        requests.reconcile(&parked);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), requests.states.count());
+    try std.testing.expect(requests.claim(active));
+}
+
+// Native qset frames are responses, not advertisements. An unsolicited frame
+// must not reach the semantic Engine cache; otherwise reader traffic can churn
+// qset state without any preceding request_qset effect.
+test "qset ingress: only a requested frame enters the engine" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const seed: [32]u8 = @splat(0x62);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "qset ingress correlation v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    const remote = try crypto.publicKeyFromSeed(@splat(0x63));
+    var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
+    defer remote_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &remote_qset);
+    const framed = try ownedQsetToFramed(gpa, &remote_qset);
+    defer gpa.free(framed);
+
+    n.onQsetFrame("malformed");
+    n.onQsetFrame(framed);
+    try std.testing.expectEqual(@as(usize, 0), n.ingressStats().dropped_network_inputs);
+
+    const requested_node = try crypto.publicKeyFromSeed(@splat(0x64));
+    var requested_qset = try Quorum.of(1, &.{requested_node}).toOwned(gpa);
+    defer requested_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &requested_qset);
+    const requested_hash = try qset.hashNormalized(gpa, &requested_qset);
+    const requested_framed = try ownedQsetToFramed(gpa, &requested_qset);
+    defer gpa.free(requested_framed);
+    n.noteQsetRequested(requested_hash);
+    n.onQsetFrame(requested_framed);
+
+    n.q.close();
+    if (n.engine_thread) |thread| thread.join();
+    n.engine_thread = null;
+    try std.testing.expectEqual(@as(usize, 2), n.stats().cached_qsets);
+}
+
+// Closing the queue is not successful admission. A requested qset which
+// races shutdown remains unconsumed and is not persisted, while the frame
+// copy remains owned by the caller of tryPush and is released exactly once.
+test "qset ingress: closed queue releases the request and does not persist" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x6a);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "qset ingress shutdown v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    n.q.close();
+    if (n.engine_thread) |thread| thread.join();
+    n.engine_thread = null;
+
+    const remote = try crypto.publicKeyFromSeed(@splat(0x6b));
+    var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
+    defer remote_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &remote_qset);
+    const hash = try qset.hashNormalized(gpa, &remote_qset);
+    const framed = try ownedQsetToFramed(gpa, &remote_qset);
+    defer gpa.free(framed);
+
+    n.noteQsetRequested(hash);
+    n.onQsetFrame(framed);
+
+    try std.testing.expect(n.consumeQsetRequested(hash));
+    const persisted = try n.store.getQset(gpa, hash);
+    defer if (persisted) |bytes| gpa.free(bytes);
+    try std.testing.expectEqual(@as(?[]u8, null), persisted);
+    try std.testing.expectEqual(@as(usize, 0), n.ingressStats().dropped_network_inputs);
+}
+
+// Request hashes name the normalized quorum set, while a valid peer may send
+// an equivalent tree whose members have not yet been sorted. Correlation must
+// use the same validate-and-normalize rule as the Engine or the response is
+// mistaken for an unsolicited frame and the parked envelope never resumes.
+test "qset ingress: correlation hashes the normalized quorum set" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x67);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "qset normalized correlation v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    const a = try crypto.publicKeyFromSeed(@splat(0x68));
+    const b = try crypto.publicKeyFromSeed(@splat(0x69));
+    var wire_qset = try Quorum.of(2, &.{ b, a }).toOwned(gpa);
+    defer wire_qset.deinit(gpa);
+    const framed = try ownedQsetToFramed(gpa, &wire_qset);
+    defer gpa.free(framed);
+
+    var normalized = try Quorum.of(2, &.{ b, a }).toOwned(gpa);
+    defer normalized.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &normalized);
+    const hash = try qset.hashNormalized(gpa, &normalized);
+    n.noteQsetRequested(hash);
+    n.onQsetFrame(framed);
+
+    try std.testing.expect(!n.consumeQsetRequested(hash));
+}
+
+// Correlation is a claim, not consumption until the response has actually
+// entered the engine queue. Under ingress pressure a valid requested response
+// must remain retryable and must not be persisted as though it were accepted.
+test "qset ingress: queue pressure preserves the request for retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x65);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var hook: PausingStatsHook = .{};
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "qset ingress retry v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .delivery = hook.hook(),
+        .diagnostic = &diag,
+    });
+    defer {
+        hook.release.store(true, .release);
+        n.deinit();
+    }
+
+    try n.propose("pause");
+    try pollUntil(io, 10_000, &hook, PausingStatsHook.hasEntered);
+    for (0..InputQueue.max_items - InputQueue.reserved_progress_items) |_| {
+        n.enqueueEnvelope("x", 1);
+    }
+    try std.testing.expectEqual(
+        InputQueue.max_items - InputQueue.reserved_progress_items,
+        n.ingressStats().queued_items,
+    );
+
+    const remote = try crypto.publicKeyFromSeed(@splat(0x66));
+    var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
+    defer remote_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &remote_qset);
+    const hash = try qset.hashNormalized(gpa, &remote_qset);
+    const framed = try ownedQsetToFramed(gpa, &remote_qset);
+    defer gpa.free(framed);
+
+    n.noteQsetRequested(hash);
+    n.onQsetFrame(framed);
+
+    try std.testing.expectEqual(@as(usize, 1), n.ingressStats().dropped_network_inputs);
+    try std.testing.expect(n.consumeQsetRequested(hash));
+    try std.testing.expectEqual(@as(?[]u8, null), try n.store.getQset(gpa, hash));
 }
 
 // -- delivery hook + create() reorder (M6 S3) ---------------------------------
@@ -2395,6 +3212,148 @@ test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascen
         try std.testing.expectEqualSlices(u64, &[_]u64{3}, hook.slots.items); // stopped at the refusal
         try std.testing.expect(hook.failed_with == null); // create failed; no latch, no on_failed
     }
+}
+
+// A normal compaction at frontier 64 leaves slots 49..64, after which a
+// crash just before frontier 128 can leave slots 49..127 in both logs. The
+// restart must derive the answering floor from the durable high-water mark
+// before restoring own.log. Otherwise the oldest 64 slots fill the Engine,
+// the newest statements are silently rejected as over-limit, and slot 128
+// cannot be nominated.
+test "restart recovery rebuilds the purge floor before restoring the retained own-log window" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const passphrase = "restart purge-floor recovery v1";
+    const seed: [32]u8 = @splat(0x43);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer_a: [32]u8 = @splat(0x77);
+    const peer_b: [32]u8 = @splat(0x78);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+
+    // This is exactly the record range left by the 64-slot compaction cadence
+    // immediately before its next boundary: 16 retained slots plus 63 newer
+    // ones. Keep one latest own EXTERNALIZE per slot.
+    {
+        var st = try store_mod.Store.open(gpa, io, data_dir);
+        defer st.deinit();
+        var slot: u64 = 49;
+        while (slot <= 127) : (slot += 1) {
+            var value_buf: [16]u8 = undefined;
+            const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{slot});
+            try st.appendExternalized(slot, value);
+            const env = try buildSignedExternalize(gpa, seed, network_id, slot, value);
+            try st.appendOwn(slot, env);
+            gpa.free(env);
+        }
+    }
+
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    const expected_floor: u64 = 127 - (purge_window - 1);
+    try std.testing.expectEqual(@as(u64, 128), n.next_deliver);
+    try std.testing.expectEqual(expected_floor, n.purge_floor.load(.acquire));
+    try std.testing.expectEqual(@as(usize, purge_window), n.stats().live_slots);
+
+    // The current proposal must still fit: before the fix, stale restored
+    // slots consumed all 64 live-slot entries and this never reached 65.
+    try n.propose("fresh-after-restart");
+    try pollUntil(io, 2_000, n, struct {
+        fn admitted(node: *Node) bool {
+            return node.stats().live_slots == @as(usize, purge_window + 1);
+        }
+    }.admitted);
+}
+
+// `start_slot` is another durable-frontier declaration: even without a
+// journal, the host must not let old peer traffic populate the Engine below
+// it. Leaving purge_floor at zero lets 64 historical slots exhaust the live
+// slot budget before the first configured slot is proposed.
+test "explicit start slot establishes the startup purge floor before peer ingress" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const passphrase = "explicit startup purge floor v1";
+    const seed: [32]u8 = @splat(0x44);
+    const peer_seed: [32]u8 = @splat(0x45);
+    const third_seed: [32]u8 = @splat(0x46);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const peer = try crypto.publicKeyFromSeed(peer_seed);
+    const third = try crypto.publicKeyFromSeed(third_seed);
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.twoThirdsOf(&.{ me, peer, third }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .start_slot = 100,
+    });
+    defer n.deinit();
+
+    try std.testing.expectEqual(@as(u64, 100), n.purge_floor.load(.acquire));
+    const stale = try buildSignedStatement(gpa, peer_seed, n.network_id, n.local_qset_hash, 99, .{ .nominate = "stale" });
+    defer gpa.free(stale);
+    n.q.push(try envelopeItem(gpa, stale));
+    try pollUntil(io, 2_000, n, struct {
+        fn rejected(node: *Node) bool {
+            return node.hold.dropped_behind.load(.acquire) == 1;
+        }
+    }.rejected);
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+
+    try n.propose("slot-100");
+    try pollUntil(io, 2_000, n, struct {
+        fn admitted(node: *Node) bool {
+            return node.stats().live_slots == 1;
+        }
+    }.admitted);
+}
+
+// `start_slot` is a permanent out-of-scope declaration, not merely the
+// startup value of the floor. The ordinary answering-window calculation for
+// the first delivered high slot may be lower and must never move it backward.
+test "explicit start slot remains the purge floor after the first delivery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x47);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const n = try Node.create(gpa, io, .{
+        .network = "explicit startup purge floor stays monotonic v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .start_slot = 100,
+    });
+    defer n.deinit();
+
+    try n.propose("slot-100");
+    const decided = n.waitExternalized(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
+    defer gpa.free(decided.value);
+    try std.testing.expectEqual(@as(u64, 100), decided.slot);
+    try std.testing.expectEqual(@as(u64, 100), n.purge_floor.load(.acquire));
 }
 
 // -- M6:example logs: peer up/down wiring ------------------------------------
@@ -2558,6 +3517,83 @@ test "compaction cadence: a drain that ends on 64 compacts, and so does a drain 
 }
 
 // -- S8 D2: stats().failed reflects the node-level inert latch ------------------
+
+const PausingStatsHook = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn onExternalized(ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void {
+        _ = slot;
+        _ = value;
+        const self: *PausingStatsHook = @ptrCast(@alignCast(ctx));
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn onFailed(ctx: *anyopaque, _: anyerror) void {
+        const self: *PausingStatsHook = @ptrCast(@alignCast(ctx));
+        self.release.store(true, .release);
+    }
+
+    fn hook(self: *PausingStatsHook) DeliveryHook {
+        return .{ .ctx = @ptrCast(self), .on_externalized = onExternalized, .on_failed = onFailed };
+    }
+
+    fn hasEntered(self: *PausingStatsHook) bool {
+        return self.entered.load(.acquire);
+    }
+};
+
+// A Node stats snapshot describes a completed input/drain boundary, not the
+// Engine's mutable internals halfway through dispatch. The delivery hook
+// deliberately parks the engine thread while its externalized effect is still
+// queued; callers on another thread must continue to observe the previously
+// published, fully-drained snapshot. Reading `self.eng.stats()` directly
+// returns effects_queued >= 1 here (and races whenever dispatch is not parked).
+test "stats: readers see the last fully-drained snapshot while the engine thread is dispatching" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x59);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var hook: PausingStatsHook = .{};
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "stats snapshot boundary v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .delivery = hook.hook(),
+        .diagnostic = &diag,
+    });
+    defer {
+        hook.release.store(true, .release);
+        n.deinit();
+    }
+
+    const ingress = n.ingressStats();
+    try std.testing.expectEqual(@as(usize, 0), ingress.queued_items);
+    try std.testing.expectEqual(@as(usize, 0), ingress.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 0), ingress.dropped_network_inputs);
+    try std.testing.expectEqual(@as(usize, 0), n.stats().effects_queued);
+    try n.propose("one");
+    try pollUntil(io, 10_000, &hook, PausingStatsHook.hasEntered);
+
+    try std.testing.expectEqual(@as(usize, 0), n.stats().effects_queued);
+    hook.release.store(true, .release);
+    const Published = struct {
+        fn completed(node: *Node) bool {
+            return node.stats().live_slots == 1;
+        }
+    };
+    try pollUntil(io, 10_000, n, Published.completed);
+    try std.testing.expectEqual(@as(usize, 0), n.stats().effects_queued);
+}
 
 // Non-vacuity: `Node.stats()` returning `self.eng.stats()` verbatim (the
 // engine's own DriverFault/EngineFailed latch only) leaves `.failed` false
@@ -3368,6 +4404,157 @@ const GateProbe = struct {
         return n.stats().live_slots >= 2;
     }
 };
+
+// The host purge floor is the admission floor, not merely a timer hint. Once
+// slots below 5 have been purged, a late valid envelope for slot 4 must be
+// consumed without recreating Engine state; slot 5 remains admissible.
+test "hold gate: peer envelopes below the purge floor cannot recreate slots" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    n.next_deliver = 20;
+    n.purge_floor.store(5, .release);
+    n.applyInput(try f.item(n, f.seed_a, 4, .{ .nominate = "old" }));
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expectEqual(@as(u64, 1), n.hold.dropped_behind.load(.acquire));
+
+    n.applyInput(try f.item(n, f.seed_a, 5, .{ .nominate = "edge" }));
+    try std.testing.expectEqual(@as(usize, 1), n.stats().live_slots);
+}
+
+// Metadata parsing is only an optimization for malformed/current traffic,
+// but it is the host's sole purge-floor gate. A transient allocation failure
+// there must drop the network item; feeding it to the Engine lets the second
+// parse succeed and recreate a retired slot because the Engine does not know
+// the host floor.
+test "hold gate: metadata OOM fails closed below the purge floor" {
+    const io = std.testing.io;
+    var fail_once = ThreadFailOnce{ .backing = std.testing.allocator, .tid = std.Thread.getCurrentId() };
+    const gpa = fail_once.allocator();
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    n.next_deliver = 20;
+    n.purge_floor.store(5, .release);
+    const stale = try f.item(n, f.seed_a, 4, .{ .nominate = "old" });
+    fail_once.arm(0);
+    n.applyInput(stale);
+    fail_once.disarm();
+
+    try std.testing.expect(fail_once.fired);
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expectEqual(@as(usize, 1), n.ingressStats().dropped_network_inputs);
+}
+
+// A priority purge may overtake local work that was already in the ordinary
+// FIFO. The host floor therefore has to be re-checked when that work is
+// applied: otherwise the stale nomination recreates the just-purged Engine
+// slot and can sign a statement incomparable with the durable one.
+test "purge floor: an overtaken local nomination cannot recreate a purged slot" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    n.purge_floor.store(5, .release);
+    n.applyInput(.{ .input = .{ .purge_slots = .{ .max_slot = 5 } }, .source_peer = null });
+    const stale_value = try gpa.dupe(u8, "stale");
+    const stale_prev = gpa.dupe(u8, "previous") catch |err| {
+        gpa.free(stale_value);
+        return err;
+    };
+    n.applyInput(.{ .input = .{ .nominate = .{
+        .slot = 4,
+        .value = stale_value,
+        .prev_value = stale_prev,
+    } }, .source_peer = null });
+
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expect(n.eng.slots.get(4) == null);
+    n.own_mu.lockUncancelable(io);
+    const stale_latest_absent = n.own_latest.get(4) == null;
+    n.own_mu.unlock(io);
+    try std.testing.expect(stale_latest_absent);
+
+    const edge_value = try gpa.dupe(u8, "edge");
+    const edge_prev = gpa.dupe(u8, "previous") catch |err| {
+        gpa.free(edge_value);
+        return err;
+    };
+    n.applyInput(.{ .input = .{ .nominate = .{
+        .slot = 5,
+        .value = edge_value,
+        .prev_value = edge_prev,
+    } }, .source_peer = null });
+    try std.testing.expectEqual(@as(usize, 1), n.stats().live_slots);
+}
+
+// A statement may have entered the hold buffer before the delivery frontier
+// advanced. Re-check the purge floor when releasing, or that retained item can
+// recreate state even though direct admission now rejects the same slot.
+test "hold gate: held envelopes are checked against the purge floor again on release" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try GateFixture.init(gpa, io);
+    defer f.deinit();
+    const me = try crypto.publicKeyFromSeed(@splat(0x42));
+    const n = try Node.create(gpa, io, .{
+        .network = GateFixture.passphrase,
+        .secret_seed = @splat(0x42),
+        .quorum = Quorum.twoThirdsOf(&.{ me, try crypto.publicKeyFromSeed(f.seed_a), try crypto.publicKeyFromSeed(f.seed_b) }),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+
+    n.applyInput(try f.item(n, f.seed_a, 3, .{ .nominate = "held-old" }));
+    try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+    n.next_deliver = 3;
+    n.purge_floor.store(4, .release);
+    n.releaseHeld();
+    n.publishStats();
+
+    try std.testing.expectEqual(@as(usize, 0), n.stats().live_slots);
+    try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), n.hold.dropped_behind.load(.acquire));
+}
 
 // Pins the S8 D1 finding (state-dependent validate + engine verdict cache +
 // sticky fully_validated: a node one slot behind that sees the next slot's

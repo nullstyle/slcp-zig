@@ -74,6 +74,22 @@ Per-peer budgets, copied from `src/node/overlay.zig` (protocol §12):
 | a connection that never sends `Hello` | `handshake_timeout_s` = 10 s absolute deadline on the read operation |
 | frame size | `max_frame_bytes = 1 MiB`; larger ⇒ framing error ⇒ disconnect |
 
+After transport decoding, the native Engine-input queue is independently
+bounded to 1,024 items / 16 MiB. Network work is capped at 960 items / 15 MiB,
+leaving 64 items / 1 MiB for local progress; network admission losses are
+visible through `Node.ingressStats()`. Admission fails closed under host
+allocation pressure, including hold-gate metadata decoding, so an old envelope
+cannot bypass the floor through a second parse attempt. A coalesced purge
+watermark lives outside those budgets and overtakes the FIFO. The host therefore rechecks its
+monotonic purge floor when applying queued work: late peer or held envelopes
+and an overtaken local nomination cannot recreate a retired slot. This
+apply-time check is essential—enqueue-time admission can become stale while
+the item waits behind attacker-controlled traffic. On restart, the same floor
+is reconstructed from the journal high-water mark and explicit `start_slot`
+before any own statement is restored or network input is accepted. Own-log
+records below it are skipped, so an uncompacted disk tail cannot consume the
+Engine slot budget with retired history.
+
 **Amplification surfaces.** `getQset` (answered with one cached qset frame,
 bounded by depth ≤ 4 / ≤ 255 validators) and `getSlotState` (answered with at
 most 64 of *our own* envelopes). Both are **per-request fan-out only**:
@@ -86,16 +102,112 @@ envelope citing an unknown qset hash parks until the qset arrives —
 4`, FIFO eviction (each eviction is a `phase_event(parked_evicted)`).
 EXTERNALIZE statements never park.
 
+**Quorum-set cache** (`src/engine/qset_store.zig`): the configured
+`max_cached_qsets` bound includes the mandatory local set and every distinct
+qset carried by a live stored remote NOMINATE, PREPARE, or CONFIRM statement.
+EXTERNALIZE uses a synthetic sender singleton, so its commit-qset hash is not a
+live cache reference. The local set is permanently pinned and live statement
+references are never eviction victims. A qset rotation may use exactly one
+additional active entry while multiple old statements move from A to X;
+unrelated new references and a second overflow are rejected as `over_limit`.
+Thus for a nonzero configured bound N, steady live retention is at most N
+qsets, or N + 1 while that one rotation is incomplete. A fetched qset is
+separately leased only for its replay input, so
+the absolute resident-cache peak is N + 2 when a different response arrives
+during an incomplete rotation; releasing the input lease immediately evicts
+that unreferenced response. `max_cached_qsets = 0` is a special local-only
+mode: rotation overflow is disabled, steady residency is exactly the local
+qset, and one fetched in-flight response can make the transient peak two.
+Native request correlation prevents unsolicited or malformed qset frames from
+reaching either the Engine or persistence. The on-disk `qsets/` cache has no
+pruning policy, however: a relevant signer can drive a serial stream of valid,
+requested qset rotations whose files accumulate for the lifetime of the data
+directory even though in-memory residency remains bounded. Writes are
+best-effort, so exhaustion is logged rather than consensus-fatal, but disk
+usage remains an operator-visible residual risk.
+
+Statement identity remains exact: graph reachability is derived from the
+union of the exact qsets on all live non-EXTERNALIZE statements, not a
+process-global "last advertisement," and every quorum calculation uses the
+statement's exact qset or EXTERNALIZE's synthetic singleton. The *published
+relevance graph* is exact at a
+checkpoint but deliberately conservative between checkpoints. Pure additions
+chase only the newly added hash. An ordinary last node→hash removal leaves the
+old nodes in a superset and opens a 64-update generation instead of traversing
+the entire graph on attacker-controlled replacement traffic. There are no
+relevance false negatives. A recently disconnected signer is a temporary
+false positive: its valid input may be held, parked, stored, forwarded, and
+processed, but its stale graph edge cannot make that signer count in an exact
+quorum calculation.
+
+The periodic exact checkpoint occurs on the generation's 64th qualifying
+update. Successful statement-reference updates qualify. So does each
+signature-verified unknown-qset envelope that reaches the Engine from a signer
+already in the published graph: the Engine advances the counter and rechecks
+exact membership when necessary **before slot admission and parking**. This
+prevents Engine-level unknown-qset parking churn from preserving a stale
+member, without letting an arbitrary outside key force rebuild work. Qset
+replay batches and every slot purge are exact checkpoints as well. Known-qset
+input rejected before a reference commit—including stale, live-slot, or
+capacity rejects—does not qualify. A future-slot envelope intercepted by the
+native hold buffer does not qualify until it is released to the Engine either;
+while held, replacement, window, entry, and byte caps bound it. Therefore the
+generation can remain conservative indefinitely in wall-clock time and total
+received inputs if none of the qualifying events occurs; 64 is a mutation/
+growth bound, not an input-duration claim. Such rejected traffic adds no qset
+reference, pending envelope, or live statement; any slot admitted before a
+later budget rejection remains under `max_live_slots`. The input still consumes
+bounded verification and parsing CPU.
+
+Memory remains bounded during the grace generation. For a nonzero configured
+cache bound N, the active graph-contributing set is at most N + 1 qset bodies
+(including the sole rotation overflow). At most one body can retire per
+qualifying reference update, so an ordinary generation adds validator ids from
+at most 64 retired bodies: at most 16,320 ids / 510 KiB of raw 32-byte keys,
+plus hash-table overhead. A qset replay batch starts from that bounded graph;
+because every waiter taken by one response cites the same newly fetched hash,
+the batch can add at most one more body before its exact final rebuild. The
+published graph therefore contains at most `1 + 255 * (N + 1 + 64)` ids outside
+replay and at most `1 + 255 * (N + 2 + 64)` transiently during replay, with the
+leading one for the explicit local-node root and duplicates reducing the
+result. False-positive statements remain under `max_live_slots` and the 20 MiB
+stored-statement budget; unknown-qset parking remains under 1,024 entries /
+8 MiB / four per signer; the native hold buffer remains under 1,024 entries /
+8 MiB; and exact qset refcounts and cache capacity are unchanged.
+
+An exact rebuild's work is bounded by unique live node/hash associations under
+the stored-statement budget and at most N + 1 active qsets × 255 validators.
+Each distinct reachable qset body is walked once and each validator enters the
+frontier once. Thus the periodic full traversal costs O(W) once per 64
+qualifying updates rather than once per replacement (amortized O(W/64)), at
+the cost of a deterministic O(W) latency spike on the checkpointing input.
+The rebuild stages a new graph, frontier, and per-traversal hash-dedup set next
+to the old published graph, so its transient allocation is O(old graph + W)
+under the node-count bounds above. Slot purge batches all retired references
+into one rebuild, and a qset response
+publishes one exact post-replay graph after processing up to the 1,024 parked-
+envelope cap. An exact rebuild is staged before publication: allocation failure
+leaves the old conservative graph intact and the generation counter saturated
+for a retry, then becomes a terminal sticky Engine failure. Reference mutations
+already committed remain ownership-safe, and a pre-parking failure frees its
+decoded statement. An old qset may already be evicted once its last live
+reference is gone, but graph state stores only node IDs—not borrowed qset
+pointers—so teardown remains ownership-safe even if graph publication fails.
+
 **Hold buffer** (`src/node/node.zig` `HoldBuffer`, M6 S8b; protocol §12):
 inbound statements of every kind (EXTERNALIZE included) for slots beyond
 the delivery frontier + 1 are parked host-side until the node has applied
 the slot before them, or until a v-blocking set of the local quorum set has
-sent EXTERNALIZE for that slot (catch-up). **Only signers inside the
-transitive quorum graph are held**: a stranger's statement goes straight to
-the engine's relevance filter below and is dropped statelessly, so an
-unauthenticated connection with random keys cannot occupy a single entry
-(the S8b review filled the first version's 1024 entries that way). Every
-parked statement was **signature-verified first** (a forged signer cannot
+sent EXTERNALIZE for that slot (catch-up). **Only signers inside the currently
+published transitive quorum graph are held**: a stranger's statement goes
+straight to the engine's relevance filter below and is dropped statelessly,
+so an unauthenticated connection with random keys cannot occupy a single entry
+(the S8b review filled the first version's 1024 entries that way). During a
+conservative generation, a recently disconnected signer is a bounded false
+positive and may enter this buffer; once held, its entry follows the normal
+replacement, window, and release rules even if a later checkpoint prunes the
+signer. Every parked statement was **signature-verified first** (a forged
+signer cannot
 occupy or displace a genuine member's entry); the buffer is bounded to a
 **64-slot window** past the frontier, **1024 entries / 8 MiB** in total,
 one entry per (slot, signer, kind) — a chatty honest sender replaces its
@@ -110,9 +222,13 @@ stops propagating the next slot's statements until it catches up (a slower
 relay in sparse topologies; invisible on the full-mesh deployments).
 
 **Relevance filter** (protocol §4 step 8): statements whose signer is outside
-the transitive quorum graph of your configuration are `ignored` before any
-per-slot state is allocated — a stranger with a valid key cannot make you
-store anything.
+the published transitive quorum graph of your configuration are `ignored`
+before any per-slot state is allocated. The graph is exact at checkpoints and
+a conservative superset between them, as described above: an arbitrary
+stranger with a valid key cannot make you store anything, while a recently
+disconnected signer can consume only the already bounded false-positive
+resources. A checkpoint rejects its new inputs; state already admitted during
+the grace period leaves through its normal purge, eviction, or release path.
 
 **Stored-statement budget** (`max_stored_statement_bytes = 20 MiB`,
 `max_live_slots = 64`): the latest-per-(node, protocol) storage is bounded
@@ -250,6 +366,10 @@ after the next crash (it could re-emit an older, conflicting statement).
   untrusted and the node runs as a **watcher for its lifetime** (v1
   as-built) — it can never emit a statement older than one it already
   broadcast, because it never emits.
+- **Uncompacted valid tail**: recovery derives the same 16-slot answering
+  floor used during live delivery (or the later explicit `start_slot`) and
+  restores only own statements at or above it. The full retained externalized
+  journal tail is still replayed to the application for slot-level dedup.
 - Cost: every own emission pays a disk sync (`fsync`, plus `F_FULLFSYNC` on
   macOS for the key file). On slow disks this throttles ballot rounds
   (design §16); acceptable at seconds-scale slots.

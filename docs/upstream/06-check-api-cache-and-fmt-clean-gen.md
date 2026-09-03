@@ -26,7 +26,7 @@ The result is more specific than the folklore, and worth having precisely:
   cacheable. Our `api-snapshot-tests` step reads
   `src/wasm/slcp_host_abi.zig` at runtime; without the flag the second run
   prints `cached` and never executes. That is the class that bit our vector
-  and ABI gates in M4/M5 (HANDOFF §6: "a corrupted or regenerated artifact
+  and ABI gates in M4/M5 (the v0.1.0 `RELEASING.md` run log records that "a corrupted or regenerated artifact
   leaves the previous pass standing").
 - **The exe steps flip into the cacheable category silently** the moment
   someone adds `expectExitCode(...)` / `addCheck(...)` (stdio becomes

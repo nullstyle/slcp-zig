@@ -551,8 +551,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "capnpc-zig", .module = capnpc_full_e2e },
         },
     });
+    const e2e_filter = b.option([]const u8, "e2e-filter", "e2e: run only tests whose name contains this");
     const e2e_node_tests = b.addTest(.{
         .name = "slcp-e2e",
+        .filters = if (e2e_filter) |f| &.{f} else &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/e2e/cluster_test.zig"),
             .target = target,
@@ -566,7 +568,7 @@ pub fn build(b: *std.Build) void {
     const run_e2e = b.addRunArtifact(e2e_node_tests);
     // The clusters open their scratch trees (.zig-cache/e2e/<scenario>) by
     // relative path through Dir.cwd(), so cwd is pinned like every other
-    // file-touching run step (HANDOFF §6: both lines, always).
+    // file-touching run step (RELEASING.md "Cold preflight": both lines, always).
     run_e2e.setCwd(b.path("."));
     run_e2e.has_side_effects = true; // real sockets/files: never answer from cache
     const e2e_step = b.step("e2e", "Run the 4-node end-to-end cluster (200 slots, kill/restart, partition/heal, equivocator)");
@@ -725,7 +727,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_example_smoke_tests.step);
 
     // ===== E1:registry =====
-    // Examples-track stage anchor (registry; examples-roadmap.md E1 §3.12):
+    // Examples-track stage anchor (registry; docs/examples-roadmap.md
+    // "E1 — Registry" acceptance gates):
     // registry-intree compile, registry-tests, the registry_smoke tool and
     // its run steps. Insert under this anchor only; never above it.
     // Keep the blank line between anchors so parallel stages merge cleanly.

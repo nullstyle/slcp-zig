@@ -178,7 +178,7 @@ preflight:
     echo "preflight: GREEN in $(( $(date +%s) - start )) s (log: preflight.log)"
 
 # gen-check with the plugin built from the capnp-zig package build.zig.zon
-# PINS (HANDOFF §6 "the pinned-plugin rule"; what CI's gen-check job does).
+# PINS (RELEASING.md "Cold preflight"; what CI's gen-check job does).
 # A capnpc-zig on PATH is never used: S6 found the checked-in src/gen had
 # been produced by a stale ~/.local/bin/capnpc-zig. Needs `capnp` (the C++
 # driver: brew/apt) and the package extracted under zig-pkg/ (any prior
@@ -219,7 +219,7 @@ fuzz-long ITERS="1M":
 
 # The package hash of HEAD, the value README's pin block and CHANGELOG.md
 # record BEFORE the tag (both files are outside `.paths`, so recording it is
-# hash-neutral — HANDOFF §6 "README-hash rule"). Not `zig fetch .`: that
+# hash-neutral — RELEASING.md "Record the package hash BEFORE the tag"). Not `zig fetch .`: that
 # copies the whole tree (worktrees, caches) into the cache first and a bare
 # fetch can poison it (see pkg-hash). `git archive HEAD` WITHOUT --prefix,
 # hashed through a throwaway cache, gives the tag tarball's hash in seconds.
@@ -309,13 +309,14 @@ two-machine:
       6. exchange the three hexes; edit the five deployment lines in src/main.zig:
          the three 'const pk_x = slcp.nodeId("…")', '.listen_port = …', '.peers = &.{ … }'
       7. zig build -Doptimize=ReleaseSafe run
-    Evidence for HANDOFF §4: the three 'public key:' lines, the three five-line blocks,
+    Evidence for the release's RELEASING.md run log: the three 'public key:' lines, the three five-line blocks,
     20 consecutive 'slot N: count = N' lines from each machine, and the tag hash
     (just verify-release-hash ${ver}). A failure ships as v0.1.1.
     EOF
 
 
-# The package-completeness proof (design §13.9; HANDOFF §6 ".paths rule"): a
+# The package-completeness proof (DESIGN.md "Verification model" and
+# RELEASING.md "Record the package hash BEFORE the tag"): a
 # path dependency (example-smoke's in-tree copies) does NOT apply `.paths`,
 # only a tarball fetch does. So: `git archive HEAD` → a scratch consumer made
 # from examples/counter with its `.path = "../.."` dep REMOVED → `zig fetch
@@ -361,7 +362,7 @@ package-preflight:
     # consumer's `zig build` at v0.1.0 — the reason this recipe exists).
     ntests=$(find "$pkg/tests" -type f | wc -l | tr -d ' ')
     [ "$ntests" = "1" ] || { echo "package-preflight: package ships $ntests files under tests/, expected only appnode_errors/cases.zig:"; find "$pkg/tests" -type f; exit 1; }
-    for f in sim tools vectors docs examples README.md CHANGELOG.md RELEASING.md Justfile; do
+    for f in sim tools vectors docs examples README.md CHANGELOG.md RELEASING.md Justfile CONTEXT.md DESIGN.md STATUS.md; do
         [ ! -e "$pkg/$f" ] || { echo "package-preflight: package ships $f (.paths too wide)"; exit 1; }
     done
     zig build -Doptimize=ReleaseSafe
@@ -375,7 +376,7 @@ package-preflight:
 # ~/.cache/zig/p/<hash>.tar.gz double-nested when the archive has a single
 # root directory (any GitHub archive, any `git archive --prefix`), and every
 # later build-time fetch of that hash from a project whose zig-pkg/ lacks it
-# fails with `hash mismatch … N-V-…` (S8 finding 23; HANDOFF §6).
+# fails with `hash mismatch … N-V-…` (v0.1.0 RELEASING.md run log).
 # release-hash / verify-release-hash must hash through this recipe.
 # Print the package hash of SRC (tarball, dir or URL) without touching the real global cache.
 pkg-hash SRC:

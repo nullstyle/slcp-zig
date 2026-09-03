@@ -2,7 +2,7 @@
 zig-cache/
 zig-out/
 zig-pkg/
-.claude/worktrees/
+.claude/
 preflight.log
 examples/counter/zig-out/
 examples/counter/.zig-cache/

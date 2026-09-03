@@ -275,23 +275,18 @@ pub const Engine = struct {
         // Relevance-filter seed: the local qset's transitive graph (§5.4);
         // self is always relevant.
         try self.qsets.addToGraph(&self.cfg.quorum_set);
-        try self.qsets.graph.put(gpa, self.cfg.node_id, {});
+        try self.qsets.addGraphRoot(self.cfg.node_id);
         self.excised = if (try qset.exciseNode(gpa, &self.cfg.quorum_set, config.node_id)) |e| e else null;
         errdefer if (self.excised) |*e| e.deinit(gpa);
         const flat = try qset.canonicalBytes(gpa, &self.cfg.quorum_set);
         defer gpa.free(flat);
         const local_hash = crypto.qsetHash(flat);
         // Self-insert the local qset: peers advertising our hash must never
-        // park on a qset this engine already knows by construction.
+        // park on a qset this engine already knows by construction. It is a
+        // permanent cache pin: local quorum math must remain available even
+        // when every configurable cache slot is under remote pressure.
         try self.qsets.insert(local_hash, try qset.clone(gpa, &self.cfg.quorum_set));
-        // Self-advertise it too: quorum checks resolve every voter's qset
-        // through the advertised map, and the local node's own statements
-        // (self-processed on emission, §5.4) always advertise local_hash —
-        // without this a quorum that NEEDS self (e.g. a 1-of-{self}
-        // configuration) can never form. Oracle: stellar-core's
-        // getQuorumSetFromStatement always resolves the local node's own
-        // qset. The hash never changes for the engine's lifetime.
-        try self.qsets.setAdvertised(config.node_id, local_hash);
+        try self.qsets.retain(local_hash);
         self.ctx = .{
             .gpa = gpa,
             .cfg = &self.cfg,

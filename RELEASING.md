@@ -1,8 +1,9 @@
 # Releasing slcp-zig
 
 The checklist for cutting a tagged release, top to bottom, and the run log of
-each release cut with it. Design §13.9 is the rationale; this file is the
-procedure. The ceremony is adapted from capnp-zig's `RELEASING.md`, whose
+each release cut with it. [`DESIGN.md`](DESIGN.md) “Verification model” is
+the rationale; this file is the procedure. The ceremony is adapted from
+capnp-zig's `RELEASING.md`, whose
 v0.4.0 was tagged three minutes before its own CI went red — every step here
 that can be mechanized is (`Justfile`, M6:release anchor; `.github/workflows/
 release.yml`).
@@ -104,8 +105,8 @@ iterations, K/M/G suffixes).
 ### 4. Ablations — prove each gate can go red
 
 Once per release, each of the five: mutate → `git diff --stat` must be
-non-empty (HANDOFF §7: a verification that passed vacuously twice in one
-session) → run the gate → quote the red line → `git checkout -- <file>`.
+non-empty (a prior release audit caught two vacuous passes this way) → run
+the gate → quote the red line → `git checkout -- <file>`.
 Ablate committed code only: `git checkout -- <file>` reverts the whole file.
 
 1. Flip one byte in `vectors/lint.json` → `zig build test` red (vectors).
@@ -138,8 +139,8 @@ it went red exactly this way at v0.1.0 (run log).
 `tools/pkg_hash.sh` in a throwaway global cache — never `zig fetch .` (copies
 the whole tree, worktrees and caches included, before filtering) and never a
 bare `zig fetch <archive>` against the real cache (on Zig 0.17.0-dev.1786 it
-poisons `~/.cache/zig/p/<hash>.tar.gz` for single-root-dir archives; HANDOFF
-§6, `just pkg-hash-check`).
+poisons `~/.cache/zig/p/<hash>.tar.gz` for single-root-dir archives; pinned by
+`just pkg-hash-check` and the v0.1.0 run log below).
 
 ### 6. Land, wait for CI, tag
 
@@ -176,10 +177,10 @@ just verify-release-hash X.Y.Z   # fetches the published tarball as a consumer
 - [ ] `just two-machine` — the §14 accept on real machines, from the tag
       tarball; the evidence (three `public key:` lines, the three five-line
       deployment blocks, 20 consecutive `slot N: count = N` lines per
-      machine, the hash) goes into HANDOFF §4, or "not yet run" is written
-      there explicitly. A failure ships as vX.Y.Z+1.
-- [ ] Record-keeping sweep: design doc §14/§15/§16, HANDOFF, memory file,
-      upstream drafts sent as messages (never issues).
+      machine, the hash) goes into this version's run log, or “not yet run”
+      is written there explicitly. A failure ships as vX.Y.Z+1.
+- [ ] Record-keeping sweep: update `CHANGELOG.md`, `STATUS.md`, canonical
+      repository docs, and upstream drafts sent as messages (never issues).
 
 ---
 
@@ -305,12 +306,12 @@ error.OwnStatementNotMonotonic` — `tests/fuzz/input_seq_fuzz.zig:117`, the
 §13.1 harness invariant "own emitted statement not strictly newer than
 previous (isNewerStatement order violated)" (`sim/invariants.zig:118`) —
 `input saved to .zig-cache/f/crash` (1024 bytes, sha256
-`86afba4c7658c3c88f594abc64b9310ec1b7c88dc83c8748cdb830c66a2bf51b`, copied
-to `/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input.bin`). `zig build
+`86afba4c7658c3c88f594abc64b9310ec1b7c88dc83c8748cdb830c66a2bf51b`, now
+tracked as `tests/fuzz/crash/input-seq-1.bin`). `zig build
 --fuzz` exited 0 regardless, so the original `fuzz-long` recipe was green
 on a red target; it now greps the report and is red (commit below).
 UNCONFIRMED and not investigated in S9 (engine/harness semantics are out of
-the release stage's scope): HANDOFF §6 records that `isNewerStatement`
+the release stage's scope): the initial audit observed that `isNewerStatement`
 returns false for ANY two EXTERNALIZEs while the engine legitimately
 re-emits EXTERNALIZE with a grown `nH`, and the fuzz target replays
 `restore_own_envelope` — a harness false positive of exactly that class is
@@ -318,14 +319,14 @@ the first hypothesis; a real own-statement regression is the second. The
 build runner's `--seed` cannot be passed through `zig build`, so the run is
 not replayable by seed; the saved input is the repro. Re-run `just fuzz-long 50K` (32 s, the corpus preserved in `.zig-cache/f/`):
 input-seq FAILED again with the same error at run 33490 (12.5K further
-runs) on a DIFFERENT input (sha256 `2d05cef1cfd3a1bf…`, copied to
-`/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input-2.bin`) — a recurring
+runs) on a DIFFERENT input (sha256 `2d05cef1cfd3a1bf…`, now tracked as
+`tests/fuzz/crash/input-seq-2.bin`) — a recurring
 class, not a corpus replay — and the amended recipe exited 1
 (`fuzz-long: a fuzz target FAILED …`), its own red proven. A third
-distinct input (sha256 `2307f4ae0f8c9e77…`,
-`/Users/nullstyle/prj/slcp/m6-s9-fuzz-crash-input-3.bin`, byte-identical
-to main's `.zig-cache/f/crash` when the fix branch forked) was preserved
-from a later run.
+distinct input (sha256 `2307f4ae0f8c9e77…`, now tracked as
+`tests/fuzz/crash/input-seq-3.bin`, byte-identical to main's
+`.zig-cache/f/crash` when the fix branch forked) was preserved from a later
+run.
 A 1M-iteration or overnight run is a post-tag v0.1.x task (R21).
 
 **Fuzz finding settled** (branch `m6/s9-fuzz`, before the tag). Replay
@@ -394,5 +395,5 @@ the purge shape deterministically.
 
 **Not done here** (the orchestrator's half of S9): push, CI on the branch,
 merge to `main`, `just release-tag 0.1.0 "omakase polish"`, `just
-verify-release-hash 0.1.0`, the GitHub Release, `just two-machine`, the
-design-doc / HANDOFF / memory sweep.
+verify-release-hash 0.1.0`, the GitHub Release, `just two-machine`, and the
+canonical context/status sweep.

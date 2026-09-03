@@ -364,7 +364,7 @@ fn record(tracker: *Tracker, gpa: std.mem.Allocator, st: stored.OwnedStatement) 
 
 // Non-vacuity: the committed-value rule for own EXTERNALIZE pairs. Red if
 // the rule is dropped (the same-value nH re-emit is flagged again — the
-// class HANDOFF §6 records and the e2e watchdog exempts) or over-relaxed
+// class the v0.1.0 RELEASING.md run log records and the e2e watchdog exempts) or over-relaxed
 // (the fork stops being flagged, or gets the generic message).
 test "own EXTERNALIZE pair: same committed value with grown nH is legal; a different value is a fork" {
     const gpa = testing.allocator;

@@ -1,5 +1,5 @@
-//! rpc.zig — the registry's client port (roadmap E1, examples-roadmap.md
-//! §3.10): a line protocol on 127.0.0.1, one request line in, one response
+//! rpc.zig — the registry's client port (docs/examples-roadmap.md E1,
+//! "localhost RPC"): a line protocol on 127.0.0.1, one request line in, one response
 //! line out. The server half runs inside `registry node`; the client half
 //! is what the CLI verbs use.
 //!

@@ -7,7 +7,7 @@
 # --prefix=…`, any GitHub `/archive/….tar.gz` — prints the right hash but
 # rewrites `$ZIG_GLOBAL_CACHE_DIR/p/<hash>.tar.gz` double-nested, and every
 # later build-time fetch of that hash from a project whose zig-pkg/ lacks it
-# fails with `hash mismatch … N-V-…` (S8 finding 23; HANDOFF §6). The fetch
+# fails with `hash mismatch … N-V-…` (v0.1.0 RELEASING.md run log). The fetch
 # below runs against a throwaway ZIG_GLOBAL_CACHE_DIR, so the real cache is
 # never written. `tools/pkg_hash_check.sh` pins this.
 #

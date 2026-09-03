@@ -1,5 +1,5 @@
-//! main.zig — the `registry` process (roadmap E1, examples-roadmap.md §3.8,
-//! §3.9, §3.11). `registry node …` runs one validator: the typed node from
+//! main.zig — the `registry` process (docs/examples-roadmap.md E1:
+//! persistence/restart, nomination cadence, and CLI). `registry node …` runs one validator: the typed node from
 //! app.zig, the RPC server from rpc.zig, the snapshot file, and the cadence
 //! loop that turns the pending queue into proposals. `submit`, `get`,
 //! `account` and `head` are the client verbs: they talk to a node's RPC.

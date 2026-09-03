@@ -6,7 +6,7 @@
 # tags, coordinated upgrade) — never transparent capnp evolution.
 # No non-zero defaults anywhere in this file: canonical encoding is
 # value-XOR-default, so a default change would silently change preimages.
-# See claude-design.md §4.
+# See DESIGN.md "Protocol data and evolution" and docs/protocol.md §§3–5.
 
 struct Ballot {
   counter @0 :UInt32;   # MUST be >= 1 on the wire. counter==0 is the engine-internal

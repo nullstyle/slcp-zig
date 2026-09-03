@@ -586,6 +586,25 @@ fn nodesWith(gpa: std.mem.Allocator, s: *slot_mod2.Slot, v: []const u8, which: M
     return out.toOwnedSlice(gpa);
 }
 
+/// Resolve each node through the exact latest nomination statement in this
+/// slot (Slot::getQuorumSetFromStatement), never through a process-global
+/// "last advertisement" that may belong to another slot or protocol.
+const NominationLookup = struct {
+    ctx: *engine_mod.Ctx,
+    s: *slot_mod2.Slot,
+
+    fn get(raw: *const anyopaque, node: qset.NodeId) ?*const qset.QuorumSetOwned {
+        const self: *const NominationLookup = @ptrCast(@alignCast(raw));
+        if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) return &self.ctx.cfg.quorum_set;
+        const env = self.s.latest_nom.get(node) orelse return null;
+        return self.ctx.qsets.get(env.statement.qsetHash());
+    }
+
+    fn lookup(self: *const NominationLookup) local_node.QSetLookup {
+        return .{ .ctx = self, .get = get };
+    }
+};
+
 /// Federated-accept promotion into own accepted AND votes (oracle:
 /// `mAccepted.emplace(vw); mVotes.emplace(vw);`, NominationProtocol.cpp:
 /// 451-452 — accepting adds to both sets, §4.1), gated by the §5.4 own-set
@@ -816,12 +835,13 @@ fn processNomination(
         defer gpa.free(voted_nodes);
         const accepted_nodes = try nodesWith(gpa, s, v, .accepted);
         defer gpa.free(accepted_nodes);
+        const nl = NominationLookup{ .ctx = ctx, .s = s };
         if (try slot_mod2.federatedAccept(
             gpa,
             &ctx.cfg.quorum_set,
             voted_nodes,
             accepted_nodes,
-            ctx.qsets.lookup(),
+            nl.lookup(),
         )) { // cpp:437-446
             const vl = try validateCached(ctx, s, v); // cpp:448
             if (vl != .invalid) {
@@ -847,11 +867,12 @@ fn processNomination(
         if (s.nom.candidates.contains(a)) continue; // cpp:474-477
         const accepted_nodes = try nodesWith(gpa, s, a, .accepted);
         defer gpa.free(accepted_nodes);
+        const nl = NominationLookup{ .ctx = ctx, .s = s };
         if (try slot_mod2.federatedRatify(
             gpa,
             &ctx.cfg.quorum_set,
             accepted_nodes,
-            ctx.qsets.lookup(),
+            nl.lookup(),
         )) { // cpp:478-481
             _ = try s.nom.candidates.insert(gpa, a); // cpp:483
             new_candidates = true;
@@ -1119,12 +1140,12 @@ const TestHarness = struct {
             .limits = limits_mod.Limits{ .max_nomination_values = opts.max_nom_values },
         };
         self.excised = try qset.exciseNode(gpa, &self.cfg.quorum_set, self.cfg.node_id);
+        try self.store.addToGraph(&self.cfg.quorum_set);
+        try self.store.addGraphRoot(self.cfg.node_id);
         if (opts.advertise) {
-            for (self.ids) |id| {
-                const copy = try makeQs(gpa, 2, &self.ids);
-                try self.store.insert(self.local_hash, copy);
-                try self.store.setAdvertised(id, self.local_hash);
-            }
+            // The lookup follows each exact stored statement's qset hash;
+            // tests only need that hash present in the verified cache.
+            try self.store.insert(self.local_hash, try makeQs(gpa, 2, &self.ids));
         }
         self.s = slot_mod2.Slot.init(1);
         self.stored_bytes = 0; // struct is `undefined`-initialized in tests

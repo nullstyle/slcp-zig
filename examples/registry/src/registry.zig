@@ -1,5 +1,5 @@
-//! registry.zig — the pure state machine of `examples/registry` (roadmap E1,
-//! examples-roadmap.md §3).
+//! registry.zig — the pure state machine of `examples/registry`
+//! (docs/examples-roadmap.md "E1 — Registry").
 //!
 //! Standard library only: no slcp import, no I/O, no clock, no allocator.
 //! Everything here is deterministic and bounded so it can run inside

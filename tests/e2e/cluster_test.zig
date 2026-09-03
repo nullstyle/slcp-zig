@@ -116,6 +116,13 @@ const Consumer = struct {
         return false;
     }
 
+    fn hasValueAt(self: *Consumer, slot: u64, value: []const u8) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const found = self.records.get(slot) orelse return false;
+        return std.mem.eql(u8, found, value);
+    }
+
     fn stopJoin(self: *Consumer) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
@@ -440,11 +447,29 @@ test "e2e: kill and restart a node mid-run; it gap-jumps, catches up, rejoins vo
         }
     }
 
-    // Restart node 3 from its own.log; it must catch up. Re-queue its
-    // proposals (the queue died with the process; values are per-node fuel).
-    wd.mark(); // everything from here on is post-restart
+    // Restart node 3 from its own.log; it must catch up. Leave its application
+    // proposal queue empty for now: the post-kill challenge below must be the
+    // first value this process instance proposes.
+    // Make the cross-restart safety witness deterministic. Without this
+    // brief isolation, validator catch-up can advance node 3 far enough to
+    // prune every pre-mark own_latest entry before the watchdog's reconnect
+    // backoff expires; consensus succeeds, but the frozen-baseline check is
+    // then vacuous. The watchdog remains allowed, so the restarted node must
+    // first re-emit at least one durable pre-kill statement for comparison.
+    slcp.overlay.setTestLinkFilter(restartWitnessFilter);
+    var restart_isolated = true;
+    defer if (restart_isolated) slcp.overlay.setTestLinkFilter(null);
+    try wd.markWithFreshTransport(); // everything received now is post-restart
     try cl.spawnNode(3);
-    try cl.refuel(3, "rr", target);
+    {
+        var waited: u64 = 0;
+        while (wd.checked_after_mark.load(.acquire) == 0) : (waited += 100) {
+            if (waited >= 90_000) return error.WatchdogBaselineTimeout;
+            sleepMs(io, 100);
+        }
+    }
+    slcp.overlay.setTestLinkFilter(null);
+    restart_isolated = false;
 
     // Node 3 rejoins the live frontier ...
     try waitFor(io, 120_000, &cl, struct {
@@ -462,11 +487,46 @@ test "e2e: kill and restart a node mid-run; it gap-jumps, catches up, rejoins vo
     try std.testing.expect(tail_last >= hwm_at_kill);
     try std.testing.expect(resumed_at > tail_last + 1);
 
-    // Now make node 3 NECESSARY: kill node 0, so 3-of-4 is {1, 2, 3}. A
-    // restarted node that stayed mute (the S8 D1 finding) halts here.
+    // Now make node 3 NECESSARY: kill node 0, so 3-of-4 is {1, 2, 3}, then
+    // submit a unique lexicographically dominant value ONLY through node 3.
+    // The default driver chooses the lexicographic maximum candidate. Seeing
+    // this value externalized on all three survivors proves node 3 emitted a
+    // fresh post-kill nomination and rejoined voting; draining pre-kill
+    // decisions cannot manufacture a value that had not yet been proposed.
     cl.killNode(0);
-    try cl.waitLiveReached(target, 90_000);
-    try assertAgreement(&cl, target);
+    const challenge = "\xffpost-restart-node-3";
+    // An out-of-order callback for any earlier slot can consume one queued
+    // proposal even when it does not advance node 3's current slot. The
+    // pre-challenge run has at most RESTART_SLOTS + 8 slots, so 80 copies
+    // outlast that entire callback universe and still leave fresh fuel.
+    for (0..80) |_| try cl.nodes[3].?.propose(challenge);
+    for (0..80) |i| {
+        var low_buf: [48]u8 = undefined;
+        const low1 = try std.fmt.bufPrint(&low_buf, "post-restart-low-{d}", .{i});
+        try cl.nodes[1].?.propose(low1);
+        try cl.nodes[2].?.propose(low1);
+    }
+    var challenge_slot: ?u64 = null;
+    {
+        var waited: u64 = 0;
+        while (waited < 90_000) : (waited += 100) {
+            const shared_highest = @min(cl.consumers[1].highestSlot(), @min(cl.consumers[2].highestSlot(), cl.consumers[3].highestSlot()));
+            var slot: u64 = 1;
+            while (slot <= shared_highest) : (slot += 1) {
+                if (cl.consumers[1].hasValueAt(slot, challenge) and
+                    cl.consumers[2].hasValueAt(slot, challenge) and
+                    cl.consumers[3].hasValueAt(slot, challenge))
+                {
+                    challenge_slot = slot;
+                    break;
+                }
+            }
+            if (challenge_slot != null) break;
+            sleepMs(io, 100);
+        }
+    }
+    const proved_slot = challenge_slot orelse return error.FreshRestartVoteTimeout;
+    try assertAgreement(&cl, proved_slot);
 
     // Watchdog verdict: node 3 was observed BOTH overall and after the
     // restart (non-vacuity), and never conflicted with itself.
@@ -582,6 +642,20 @@ fn partitionFilter(local: [32]u8, peer: [32]u8) bool {
     return halfOf(local) == halfOf(peer);
 }
 
+/// During the restart safety witness, node 3 may talk only to the watchdog.
+/// All other pairs remain connected so the three live validators keep their
+/// state while the watchdog compares node 3's restored emissions against its
+/// frozen pre-kill baseline.
+fn restartWitnessFilter(local: [32]u8, peer: [32]u8) bool {
+    const restarted = pubFor(3);
+    const watchdog = pubFor(N + 1);
+    const local_is_restarted = std.mem.eql(u8, &local, &restarted);
+    const peer_is_restarted = std.mem.eql(u8, &peer, &restarted);
+    if (!local_is_restarted and !peer_is_restarted) return true;
+    const other = if (local_is_restarted) peer else local;
+    return std.mem.eql(u8, &other, &watchdog);
+}
+
 fn halfOf(pk: [32]u8) u8 {
     // Map a pubkey back to its node index by comparing against the known set.
     for (0..N) |i| {
@@ -653,7 +727,7 @@ const Watchdog = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     target: [32]u8,
-    ov: *slcp.overlay.Overlay,
+    ov: ?*slcp.overlay.Overlay = null,
     peers_owned: []const []const u8 = &.{},
     mu: std.Io.Mutex = .init,
     /// Pre-mark: the newest statement seen per key (kept fresh under flood
@@ -679,28 +753,49 @@ const Watchdog = struct {
     fn create(gpa: std.mem.Allocator, io: std.Io, base_port: u16, target: [32]u8) !*Watchdog {
         const self = try gpa.create(Watchdog);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .target = target, .ov = undefined };
+        self.* = .{ .gpa = gpa, .io = io, .target = target };
 
-        const network_id = crypto.networkIdFromPassphrase(NETWORK);
         const peers = try addrList(gpa, base_port, N, N); // dial all real nodes
         errdefer freeAddrList(gpa, peers);
-        const ov = try gpa.create(slcp.overlay.Overlay);
-        errdefer gpa.destroy(ov);
-        ov.* = try slcp.overlay.Overlay.init(gpa, io, .{
-            .listen_port = 0,
-            .peers = peers,
-            .network_id_prefix = network_id[0..8].*,
-            .node_id = pubFor(N + 1),
-        }, .{ .ctx = self, .on_recv = onRecv, .on_peer_up = onPeerUp });
-        self.ov = ov;
         self.peers_owned = peers;
-        try self.ov.start();
+        try self.startTransport();
         return self;
     }
 
-    /// Everything from here on counts as "after the restart".
-    fn mark(self: *Watchdog) void {
+    fn startTransport(self: *Watchdog) !void {
+        std.debug.assert(self.ov == null);
+        const network_id = crypto.networkIdFromPassphrase(NETWORK);
+        const ov = try self.gpa.create(slcp.overlay.Overlay);
+        errdefer self.gpa.destroy(ov);
+        ov.* = try slcp.overlay.Overlay.init(self.gpa, self.io, .{
+            .listen_port = 0,
+            .peers = self.peers_owned,
+            .network_id_prefix = network_id[0..8].*,
+            .node_id = pubFor(N + 1),
+        }, .{ .ctx = self, .on_recv = onRecv, .on_peer_up = onPeerUp });
+        errdefer {
+            ov.stop();
+            ov.deinit();
+        }
+        try ov.start();
+        self.ov = ov;
+    }
+
+    fn stopTransport(self: *Watchdog) void {
+        const ov = self.ov orelse return;
+        self.ov = null;
+        ov.stop();
+        ov.deinit();
+        self.gpa.destroy(ov);
+    }
+
+    /// Close and join the pre-kill observation transport before freezing the
+    /// baseline, then start fresh dialers. No frame queued on the old socket
+    /// can satisfy the post-mark witness.
+    fn markWithFreshTransport(self: *Watchdog) !void {
+        self.stopTransport();
         self.marked.store(true, .release);
+        try self.startTransport();
     }
 
     fn onPeerUp(ctx: ?*anyopaque, peer_id: usize) void {
@@ -836,9 +931,7 @@ const Watchdog = struct {
     }
 
     fn deinit(self: *Watchdog) void {
-        self.ov.stop();
-        self.ov.deinit();
-        self.gpa.destroy(self.ov);
+        self.stopTransport();
         var it = self.latest.valueIterator();
         while (it.next()) |v| self.gpa.free(v.*);
         self.latest.deinit(self.gpa);

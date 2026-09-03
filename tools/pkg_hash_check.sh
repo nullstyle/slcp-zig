@@ -8,7 +8,7 @@
 # (`<hash>/<root-dir>/build.zig`). Every later build-time fetch of that hash
 # from a project whose zig-pkg/ lacks it then fails with
 # `hash mismatch: manifest declares <hash> but the fetched package has N-V-…`.
-# (S8 finding 23; HANDOFF §6 "the poisoned-cache fetch".)
+# (v0.1.0 RELEASING.md run log, "the poisoned-cache fetch".)
 #
 # A scratch cache stands in for ~/.cache/zig. Three things are asserted:
 #   1. the control: a bare fetch of a --prefix tarball poisons the scratch
@@ -52,7 +52,7 @@ if healthy; then pass; else fail "seed: $tarball does not list $h/build.zig.zon"
 h2=$("$zig" fetch "$tmp/prefixed.tgz" 2>/dev/null)
 if [ "$h2" = "$h" ]; then pass; else fail "control: bare fetch printed '$h2', expected '$h'"; fi
 if healthy; then
-    fail "control: bare fetch of the --prefix tarball did NOT poison the cache entry (toolchain changed? retire the workaround in tools/pkg_hash.sh and HANDOFF §6)"
+    fail "control: bare fetch of the --prefix tarball did NOT poison the cache entry (toolchain changed? retire the workaround documented in tools/pkg_hash.sh and RELEASING.md)"
 else
     pass
 fi

@@ -1,7 +1,8 @@
 //! slcp-core — the sans-io deterministic SLCP engine module.
 //! Zero std.Io, zero clock, zero RNG anywhere in this module graph; the only
 //! dependency is capnpc-zig-core (imported as "capnpc-zig").
-//! Design of record: ../claude-design.md.
+//! Architecture and enduring invariants: ../DESIGN.md. Normative protocol
+//! behavior: ../docs/protocol.md.
 
 const std = @import("std");
 

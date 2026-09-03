@@ -11,7 +11,8 @@
 //! expected-fail object and `zig build test` would stay green (S8 review).
 //!
 //! `needle` is the TAIL of the compile error's first line after the `<T>` /
-//! `<path>` rendering (HANDOFF §6): `matchCompileError` tries endsWith first,
+//! `<path>` rendering (RELEASING.md "Cold preflight"):
+//! `matchCompileError` tries endsWith first,
 //! so it holds from any cwd. `src` is a fragment of the message as SPELLED in
 //! app_node.zig — the two differ where the message splices a type name or a
 //! field name in. Change a message, its needle and its src together.

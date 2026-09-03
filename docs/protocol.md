@@ -90,7 +90,7 @@ value-XOR-default, so a default change would silently change preimages).
 # tags, coordinated upgrade) — never transparent capnp evolution.
 # No non-zero defaults anywhere in this file: canonical encoding is
 # value-XOR-default, so a default change would silently change preimages.
-# See claude-design.md §4.
+# See DESIGN.md "Protocol data and evolution" and docs/protocol.md §§3–5.
 
 struct Ballot {
   counter @0 :UInt32;   # MUST be >= 1 on the wire. counter==0 is the engine-internal
@@ -208,7 +208,10 @@ signature can be checked, because the verifying key *is* `statement.nodeId`):
  6. Ed25519 verify over the RECEIVED statementBytes (§4.2; wrong-network
     envelopes implicitly fail — their digests differ) → invalid_signature
  7. strictCanonical structural walk on the SAME parse (§4.2) → insane
- 8. relevance: sender outside the transitive quorum graph (§5.4) → ignored
+ 8. relevance: sender outside the published transitive quorum graph (§5.4) →
+    ignored; for an unknown-qset envelope during a conservative generation,
+    advance the generation and recheck before slot admission (an exact
+    checkpoint can change the result to ignored)
  9. slot admission (max_live_slots; existing slots always accept) →
     over_limit
 10. freshness vs the per-(node, protocol) latest via stored.isNewerOwned
@@ -218,8 +221,14 @@ signature can be checked, because the verifying key *is* `statement.nodeId`):
     over_limit (per-node cap); evictions of PAST inputs emit
     phase_event(parked_evicted), never a second input_status
 12. stored-bytes budget (§5.1 max_stored_statement_bytes) → over_limit
-13. setAdvertised + storeLatest + forward_envelope (freshness advanced ⇒
-    relay, §5.3) + protocol dispatch → applied
+13. ballot protocol/value rejection before replacement: a driver-invalid
+    PREPARE, or any ballot incompatible with this node's already externalized
+    value → insane; the sender's previous statement and its exact qset
+    reference remain live
+14. exact live-statement qset-reference capacity → over_limit
+15. storeLatest + replace its exact live-statement qset reference + protocol
+    dispatch + forward_envelope (freshness advanced ⇒ relay, §5.3) →
+    applied
 ```
 
 `strict_canonical` defaults to `true` (`Node.Options.strict_canonical`,
@@ -280,6 +289,54 @@ No networkId is mixed in: qsets are network-independent, cacheable data.
 This hash is what `Nomination.quorumSetHash` / `Prepare.quorumSetHash` /
 `Confirm.quorumSetHash` / `Externalize.commitQuorumSetHash` carry, what
 `getQset` requests by, and what `qsets/<hex64>.bin` is named by (§13).
+
+**Statement identity and relevance** (`src/engine/qset_store.zig`): every
+live remote NOMINATE, PREPARE, or CONFIRM statement retains the exact
+normalized qset hash it carries. Different slots or protocols from the same
+signer may therefore contribute different qsets simultaneously; quorum
+evaluation resolves the hash on the statement being evaluated, never a
+process-global "latest advertisement." EXTERNALIZE follows the singleton rule
+above; its commit-qset hash is audit metadata and is not retained for quorum
+lookup.
+
+The relevance filter uses a published transitive graph rooted in the local
+qset. Immediately after a checkpoint it is the exact closure through all live
+statement references. After an ordinary last-edge removal, pruning is deferred
+and the graph is a **conservative superset** until the next checkpoint. Pure
+additions still expand immediately, so an exactly reachable signer is never
+excluded. A temporary false positive can be parked, stored and relayed (and
+can occupy the native future-slot hold buffer), but it cannot change quorum
+truth: nomination and ballot checks continue to use exact statement qsets.
+
+A dirty generation checkpoints on its 64th qualifying update, at every qset
+replay-batch boundary, and at every slot purge. A qualifying update is either
+a successful statement-reference lifecycle update or a signature-verified
+unknown-qset envelope that reaches the Engine from a signer already in the
+published graph. The latter advances and rechecks **before slot admission**, so
+a signer pruned by that checkpoint leaves no empty slot; a signer outside the
+published graph cannot force checkpoint work. Known-qset traffic rejected
+before reference commit (for example stale or over-limit input) does not
+advance the generation. Neither does a future-slot envelope while the native
+hold buffer intercepts it; if later released, it is rechecked by the Engine.
+Consequently 64 is a bound on deferred mutation work and growth, not on wall
+clock time or total received inputs: without a qualifying update, replay, or
+purge, a conservative graph may remain published indefinitely.
+
+For a nonzero cache bound N, at most N + 1 qset bodies are active during the
+single allowed rotation. One ordinary generation can additionally retain
+validator ids from at most 64 retired bodies. A qset replay batch starts from
+that bounded graph and all of its waiters cite the same newly fetched hash, so
+it can add only that one body before its exact end-of-batch rebuild. Since a
+valid body has at most 255 validators, the published graph outside replay has
+at most `1 + 255 * (N + 1 + 64)` node ids and its absolute in-replay transient
+bound is `1 + 255 * (N + 2 + 64)` (the leading one is the explicit local-node
+root, and duplicates only reduce these bounds). The ordinary retired-body term
+is at most 16,320 ids, or 510 KiB of raw 32-byte keys plus hash-table overhead.
+An exact rebuild walks each reachable qset body and node once; if its current-
+closure work is W, the periodic checkpoint amortizes that work across 64
+qualifying updates, while the checkpointing input still pays a deterministic
+O(W) latency spike. Replay and purge batch their mutations into one such
+rebuild.
 
 **Lint** (design §12; `qset.zig` `lint`, `LintCode`, `minBlockingSize`) is
 *not* consensus-normative — it judges the local configuration — but its
@@ -422,6 +479,8 @@ pub const Limits = struct {
     max_pending_envelopes: u32 = 1024,
     max_pending_bytes: u32 = 8 * 1024 * 1024,
     max_live_slots: u32 = 64,
+    // Direct Engine configs may use 0 for a local-only cache; Store reserves
+    // the one mandatory local entry. host.capnp 0 still decodes as default.
     max_cached_qsets: u32 = 1024,
     timeout_cap_ms: u32 = frozen_timeout_cap_ms,
     max_stored_statement_bytes: u32 = 20 * 1024 * 1024,
@@ -431,7 +490,18 @@ pub const Limits = struct {
 `limits.validate` is the rule: configuration may **lower** `max_value_bytes`,
 `max_nomination_values` and `timeout_cap_ms`, never raise them past the
 frozen caps, and never set them to 0 (`BadValueBytes`, `BadNominationValues`,
-`BadTimeoutCap`). In `host.capnp` `Limits`, `0` means "engine default".
+`BadTimeoutCap`). A direct Engine configuration with
+`max_cached_qsets = 0` is the one exception: it means a local-only cache and
+still reserves and permanently pins the mandatory local quorum set; rotation
+overflow is disabled, so only one fetched response can raise residency from
+one to two for the duration of that input. At a nonzero bound N, qsets carried
+by live non-EXTERNALIZE statements are pinned: steady live retention is at
+most N, or N + 1 while a multi-statement qset rotation occupies its sole
+transition entry.
+Unrelated new qsets cannot consume that entry. A separately leased fetched
+response makes the absolute transient cache maximum N + 2, and is evicted on
+lease release unless it became live. In `host.capnp` `Limits`, `0` means
+"engine default" rather than the direct-Engine special mode.
 
 ## 9. Statement sanity
 
@@ -500,10 +570,11 @@ its protocol's partial order (same node, same slot):
   duplicate EXTERNALIZE").
 
 Engine freshness is the only dedup: hosts keep no seen-cache (§12 relay).
-Watchdog lesson (HANDOFF §6): the engine legitimately re-emits EXTERNALIZE
-for a slot with a grown `nH`, so two of a node's EXTERNALIZE envelopes may
-differ in bytes without either being "newer". Judge EXTERNALIZE pairs by
-**committed value** — different values are a fork; different `nH` is normal.
+The watchdog regression in `tests/e2e/cluster_test.zig` pins that the engine
+legitimately re-emits EXTERNALIZE for a slot with a grown `nH`, so two of a
+node's EXTERNALIZE envelopes may differ in bytes without either being "newer".
+Judge EXTERNALIZE pairs by **committed value** — different values are a fork;
+different `nH` is normal.
 
 ## 11. Engine boundary
 
@@ -611,10 +682,10 @@ each):
 | `applied` | the input changed engine state (or was a well-formed no-op the protocol accepted) |
 | `stale` | an envelope not newer than the stored latest for its (node, protocol) (§10) |
 | `invalid_signature` | Ed25519 verification over the received `statementBytes` failed (wrong key, wrong network, tampered bytes) |
-| `insane` | frame cap, decode, sanity (§9) or strict-canonical failure |
+| `insane` | frame cap, decode, sanity (§9), strict-canonical failure, driver-invalid PREPARE, or a ballot incompatible with this node's already externalized value |
 | `parked_awaiting_qset` | the statement references an unknown qset hash; parked, `request_qset` emitted |
-| `over_limit` | a budget refused it: live-slot cap, parking caps, stored-bytes budget |
-| `ignored` | the signer is outside the transitive quorum graph (relevance filter), or the input is otherwise irrelevant |
+| `over_limit` | a budget refused it: live-slot cap, parking caps, stored-bytes budget, or distinct active-qset capacity |
+| `ignored` | the signer is outside the published transitive quorum graph (or is removed by an exact pre-parking checkpoint), or the input is otherwise irrelevant |
 
 `phase_event` is **non-normative** (observability): the trace vectors mark it
 as OBSERVABLE (record kind 3) and a replay may pin or ignore it. Everything
@@ -667,7 +738,8 @@ Symmetric: every node listens *and* dials.
 @0xd1e0e224689f7c4d;
 # overlay.capnp — transport frames. Normal append-only capnp evolution.
 # TRUST MODEL: only envelope signatures are authenticated. Hello fields are
-# unauthenticated hints. See claude-design.md §9.
+# unauthenticated hints. See DESIGN.md "Trust and operations" and
+# docs/threat-model.md.
 
 using Slcp = import "slcp.capnp";
 
@@ -728,6 +800,17 @@ most `max_slot_state_envelopes = 64` envelopes.
 | `max_budget_strikes` | `32` breaches over the connection's lifetime (strikes never reset) ⇒ disconnect |
 | reconnect backoff | exponential 1 s → 60 s (`max_backoff_shift = 6`, capped) plus deterministic per-peer jitter < 1 s (Wyhash over the attempt counter — no clock, no RNG) |
 
+**Native engine-ingress queue** (`node.zig` `InputQueue`): the ordinary FIFO
+is bounded to 1,024 items and 16 MiB of owned payload bytes. Network inputs
+may occupy at most 960 items / 15 MiB, reserving 64 items / 1 MiB for local
+proposals and timer progress. Overflow or host allocation pressure—including
+failure while decoding hold-gate metadata—consumes the rejected input; network
+losses increment the Experimental
+`Node.ingressStats().dropped_network_inputs` counter. Purges use a separate,
+non-allocating control lane: repeated watermarks coalesce to the maximum and
+run before the ordinary backlog, so a queued qset response cannot revive
+pending state below a newly published purge floor.
+
 **Relay policy — as built** (`src/node/node.zig` `dispatch`, `onRecv`,
 `onPeerUp`, `resyncLoop`; this is normative for v1 and supersedes design
 §9.2's request_qset bullet):
@@ -744,9 +827,12 @@ most `max_slot_state_envelopes = 64` envelopes.
   engine's freshness order applies at release and the sender's next
   re-flood heals it), window 64 slots past the frontier (further ⇒
   dropped), 1024 entries / 8 MiB in total (a cap breach drops the newcomer;
-  no eviction). Only signers inside the transitive quorum graph are held;
-  a stranger's statement is fed and `ignored` by the engine's step-8
-  relevance filter before any state, so it never occupies the buffer. Held
+  no eviction). Only signers inside the published transitive quorum graph are
+  held; a stranger's statement is fed and `ignored` by the engine's step-8
+  relevance filter before any state, so it never occupies the buffer. A
+  recently disconnected signer can enter as a conservative-graph false
+  positive; holding does not advance the 64-update generation until release
+  to the Engine (§5), but the hold caps remain absolute. Held
   envelopes are neither relayed nor answered. Whenever an input moves
   `next_deliver` the held statements for the new frontier slot are fed,
   ascending by slot and in arrival order within a slot, after that input's
@@ -776,8 +862,14 @@ most `max_slot_state_envelopes = 64` envelopes.
 - `dontHave` is **ignored** (the flood covers the requester; parked envelopes
   expire by the parking caps).
 - `getQset` is answered from the persisted qset cache (§13) or with
-  `dontHave{kind 0, id = hash}`. Only qsets the node itself **requested** are
-  persisted on receipt (disk-fill guard); the engine is always fed.
+  `dontHave{kind 0, id = hash}`. A native Node parses, validates, normalizes,
+  and hashes an inbound qset before correlating it with an outstanding
+  `request_qset`. Only a matching response that successfully enters the input
+  queue consumes that request and is persisted; malformed, unsolicited,
+  duplicate, or queue-rejected responses reach neither the Engine nor disk,
+  and queue pressure releases the claim for a later retry. The direct sans-I/O
+  Engine has no request ledger and accepts any valid `qset_received` input,
+  including deliberate cache pre-warming by its host.
 - `getSlotState(s)` is answered with up to 64 of the node's **own** latest
   envelopes (ballot statements preferred) for the requested window; `0`
   means "latest externalized you have". Requests are never relayed.
@@ -791,17 +883,16 @@ most `max_slot_state_envelopes = 64` envelopes.
   liveness backstop after a partition heals with connections intact; receivers
   dedup via freshness, so there is no relay amplification.
 - Zero-frame placeholder envelopes the engine emits as self-records are
-  dropped at the single `emitEnvelope` chokepoint (HANDOFF §6: a contract,
-  not an optimization).
+  dropped at the single `Node.emitEnvelope` chokepoint. This is a protocol
+  contract, not an optimization.
 - `ping` is answered with `pong` of the same payload; `pong` is ignored.
 
 ## 13. Persistence
 
 Source: `src/node/store.zig` (header + `Recovery`), `src/node/node.zig`
 (identity marker, `purge_window`, compaction), `src/node/keys.zig`.
-**No vector yet** — the cross-language on-disk fixture is the deferred Deno
-track's guard; until then `store.zig`'s tests (round-trip, last-wins dedup,
-torn tail, crc) are the pin.
+**No cross-language vector yet** — until one is added, `store.zig`'s tests
+(round-trip, last-wins dedup, torn tail, crc) are the pin.
 
 **`data_dir` layout** (as built, M6):
 
@@ -812,7 +903,7 @@ slcp-data/
   own.log            # append-only: (u64 slot, u32 len, envelope bytes, u32 crc32); fsync'd
   externalized.log   # append-only: (u64 slot, u32 len, value, u32 crc32); fsync'd —
                      # the app-visible journal AND the crash-fallback slot bound
-  qsets/<hex64>.bin  # verified foreign qset cache (best-effort, no fsync)
+  qsets/<hex64>.bin  # verified local/requested-remote qset cache (best-effort, no fsync)
   own.log.compact / externalized.log.compact   # compaction scratch (harmless leftovers)
 ```
 
@@ -864,10 +955,15 @@ crash is inert and a restart needs no cleanup. On a filesystem without lock
 support the node logs a warning and starts unguarded.
 
 **Restart order** (`Node.create`, M6 S3): (1) the delivery frontier comes
-from the journal high-water mark; (2) the journal tail is replayed to the app
-through the single delivery chokepoint in ascending slot order; (3) then the
-`own.log` latest records are fed as `restore_own_envelope` inputs before any
-other input; (4) go live: listen, engine thread, anti-entropy thread.
+from the journal high-water mark; (2) before restoring Engine state, the host
+reconstructs its monotonic purge floor as
+`max(start_slot, F − 15)` when the delivered frontier `F >= 16` (otherwise
+`start_slot`); (3) the complete retained journal tail is replayed to the app
+through the single delivery chokepoint in ascending slot order; (4) only
+`own.log` latest records at or above that floor are fed as
+`restore_own_envelope` inputs; (5) go live: listen, engine thread,
+anti-entropy thread. An explicit `start_slot` declares every lower slot out of
+scope even when the journal is empty.
 
 **Write path**: `persist_own_envelope` → append + fsync `own.log` → only then
 the paired `broadcast_envelope`. A failed append latches the node **inert**
@@ -881,14 +977,31 @@ time `F` enters a new 64-slot bucket since the last compaction (so a
 multi-slot catch-up drain that steps over a multiple of 64 still counts),
 compacts both logs to `slot >= F − 15` (atomic temp-file + fsync +
 rename-over). So between compactions a log holds between 16 and ~80 slots,
-and a restart replays all of them (dedup by slot in the app, design §8.5).
+and a restart replays the whole retained **journal** tail to the application
+(dedup by slot in the app, design §8.5), while old `own.log` records below
+the reconstructed startup floor are skipped before Engine restoration. This
+prevents an uncompacted ~80-slot tail from filling the 64-slot Engine budget
+oldest-first and excluding current protocol state.
+A native node publishes the later of its current floor and `F − 15` before
+it queues the priority Engine purge. The floor never retreats, including when
+an explicit `start_slot` is later than the first answering-window calculation.
+Late peer envelopes, entries already in the hold buffer, and local nominations
+that the purge overtook in the ordinary queue are all checked against that
+floor at apply time and consumed when their slot is lower. This prevents stale
+work from recreating a just-purged slot and producing fresh state for old
+history.
 A catch-up gap wider than the window is declared unrecoverable and skipped
 loudly; held statements (§12) for the skipped range are dropped with it,
 and the new frontier slot's held statements are released.
 
 **Qset cache**: `qsets/<lower-case hex of qsetHash>.bin` holds the framed
-`QuorumSet` message bytes; best-effort, no fsync, written only for hashes the
-node requested.
+`QuorumSet` message bytes; best-effort, no fsync, written for the local qset and
+for validated inbound hashes the node requested. These files are not currently
+pruned by log compaction or in-memory qset eviction. A long-lived node that
+resolves a continuing sequence of requested qset rotations can therefore grow
+`qsets/` without a built-in disk bound; native request correlation prevents
+unsolicited frames from doing so, but operators must still monitor the data
+directory.
 
 **Key file** (`keys.zig` header): exactly **32 raw seed bytes** (not hex),
 mode `0600`, created atomically and durably (temp file → fsync, plus

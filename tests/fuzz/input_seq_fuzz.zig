@@ -31,7 +31,8 @@
 //!
 //! Fuzz API (zig 0.17): std.testing.fuzz(context, testOne, .{ .corpus }),
 //! testOne: fn (context, *std.testing.Smith). The deterministic `fuzz-smoke`
-//! run replays 5000 fixed-seed iterations through Smith{ .in = bytes }.
+//! runs 5000 fixed-seed multi-input sequences, giving every input a valid
+//! Smith{ .in = bytes } replay stream.
 
 const std = @import("std");
 const slcp = @import("slcp-core");
@@ -55,6 +56,84 @@ const n_members: u8 = 4;
 const max_inputs = 48; // per-iteration cap on the derived sequence
 const max_value_bytes = 40;
 
+/// What the deterministic smoke actually derived at the `stepOnce` seam.
+/// This deliberately observes consumed Smith values rather than the byte
+/// producer, so a malformed replay stream cannot satisfy the diversity gate.
+const SmokeDiversity = struct {
+    const max_distinct_values = 64;
+    const Value = struct {
+        len: u8 = 0,
+        bytes: [max_value_bytes]u8 = @splat(0),
+    };
+
+    operations: [7]bool = @splat(false),
+    slots: [8]bool = @splat(false),
+    forged_statements: [4]bool = @splat(false),
+    statuses: std.enums.EnumSet(engine.InputStatus) = .empty,
+    checked_inputs: usize = 0,
+    values: [max_distinct_values]Value = @splat(.{}),
+    value_count: usize = 0,
+
+    fn record(self: *SmokeDiversity, operation: u8, slot: ?u64, value: ?[]const u8) void {
+        self.operations[operation] = true;
+        if (slot) |s| self.slots[s - 1] = true;
+
+        // Values only reach the engine on nominate and forged-envelope
+        // inputs. Callers pass null for operations without an input value so
+        // the common decoder's unused candidate cannot inflate this count.
+        const input_value = value orelse return;
+        for (self.values[0..self.value_count]) |known| {
+            if (known.len == input_value.len and std.mem.eql(u8, known.bytes[0..known.len], input_value)) return;
+        }
+        if (self.value_count == self.values.len) return;
+        var sample: Value = .{ .len = @intCast(input_value.len) };
+        @memcpy(sample.bytes[0..input_value.len], input_value);
+        self.values[self.value_count] = sample;
+        self.value_count += 1;
+    }
+
+    fn operationCount(self: *const SmokeDiversity) usize {
+        var count: usize = 0;
+        for (self.operations) |seen| count += @intFromBool(seen);
+        return count;
+    }
+
+    fn slotCount(self: *const SmokeDiversity) usize {
+        var count: usize = 0;
+        for (self.slots) |seen| count += @intFromBool(seen);
+        return count;
+    }
+
+    fn recordForged(self: *SmokeDiversity, statement: adversary.RawStatement) void {
+        const subtype: usize = switch (statement) {
+            .nominate => 0,
+            .prepare => 1,
+            .confirm => 2,
+            .externalize => 3,
+        };
+        self.forged_statements[subtype] = true;
+    }
+
+    fn forgedStatementCount(self: *const SmokeDiversity) usize {
+        var count: usize = 0;
+        for (self.forged_statements) |seen| count += @intFromBool(seen);
+        return count;
+    }
+
+    fn recordCheckedStatus(self: *SmokeDiversity, status: engine.InputStatus) void {
+        self.statuses.insert(status);
+        self.checked_inputs += 1;
+    }
+
+    fn sawStatus(self: *const SmokeDiversity, status: engine.InputStatus) bool {
+        return self.statuses.contains(status);
+    }
+
+    fn statusCount(self: *const SmokeDiversity) usize {
+        return self.statuses.count();
+    }
+};
+
 /// A fully-wired honest node plus the shared-qset framing the fuzzer needs to
 /// answer request_qset and to make peer statements resolve (not park).
 const Fixture = struct {
@@ -64,6 +143,7 @@ const Fixture = struct {
     shared_hash: [32]u8,
     tracker: invariants.Tracker = .{},
     last_own: ?[]u8 = null,
+    smoke_diversity: ?*SmokeDiversity = null,
     // Replay instrumentation (null in fuzz / smoke runs): an optional trace
     // sink plus the bookkeeping a violation report needs — the previous own
     // statement per (slot, protocol) and the last APPLIED restore per slot.
@@ -162,6 +242,10 @@ fn drainAndCheck(gpa: std.mem.Allocator, fx: *Fixture) !void {
     if (status_count != 1 or !last_was_status) return error.InputStatusContract;
     // Per-slot ballot invariants + effect-queue bound (§13.1).
     if (try invariants.checkEngine(eng, &fx.tracker, gpa)) |_| return error.EngineInvariant;
+    if (fx.smoke_diversity) |diversity| {
+        diversity.recordCheckedStatus(fx.last_status orelse unreachable);
+        executed_steps += 1;
+    }
 }
 
 /// Push one input; on a clean sticky failure (a legitimate §7.2 outcome)
@@ -222,24 +306,28 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
     const value = vbuf[0..vlen];
     const vtag = hashTag(value);
 
-    // Mostly the shared hash (statements resolve); occasionally a random hash
-    // to exercise the park path.
+    // Mostly a random hash to exercise the park path; occasionally the shared
+    // hash so statements resolve immediately.
     const shared_qh = smith.boolWeighted(7, 1);
     const qh: [32]u8 = if (shared_qh) fx.shared_hash else smith.value([32]u8);
 
-    switch (smith.valueRangeAtMost(u8, 0, 6)) {
+    const operation = smith.valueRangeAtMost(u8, 0, 6);
+    switch (operation) {
         0 => {
             try traceInput(fx, "nominate slot={d} value={s}/{d}B", .{ slot, &vtag, value.len });
+            if (fx.smoke_diversity) |diversity| diversity.record(operation, slot, value);
             return pushOne(gpa, fx, .{ .nominate = .{ .slot = slot, .value = value, .prev_value = &.{} } });
         },
         1 => {
             const timer: engine.TimerId = if (smith.value(bool)) .ballot else .nomination;
             try traceInput(fx, "timer_fired slot={d} timer={t}", .{ slot, timer });
+            if (fx.smoke_diversity) |diversity| diversity.record(operation, slot, null);
             return pushOne(gpa, fx, .{ .timer_fired = .{ .slot = slot, .timer = timer } });
         },
         2 => {
             // A real key-holder envelope with fuzz-chosen content.
-            const raw: adversary.RawStatement = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            const forged_subtype = smith.valueRangeAtMost(u8, 0, 3);
+            const raw: adversary.RawStatement = switch (forged_subtype) {
                 0 => .{ .nominate = .{ .qset_hash = qh, .votes = &.{value}, .accepted = &.{} } },
                 1 => .{ .prepare = .{ .qset_hash = qh, .ballot = pickBallot(smith, value) } },
                 2 => .{ .confirm = .{
@@ -263,15 +351,21 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
             }
             const env = fx.forger.sign(slot, raw) catch return .ok; // build failure ⇒ skip
             defer gpa.free(env);
+            if (fx.smoke_diversity) |diversity| {
+                diversity.record(operation, slot, value);
+                diversity.recordForged(raw);
+            }
             return pushOne(gpa, fx, .{ .envelope_received = .{ .bytes = env } });
         },
         3 => {
             try traceInput(fx, "qset_received (shared qset)", .{});
+            if (fx.smoke_diversity) |diversity| diversity.record(operation, null, null);
             return pushOne(gpa, fx, .{ .qset_received = .{ .bytes = fx.shared_framed } });
         },
         4 => {
             const max_slot = smith.valueRangeAtMost(u64, 0, 8);
             try traceInput(fx, "purge_slots max_slot={d}", .{max_slot});
+            if (fx.smoke_diversity) |diversity| diversity.record(operation, null, null);
             return purgeSlots(gpa, fx, max_slot);
         },
         5 => {
@@ -288,6 +382,7 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
                     try writeSummary(w, rs);
                     try w.writeAll("\n");
                 };
+                if (fx.smoke_diversity) |diversity| diversity.record(operation, rs.slot, null);
                 const outcome = try pushOne(gpa, fx, .{ .restore_own_envelope = .{ .bytes = dup } });
                 if (outcome == .ok and fx.last_status == .applied) try fx.restore_steps.put(gpa, rs.slot, fx.step);
                 return outcome;
@@ -300,6 +395,7 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
             var gbuf: [64]u8 = undefined;
             const glen = smith.slice(&gbuf);
             try traceInput(fx, "envelope(garbage {d}B)", .{glen});
+            if (fx.smoke_diversity) |diversity| diversity.record(operation, null, null);
             return pushOne(gpa, fx, .{ .envelope_received = .{ .bytes = gbuf[0..glen] } });
         },
     }
@@ -310,32 +406,119 @@ fn stepOnce(gpa: std.mem.Allocator, fx: *Fixture, smith: *std.testing.Smith) !Pu
 /// leak-checked DebugAllocator so leaks fail the iteration.
 fn fuzzInputSeqOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var da: std.heap.DebugAllocator(.{}) = .init;
-    const result = run(da.allocator(), smith, null, null); // coverage-guided: eos picks the length
+    const result = run(da.allocator(), smith, null); // coverage-guided: eos picks the length
     const leak = da.deinit();
     try result;
     if (leak == .leak) return error.MemoryLeak;
 }
 
-/// One deterministic smoke iteration over a fixed `budget` of inputs (finding
-/// #1 fix): guarantees a real multi-input sequence with an invariant check
-/// after each. Leak-checked.
-fn smokeOne(smith: *std.testing.Smith, budget: usize) anyerror!void {
+fn appendSmokeU64(out: []u8, used: *usize, value: u64) void {
+    std.debug.assert(used.* + @sizeOf(u64) <= out.len);
+    std.mem.writeInt(u64, out[used.*..][0..@sizeOf(u64)], value, .little);
+    used.* += @sizeOf(u64);
+}
+
+fn appendSmokeSlice(rand: std.Random, out: []u8, used: *usize, max_len: u32) void {
+    const len = rand.uintLessThan(u32, max_len + 1);
+    const len_usize: usize = @intCast(len);
+    std.debug.assert(used.* + @sizeOf(u32) + len_usize <= out.len);
+    std.mem.writeInt(u32, out[used.*..][0..@sizeOf(u32)], len, .little);
+    used.* += @sizeOf(u32);
+    rand.bytes(out[used.* .. used.* + len_usize]);
+    used.* += len_usize;
+}
+
+fn appendSmokeBytes(rand: std.Random, out: []u8, used: *usize, len: usize) void {
+    std.debug.assert(used.* + len <= out.len);
+    rand.bytes(out[used.* .. used.* + len]);
+    used.* += len;
+}
+
+/// Produce one valid Smith replay stream for `stepOnce`. In replay mode every
+/// constrained scalar occupies a little-endian u64 and every slice is a u32
+/// length followed by that many bytes. Uniform random bytes do not have that
+/// shape: nearly every scalar falls outside its allowed range and the first
+/// random slice length consumes the rest of the stream.
+fn smokeStepBytes(rand: std.Random, out: []u8) []const u8 {
+    var used: usize = 0;
+
+    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 1, 8)); // slot
+    appendSmokeSlice(rand, out, &used, max_value_bytes); // value
+
+    // Mirror boolWeighted(7, 1): false seven-eighths of the time, true once.
+    const shared_qset = rand.uintLessThan(u8, 8) == 0;
+    appendSmokeU64(out, &used, @intFromBool(shared_qset));
+    if (!shared_qset) appendSmokeBytes(rand, out, &used, 32); // random qset hash
+
+    const operation = rand.uintLessThan(u8, 7);
+    appendSmokeU64(out, &used, operation);
+    switch (operation) {
+        0, 3, 5 => {},
+        1 => appendSmokeU64(out, &used, @intFromBool(rand.boolean())),
+        2 => {
+            const statement = rand.uintLessThan(u8, 4);
+            appendSmokeU64(out, &used, statement);
+            switch (statement) {
+                0 => {},
+                1 => appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)),
+                2 => {
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // ballot counter
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // n_prepared
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // n_commit
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // n_h
+                },
+                else => {
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // commit counter
+                    appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 6)); // n_h
+                },
+            }
+        },
+        4 => appendSmokeU64(out, &used, rand.intRangeAtMost(u64, 0, 8)),
+        else => appendSmokeSlice(rand, out, &used, 64), // arbitrary garbage envelope
+    }
+    return out[0..used];
+}
+
+/// One deterministic smoke iteration over a fixed `budget` of inputs. Each
+/// input receives its own well-formed Smith stream, so branch-specific bytes
+/// left unread by one step cannot misalign the next. The engine fixture stays
+/// alive for the full multi-input sequence. Leak-checked.
+fn smokeOne(rand: std.Random, budget: usize, diversity: *SmokeDiversity) anyerror!void {
     var da: std.heap.DebugAllocator(.{}) = .init;
-    const result = run(da.allocator(), smith, budget, null);
+    const result = smokeSequence(da.allocator(), rand, budget, diversity);
     const leak = da.deinit();
     try result;
     if (leak == .leak) return error.MemoryLeak;
 }
 
-/// `budget == null`: the coverage-guided path — the loop length is chosen by
-/// `smith.eos()` (correct under `zig build fuzz --fuzz`, where the fuzzer
-/// drives eos from coverage). `budget != null`: the deterministic smoke — run
-/// exactly that many steps ignoring eos, because in `Smith{ .in = bytes }`
-/// mode eos() consumes a byte and returns true on any nonzero value, which
-/// would terminate the loop after ~1 step on random input (M3 review finding
-/// #1). A fixed budget is what makes the smoke actually exercise multi-input
-/// sequences and the after-every-input invariant checks.
-fn run(gpa: std.mem.Allocator, smith: *std.testing.Smith, budget: ?usize, trace: ?*Trace) !void {
+fn smokeSequence(gpa: std.mem.Allocator, rand: std.Random, budget: usize, diversity: *SmokeDiversity) !void {
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit(gpa);
+    fx.smoke_diversity = diversity;
+
+    var scratch: [192]u8 = undefined;
+    const guard_len = 16;
+    var steps: usize = 0;
+    while (steps < budget) : (steps += 1) {
+        const encoded = smokeStepBytes(rand, &scratch);
+        @memset(scratch[encoded.len..][0..guard_len], 0xa5);
+        var smith: std.testing.Smith = .{ .in = scratch[0 .. encoded.len + guard_len] };
+        const outcome = try stepOnce(gpa, &fx, &smith);
+        // The producer mirrors Smith's replay ABI exactly. Keeping a guard
+        // beyond the intended stream catches both under-production (Smith
+        // consumes guard bytes instead of defaulting at EOF) and over-
+        // production (encoded bytes remain before the intact guard).
+        const remaining = smith.in.?;
+        if (remaining.len != guard_len or !std.mem.allEqual(u8, remaining, 0xa5)) {
+            return error.SmokeSmithStreamMismatch;
+        }
+        if (outcome == .failed) break;
+    }
+}
+
+/// Coverage-guided path: the fuzzer drives sequence length through eos and
+/// supplies Smith's typed values directly.
+fn run(gpa: std.mem.Allocator, smith: *std.testing.Smith, trace: ?*Trace) !void {
     var fx = try Fixture.init(gpa);
     defer fx.deinit(gpa);
     fx.trace = trace;
@@ -344,15 +527,8 @@ fn run(gpa: std.mem.Allocator, smith: *std.testing.Smith, budget: ?usize, trace:
     };
 
     var steps: usize = 0;
-    if (budget) |b| {
-        while (steps < b) : (steps += 1) {
-            executed_steps += 1;
-            if (try stepOnce(gpa, &fx, smith) == .failed) break; // cleanly sticky-failed
-        }
-    } else {
-        while (steps < max_inputs and !smith.eos()) : (steps += 1) {
-            if (try stepOnce(gpa, &fx, smith) == .failed) break;
-        }
+    while (steps < max_inputs and !smith.eos()) : (steps += 1) {
+        if (try stepOnce(gpa, &fx, smith) == .failed) break;
     }
 }
 
@@ -397,7 +573,7 @@ pub const Finding = struct {
     /// the two emissions.
     restore_between: bool,
     /// Set only when both are EXTERNALIZE: byte-equal commit values (the
-    /// HANDOFF §6 re-emit class) or not (a fork).
+    /// v0.1.0 RELEASING.md run-log re-emit class) or not (a fork).
     same_committed_value: ?bool,
 };
 
@@ -422,7 +598,7 @@ pub fn replayBytes(gpa: std.mem.Allocator, bytes: []const u8, trace: ?*Trace) !v
     defer if (trace) |t| {
         t.bytes_left = if (smith.in) |rest| rest.len else 0;
     };
-    return run(gpa, &smith, null, trace);
+    return run(gpa, &smith, trace);
 }
 
 /// 16 hex chars of sha256(bytes) — a short stable tag for values / frames.
@@ -673,28 +849,25 @@ test "fuzz: random valid-typed input interleavings preserve §13.1 invariants" {
 pub const smoke_iterations: usize = 5000;
 pub const smoke_seed: u64 = 0x1257_5e9f_a220_1b0d;
 
-/// Actual single inputs executed through the engine (incremented per
-/// stepOnce). Asserted large at the end of runSmoke so a regression to the
-/// vacuous eos-terminated behavior (M3 review finding #1: 15 steps across
-/// 5000 iterations) fails loudly.
+/// Actual single inputs successfully fed through the engine and checked at
+/// the invariant seam. Skipped restore operations and pre-feed construction
+/// failures do not inflate it. Asserted large at the end of runSmoke so a
+/// regression to the vacuous eos-terminated behavior (M3 review finding #1:
+/// 15 steps across 5000 iterations) fails loudly.
 pub var executed_steps: usize = 0;
+var smoke_diversity: SmokeDiversity = .{};
 
 pub fn runSmoke() !void {
     executed_steps = 0;
+    smoke_diversity = .{};
     var prng = std.Random.DefaultPrng.init(smoke_seed);
     const rand = prng.random();
-    // Big enough that a full budget of steps rarely exhausts the byte stream
-    // (each stepOnce consumes ~10-40 bytes); when it does, Smith yields zeros
-    // — still valid typed inputs.
-    var scratch: [4096]u8 = undefined;
 
     var i: usize = 0;
     while (i < smoke_iterations) : (i += 1) {
-        rand.bytes(&scratch);
         // A real per-iteration budget in [8, max_inputs] — never eos-gated.
         const budget = 8 + rand.uintLessThan(usize, max_inputs - 7);
-        var smith: std.testing.Smith = .{ .in = &scratch };
-        try smokeOne(&smith, budget);
+        try smokeOne(rand, budget, &smoke_diversity);
     }
 }
 
@@ -705,4 +878,18 @@ test "fuzz-smoke: input-seq target, 5000 deterministic iterations, leak-free" {
     // 5000 iterations this is tens of thousands of engine inputs, each
     // invariant-checked.
     try std.testing.expect(executed_steps > 40_000);
+    try std.testing.expectEqual(smoke_diversity.checked_inputs, executed_steps);
+    // Behavioral non-vacuity: derived inputs must span every operation and
+    // slot, every forged wire-statement subtype, and many byte-distinct
+    // nominate/envelope values. Statuses are recorded only after the Engine
+    // feed and invariant check, so they prove several semantic paths ran too.
+    try std.testing.expectEqual(@as(usize, 7), smoke_diversity.operationCount());
+    try std.testing.expectEqual(@as(usize, 8), smoke_diversity.slotCount());
+    try std.testing.expectEqual(@as(usize, SmokeDiversity.max_distinct_values), smoke_diversity.value_count);
+    try std.testing.expectEqual(@as(usize, 4), smoke_diversity.forgedStatementCount());
+    try std.testing.expect(smoke_diversity.sawStatus(.applied));
+    try std.testing.expect(smoke_diversity.sawStatus(.insane));
+    try std.testing.expect(smoke_diversity.sawStatus(.parked_awaiting_qset));
+    try std.testing.expect(smoke_diversity.sawStatus(.ignored));
+    try std.testing.expect(smoke_diversity.statusCount() >= 4);
 }

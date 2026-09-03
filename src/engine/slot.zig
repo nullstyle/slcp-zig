@@ -420,19 +420,4 @@ pub const Slot = struct {
         const map = if (nomination_protocol) &self.latest_nom else &self.latest_ballot;
         return map.get(node);
     }
-
-    /// Remove and free the stored latest for (node, protocol); returns the
-    /// freed byte size (0 when absent). Used by the pipeline to purge a
-    /// statement the ballot protocol rejected post-store (oracle: such a
-    /// statement never counts in any federated predicate).
-    pub fn removeLatest(self: *Slot, gpa: std.mem.Allocator, node: [32]u8, nomination_protocol: bool) usize {
-        const map = if (nomination_protocol) &self.latest_nom else &self.latest_ballot;
-        if (map.fetchRemove(node)) |kv| {
-            const sz = kv.value.byteSize();
-            kv.value.deinit(gpa);
-            gpa.destroy(kv.value);
-            return sz;
-        }
-        return 0;
-    }
 };

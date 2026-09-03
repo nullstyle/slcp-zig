@@ -396,6 +396,15 @@ in [`docs/stability.md`](docs/stability.md).
 
 ## Documentation
 
+- [`CONTEXT.md`](CONTEXT.md) — the canonical glossary for protocol,
+  federated trust, and delivery terms.
+- [`DESIGN.md`](DESIGN.md) — the enduring architecture, module seams,
+  system invariants, and code map.
+- [`STATUS.md`](STATUS.md) — the dated split between released, committed
+  unreleased, and current worktree state, including the verification ledger.
+- [`docs/examples-roadmap.md`](docs/examples-roadmap.md) — E1's shipped
+  registry shape and the planned E2/E3 progression toward history, upgrades,
+  and operations.
 - `docs/protocol.md` — the normative byte-level definition of SLCP v1 as a
   citation index: domain tags, canonical form, quorum sets, leader election,
   frozen limits, statement sanity, the engine boundary, overlay and

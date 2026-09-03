@@ -1,7 +1,8 @@
 @0xb6651e61a62e69c5;
 # host.capnp — engine boundary (EngineConfig, Input, Effect).
 # Versioned with the WASM ABI; append-only evolution. NOT signed data, so
-# non-zero defaults are allowed here. See claude-design.md §7.1.
+# non-zero defaults are allowed here. See DESIGN.md "WASM module" and
+# docs/protocol.md §14.
 
 using Slcp = import "slcp.capnp";
 

@@ -68,10 +68,11 @@ slcp.Node.prop_mu: field Io.Mutex = <default>
 slcp.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
 slcp.Node.purge_floor: field atomic.Value(u64) = <default>
 slcp.Node.q: field node.node.InputQueue
-slcp.Node.qset_mu: field Io.Mutex = <default>
-slcp.Node.req_qsets: field hash_map.Custom([32]u8,void,hash_map.AutoContext([32]u8),80) = <default>
+slcp.Node.qset_requests: field node.node.QsetRequests
 slcp.Node.resync_stop: field atomic.Value(bool) = <default>
 slcp.Node.resync_thread: field ?Thread = null
+slcp.Node.stats_mu: field Io.Mutex = <default>
+slcp.Node.stats_snapshot: field engine.engine.Stats = <default>
 slcp.Node.store: field node.store.Store
 slcp.Node.watcher: field bool
 slcp.Node.wheel: field node.timers.Wheel
@@ -977,21 +978,38 @@ slcp.core.qset.lint: fn (mem.Allocator, *const engine.qset.QuorumSetOwned) error
 slcp.core.qset.minBlockingSize: fn (*const engine.qset.QuorumSetOwned) u32
 slcp.core.qset.validateAndNormalize: fn (mem.Allocator, *engine.qset.QuorumSetOwned) anyerror!void
 slcp.core.qset: struct
+slcp.core.qset_store.StatementReference.hash: field [32]u8
+slcp.core.qset_store.StatementReference.node: field [32]u8
+slcp.core.qset_store.StatementReference: struct
+slcp.core.qset_store.Store.addGraphRoot: fn (*engine.qset_store.Store, [32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store.addToGraph: fn (*engine.qset_store.Store, *const engine.qset.QuorumSetOwned) error{OutOfMemory}!void
-slcp.core.qset_store.Store.advertised: field hash_map.Custom([32]u8,[32]u8,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.qset_store.Store.beginReferenceBatch: fn (*engine.qset_store.Store) void
 slcp.core.qset_store.Store.by_hash: field hash_map.Custom([32]u8,*engine.qset.QuorumSetOwned,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.qset_store.Store.canReplaceStatementReference: fn (*const engine.qset_store.Store, ?[32]u8, ?[32]u8) bool
 slcp.core.qset_store.Store.count: fn (*const engine.qset_store.Store) usize
+slcp.core.qset_store.Store.deferred_reference_updates: field u8 = 0
 slcp.core.qset_store.Store.deinit: fn (*engine.qset_store.Store) void
+slcp.core.qset_store.Store.finishReferenceBatch: fn (*engine.qset_store.Store) error{OutOfMemory}!void
 slcp.core.qset_store.Store.get: fn (*const engine.qset_store.Store, [32]u8) ?*const engine.qset.QuorumSetOwned
 slcp.core.qset_store.Store.gpa: field mem.Allocator
 slcp.core.qset_store.Store.graph: field hash_map.Custom([32]u8,void,hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.qset_store.Store.inGraph: fn (*const engine.qset_store.Store, [32]u8) bool
 slcp.core.qset_store.Store.init: fn (mem.Allocator, u32) engine.qset_store.Store
 slcp.core.qset_store.Store.insert: fn (*engine.qset_store.Store, [32]u8, engine.qset.QuorumSetOwned) error{OutOfMemory}!void
-slcp.core.qset_store.Store.lookup: fn (*const engine.qset_store.Store) engine.local_node.QSetLookup
+slcp.core.qset_store.Store.local_only: field bool
 slcp.core.qset_store.Store.max_cached: field u32
+slcp.core.qset_store.Store.node_refs: field hash_map.Custom([32]u8,hash_map.Custom([32]u8,u32,hash_map.AutoContext([32]u8),80),hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.qset_store.Store.order: field array_list.Aligned([32]u8,null) = <default>
-slcp.core.qset_store.Store.setAdvertised: fn (*engine.qset_store.Store, [32]u8, [32]u8) error{OutOfMemory}!void
+slcp.core.qset_store.Store.recheckBeforeParking: fn (*engine.qset_store.Store, [32]u8) error{OutOfMemory}!bool
+slcp.core.qset_store.Store.reference_batch_active: field bool = false
+slcp.core.qset_store.Store.reference_batch_dirty: field bool = false
+slcp.core.qset_store.Store.release: fn (*engine.qset_store.Store, [32]u8) void
+slcp.core.qset_store.Store.removeStatementReferences: fn (*engine.qset_store.Store, []const engine.qset_store.StatementReference) error{OutOfMemory}!void
+slcp.core.qset_store.Store.replaceStatementReference: fn (*engine.qset_store.Store, [32]u8, ?[32]u8, ?[32]u8) error{OutOfMemory}!void
+slcp.core.qset_store.Store.retain: fn (*engine.qset_store.Store, [32]u8) error{OutOfMemory}!void
+slcp.core.qset_store.Store.retained: field hash_map.Custom([32]u8,u32,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.qset_store.Store.roots: field hash_map.Custom([32]u8,void,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.qset_store.Store.statement_refs: field hash_map.Custom([32]u8,u32,hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.qset_store.Store: struct
 slcp.core.qset_store: struct
 slcp.core.slot.NodeId: type = [32]u8
@@ -1007,7 +1025,6 @@ slcp.core.slot.Slot.latest_nom: field hash_map.Custom([32]u8,*engine.stored.Stor
 slcp.core.slot.Slot.nom: field engine.nomination.State = <default>
 slcp.core.slot.Slot.own_ballot: field ?engine.stored.StoredEnvelope = null
 slcp.core.slot.Slot.own_nom: field ?engine.stored.StoredEnvelope = null
-slcp.core.slot.Slot.removeLatest: fn (*engine.slot.Slot, mem.Allocator, [32]u8, bool) usize
 slcp.core.slot.Slot.storeLatest: fn (*engine.slot.Slot, mem.Allocator, engine.stored.StoredEnvelope) error{OutOfMemory}!isize
 slcp.core.slot.Slot.storedBytes: fn (*const engine.slot.Slot) usize
 slcp.core.slot.Slot.validation_cache: field engine.values.ValidationCache = <default>
@@ -1188,6 +1205,10 @@ slcp.node.HoldBuffer.takeReleasable: fn (*node.node.HoldBuffer, mem.Allocator, u
 slcp.node.HoldBuffer.takeSlot: fn (*node.node.HoldBuffer, u64) ?array_list.Aligned(node.node.HoldBuffer.Entry,null)
 slcp.node.HoldBuffer.window: const u64 = 64
 slcp.node.HoldBuffer: struct
+slcp.node.IngressStats.dropped_network_inputs: field usize
+slcp.node.IngressStats.queued_bytes: field usize
+slcp.node.IngressStats.queued_items: field usize
+slcp.node.IngressStats: struct
 slcp.node.InputItem.input: field engine.engine.Input
 slcp.node.InputItem.source_peer: field ?usize
 slcp.node.InputItem: struct
@@ -1214,6 +1235,7 @@ slcp.node.Node.ext_waiters: field usize = 0
 slcp.node.Node.failed: field atomic.Value(bool) = <default>
 slcp.node.Node.gpa: field mem.Allocator
 slcp.node.Node.hold: field node.node.HoldBuffer = <default>
+slcp.node.Node.ingressStats: fn (*node.node.Node) node.node.IngressStats
 slcp.node.Node.io: field Io
 slcp.node.Node.journal_tail: field ?node.node.Node.JournalTail = null
 slcp.node.Node.last_compact_frontier: field u64 = 0
@@ -1236,10 +1258,11 @@ slcp.node.Node.prop_mu: field Io.Mutex = <default>
 slcp.node.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
 slcp.node.Node.purge_floor: field atomic.Value(u64) = <default>
 slcp.node.Node.q: field node.node.InputQueue
-slcp.node.Node.qset_mu: field Io.Mutex = <default>
-slcp.node.Node.req_qsets: field hash_map.Custom([32]u8,void,hash_map.AutoContext([32]u8),80) = <default>
+slcp.node.Node.qset_requests: field node.node.QsetRequests
 slcp.node.Node.resync_stop: field atomic.Value(bool) = <default>
 slcp.node.Node.resync_thread: field ?Thread = null
+slcp.node.Node.stats_mu: field Io.Mutex = <default>
+slcp.node.Node.stats_snapshot: field engine.engine.Stats = <default>
 slcp.node.Node.store: field node.store.Store
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel

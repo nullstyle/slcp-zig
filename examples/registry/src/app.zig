@@ -1,5 +1,5 @@
-//! app.zig — the `slcp.AppNode` adapter for the registry (roadmap E1,
-//! examples-roadmap.md §3.4–§3.8).
+//! app.zig — the `slcp.AppNode` adapter for the registry
+//! (docs/examples-roadmap.md "E1 — Registry").
 //!
 //! The pure state machine lives in `registry.zig`; this file is the glue the
 //! typed layer needs: the `App` contract (`State`, `Command`, `validate`,
@@ -7,7 +7,8 @@
 //! the process-wide `boot` snapshot the two initial* functions read.
 //!
 //! `boot` is a global because `initialState()` is `fn () State` — it can
-//! take no `io` and no argument (roadmap §2.1 gap 1). `main.zig` sets it
+//! take no `io` and no argument (the roadmap's first "Gaps recorded by E1"
+//! item). `main.zig` sets it
 //! from the snapshot file (or genesis) BEFORE `Node.create`.
 
 const std = @import("std");

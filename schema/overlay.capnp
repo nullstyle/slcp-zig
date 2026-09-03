@@ -1,7 +1,8 @@
 @0xd1e0e224689f7c4d;
 # overlay.capnp — transport frames. Normal append-only capnp evolution.
 # TRUST MODEL: only envelope signatures are authenticated. Hello fields are
-# unauthenticated hints. See claude-design.md §9.
+# unauthenticated hints. See DESIGN.md "Trust and operations" and
+# docs/threat-model.md.
 
 using Slcp = import "slcp.capnp";
 

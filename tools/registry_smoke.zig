@@ -1,5 +1,5 @@
-//! registry-smoke — examples/registry run for real (examples-roadmap.md §2.1
-//! acceptance, §3.12 gates).
+//! registry-smoke — examples/registry run for real
+//! (docs/examples-roadmap.md "E1 — Registry" acceptance gates).
 //!
 //! Builds `examples/registry` ONCE as a consumer package — a nested
 //! `zig build -Doptimize=ReleaseSafe` of a scratch copy with this repo as a

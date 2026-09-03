@@ -302,7 +302,8 @@ fn ensureSingleton(gpa: std.mem.Allocator, bs: *State, node: [32]u8) !void {
 ///   synthetic singleton `{threshold 1, [node]}` (§5.4 SINGLETON QSET rule);
 /// - the local node resolves to the configured local qset (its statements
 ///   advertise local_qset_hash);
-/// - anyone else resolves through the engine's advertised-qset store.
+/// - anyone else resolves the qset hash carried by that exact slot's latest
+///   ballot statement (never a global advertisement from another slot).
 /// Read-only: respects the QSetLookup borrow contract.
 const BallotLookup = struct {
     ctx: *engine_mod.Ctx,
@@ -314,12 +315,12 @@ const BallotLookup = struct {
             if (env.statement.pledges == .externalize) {
                 return self.s.ballot.singletons.get(node);
             }
+            if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) {
+                return &self.ctx.cfg.quorum_set;
+            }
+            return self.ctx.qsets.get(env.statement.qsetHash());
         }
-        if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) {
-            return &self.ctx.cfg.quorum_set;
-        }
-        const inner = self.ctx.qsets.lookup();
-        return inner.get(inner.ctx, node);
+        return null;
     }
 
     fn lookup(self: *const BallotLookup) local_node.QSetLookup {
@@ -384,12 +385,17 @@ fn minValidity(a: driver_mod.Validity, b: driver_mod.Validity) driver_mod.Validi
 /// statementValidationLevel over getStatementValues,
 /// BallotProtocol.cpp:2086-2150; the PREPARE b-value is skipped at counter 0
 /// exactly as getStatementValues does).
-/// Pre-store gate for the pipeline (oracle BallotProtocol.cpp:189-249:
-/// validation PRECEDES recordEnvelope, so a driver-invalid PREPARE never
-/// enters the voting universe and the sender's previous statement survives).
-/// Only PREPARE rejects; invalid CONFIRM/EXTERNALIZE demote to maybe_valid
-/// during processing (§5.4 validation-level collapse).
+/// Pre-store gate for the pipeline (oracle BallotProtocol.cpp:189-271): every
+/// rejection PRECEDES recordEnvelope, so the sender's previous statement and
+/// its exact qset reference survive. Driver-invalid PREPARE rejects; invalid
+/// CONFIRM/EXTERNALIZE demote to maybe_valid (§5.4), while any ballot that is
+/// incompatible with an already externalized value rejects.
 pub fn statementRejectsPreStore(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, st: *const stored.OwnedStatement) !bool {
+    if (s.ballot.phase == .externalize and
+        !compatible(getWorkingBallot(st), bv(&s.ballot.commit.?)))
+    {
+        return true;
+    }
     if (st.pledges != .prepare) return false;
     return (try statementValidationLevel(ctx, s, st)) == .invalid;
 }
@@ -1690,10 +1696,11 @@ const TestEnv = struct {
             .quorum_set = try makeFlatQs(gpa, 2, &members),
             .limits = .{},
         };
-        // both peers advertise the same 2-of-3 (as the pipeline records)
+        try self.store.addToGraph(&self.cfg.quorum_set);
+        try self.store.addGraphRoot(self.cfg.node_id);
+        // Both peers' stored statements carry this same 2-of-3 hash. The
+        // exact-statement lookup only needs the verified qset cached here.
         try self.store.insert(peer_qset_hash, try makeFlatQs(gpa, 2, &members));
-        try self.store.setAdvertised(node_a, peer_qset_hash);
-        try self.store.setAdvertised(node_b, peer_qset_hash);
         self.stored_bytes = 0; // struct is `undefined`-initialized in tests
         self.ctx = .{
             .gpa = gpa,

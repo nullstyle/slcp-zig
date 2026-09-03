@@ -32,7 +32,7 @@
 //!     as TEXT at runtime and rendered as `slcp-abi.*` lines that flow through
 //!     the same tier routing as the comptime walk. That is why every run step
 //!     of this tool reads files the build graph does not declare, and why each
-//!     carries `setCwd` + `has_side_effects` (HANDOFF §6).
+//!     carries `setCwd` + `has_side_effects` (RELEASING.md "Cold preflight").
 //!   * `slcp.core.capnpc` — the re-exported capnp-zig module — is on a skip
 //!     list. It is upstream's surface, frozen by upstream's own snapshot.
 //!

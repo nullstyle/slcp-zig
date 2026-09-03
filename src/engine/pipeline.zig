@@ -1,7 +1,8 @@
 //! The envelope/input pipeline (design §5 intro, §5.2/§5.3, M2): decode →
 //! sanity → signature verify → strictCanonical → relevance filter → slot
 //! admission → freshness → qset resolution/parking → stored-bytes budget →
-//! store/forward/dispatch — and exactly ONE input_status per input, ALWAYS
+//! protocol precheck → qset-reference capacity → store/dispatch/forward —
+//! and exactly ONE input_status per input, ALWAYS
 //! pushed as the final effect of its drain (§5.3).
 //!
 //! Receive-path order for envelope_received (§4.2 with the one mechanical
@@ -16,7 +17,10 @@
 //!   6. Ed25519 verify over the RECEIVED statementBytes (§4.2; wrong-network
 //!      envelopes implicitly fail — their digests differ) → invalid_signature
 //!   7. strictCanonical structural walk on the SAME parse (§4.2) → insane
-//!   8. relevance: sender outside the transitive quorum graph (§5.4) → ignored
+//!   8. relevance: sender outside the published transitive quorum graph (§5.4) →
+//!      ignored; for an unknown-qset envelope during a conservative generation,
+//!      advance the generation and recheck before slot admission (an exact
+//!      checkpoint can change the result to ignored)
 //!   9. slot admission (max_live_slots; existing slots always accept) →
 //!      over_limit
 //!  10. freshness vs the per-(node, protocol) latest via stored.isNewerOwned
@@ -26,8 +30,11 @@
 //!      over_limit (per-node cap); evictions of PAST inputs emit
 //!      phase_event(parked_evicted), never a second input_status
 //!  12. stored-bytes budget (§5.1 max_stored_statement_bytes) → over_limit
-//!  13. setAdvertised + storeLatest + forward_envelope (freshness advanced ⇒
-//!      relay, §5.3) + protocol dispatch → applied
+//!  13. ballot protocol/value rejection before replacement → insane
+//!  14. exact live-statement qset-reference capacity → over_limit
+//!  15. storeLatest + replace its exact live-statement qset reference +
+//!      protocol dispatch + forward_envelope (freshness advanced ⇒ relay,
+//!      §5.3) → applied
 //!
 //! Failure discipline (§7.2): any EffectQueue budget breach, OOM, or
 //! non-protocol error marks the engine failed (sticky); pushInput then
@@ -205,15 +212,15 @@ fn getOrCreateSlot(eng: *engine.Engine, index: u64) !?*slot_mod.Slot {
 }
 
 // ---------------------------------------------------------------------------
-// Post-resolution half: budget → advertise → store → forward → dispatch.
+// Post-resolution half: budget → retain qset → store → dispatch → forward.
 // Shared by the live envelope path and the qset_received unpark replay.
 // ---------------------------------------------------------------------------
 
-/// Returns false when the protocol rejected the statement's VALUE via the
-/// driver (ballot error.InvalidValue — stellar-core's EnvelopeState::INVALID):
-/// the statement stays stored (freshness dedup holds, reprocessing-spam
-/// protection — a deliberate SLCP divergence, documented) but is NOT relayed.
-fn dispatchProtocol(eng: *engine.Engine, s: *slot_mod.Slot, st: *const stored.OwnedStatement) engine.EngineError!bool {
+/// All statement-local rejection must happen in the pre-store gate below so
+/// replacing a sender's previous statement is transactional. InvalidValue at
+/// this point means that gate and the protocol have drifted apart; fail the
+/// engine closed instead of trying to reconstruct the overwritten state.
+fn dispatchProtocol(eng: *engine.Engine, s: *slot_mod.Slot, st: *const stored.OwnedStatement) engine.EngineError!void {
     const r = if (st.isNomination())
         nomination_mod.processEnvelope(&eng.ctx, s, st)
     else
@@ -221,23 +228,34 @@ fn dispatchProtocol(eng: *engine.Engine, s: *slot_mod.Slot, st: *const stored.Ow
     r catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EffectBudgetExceeded => return error.EffectBudgetExceeded,
-        error.InvalidValue => return false,
+        error.InvalidValue => return error.EngineFailed,
         else => return error.EngineFailed,
     };
-    return true;
 }
 
-/// Steps 12–13. Takes ownership of `env` unconditionally. Returns false when
-/// the engine-wide stored-bytes budget rejected it (dropped, not stored).
-const Admit = enum { admitted, over_budget, value_invalid };
+/// Steps 12–15. Takes ownership of `env` unconditionally. Reports a budget,
+/// qset-capacity, or value rejection without replacing the prior statement.
+const Admit = enum { admitted, over_budget, over_qset_capacity, value_invalid };
+
+/// The cache reference owned by one stored statement. Local statements use
+/// the configured qset directly, and EXTERNALIZE uses a synthetic singleton,
+/// so neither contributes a remote cache reference.
+fn statementQsetReference(eng: *const engine.Engine, st: *const stored.OwnedStatement) ?[32]u8 {
+    if (std.mem.eql(u8, &st.node_id, &eng.cfg.node_id)) return null;
+    if (st.pledges == .externalize) return null;
+    return st.qsetHash();
+}
 
 fn admitResolved(eng: *engine.Engine, s: *slot_mod.Slot, env: stored.StoredEnvelope) engine.EngineError!Admit {
     var owned = env;
     const gpa = eng.gpa;
     const node = owned.statement.node_id;
     const is_nom = owned.statement.isNomination();
-    const is_ext = owned.statement.pledges == .externalize;
-    const qh = owned.statement.qsetHash();
+    const old_ref = if (s.latestFor(node, is_nom)) |old|
+        statementQsetReference(eng, &old.statement)
+    else
+        null;
+    const new_ref = statementQsetReference(eng, &owned.statement);
 
     // §5.1 engine-wide latest-envelope budget: projected size after the
     // replace must fit, else over_limit (drop, do not store).
@@ -266,23 +284,22 @@ fn admitResolved(eng: *engine.Engine, s: *slot_mod.Slot, env: stored.StoredEnvel
         }
     }
 
+    if (!eng.qsets.canReplaceStatementReference(old_ref, new_ref)) {
+        owned.deinit(gpa);
+        return .over_qset_capacity;
+    }
+
     const delta = try s.storeLatest(gpa, owned);
     eng.stored_statement_bytes = @intCast(@as(isize, @intCast(eng.stored_statement_bytes)) + delta);
-    // Advertised AFTER the store (ownership review: an advertise failure
-    // must not leak the in-flight envelope). EXTERNALIZE's audit hash is
-    // never advertised (§5.4: the sender counts as the singleton {sender,1}).
-    if (!is_ext) try eng.qsets.setAdvertised(node, qh);
+    try eng.qsets.replaceStatementReference(node, old_ref, new_ref);
     const kept = s.latestFor(node, is_nom).?;
 
     // Process BEFORE relaying (stellar-core broadcasts only VALID
-    // envelopes). A residual protocol rejection (the EXTERNALIZE-phase
-    // value-mismatch arm) purges the stored statement — it must count in no
-    // federated predicate (oracle: never recorded).
-    if (!try dispatchProtocol(eng, s, &kept.statement)) {
-        const freed = s.removeLatest(gpa, node, is_nom);
-        eng.stored_statement_bytes -= freed;
-        return .value_invalid;
-    }
+    // envelopes). Current protocol-invalid paths are exhausted by the gate
+    // above. A residual InvalidValue is therefore an invariant failure and
+    // dispatchProtocol makes the engine sticky-failed rather than losing the
+    // previous statement through a partial rollback.
+    try dispatchProtocol(eng, s, &kept.statement);
 
     // Freshness advanced + processed ⇒ relay (§5.3): engine freshness IS
     // the dedup.
@@ -319,13 +336,27 @@ fn handleEnvelope(eng: *engine.Engine, bytes: []const u8) engine.EngineError!eng
     // the SAME parse, no re-canonicalization.
     if (eng.cfg.strict_canonical and !capnpc.canonical.isCanonical(&dec.stmt_msg)) return .insane;
 
-    // Step 8: §5.4 relevance filter — outside the transitive quorum graph.
+    // Step 8: §5.4 relevance filter — outside the published graph. The graph
+    // can temporarily be a conservative superset, never a subset.
     if (!eng.qsets.inGraph(node)) return .ignored;
 
     var owned = stored.fromReader(gpa, rdr) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .insane, // sane statements decode; defense in depth
     };
+
+    const qset_hash = owned.qsetHash();
+    const is_ext = owned.pledges == .externalize;
+    if (!is_ext and eng.qsets.get(qset_hash) == null) {
+        const still_relevant = eng.qsets.recheckBeforeParking(node) catch |err| {
+            owned.deinit(gpa);
+            return err;
+        };
+        if (!still_relevant) {
+            owned.deinit(gpa);
+            return .ignored;
+        }
+    }
 
     // Step 9: slot admission.
     const s = (getOrCreateSlot(eng, owned.slot) catch |err| {
@@ -346,8 +377,6 @@ fn handleEnvelope(eng: *engine.Engine, bytes: []const u8) engine.EngineError!eng
     }
 
     // Step 11: qset resolution. EXTERNALIZE never parks (§5.4).
-    const qset_hash = owned.qsetHash();
-    const is_ext = owned.pledges == .externalize;
     if (!is_ext and eng.qsets.get(qset_hash) == null) {
         const frame_copy = gpa.dupe(u8, bytes) catch |err| {
             owned.deinit(gpa);
@@ -377,8 +406,10 @@ fn handleEnvelope(eng: *engine.Engine, bytes: []const u8) engine.EngineError!eng
     return switch (try admitResolved(eng, s, env)) {
         .admitted => .applied,
         .over_budget => .over_limit,
-        // Driver-invalid value: stored (dedup) but rejected — the closest
-        // §5.2 status is insane (the statement is unusable as received).
+        .over_qset_capacity => .over_limit,
+        // Driver/protocol-invalid value: rejected before replacement; the
+        // sender's prior statement and exact qset reference remain live. The
+        // closest §5.2 status is insane (unusable as received).
         .value_invalid => .insane,
     };
 }
@@ -419,6 +450,11 @@ fn handleQset(eng: *engine.Engine, bytes: []const u8) engine.EngineError!engine.
             else => .insane,
         };
     };
+    eng.qsets.retain(h) catch |err| {
+        qs.deinit(gpa);
+        return err;
+    };
+    defer eng.qsets.release(h);
     try eng.qsets.insert(h, qs); // takes ownership; dedups
 
     // Unpark: re-drive every envelope waiting on this hash through the
@@ -428,20 +464,44 @@ fn handleQset(eng: *engine.Engine, bytes: []const u8) engine.EngineError!engine.
     // rule); a replay that now fails admission is dropped silently.
     const taken = try eng.pending.take(h);
     defer gpa.free(taken);
-    var replay_err: ?engine.EngineError = null;
-    for (taken) |env| {
-        var e = env;
-        if (replay_err != null) {
-            e.deinit(gpa);
-            continue;
-        }
-        replayParked(eng, e) catch |err| {
-            replay_err = err;
-        };
-    }
-    if (replay_err) |e| return e;
+    var remaining = taken.len;
+    defer for (taken[0..remaining]) |*env| env.deinit(gpa);
 
-    // Unsolicited qsets are still useful (cache warm-up) — applied either way.
+    // A qset response may unlock the entire pending-envelope cap. All replay
+    // happens inside this input, and protocol quorum lookup uses each exact
+    // statement qset rather than the relevance graph, so publish one exact
+    // post-replay graph instead of rebuilding after every replacement.
+    eng.qsets.beginReferenceBatch();
+
+    // Usually this is a FIFO pass. At a full cache an earlier waiter may be
+    // blocked until a later statement rotates an old live qset to this hash.
+    // Ordered in-place removal preserves FIFO among currently eligible items
+    // while permitting that bounded one-entry transition to complete.
+    while (remaining > 0) {
+        var progressed = false;
+        var i: usize = 0;
+        while (i < remaining) {
+            if (!canReplayQsetReference(eng, &taken[i])) {
+                i += 1;
+                continue;
+            }
+            const env = taken[i];
+            var shift = i;
+            while (shift + 1 < remaining) : (shift += 1) {
+                taken[shift] = taken[shift + 1];
+            }
+            remaining -= 1;
+            progressed = true;
+            try replayParked(eng, env);
+            break; // restart at the oldest waiter after every state change
+        }
+        if (!progressed) break;
+    }
+    try eng.qsets.finishReferenceBatch();
+
+    // The sans-I/O Engine has no request ledger: direct hosts may pre-warm it
+    // with any valid qset. Native Node correlates network responses with an
+    // outstanding request before it constructs this input.
     return .applied;
 }
 
@@ -466,6 +526,22 @@ fn replayParked(eng: *engine.Engine, env: stored.StoredEnvelope) engine.EngineEr
         }
     }
     _ = try admitResolved(eng, s, owned_env); // budget rejection: drop
+}
+
+fn canReplayQsetReference(eng: *engine.Engine, env: *const stored.StoredEnvelope) bool {
+    const new_ref = statementQsetReference(eng, &env.statement) orelse return true;
+    const s = eng.slots.get(env.statement.slot) orelse {
+        return eng.qsets.canReplaceStatementReference(null, new_ref);
+    };
+    const is_nom = env.statement.isNomination();
+    const old = s.latestFor(env.statement.node_id, is_nom) orelse {
+        return eng.qsets.canReplaceStatementReference(null, new_ref);
+    };
+    if (!stored.isNewerOwned(&old.statement, &env.statement)) return true;
+    return eng.qsets.canReplaceStatementReference(
+        statementQsetReference(eng, &old.statement),
+        new_ref,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -609,10 +685,31 @@ fn handlePurge(eng: *engine.Engine, max_slot: u64) engine.EngineError!engine.Inp
     const gpa = eng.gpa;
     var victims: std.ArrayList(u64) = .empty;
     defer victims.deinit(gpa);
+    var qset_refs: std.ArrayList(qset_store.StatementReference) = .empty;
+    defer qset_refs.deinit(gpa);
     var it = eng.slots.iterator();
     while (it.next()) |entry| {
         if (entry.key_ptr.* < max_slot) try victims.append(gpa, entry.key_ptr.*);
     }
+
+    // Gather before mutating anything so allocation failure in this phase
+    // leaves both ownership domains unchanged. The following batch mutates
+    // references before staging its rebuilt graph; an OOM there is terminal
+    // (Engine becomes sticky-failed), but retains every qset and remains safe
+    // to deinit. Retire the window with only one graph rebuild.
+    for (victims.items) |k| {
+        const p = eng.slots.get(k).?;
+        inline for (.{ &p.latest_nom, &p.latest_ballot }) |latest| {
+            var statements = latest.valueIterator();
+            while (statements.next()) |boxed| {
+                if (statementQsetReference(eng, &boxed.*.statement)) |hash| {
+                    try qset_refs.append(gpa, .{ .node = boxed.*.statement.node_id, .hash = hash });
+                }
+            }
+        }
+    }
+    try eng.qsets.removeStatementReferences(qset_refs.items);
+
     for (victims.items) |k| {
         if (eng.slots.fetchSwapRemove(k)) |kv| {
             const p = kv.value;
@@ -684,11 +781,12 @@ fn framedQset(gpa: std.mem.Allocator, threshold: u32, members: []const [32]u8) !
 const EngineOpts = struct {
     watcher: bool = false,
     strict: bool = true,
+    quorum_threshold: u32 = 1,
     limits: limits_mod.Limits = .{},
 };
 
 /// Engine whose local qset is {1, [self, peer, peer2, peer3]} — all test
-/// peers are in the transitive quorum graph.
+/// peers are in the published transitive quorum graph.
 fn makeEngine(gpa: std.mem.Allocator, opts: EngineOpts) !engine.Engine {
     const node_id = try crypto.publicKeyFromSeed(engine_seed);
     const members = [_][32]u8{
@@ -697,7 +795,7 @@ fn makeEngine(gpa: std.mem.Allocator, opts: EngineOpts) !engine.Engine {
         try crypto.publicKeyFromSeed(peer2_seed),
         try crypto.publicKeyFromSeed(peer3_seed),
     };
-    const qs = try ownedQsetOf(gpa, 1, &members);
+    const qs = try ownedQsetOf(gpa, opts.quorum_threshold, &members);
     return engine.Engine.init(gpa, .{
         .network_id = testNet(),
         .node_id = node_id,
@@ -859,6 +957,105 @@ test "applied: qset_received then fresh envelope stores, forwards, dispatches" {
     } });
     defer gpa.free(env2);
     try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = env2 } }, .applied);
+}
+
+// Oracle order requires every value/protocol rejection to happen before
+// recordEnvelope replaces the sender's latest statement. In particular, once
+// this node has externalized, a fresher but incompatible EXTERNALIZE must not
+// erase an older valid CONFIRM or release its exact qset reference.
+test "externalized slot rejects an incompatible newer ballot without replacing the previous peer statement" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .watcher = true, .quorum_threshold = 4 });
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const qh = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const qbytes = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(qbytes);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = qbytes } }, .applied);
+
+    const prior = try peerEnvelope(gpa, peer_seed, 7, .{ .confirm = .{
+        .qset_hash = qh,
+        .ballot = .{ .counter = 2, .value = "committed" },
+        .n_prepared = 2,
+        .n_commit = 1,
+        .n_h = 2,
+    } });
+    defer gpa.free(prior);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = prior } }, .applied);
+
+    const s = eng.slots.get(7).?;
+    try testing.expectEqual(@as(u32, 1), eng.qsets.statement_refs.get(qh).?);
+    const bytes_before = eng.stored_statement_bytes;
+    if (s.ballot.commit) |*old| old.deinit(gpa);
+    s.ballot.commit = .{ .counter = 2, .value = try gpa.dupe(u8, "committed") };
+    s.ballot.phase = .externalize;
+
+    const incompatible = try peerEnvelope(gpa, peer_seed, 7, .{ .externalize = .{
+        .commit = .{ .counter = 2, .value = "other" },
+        .n_h = 2,
+        .commit_qset_hash = qh,
+    } });
+    defer gpa.free(incompatible);
+    var rejected = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = incompatible } });
+    defer rejected.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.insane, rejected.status);
+    try testing.expectEqual(@as(usize, 0), rejected.forwards);
+
+    const kept = s.latestFor(peer_pk, false) orelse return error.PreviousStatementWasLost;
+    switch (kept.statement.pledges) {
+        .confirm => |*c| try testing.expectEqualSlices(u8, "committed", c.ballot.value),
+        else => return error.PreviousStatementWasReplaced,
+    }
+    try testing.expectEqual(bytes_before, eng.stored_statement_bytes);
+    try testing.expectEqual(@as(u32, 1), eng.qsets.statement_refs.get(qh).?);
+}
+
+test "zero-sized foreign cache preserves the engine's mandatory local qset" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .limits = .{ .max_cached_qsets = 0 } });
+    defer eng.deinit();
+    const local_hash = eng.ctx.local_qset_hash;
+
+    const foreign_node: [32]u8 = @splat(0xA5);
+    const foreign_qset = try framedQset(gpa, 1, &.{foreign_node});
+    defer gpa.free(foreign_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = foreign_qset } }, .applied);
+
+    try testing.expect(eng.qsets.get(local_hash) != null);
+    try testing.expectEqual(@as(usize, 1), eng.stats().cached_qsets);
+}
+
+test "zero-sized foreign cache cannot be bypassed by rotating a live reference" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .limits = .{ .max_cached_qsets = 0 } });
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const using_local = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{"a"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(using_local);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = using_local } }, .applied);
+
+    const foreign_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const rotating = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = foreign_hash,
+        .votes = &.{ "a", "b" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(rotating);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = rotating } }, .parked_awaiting_qset);
+
+    const foreign_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(foreign_qset);
+    var answered = try pushAndDrain(gpa, &eng, .{ .qset_received = .{ .bytes = foreign_qset } });
+    defer answered.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, answered.status);
+    try testing.expectEqual(@as(usize, 0), answered.forwards);
+    try testing.expectEqual(@as(usize, 1), eng.stats().cached_qsets);
 }
 
 test "stale: the same envelope twice" {
@@ -1031,6 +1228,449 @@ test "parked_awaiting_qset then unpark on qset_received" {
     try testing.expectEqual(@as(usize, 1), d2.forwards); // the unparked envelope relayed
     try testing.expectEqual(@as(usize, 0), eng.stats().parked);
     try testing.expect(eng.stats().stored_statement_bytes > 0);
+}
+
+test "qset_received replaces a peer's advertised qset at cache capacity" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .limits = .{ .max_cached_qsets = 2 } });
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const peer2_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const first_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const first_env = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = first_hash,
+        .votes = &.{"v1"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(first_env);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = first_env } }, .parked_awaiting_qset);
+    const first_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(first_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = first_qset } }, .applied);
+
+    const replacement_members = [_][32]u8{ peer_pk, peer2_pk };
+    const replacement_hash = try qsetHashOf(gpa, 2, &replacement_members);
+    const replacement_env = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = replacement_hash,
+        .votes = &.{ "v1", "v2" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(replacement_env);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = replacement_env } }, .parked_awaiting_qset);
+    const replacement_qset = try framedQset(gpa, 2, &replacement_members);
+    defer gpa.free(replacement_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = replacement_qset } }, .applied);
+
+    const replacement_cached = eng.qsets.get(replacement_hash).?;
+    try testing.expectEqual(@as(u32, 2), replacement_cached.threshold);
+    try testing.expectEqual(@as(usize, 2), replacement_cached.validators.len);
+    try testing.expect(eng.qsets.get(first_hash) == null);
+    try testing.expectEqual(@as(usize, 2), eng.stats().cached_qsets);
+}
+
+test "qset replay admits capacity-freeing replacements before other waiters" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .limits = .{ .max_cached_qsets = 2 } });
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const peer2_pk = try crypto.publicKeyFromSeed(peer2_seed);
+
+    // Local + this live reference fills the cache.
+    const old_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const old_env = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = old_hash,
+        .votes = &.{"old"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(old_env);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = old_env } }, .parked_awaiting_qset);
+    const old_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(old_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = old_qset } }, .applied);
+
+    const replacement_members = [_][32]u8{ peer_pk, peer2_pk };
+    const replacement_hash = try qsetHashOf(gpa, 1, &replacement_members);
+
+    // This no-old-reference waiter arrives first and cannot initially grow
+    // the full cache. It must be retried after the next waiter trades away
+    // the cache's last old_hash reference.
+    const first_waiter = try peerEnvelope(gpa, peer2_seed, 2, .{ .nominate = .{
+        .qset_hash = replacement_hash,
+        .votes = &.{"new"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(first_waiter);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = first_waiter } }, .parked_awaiting_qset);
+
+    const freeing_waiter = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = replacement_hash,
+        .votes = &.{ "new", "old" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(freeing_waiter);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = freeing_waiter } }, .parked_awaiting_qset);
+
+    const replacement_qset = try framedQset(gpa, 1, &replacement_members);
+    defer gpa.free(replacement_qset);
+    var replayed = try pushAndDrain(gpa, &eng, .{ .qset_received = .{ .bytes = replacement_qset } });
+    defer replayed.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, replayed.status);
+    try testing.expectEqual(@as(usize, 2), replayed.forwards);
+}
+
+test "qset replay rotates every live reference to the same replacement at cache pressure" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .limits = .{ .max_cached_qsets = 2 } });
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const peer2_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const old_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+
+    var old_frames: [2][]u8 = undefined;
+    var old_made: usize = 0;
+    defer for (old_frames[0..old_made]) |frame| gpa.free(frame);
+    for (&old_frames, 0..) |*frame, i| {
+        frame.* = try peerEnvelope(gpa, peer_seed, i + 1, .{ .nominate = .{
+            .qset_hash = old_hash,
+            .votes = &.{"a"},
+            .accepted = &.{},
+        } });
+        old_made += 1;
+        try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = frame.* } }, .parked_awaiting_qset);
+    }
+    const old_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(old_qset);
+    var old_replay = try pushAndDrain(gpa, &eng, .{ .qset_received = .{ .bytes = old_qset } });
+    defer old_replay.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), old_replay.forwards);
+
+    const replacement_members = [_][32]u8{ peer_pk, peer2_pk };
+    const replacement_hash = try qsetHashOf(gpa, 1, &replacement_members);
+    var replacements: [2][]u8 = undefined;
+    var replacements_made: usize = 0;
+    defer for (replacements[0..replacements_made]) |frame| gpa.free(frame);
+    for (&replacements, 0..) |*frame, i| {
+        frame.* = try peerEnvelope(gpa, peer_seed, i + 1, .{ .nominate = .{
+            .qset_hash = replacement_hash,
+            .votes = &.{ "a", "b" },
+            .accepted = &.{},
+        } });
+        replacements_made += 1;
+        try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = frame.* } }, .parked_awaiting_qset);
+    }
+
+    const replacement_qset = try framedQset(gpa, 1, &replacement_members);
+    defer gpa.free(replacement_qset);
+    var replayed = try pushAndDrain(gpa, &eng, .{ .qset_received = .{ .bytes = replacement_qset } });
+    defer replayed.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, replayed.status);
+    try testing.expectEqual(@as(usize, 2), replayed.forwards);
+}
+
+test "qset replay preserves FIFO among eligible statements" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{});
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const qh = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const vote_sets = [_][]const []const u8{
+        &.{"a"},
+        &.{ "a", "b" },
+        &.{ "a", "b", "c" },
+    };
+    var frames: [vote_sets.len][]u8 = undefined;
+    var made: usize = 0;
+    defer for (frames[0..made]) |frame| gpa.free(frame);
+    for (vote_sets, 0..) |votes, i| {
+        frames[i] = try peerEnvelope(gpa, peer_seed, 7, .{ .nominate = .{
+            .qset_hash = qh,
+            .votes = votes,
+            .accepted = &.{},
+        } });
+        made += 1;
+        try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = frames[i] } }, .parked_awaiting_qset);
+    }
+
+    const qbytes = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(qbytes);
+    var replayed = try pushAndDrain(gpa, &eng, .{ .qset_received = .{ .bytes = qbytes } });
+    defer replayed.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, replayed.status);
+    try testing.expectEqual(@as(usize, 3), replayed.forwards);
+}
+
+test "live statements keep their slot-specific qsets after the signer changes qsets elsewhere" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{
+        .quorum_threshold = 2,
+        .limits = .{ .max_cached_qsets = 3 },
+    });
+    defer eng.deinit();
+
+    try expectStatus(gpa, &eng, .{ .nominate = .{ .slot = 1, .value = "own", .prev_value = "" } }, .applied);
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const first_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const first_env = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = first_hash,
+        .votes = &.{"v1"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(first_env);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = first_env } }, .parked_awaiting_qset);
+    const first_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(first_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = first_qset } }, .applied);
+
+    // The same signer uses a different qset in another slot. That changes
+    // graph reachability, but must not change how its slot-1 statement is
+    // interpreted or make the slot-1 qset evictable.
+    const outsider: [32]u8 = @splat(0xA1);
+    const second_hash = try qsetHashOf(gpa, 1, &.{outsider});
+    const second_env = try peerEnvelope(gpa, peer_seed, 2, .{ .nominate = .{
+        .qset_hash = second_hash,
+        .votes = &.{"other-slot"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(second_env);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = second_env } }, .parked_awaiting_qset);
+    const second_qset = try framedQset(gpa, 1, &.{outsider});
+    defer gpa.free(second_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = second_qset } }, .applied);
+
+    // Force real cache pressure. The disposable qset, not a qset referenced
+    // by either live statement, is the only valid eviction victim.
+    const disposable_node: [32]u8 = @splat(0xD1);
+    const disposable_qset = try framedQset(gpa, 1, &.{disposable_node});
+    defer gpa.free(disposable_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = disposable_qset } }, .applied);
+
+    const peer2_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const deciding_env = try peerEnvelope(gpa, peer2_seed, 1, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{"v1"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(deciding_env);
+    var decided = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = deciding_env } });
+    defer decided.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, decided.status);
+    try testing.expectEqual(@as(usize, 1), decided.broadcasts);
+    _ = peer2_pk;
+}
+
+test "all live statements from one signer contribute to graph reachability until purge" {
+    const gpa = testing.allocator;
+    const self_pk = try crypto.publicKeyFromSeed(engine_seed);
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const peer2_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const local_members = [_][32]u8{ self_pk, peer_pk };
+    var eng = try engine.Engine.init(gpa, .{
+        .network_id = testNet(),
+        .node_id = self_pk,
+        .secret_seed = null, // watcher: exercise tracking without emissions
+        .quorum_set = try ownedQsetOf(gpa, 1, &local_members),
+        .limits = .{ .max_cached_qsets = 3 },
+    }, driver_mod.Driver.default());
+    defer eng.deinit();
+
+    // Slot 1 makes peer2 transitively relevant through peer's first qset.
+    const reaches_peer2_hash = try qsetHashOf(gpa, 1, &.{peer2_pk});
+    const slot1 = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = reaches_peer2_hash,
+        .votes = &.{"slot-1"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(slot1);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = slot1 } }, .parked_awaiting_qset);
+    const reaches_peer2 = try framedQset(gpa, 1, &.{peer2_pk});
+    defer gpa.free(reaches_peer2);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = reaches_peer2 } }, .applied);
+
+    // A newer advertisement in another slot excludes peer2. The still-live
+    // slot-1 statement keeps its own edge in the union.
+    const self_only_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const slot2 = try peerEnvelope(gpa, peer_seed, 2, .{ .nominate = .{
+        .qset_hash = self_only_hash,
+        .votes = &.{"slot-2"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(slot2);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = slot2 } }, .parked_awaiting_qset);
+    const self_only = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(self_only);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = self_only } }, .applied);
+
+    const peer2_live = try peerEnvelope(gpa, peer2_seed, 1, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{"reachable"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(peer2_live);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = peer2_live } }, .applied);
+
+    // Once every contributing slot is purged, the stale transitive edge is
+    // rebuilt away and the same non-root signer is filtered again.
+    try expectStatus(gpa, &eng, .{ .purge_slots = .{ .max_slot = 3 } }, .applied);
+    const peer2_after_purge = try peerEnvelope(gpa, peer2_seed, 3, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{"no-longer-reachable"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(peer2_after_purge);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = peer2_after_purge } }, .ignored);
+}
+
+test "conservative relevance temporarily admits a disconnected signer until purge" {
+    const gpa = testing.allocator;
+    const self_pk = try crypto.publicKeyFromSeed(engine_seed);
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const disconnected_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const local_members = [_][32]u8{ self_pk, peer_pk };
+    var eng = try engine.Engine.init(gpa, .{
+        .network_id = testNet(),
+        .node_id = self_pk,
+        .secret_seed = null,
+        .quorum_set = try ownedQsetOf(gpa, 1, &local_members),
+        .limits = .{ .max_cached_qsets = 3 },
+    }, driver_mod.Driver.default());
+    defer eng.deinit();
+
+    const reaches_disconnected_hash = try qsetHashOf(gpa, 1, &.{disconnected_pk});
+    const reaches_disconnected = try framedQset(gpa, 1, &.{disconnected_pk});
+    defer gpa.free(reaches_disconnected);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = reaches_disconnected } }, .applied);
+
+    const peer_only_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const peer_only = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(peer_only);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = peer_only } }, .applied);
+
+    const first = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = reaches_disconnected_hash,
+        .votes = &.{"a"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(first);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = first } }, .applied);
+
+    const replacement = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = peer_only_hash,
+        .votes = &.{ "a", "b" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(replacement);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = replacement } }, .applied);
+    try testing.expect(eng.qsets.inGraph(disconnected_pk));
+
+    // This signer is absent from exact current reachability, but the bounded
+    // conservative generation admits and relays it as a resource-policy
+    // false positive. Quorum math still uses exact statement qsets.
+    const during_grace = try peerEnvelope(gpa, peer2_seed, 2, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{"grace"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(during_grace);
+    var admitted = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = during_grace } });
+    defer admitted.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.applied, admitted.status);
+    try testing.expectEqual(@as(usize, 1), admitted.forwards);
+
+    try expectStatus(gpa, &eng, .{ .purge_slots = .{ .max_slot = 2 } }, .applied);
+    try testing.expect(!eng.qsets.inGraph(disconnected_pk));
+
+    const after_checkpoint = try peerEnvelope(gpa, peer2_seed, 2, .{ .nominate = .{
+        .qset_hash = eng.ctx.local_qset_hash,
+        .votes = &.{ "grace", "later" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(after_checkpoint);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = after_checkpoint } }, .ignored);
+}
+
+test "unknown-qset churn checkpoints stale relevance before slot admission" {
+    const gpa = testing.allocator;
+    const self_pk = try crypto.publicKeyFromSeed(engine_seed);
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const disconnected_pk = try crypto.publicKeyFromSeed(peer2_seed);
+    const local_members = [_][32]u8{ self_pk, peer_pk };
+    var eng = try engine.Engine.init(gpa, .{
+        .network_id = testNet(),
+        .node_id = self_pk,
+        .secret_seed = null,
+        .quorum_set = try ownedQsetOf(gpa, 1, &local_members),
+        .limits = .{ .max_cached_qsets = 3 },
+    }, driver_mod.Driver.default());
+    defer eng.deinit();
+
+    const old_hash = try qsetHashOf(gpa, 1, &.{disconnected_pk});
+    const old_qset = try framedQset(gpa, 1, &.{disconnected_pk});
+    defer gpa.free(old_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = old_qset } }, .applied);
+
+    const replacement_hash = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const replacement_qset = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(replacement_qset);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = replacement_qset } }, .applied);
+
+    const old = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = old_hash,
+        .votes = &.{"a"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(old);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = old } }, .applied);
+
+    const replacement = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = replacement_hash,
+        .votes = &.{ "a", "b" },
+        .accepted = &.{},
+    } });
+    defer gpa.free(replacement);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = replacement } }, .applied);
+    try testing.expect(eng.qsets.inGraph(disconnected_pk));
+
+    const missing_hash: [32]u8 = @splat(0xcc);
+    const churn = try peerEnvelope(gpa, peer2_seed, 2, .{ .nominate = .{
+        .qset_hash = missing_hash,
+        .votes = &.{"unknown"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(churn);
+
+    // The first four consume the per-node pending allowance. Rejected repeats
+    // still advance the already-open generation; pending memory stays bounded,
+    // but it must not let unknown-qset churn preserve stale relevance forever.
+    for (0..62) |i| {
+        var d = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = churn } });
+        defer d.deinit(gpa);
+        try testing.expectEqual(
+            if (i < 4) engine.InputStatus.parked_awaiting_qset else engine.InputStatus.over_limit,
+            d.status,
+        );
+    }
+    try testing.expectEqual(@as(usize, 4), eng.pending.count());
+
+    // This is the 64th generation update (the replacement was the first).
+    // Its exact checkpoint removes the signer before getOrCreateSlot, so a
+    // never-before-seen slot cannot be left behind empty.
+    const triggering = try peerEnvelope(gpa, peer2_seed, 99, .{ .nominate = .{
+        .qset_hash = missing_hash,
+        .votes = &.{"trigger"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(triggering);
+    var final = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = triggering } });
+    defer final.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.ignored, final.status);
+    try testing.expectEqual(@as(usize, 0), final.requests);
+    try testing.expect(eng.slots.get(99) == null);
+    try testing.expect(!eng.qsets.inGraph(disconnected_pk));
 }
 
 test "over_limit: live-slot cap" {
@@ -1312,6 +1952,58 @@ fn expectRestoreLeaksNothing(own: []const u8) !void {
         }
     }
     try testing.expect(swept >= 8); // non-vacuity: the restore path really allocates
+}
+
+const PreparkOomAttempt = struct {
+    induced: bool,
+    checkpoint_failure: bool,
+};
+
+fn runPreparkOomAttempt(fa: *std.testing.FailingAllocator, fail_offset: usize) !PreparkOomAttempt {
+    const gpa = fa.allocator();
+    var eng = try makeEngine(gpa, .{});
+    defer eng.deinit();
+
+    const unknown_hash: [32]u8 = @splat(0xdd);
+    const env = try peerEnvelope(gpa, peer2_seed, 99, .{ .nominate = .{
+        .qset_hash = unknown_hash,
+        .votes = &.{"unknown"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(env);
+
+    // The next qualifying unknown-qset envelope must attempt exact graph
+    // publication. Configure failure only after all test setup is owned.
+    eng.qsets.deferred_reference_updates = 63;
+    fa.fail_index = fa.alloc_index + fail_offset;
+    const result = handleEnvelope(&eng, env);
+    const induced = fa.has_induced_failure;
+    const checkpoint_failure = induced and eng.qsets.deferred_reference_updates == 64;
+    if (result) |status| {
+        try testing.expect(!induced);
+        try testing.expectEqual(engine.InputStatus.parked_awaiting_qset, status);
+    } else |err| {
+        try testing.expect(induced);
+        try testing.expectEqual(@as(anyerror, error.OutOfMemory), @as(anyerror, err));
+    }
+    return .{ .induced = induced, .checkpoint_failure = checkpoint_failure };
+}
+
+test "unknown-qset pre-parking checkpoint leaks nothing on allocation failure" {
+    const gpa = testing.allocator;
+    var fail_offset: usize = 0;
+    var swept: usize = 0;
+    var saw_checkpoint_failure = false;
+    while (true) : (fail_offset += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{});
+        const attempt = try runPreparkOomAttempt(&fa, fail_offset);
+        if (fa.allocated_bytes != fa.freed_bytes) return error.MemoryLeakDetected;
+        if (!attempt.induced) break;
+        swept += 1;
+        saw_checkpoint_failure = saw_checkpoint_failure or attempt.checkpoint_failure;
+    }
+    try testing.expect(swept >= 8);
+    try testing.expect(saw_checkpoint_failure);
 }
 
 // Non-vacuity: handleRestore stores `latest_env` via s.storeLatest (which
