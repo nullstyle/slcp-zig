@@ -1,5 +1,5 @@
 //! registry-smoke — examples/registry run for real
-//! (docs/examples-roadmap.md E1–E2c acceptance gates).
+//! (docs/examples-roadmap.md E1–E2d acceptance gates).
 //!
 //! Builds `examples/registry` ONCE as a consumer package — a nested
 //! `zig build -Doptimize=ReleaseSafe` of a scratch copy with this repo as a
@@ -11,13 +11,14 @@
 //! nodes at the same slot, node2 is SIGKILLed and restarted from its
 //! snapshot + journal and catches up to the same hash, and a transaction
 //! submitted to the restarted node lands everywhere. It is then killed for
-//! at least 201 slots, restored from a quorum-certified history checkpoint inside
-//! the 16-slot answering window, and shown to be a necessary voter for the
+//! at least 201 slots, then restored alone by replaying more than the entire
+//! 16-slot answering window from a quorum-certified archive tip while both
+//! surviving peers are dead. It is then shown to be a necessary voter for the
 //! first later transaction-bearing slot (with any intervening ledgers proved
 //! empty and identical). The validators deliberately propose
 //! from wall clocks skewed by -30/0/+30 seconds; every RPC and durable slot log
 //! must agree on close time, and every observed adjacent ledger must advance it
-//! by 1..60 seconds. Checkpoint boot, exact-H catch-up, and the complete post-H
+//! by 1..60 seconds. Archive replay, exact-H boot, and the complete post-H
 //! continuation are all pinned to that same temporal chain. Before the first
 //! crash the nodes form the deliberate line node2→node1→node0. One transaction is
 //! submitted only to nomination-disabled node2; `head pending=1` proves it
@@ -25,9 +26,9 @@
 //! then their `slot S+1: txs=1` lines prove it survived node2's SIGKILL and
 //! landed in exactly the next slot. The first restart gets a second recovery
 //! peer because consensus envelopes are not relayed across that line. For the
-//! history restart that peer is dead: node2 has only node1, which was proved
-//! unable to advance alone. Every wait is a bounded state poll rather than a
-//! fixed sleep.
+//! history restart both configured peers are dead; only after node2 proves the
+//! exact archived H/hash/time does node1 return. Every wait is a bounded state
+//! poll rather than a fixed sleep.
 //!
 //! The scratch copy is the published example with ONE line rewritten — the
 //! `.path = "../.."` dependency in build.zig.zon, re-pointed at the repo from
@@ -67,11 +68,12 @@ const default_registry_src = "examples/registry";
 const scratch_root = ".zig-cache/registry-smoke";
 const tail_lines: usize = 20;
 const line_buf_bytes: usize = 64 * 1024;
-/// Poll cadence and bounds (ms). Every wait is bounded on its own; the whole
-/// run (from the first spawn) is bounded by `--deadline-s`.
+/// Poll cadence and bounds (ms). Ordinary waits have a short phase bound; the
+/// 201-slot history-generation wait may use the whole run budget still
+/// available to it. The whole run (from the first spawn) is always bounded by
+/// `--deadline-s`.
 const poll_ms: u64 = 200;
 const poll_bound_ms: u64 = 90_000;
-const history_bound_ms: u64 = 180_000;
 const ready_bound_ms: u64 = 60_000;
 /// One CLI invocation (a TCP round trip on loopback) may not hang the smoke.
 const cli_timeout_ms: u64 = 10_000;
@@ -89,18 +91,21 @@ const survivor_heartbeat_ms = "500";
 /// Pending must remain at S past an entire idle-heartbeat deadline. The old
 /// `(pending && busy_min) || heartbeat` bug advances during this interval.
 const pending_cadence_guard_ms: u64 = 1000;
-/// The history-rejoining node must co-vote with the sole survivor through the
-/// short retained tail. A one-second heartbeat keeps the post-H transaction
-/// close while the harness permits and proves any already-due empty ledgers.
+/// After peerless archive replay, the recovered node must co-vote with the
+/// first validator brought back. A one-second heartbeat keeps the post-H
+/// transaction close while the harness permits any already-due empty ledgers.
 const rejoin_heartbeat_ms = "1000";
 const disabled_cadence_ms = "18446744073709551615";
-const checkpoint_every = "8";
+const checkpoint_every = "64";
+const history_anchor_every: u64 = 64;
+/// A replay at least this deep cannot be satisfied by the native node's
+/// retained 16-slot answering window.
+const min_archive_replay_ledgers: u64 = answering_window + 1;
 /// Deliberately disagreeing proposal clocks. Consensus must still derive one
 /// deterministic close time, and every restart retains its original skew.
 const proposal_clock_offsets = [_][]const u8{ "-30", "0", "30" };
 const absent_slots: u64 = 201;
 const answering_window: u64 = 16;
-const stable_head_ms: u64 = 1000;
 /// Consensus close time must advance on every sequential ledger, but by no
 /// more than this protocol constant. Keep the smoke independent of the
 /// example package while pinning the same wire-level rule.
@@ -156,6 +161,19 @@ pub const Head = struct {
     pending: u64,
     network: [64]u8,
 };
+
+/// The exact portion of a `head` reply that archive recovery must preserve.
+/// It is captured while certifiers are live, then matched after all of them
+/// are stopped and the recovering node is the only process running.
+const HistoryFrontier = struct {
+    slot: u64,
+    close_time: u64,
+    hash: [64]u8,
+};
+
+fn historyFrontier(head: Head) HistoryFrontier {
+    return .{ .slot = head.slot, .close_time = head.close_time, .hash = head.hash };
+}
 
 /// `head slot=<n> close_time=<unix-seconds> hash=<hex64> accounts=<n>
 /// names=<n> pending=<n> network=<hex64>`,
@@ -312,6 +330,11 @@ pub fn parseSlotLine(raw: []const u8) ?SlotLine {
 
 pub const CheckpointKind = enum { signed, certified };
 pub const CheckpointLine = struct { slot: u64, kind: CheckpointKind };
+pub const HistoryTipLine = struct {
+    slot: u64,
+    kind: CheckpointKind,
+    head: [64]u8,
+};
 
 /// The machine-readable prefix of the registry's checkpoint progress log:
 /// `history checkpoint slot N signed|certified ...`. The suffix is diagnostic
@@ -332,22 +355,61 @@ pub fn parseCheckpointLine(raw: []const u8) ?CheckpointLine {
     return .{ .slot = slot, .kind = kind };
 }
 
-pub const HistoryBootLine = struct { slot: u64, close_time: u64 };
+/// The E2d publication prefix, `history tip slot N signed|certified ...`.
+/// Keep the legacy checkpoint parser separate: a checkpoint proves an anchor,
+/// while this line proves certification of the exact replay tip.
+pub fn parseHistoryTipLine(raw: []const u8) ?HistoryTipLine {
+    var it = std.mem.tokenizeScalar(u8, trimLine(raw), ' ');
+    if (!std.mem.eql(u8, it.next() orelse return null, "history")) return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "tip")) return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "slot")) return null;
+    const slot = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const status = it.next() orelse return null;
+    const kind: CheckpointKind = if (std.mem.eql(u8, status, "signed"))
+        .signed
+    else if (std.mem.eql(u8, status, "certified"))
+        .certified
+    else
+        return null;
+    var head: ?[64]u8 = null;
+    while (it.next()) |tok| {
+        const field = kv(tok) orelse continue;
+        if (!std.mem.eql(u8, field.key, "head")) continue;
+        if (head != null) return null;
+        head = hex64(field.val) orelse return null;
+    }
+    return .{ .slot = slot, .kind = kind, .head = head orelse return null };
+}
 
-/// Extract the exact checkpoint slot and close time from the normal node
-/// startup line. A local `snapshot` boot, or a history line without temporal
-/// evidence, must not satisfy this witness.
-pub fn parseHistoryBootLine(raw: []const u8) ?HistoryBootLine {
-    const marker = "starting from history checkpoint at slot ";
+pub const HistoryReplayLine = struct {
+    anchor: u64,
+    tip: u64,
+    ledgers: u64,
+};
+
+/// Extract the semantic core of an E2d startup diagnostic containing
+/// `history replay anchor A through tip H (N ledgers)`. Prefixes and suffixes
+/// remain diagnostic-only, so wording around this stable phrase may evolve.
+pub fn parseHistoryReplayLine(raw: []const u8) ?HistoryReplayLine {
+    const marker = "history replay anchor ";
     const line = trimLine(raw);
     const at = std.mem.indexOf(u8, line, marker) orelse return null;
-    var it = std.mem.tokenizeScalar(u8, line[at + marker.len ..], ' ');
-    const slot = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
-    const time = kv(it.next() orelse return null) orelse return null;
-    if (!std.mem.eql(u8, time.key, "close_time")) return null;
-    const close_time = std.fmt.parseInt(u64, time.val, 10) catch return null;
-    if (it.next() != null) return null;
-    return .{ .slot = slot, .close_time = close_time };
+    var rest = line[at + marker.len ..];
+
+    const through = " through tip ";
+    const anchor_end = std.mem.indexOf(u8, rest, through) orelse return null;
+    const anchor = std.fmt.parseInt(u64, rest[0..anchor_end], 10) catch return null;
+    rest = rest[anchor_end + through.len ..];
+
+    const count_open = " (";
+    const tip_end = std.mem.indexOf(u8, rest, count_open) orelse return null;
+    const tip = std.fmt.parseInt(u64, rest[0..tip_end], 10) catch return null;
+    rest = rest[tip_end + count_open.len ..];
+
+    const count_close = " ledgers)";
+    const count_end = std.mem.indexOf(u8, rest, count_close) orelse return null;
+    const ledgers = std.fmt.parseInt(u64, rest[0..count_end], 10) catch return null;
+    return .{ .anchor = anchor, .tip = tip, .ledgers = ledgers };
 }
 
 /// True only for the deterministic close-time transition allowed between
@@ -408,11 +470,29 @@ fn transactionSpanOk(
     }
 }
 
-/// The two arithmetic acceptance boundaries of the E2b witness. Written as a
-/// pure predicate so off-by-one weakening goes red in unit tests.
-pub fn historyWitnessOk(absent_at: u64, stable_head: u64, checkpoint: u64) bool {
-    if (stable_head < absent_at or checkpoint > stable_head) return false;
-    return stable_head - absent_at >= absent_slots and stable_head - checkpoint < answering_window;
+/// The arithmetic acceptance boundaries of the E2d witness. Written as a pure
+/// predicate so an off-by-one can neither shrink the outage nor disguise a
+/// live-window catch-up as archive replay.
+pub fn archiveReplayWitnessOk(absent_at: u64, anchor: u64, tip: u64, ledgers: u64) bool {
+    if (tip < absent_at or tip <= anchor) return false;
+    if (tip - absent_at < absent_slots) return false;
+    if (anchor % history_anchor_every != 0 or tip % history_anchor_every == 0) return false;
+    if (anchor != tip - tip % history_anchor_every) return false;
+    const span = tip - anchor;
+    return span >= min_archive_replay_ledgers and ledgers == span;
+}
+
+/// A successful peerless recovery authenticates its selected tip. The sampled
+/// tip is therefore a floor, not an exact guess at where two stopped publisher
+/// threads finished; every other replay-shape invariant remains exact.
+pub fn recoveredArchiveTipWitnessOk(
+    absent_at: u64,
+    certified_floor: u64,
+    anchor: u64,
+    tip: u64,
+    ledgers: u64,
+) bool {
+    return tip >= certified_floor and archiveReplayWitnessOk(absent_at, anchor, tip, ledgers);
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +528,13 @@ pub fn evidenceLine(buf: []u8, nodes: usize, txs: u64, slots: u64, head16: []con
 // Node processes
 // ---------------------------------------------------------------------------
 
-const checkpoint_signed_bit: u8 = 1 << 0;
-const checkpoint_certified_bit: u8 = 1 << 1;
+const history_tip_signed_bit: u8 = 1 << 0;
+const history_tip_certified_bit: u8 = 1 << 1;
+
+const HistoryTipSeen = struct {
+    head: [64]u8,
+    status: u8,
+};
 
 /// One `registry node` process: its scratch dir (cwd: `--data-dir data` is
 /// relative), its argv (identical across restarts), the child, and a reader
@@ -481,11 +566,13 @@ const NodeProc = struct {
     /// slot → deterministic ledger close time, paired with the required
     /// `slot_heads` evidence and retained across restarts.
     slot_times: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    /// checkpoint slot → observed progress bits. `certified` also implies
+    /// archive-tip slot → observed progress bits. `certified` also implies
     /// this validator has emitted its own signed attestation.
-    history_checkpoints: std.AutoHashMapUnmanaged(u64, u8) = .empty,
-    /// Set only by the explicit `starting from history checkpoint` boot log.
-    history_boot: ?HistoryBootLine = null,
+    history_tips: std.AutoHashMapUnmanaged(u64, HistoryTipSeen) = .empty,
+    /// Set only by the E2d archive-replay summary. This is the proof that the
+    /// selected tip was reconstructed from an older anchor rather than loaded
+    /// directly from a checkpoint snapshot.
+    history_replay: ?HistoryReplayLine = null,
     eof: bool = false,
     expect_eof: bool = false,
     /// The first line that contradicted an earlier print of the same slot by
@@ -524,7 +611,7 @@ const NodeProc = struct {
         self.slot_heads.deinit(gpa);
         self.slot_txs.deinit(gpa);
         self.slot_times.deinit(gpa);
-        self.history_checkpoints.deinit(gpa);
+        self.history_tips.deinit(gpa);
         for (self.argv) |s| gpa.free(s);
         gpa.free(self.argv);
         gpa.free(self.dir);
@@ -540,7 +627,7 @@ const NodeProc = struct {
         self.eof = false;
         self.expect_eof = false;
         self.max_slot = 0;
-        self.history_boot = null;
+        self.history_replay = null;
         self.mu.unlock(self.io);
         self.child = try std.process.spawn(self.io, .{
             .argv = self.argv,
@@ -627,27 +714,33 @@ const NodeProc = struct {
 
     fn noteLine(self: *NodeProc, line: []const u8) void {
         const parsed = parseSlotLine(line);
-        const checkpoint = parseCheckpointLine(line);
-        const history_boot = parseHistoryBootLine(line);
+        const tip = parseHistoryTipLine(line);
+        const history_replay = parseHistoryReplayLine(line);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const copy = self.gpa.dupe(u8, line) catch return;
         if (self.tail[self.tail_next]) |old| self.gpa.free(old);
         self.tail[self.tail_next] = copy;
         self.tail_next = (self.tail_next + 1) % tail_lines;
-        if (checkpoint) |event| {
-            const gop = self.history_checkpoints.getOrPut(self.gpa, event.slot) catch return;
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* |= switch (event.kind) {
-                .signed => checkpoint_signed_bit,
-                .certified => checkpoint_signed_bit | checkpoint_certified_bit,
+        if (tip) |event| {
+            const gop = self.history_tips.getOrPut(self.gpa, event.slot) catch return;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .head = event.head, .status = 0 };
+            } else if (!std.mem.eql(u8, &gop.value_ptr.head, &event.head)) {
+                if (self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+                return;
+            }
+            gop.value_ptr.status |= switch (event.kind) {
+                .signed => history_tip_signed_bit,
+                .certified => history_tip_signed_bit | history_tip_certified_bit,
             };
         }
-        if (history_boot) |boot| {
-            if (self.history_boot) |old| {
-                if ((old.slot != boot.slot or old.close_time != boot.close_time) and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+        if (history_replay) |replay| {
+            if (self.history_replay) |old| {
+                if (!std.meta.eql(old, replay) and self.bad == null)
+                    self.bad = self.gpa.dupe(u8, line) catch null;
             } else {
-                self.history_boot = boot;
+                self.history_replay = replay;
             }
         }
         const p = parsed orelse return;
@@ -770,6 +863,47 @@ const n_clients = client_names.len;
 const HeadSeen = struct { hash: [64]u8, close_time: u64, mask: u8 };
 const LogHeadSeen = struct { head16: [16]u8, close_time: u64, mask: u8 };
 
+/// Return the exact historical RPC frontier only when every required process
+/// reported the same full hash and close time before it was stopped.
+fn exactHistoryFrontier(
+    heads: *const std.AutoHashMapUnmanaged(u64, HeadSeen),
+    required_mask: u8,
+    slot: u64,
+) ?HistoryFrontier {
+    if (required_mask == 0) return null;
+    const seen = heads.get(slot) orelse return null;
+    if (seen.mask & required_mask != required_mask) return null;
+    return .{ .slot = slot, .close_time = seen.close_time, .hash = seen.hash };
+}
+
+fn certifiedHistoryTipEvidenceOk(
+    a: HistoryTipSeen,
+    b: HistoryTipSeen,
+    logged: LogHeadSeen,
+    required_mask: u8,
+) bool {
+    if (required_mask == 0 or logged.mask & required_mask != required_mask) return false;
+    if (a.status & history_tip_signed_bit == 0 or b.status & history_tip_signed_bit == 0) return false;
+    if ((a.status | b.status) & history_tip_certified_bit == 0) return false;
+    return std.mem.eql(u8, &a.head, &b.head) and
+        std.mem.eql(u8, a.head[0..16], &logged.head16);
+}
+
+/// Reconstruct one exact application frontier entirely from evidence emitted
+/// before the certifiers stop. The signed tip diagnostics carry the complete
+/// head; the durable application logs independently supply close time and
+/// prove both processes installed that same slot.
+fn certifiedHistoryFrontier(
+    slot: u64,
+    a: HistoryTipSeen,
+    b: HistoryTipSeen,
+    logged: LogHeadSeen,
+    required_mask: u8,
+) ?HistoryFrontier {
+    if (!certifiedHistoryTipEvidenceOk(a, b, logged, required_mask)) return null;
+    return .{ .slot = slot, .close_time = logged.close_time, .hash = a.head };
+}
+
 /// What a `get` poll waits for.
 const GetWant = union(enum) {
     none,
@@ -811,6 +945,11 @@ fn clip(s: []const u8, n: usize) []const u8 {
 fn elapsedMs(io: std.Io, since: std.Io.Timestamp) u64 {
     const d = since.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
     return if (d < 0) 0 else @intCast(d);
+}
+
+fn historyWaitBudgetMs(run_deadline_ms: u64, run_elapsed_ms: u64) u64 {
+    if (run_elapsed_ms >= run_deadline_ms) return 0;
+    return run_deadline_ms - run_elapsed_ms;
 }
 
 fn wallSeconds(io: std.Io) u64 {
@@ -1478,143 +1617,162 @@ const Cluster = struct {
         }
     }
 
-    const CertifiedWitness = struct { checkpoint: u64, live_head: u64 };
-
-    fn certifiedCheckpointNow(self: *Cluster, nodes: *const [2]usize, max_slot: u64) ?u64 {
-        const mask = nodesMask(nodes);
+    fn certifiedFrontierNow(self: *Cluster, nodes: *const [2]usize, slot: u64) ?HistoryFrontier {
+        const required = nodesMask(nodes);
         const a = self.procs[nodes[0]];
         const b = self.procs[nodes[1]];
-        var best: ?u64 = null;
         a.mu.lockUncancelable(self.io);
         b.mu.lockUncancelable(self.io);
         defer b.mu.unlock(self.io);
         defer a.mu.unlock(self.io);
-        var it = a.history_checkpoints.iterator();
-        while (it.next()) |e| {
-            const slot = e.key_ptr.*;
-            const a_status = e.value_ptr.*;
-            const b_status = b.history_checkpoints.get(slot) orelse continue;
-            if (a_status & checkpoint_signed_bit == 0 or b_status & checkpoint_signed_bit == 0) continue;
-            if ((a_status | b_status) & checkpoint_certified_bit == 0) continue;
-            if (slot > max_slot) continue;
+        const a_tip = a.history_tips.get(slot) orelse return null;
+        const b_tip = b.history_tips.get(slot) orelse return null;
+        const logged = self.log_heads.get(slot) orelse return null;
+        return certifiedHistoryFrontier(slot, a_tip, b_tip, logged, required);
+    }
+
+    /// Wait until the exact RPC head shared by the two survivors is itself a
+    /// two-signer certified archive tip. Its anchor-to-tip span must exceed
+    /// the native answering window, so the later peerless boot cannot be a
+    /// disguised live catch-up.
+    fn waitCertifiedArchiveTip(self: *Cluster, nodes: *const [2]usize, first_slot: u64, min_tip: u64) !HistoryFrontier {
+        const budget_ms = historyWaitBudgetMs(self.deadline_ms, elapsedMs(self.io, self.started));
+        var poll = Poll.init(self.io, budget_ms, "a non-anchor certified archive tip at least 17 ledgers beyond its anchor and 201 beyond node2");
+        while (true) {
+            try self.checkProcs();
+            const a = (try self.queryHead(nodes[0])) orelse {
+                try poll.tick(self);
+                continue;
+            };
+            const b = (try self.queryHead(nodes[1])) orelse {
+                try poll.tick(self);
+                continue;
+            };
+            if (a.slot != b.slot or a.slot < min_tip or
+                a.close_time != b.close_time or !std.mem.eql(u8, &a.hash, &b.hash))
+            {
+                try poll.tick(self);
+                continue;
+            }
+            const anchor = a.slot - a.slot % history_anchor_every;
+            const replayed = a.slot - anchor;
+            const certified = self.certifiedFrontierNow(nodes, a.slot);
+            if (!archiveReplayWitnessOk(first_slot, anchor, a.slot, replayed) or
+                certified == null or certified.?.close_time != a.close_time or
+                !std.mem.eql(u8, &certified.?.hash, &a.hash) or
+                !loggedChainOk(&self.log_heads, nodesMask(nodes), first_slot, a.slot))
+            {
+                try poll.tick(self);
+                continue;
+            }
+            std.debug.print("[registry-smoke] ok after {d} ms: archive tip H={d} signed by node{d}+node{d}, certified, anchor A={d}, replay span={d}, outage={d}\n", .{
+                poll.elapsed(self.io), a.slot, nodes[0], nodes[1], anchor, replayed, a.slot - first_slot,
+            });
+            return historyFrontier(a);
+        }
+    }
+
+    fn certifiedFrontierAtOrAfterNow(
+        self: *Cluster,
+        nodes: *const [2]usize,
+        min_slot: u64,
+    ) ?HistoryFrontier {
+        const required = nodesMask(nodes);
+        const a = self.procs[nodes[0]];
+        const b = self.procs[nodes[1]];
+        var best: ?HistoryFrontier = null;
+        a.mu.lockUncancelable(self.io);
+        b.mu.lockUncancelable(self.io);
+        defer b.mu.unlock(self.io);
+        defer a.mu.unlock(self.io);
+        var it = a.history_tips.iterator();
+        while (it.next()) |entry| {
+            const slot = entry.key_ptr.*;
+            if (slot < min_slot) continue;
+            const b_tip = b.history_tips.get(slot) orelse continue;
             const logged = self.log_heads.get(slot) orelse continue;
-            if (logged.mask & mask != mask) continue;
-            if (best == null or slot > best.?) best = slot;
+            const exact = certifiedHistoryFrontier(slot, entry.value_ptr.*, b_tip, logged, required) orelse continue;
+            if (best == null or exact.slot > best.?.slot) best = exact;
         }
         return best;
     }
 
-    /// Wait for two distinct survivor processes to report their attestation
-    /// for C, at least one to report C certified, and both to have durably
-    /// applied C with the same head. The returned live head is within the
-    /// protocol's 16-slot answering window of C.
-    fn waitCertifiedCheckpoint(self: *Cluster, nodes: *const [2]usize, first_slot: u64, min_live_slot: u64) !CertifiedWitness {
-        var poll = Poll.init(self.io, history_bound_ms, "a recent two-signer certified history checkpoint after at least 201 missed slots");
+    /// Both restarted validators must prove that ordered history publication
+    /// resumed, not merely that their consensus/application state converged.
+    fn waitCertifiedHistoryAfterRestart(
+        self: *Cluster,
+        nodes: *const [2]usize,
+        min_slot: u64,
+    ) !HistoryFrontier {
+        var poll = Poll.init(self.io, poll_bound_ms, "node1+node2 to certify an exact history tip at or beyond tx8");
         while (true) {
             try self.checkProcs();
-            const live_head = self.commonLoggedSlotNow(nodes, min_live_slot, 0);
-            if (live_head) |h| {
-                if (self.certifiedCheckpointNow(nodes, h)) |c| {
-                    if (h - c >= answering_window) {
-                        try poll.tick(self);
-                        continue;
-                    }
-                    // This is a temporal-chain witness, not merely two sparse
-                    // endpoints: both survivors must have printed every slot
-                    // from the outage origin through the live frontier.
-                    if (!loggedChainOk(&self.log_heads, nodesMask(nodes), first_slot, h)) {
-                        try poll.tick(self);
-                        continue;
-                    }
-                    std.debug.print("[registry-smoke] ok after {d} ms: checkpoint C={d} signed by node{d}+node{d}, certified, live H={d}, lag={d}\n", .{
-                        poll.elapsed(self.io), c, nodes[0], nodes[1], h, h - c,
-                    });
-                    return .{ .checkpoint = c, .live_head = h };
-                }
-            }
-            try poll.tick(self);
-        }
-    }
-
-    /// After the second validator dies, allow already-buffered work to drain,
-    /// then require one exact slot/hash to remain unchanged for `stable_ms`.
-    fn waitHeadStable(self: *Cluster, i: usize, min_slot: u64, stable_ms: u64) !Head {
-        var poll = Poll.init(self.io, poll_bound_ms, "the sole survivor's head to remain unchanged for one second");
-        var candidate: ?Head = null;
-        var since = std.Io.Timestamp.now(self.io, .awake);
-        while (true) {
-            const h = (try self.queryHead(i)) orelse {
-                candidate = null;
-                try poll.tick(self);
-                continue;
-            };
-            if (h.slot < min_slot) {
-                try poll.tick(self);
-                continue;
-            }
-            if (candidate == null or candidate.?.slot != h.slot or candidate.?.close_time != h.close_time or !std.mem.eql(u8, &candidate.?.hash, &h.hash)) {
-                candidate = h;
-                since = std.Io.Timestamp.now(self.io, .awake);
-            } else if (elapsedMs(self.io, since) >= stable_ms) {
-                std.debug.print("[registry-smoke] ok after {d} ms: node{d} stalled without quorum at H={d} close_time={d} head={s}… for >= {d} ms\n", .{
-                    poll.elapsed(self.io), i, h.slot, h.close_time, h.hash[0..16], stable_ms,
+            _ = try self.queryHead(nodes[0]);
+            _ = try self.queryHead(nodes[1]);
+            if (self.certifiedFrontierAtOrAfterNow(nodes, min_slot)) |frontier| {
+                std.debug.print("[registry-smoke] ok after {d} ms: restarted node{d}+node{d} resumed publication and certified exact history tip H={d} close_time={d} head={s}…\n", .{
+                    poll.elapsed(self.io), nodes[0], nodes[1], frontier.slot, frontier.close_time, frontier.hash[0..16],
                 });
-                return h;
+                return frontier;
             }
             try poll.tick(self);
         }
     }
 
-    fn waitHistoryBoot(self: *Cluster, i: usize, certifiers: *const [2]usize, min_slot: u64, stable_head: u64) !HistoryBootLine {
-        var poll = Poll.init(self.io, ready_bound_ms, "node2's explicit history-checkpoint boot log");
+    /// Booting from this archive with both peers dead is itself the authoritative
+    /// certificate check. The sampled certified tip is only a floor: publisher
+    /// threads may have durably completed a newer tip before SIGKILL. Accept
+    /// that tip only when both stopped processes had already reported its exact
+    /// full signed hash and durable close time and its replay shape remains
+    /// independently non-vacuous.
+    fn waitArchiveReplay(
+        self: *Cluster,
+        i: usize,
+        certifiers: *const [2]usize,
+        absent_at: u64,
+        certified_floor: HistoryFrontier,
+    ) !HistoryFrontier {
+        var poll = Poll.init(self.io, ready_bound_ms, "node2's explicit archive-replay boot log while both peers are dead");
         while (true) {
             try self.checkProcs();
             const p = self.procs[i];
             p.mu.lockUncancelable(self.io);
-            const got = p.history_boot;
+            const got = p.history_replay;
             p.mu.unlock(self.io);
-            if (got) |boot| {
-                // A second certificate can become complete after the harness
-                // sampled C but before node0's kill reaches it. loadLatest
-                // correctly chooses that newer artifact, so accept B >= C
-                // while retaining the same stable-H/window proof.
-                if (boot.slot < min_slot or boot.slot > stable_head or stable_head - boot.slot >= answering_window) {
-                    std.debug.print("[registry-smoke] node{d} booted from history checkpoint B={d}; expected C={d} <= B <= H={d} and H-B < {d}\n", .{
-                        i, boot.slot, min_slot, stable_head, answering_window,
+            if (got) |replay| {
+                if (!recoveredArchiveTipWitnessOk(
+                    absent_at,
+                    certified_floor.slot,
+                    replay.anchor,
+                    replay.tip,
+                    replay.ledgers,
+                )) {
+                    std.debug.print("[registry-smoke] node{d} reported replay A={d} H={d} N={d}; certified floor was H={d}, and the recovered tip must remain non-anchor with an exact >=17-ledger replay\n", .{
+                        i, replay.anchor, replay.tip, replay.ledgers, certified_floor.slot,
                     });
-                    return error.WrongHistoryCheckpoint;
+                    return error.WrongHistoryReplay;
                 }
-                // If startup legitimately selected a certificate newer than
-                // the requested floor, prove that exact B—not just some older
-                // C—was signed by both frozen survivors and certified.
-                if (self.certifiedCheckpointNow(certifiers, boot.slot) != boot.slot) {
-                    std.debug.print("[registry-smoke] node{d} booted from B={d}, but that exact checkpoint lacks frozen two-signer certification and durable quorum logs\n", .{ i, boot.slot });
-                    return error.UncertifiedHistoryBoot;
-                }
-                const recorded = self.log_heads.get(boot.slot) orelse return error.MissingCheckpointTimeEvidence;
-                if (recorded.close_time != boot.close_time) {
-                    std.debug.print("[registry-smoke] node{d} history boot B={d} has close_time={d}; durable quorum evidence says {d}\n", .{
-                        i, boot.slot, boot.close_time, recorded.close_time,
-                    });
-                    return error.HistoryBootTimeDisagreement;
-                }
-                std.debug.print("[registry-smoke] ok after {d} ms: node{d} booted from history checkpoint B={d} close_time={d} (requested minimum C={d}, stable H={d})\n", .{
-                    poll.elapsed(self.io), i, boot.slot, boot.close_time, min_slot, stable_head,
+                const recovered = self.certifiedFrontierNow(certifiers, replay.tip) orelse {
+                    std.debug.print("[registry-smoke] recovered H={d} lacked matching full signed heads and durable close time from both stopped certifiers (floor H={d})\n", .{ replay.tip, certified_floor.slot });
+                    return error.MissingFrozenTipEvidence;
+                };
+                std.debug.print("[registry-smoke] ok after {d} ms: node{d} authenticated and replayed archive A={d} through H={d} ({d} ledgers) while node0+node1 were dead; sampled certified floor H={d}\n", .{
+                    poll.elapsed(self.io), i, replay.anchor, replay.tip, replay.ledgers, certified_floor.slot,
                 });
-                return boot;
+                return recovered;
             }
             try poll.tick(self);
         }
     }
 
-    /// The checkpoint-restored process must visibly pass through the exact
-    /// stable frontier, not merely appear at some later matching state.
-    fn waitHeadExact(self: *Cluster, i: usize, want: Head) !Head {
-        var poll = Poll.init(self.io, poll_bound_ms, "node2 to catch the sole survivor's exact stable H/hash");
+    /// The archive-restored process must expose the exact certified frontier,
+    /// not merely appear at some later matching state.
+    fn waitHeadExact(self: *Cluster, i: usize, want: HistoryFrontier) !Head {
+        var poll = Poll.init(self.io, poll_bound_ms, "node2 to expose the exact peerless archive H/hash/time");
         while (true) {
             if (try self.queryHead(i)) |h| {
                 if (h.slot > want.slot) {
-                    std.debug.print("[registry-smoke] node{d} skipped the observable catch-up frontier H={d} and reached {d}\n", .{ i, want.slot, h.slot });
+                    std.debug.print("[registry-smoke] node{d} skipped the certified archive frontier H={d} and reached {d}\n", .{ i, want.slot, h.slot });
                     return error.CatchUpOvershot;
                 }
                 if (h.slot == want.slot) {
@@ -1785,81 +1943,64 @@ const Cluster = struct {
         std.debug.print("[registry-smoke] history outage begins at durable S={d}; node2 stopped\n", .{absent_at});
 
         // node0+node1 are still a 2-of-3 quorum. Their 500 ms idle heartbeat
-        // drives at least 201 transaction-free slots while the shared history
-        // archive receives an attestation every 8 slots. A usable C must be
-        // signed by both, certified by the local qset, and no more than 15
-        // slots behind the live common head.
+        // drives at least 201 transaction-free slots. E2d stores every ledger,
+        // takes snapshot anchors only every 64 slots, and attests replayable
+        // tips between anchors. Wait until the exact common RPC head is itself
+        // certified and at least 17 ledgers beyond its anchor: that replay is
+        // strictly larger than the native answering window.
         const survivors = [_]usize{ 0, 1 };
-        const certified = try self.waitCertifiedCheckpoint(&survivors, absent_at, absent_at + absent_slots);
+        const sampled_tip = try self.waitCertifiedArchiveTip(&survivors, absent_at, absent_at + absent_slots);
 
-        // Remove node0 as well. node1 may finish already-buffered work, so the
-        // stable H is measured after the kill; five or more independent head
-        // samples over one second prove it cannot advance by itself.
-        {
-            const p0 = self.procs[0];
-            p0.mu.lockUncancelable(self.io);
-            p0.expect_eof = true;
-            p0.mu.unlock(self.io);
-            p0.stop();
+        // Freeze both certifiers before recovery. Node2's configured node0 and
+        // node1 peers are now simultaneously dead, so reaching H cannot use a
+        // live statement tail. The sampled certified tip remains the recovery
+        // floor; successful authenticated boot below decides whether an equal
+        // or newer fully witnessed tip was actually durable at the cut.
+        for (survivors) |i| {
+            const p = self.procs[i];
+            p.mu.lockUncancelable(self.io);
+            p.expect_eof = true;
+            p.mu.unlock(self.io);
         }
-        const stable = try self.waitHeadStable(1, certified.live_head, stable_head_ms);
-        // Buffered votes may let the remaining process finish a few ledgers
-        // after node0 dies. Its own complete log must extend the already
-        // two-survivor-certified chain through the exact stable H.
+        for (survivors) |i| self.procs[i].stop();
         try self.checkProcs();
-        if (!loggedChainOk(&self.log_heads, bit(1), absent_at, stable.slot))
-            return error.IncompleteHistoryTimeChain;
-        // node0's reader is joined, so freeze the newest certificate both
-        // survivors actually logged before selecting the import floor. This
-        // closes the C→C+8 race between the earlier sample and SIGKILL.
-        try self.checkProcs();
-        const checkpoint_floor = self.certifiedCheckpointNow(&survivors, stable.slot) orelse return error.MissingCertifiedCheckpoint;
-        if (!historyWitnessOk(absent_at, stable.slot, checkpoint_floor)) {
-            std.debug.print("[registry-smoke] invalid E2b witness: S={d} C={d} stable H={d}; need H-S >= {d} and H-C < {d}\n", .{
-                absent_at, checkpoint_floor, stable.slot, absent_slots, answering_window,
-            });
-            return error.HistoryWitnessOutOfRange;
-        }
-        {
-            const p1 = self.procs[1];
-            p1.mu.lockUncancelable(self.io);
-            const advanced = p1.slot_txs.contains(stable.slot + 1);
-            p1.mu.unlock(self.io);
-            if (advanced) return error.SoleSurvivorAdvanced;
-        }
 
-        // (10) Restart node2 from the certified archive, not its 201-slot-old
-        // local snapshot. The extra node0 dial from its first restart remains
-        // configured but node0 is dead, leaving node1 as its only live peer.
-        // A finite heartbeat lets node2 co-vote through C+1..H; the one-second
-        // interval then leaves time to observe exact H before tx8 is queued.
-        var checkpoint_buf: [20]u8 = undefined;
-        const checkpoint_s = try std.fmt.bufPrint(&checkpoint_buf, "{d}", .{checkpoint_floor});
+        // (10) Restart node2 from the archive, not its 201-slot-old local
+        // snapshot. Both peers remain dead. The sampled non-anchor tip is the
+        // floor; archive authentication may reveal a newer tip completed at
+        // shutdown, but only if both dead certifiers previously returned its
+        // exact full hash/time. Expose that exact recovered frontier before
+        // either certifier returns.
+        var tip_buf: [20]u8 = undefined;
+        const tip_s = try std.fmt.bufPrint(&tip_buf, "{d}", .{sampled_tip.slot});
         try self.procs[2].setFlagValue("--min-slot-ms", survivor_min_slot_ms);
         try self.procs[2].setFlagValue("--heartbeat-ms", rejoin_heartbeat_ms);
-        try self.procs[2].setFlagValue("--history-min-slot", checkpoint_s);
-        std.debug.print("[registry-smoke] restarting node2 with --history-min-slot C={d}; node0 peer is configured but dead, node1 is the sole live peer\n", .{checkpoint_floor});
+        try self.procs[2].setFlagValue("--history-min-slot", tip_s);
+        std.debug.print("[registry-smoke] all validators stopped; restarting node2 alone with certified --history-min-slot floor H={d}; node0+node1 remain dead\n", .{sampled_tip.slot});
         self.procs[2].spawn() catch |err| {
-            std.debug.print("[registry-smoke] cannot respawn node2 from history: {t}\n", .{err});
+            std.debug.print("[registry-smoke] cannot respawn node2 from replayable history: {t}\n", .{err});
             return err;
         };
-        const boot = try self.waitHistoryBoot(2, &survivors, checkpoint_floor, stable.slot);
-        if (!historyWitnessOk(absent_at, stable.slot, boot.slot)) return error.HistoryWitnessOutOfRange;
-        _ = try self.waitHeadExact(2, stable);
+        const archive_tip = try self.waitArchiveReplay(2, &survivors, absent_at, sampled_tip);
+        _ = try self.waitHeadExact(2, archive_tip);
 
-        // tx8 changes state and must occupy the first common transaction-
-        // bearing ledger after H on both live nodes. An idle H+1 may already
-        // have been proposed while the CLI process starts; if so, retain and
-        // prove it as an agreed empty ledger instead of making correctness
-        // depend on a sub-second scheduling race. Node1 was proved stalled at
-        // H, so every post-H externalization still requires the restored node.
+        // Only now return node1. tx8 changes state and must occupy the first
+        // common transaction-bearing ledger after H on node1+node2. An idle
+        // H+1 may race the CLI, so retain and prove any intervening ledgers as
+        // empty rather than coupling correctness to sub-second scheduling.
+        std.debug.print("[registry-smoke] exact peerless archive replay proved at H={d}; restarting node1 while node0 remains dead\n", .{archive_tip.slot});
+        self.procs[1].spawn() catch |err| {
+            std.debug.print("[registry-smoke] cannot respawn node1 after node2's archive replay: {t}\n", .{err});
+            return err;
+        };
+        _ = try self.headRetry(1, "node1 RPC after node2 completed peerless archive replay");
         _ = try self.submit(.bob, 2, &.{ "set", "alice", "history" });
-        const first_post_h = std.math.add(u64, stable.slot, 1) catch return error.StableHeadAtMaxSlot;
+        const first_post_h = std.math.add(u64, archive_tip.slot, 1) catch return error.StableHeadAtMaxSlot;
         const rejoined_slot = try self.waitCommonLoggedSlot(
             &.{ 1, 2 },
             first_post_h,
             1,
-            "node1+node2 externalized the first transaction-bearing ledger after checkpoint catch-up",
+            "node1+node2 externalized the first transaction-bearing ledger after peerless archive replay",
         );
         try self.checkProcs();
 
@@ -1867,22 +2008,23 @@ const Cluster = struct {
         const p2 = self.procs[2];
         p1.mu.lockUncancelable(self.io);
         p2.mu.lockUncancelable(self.io);
-        const exact_span = transactionSpanOk(&p1.slot_txs, &p2.slot_txs, stable.slot, rejoined_slot);
+        const exact_span = transactionSpanOk(&p1.slot_txs, &p2.slot_txs, archive_tip.slot, rejoined_slot);
         p2.mu.unlock(self.io);
         p1.mu.unlock(self.io);
         if (!exact_span) return error.BadRejoinTransactionSpan;
-        if (!loggedChainOk(&self.log_heads, bit(1) | bit(2), stable.slot, rejoined_slot))
+        if (!loggedChainOk(&self.log_heads, bit(1) | bit(2), first_post_h, rejoined_slot))
             return error.IncompleteRejoinTimeChain;
 
         const rejoined = self.log_heads.get(rejoined_slot) orelse return error.MissingSlotTime;
         std.debug.print("[registry-smoke] tx8 temporal witness: H={d} close_time={d}; first tx ledger={d} close_time={d} after {d} complete post-H ledger(s)\n", .{
-            stable.slot, stable.close_time, rejoined_slot, rejoined.close_time, rejoined_slot - stable.slot,
+            archive_tip.slot, archive_tip.close_time, rejoined_slot, rejoined.close_time, rejoined_slot - archive_tip.slot,
         });
         try self.waitGet("alice", .{ .value = "686973746f7279" }, &.{ 1, 2 }, "tx8 state agrees on node1+node2 at the rejoined frontier");
+        const rejoined_publishers = [_]usize{ 1, 2 };
+        _ = try self.waitCertifiedHistoryAfterRestart(&rejoined_publishers, rejoined_slot);
 
-        // (11) Finally restart node0. Depending on whether a post-H ledger was an
-        // 8-slot boundary it may select local persistence or the newer shared
-        // certificate; either path must converge with the two-node chain.
+        // (11) Finally restart node0. It may select local persistence or newer
+        // shared history; either path must converge with the two-node chain.
         // (The exact tx8 line is already pinned on its necessary voters.)
         std.debug.print("[registry-smoke] restarting node0 after node1+node2 rejoined at slot {d}\n", .{rejoined_slot});
         self.procs[0].spawn() catch |err| {
@@ -2179,7 +2321,7 @@ fn run(init: std.process.Init, args: Args) !void {
         std.debug.print("[registry-smoke] cannot spawn node{d} ({s}): {t}\n", .{ p.index, p.argv[0], err });
         return err;
     };
-    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; genesis close_time={d}; proposal clock offsets {any}; busy min {s} ms, idle heartbeat {s} ms, checkpoint every {s}; node2 nomination disabled\n", .{
+    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; genesis close_time={d}; proposal clock offsets {any}; busy min {s} ms, idle heartbeat {s} ms, history anchor every {s}; node2 nomination disabled\n", .{
         listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), genesis_close_time, proposal_clock_offsets, survivor_min_slot_ms, survivor_heartbeat_ms, checkpoint_every,
     });
 
@@ -2327,7 +2469,48 @@ test "parseSlotLine: the node's timed `slot N: ...` line" {
 // Non-vacuity: a locally published signature is not itself a certificate.
 // The at-least-201-slot witness waits specifically for `.certified`, while retaining
 // the per-process `.signed` observations that prove two distinct signers.
-test "parseCheckpointLine: signed and certified are distinct exact statuses" {
+test "parseHistoryTipLine: signed and certified are distinct exact statuses" {
+    const signed = parseHistoryTipLine("history tip slot 273 signed head=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").?;
+    try testing.expectEqual(@as(u64, 273), signed.slot);
+    try testing.expectEqual(CheckpointKind.signed, signed.kind);
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &signed.head);
+    const certified = parseHistoryTipLine("history tip slot 274 certified head=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210").?;
+    try testing.expectEqual(@as(u64, 274), certified.slot);
+    try testing.expectEqual(CheckpointKind.certified, certified.kind);
+    try testing.expectEqualStrings("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", &certified.head);
+    try testing.expect(parseHistoryTipLine("history tip slot 274 certified") == null);
+    try testing.expect(parseHistoryTipLine("history tip slot 274 certified head=too-short") == null);
+    try testing.expect(parseHistoryTipLine("history tip slot 274 certified head=ABCDEF9876543210ABCDEF9876543210ABCDEF9876543210ABCDEF9876543210") == null);
+    try testing.expect(parseHistoryTipLine("history tip slot 274 certified head=0123456789abcdef") == null);
+    try testing.expect(parseHistoryTipLine("history checkpoint slot 274 certified") == null);
+    try testing.expect(parseHistoryTipLine("history tip slot 274 published") == null);
+    try testing.expect(parseHistoryTipLine("history tip slot x certified") == null);
+    try testing.expect(parseHistoryTipLine("tip slot 274 certified") == null);
+    try testing.expect(parseHistoryTipLine("slot 274: txs=0 ok=0") == null);
+}
+
+test "parseHistoryTipLine retains the complete head for a cut-time successor" {
+    const line = parseHistoryTipLine(
+        "history tip slot 274 certified head=0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210",
+    ).?;
+    try testing.expectEqualStrings(
+        "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210",
+        &line.head,
+    );
+}
+
+test "parseHistoryReplayLine: replay summary is prefix-independent but structurally exact" {
+    const replay = parseHistoryReplayLine("registry node: history replay anchor 256 through tip 273 (17 ledgers); local journal starts at 274").?;
+    try testing.expectEqual(@as(u64, 256), replay.anchor);
+    try testing.expectEqual(@as(u64, 273), replay.tip);
+    try testing.expectEqual(@as(u64, 17), replay.ledgers);
+    try testing.expect(parseHistoryReplayLine("history replay anchor 256 through tip 273") == null);
+    try testing.expect(parseHistoryReplayLine("history replay anchor 256 through head 273 (17 ledgers)") == null);
+    try testing.expect(parseHistoryReplayLine("history replay anchor 256 through tip 273 (16 ledgers)") != null);
+    try testing.expect(parseHistoryReplayLine("history replay anchor x through tip 273 (17 ledgers)") == null);
+}
+
+test "legacy checkpoint parser remains narrow for pre-replay diagnostics" {
     const signed = parseCheckpointLine("history checkpoint slot 208 signed signer=abc").?;
     try testing.expectEqual(@as(u64, 208), signed.slot);
     try testing.expectEqual(CheckpointKind.signed, signed.kind);
@@ -2340,18 +2523,6 @@ test "parseCheckpointLine: signed and certified are distinct exact statuses" {
     try testing.expect(parseCheckpointLine("slot 216: txs=0 ok=0") == null);
 }
 
-test "parseHistoryBootLine: only an explicitly timed history-checkpoint boot satisfies it" {
-    const line = "registry: node abc listening on port 1; 1 peer(s); data in data; starting from history checkpoint at slot 208 close_time=1700000208";
-    const boot = parseHistoryBootLine(line).?;
-    try testing.expectEqual(@as(u64, 208), boot.slot);
-    try testing.expectEqual(@as(u64, 1_700_000_208), boot.close_time);
-    try testing.expect(parseHistoryBootLine("registry: node abc; starting from the snapshot at slot 208 close_time=1700000208") == null);
-    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot 208") == null);
-    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot nope close_time=1700000208") == null);
-    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot 208 close_time=nope") == null);
-    try testing.expect(parseHistoryBootLine("history checkpoint slot 208 certified") == null);
-}
-
 test "close-time transition permits exactly 1 through 60 seconds" {
     try testing.expect(closeTimeTransitionOk(100, 101));
     try testing.expect(closeTimeTransitionOk(100, 160));
@@ -2359,6 +2530,13 @@ test "close-time transition permits exactly 1 through 60 seconds" {
     try testing.expect(!closeTimeTransitionOk(100, 99));
     try testing.expect(!closeTimeTransitionOk(100, 161));
     try testing.expect(closeTimeTransitionOk(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
+}
+
+test "history generation may use all time remaining in the run deadline" {
+    try testing.expectEqual(@as(u64, 480_000), historyWaitBudgetMs(600_000, 120_000));
+    try testing.expectEqual(@as(u64, 170_000), historyWaitBudgetMs(300_000, 130_000));
+    try testing.expectEqual(@as(u64, 0), historyWaitBudgetMs(300_000, 300_000));
+    try testing.expectEqual(@as(u64, 0), historyWaitBudgetMs(300_000, 300_001));
 }
 
 test "close time remains inside the cumulative interval anchored at genesis" {
@@ -2410,12 +2588,88 @@ test "rejoin transaction span permits agreed empty ledgers before the first tran
     try testing.expect(!transactionSpanOk(&a, &b, 211, 213));
 }
 
-test "history witness boundaries: more than 200 absent slots and checkpoint inside 16-slot window" {
-    try testing.expect(historyWitnessOk(10, 211, 196)); // exact 201; exact lag 15
-    try testing.expect(!historyWitnessOk(10, 210, 195)); // exact 200 is insufficient
-    try testing.expect(!historyWitnessOk(10, 211, 195)); // lag 16 is outside
-    try testing.expect(!historyWitnessOk(10, 211, 212)); // checkpoint from the future
-    try testing.expect(!historyWitnessOk(10, 9, 9));
+test "archive replay witness boundaries: long outage and a non-anchor tip at least 17 ledgers deep" {
+    try testing.expect(archiveReplayWitnessOk(72, 256, 273, 17)); // exact 201-slot outage and 17-ledger replay
+    try testing.expect(!archiveReplayWitnessOk(73, 256, 273, 17)); // exact 200 is insufficient
+    try testing.expect(!archiveReplayWitnessOk(72, 256, 272, 16)); // sixteen ledgers does not escape the answering window
+    try testing.expect(!archiveReplayWitnessOk(72, 255, 273, 18)); // anchor is not a 64-slot boundary
+    try testing.expect(!archiveReplayWitnessOk(72, 192, 273, 81)); // an older boundary is not this tip's anchor
+    try testing.expect(!archiveReplayWitnessOk(72, 256, 320, 64)); // tip itself is an anchor boundary
+    try testing.expect(!archiveReplayWitnessOk(72, 256, 273, 16)); // summary count must equal the replay span
+    try testing.expect(!archiveReplayWitnessOk(274, 256, 273, 17)); // tip predates the outage origin
+}
+
+test "recovered archive tip may advance beyond the certified floor but never behind it" {
+    try testing.expect(recoveredArchiveTipWitnessOk(72, 273, 256, 273, 17));
+    try testing.expect(recoveredArchiveTipWitnessOk(72, 273, 256, 274, 18));
+    try testing.expect(!recoveredArchiveTipWitnessOk(72, 274, 256, 273, 17));
+    try testing.expect(!recoveredArchiveTipWitnessOk(72, 273, 256, 320, 64));
+    try testing.expect(!recoveredArchiveTipWitnessOk(72, 273, 256, 274, 17));
+}
+
+test "recovered frontier requires the exact full head from both stopped certifiers" {
+    const gpa = testing.allocator;
+    var heads: std.AutoHashMapUnmanaged(u64, HeadSeen) = .empty;
+    defer heads.deinit(gpa);
+    try heads.put(gpa, 273, .{
+        .hash = @splat('a'),
+        .close_time = 1_700_000_273,
+        .mask = bit(0) | bit(1),
+    });
+
+    const witnessed = exactHistoryFrontier(&heads, bit(0) | bit(1), 273).?;
+    try testing.expectEqual(@as(u64, 273), witnessed.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_273), witnessed.close_time);
+    try testing.expectEqualSlices(u8, &@as([64]u8, @splat('a')), &witnessed.hash);
+    try testing.expect(exactHistoryFrontier(&heads, all_mask, 273) == null);
+    try testing.expect(exactHistoryFrontier(&heads, bit(0) | bit(1), 274) == null);
+}
+
+test "history tip certification binds both signers to the application head" {
+    const head: [64]u8 = @splat('a');
+    const a: HistoryTipSeen = .{ .head = head, .status = history_tip_signed_bit };
+    const b: HistoryTipSeen = .{
+        .head = head,
+        .status = history_tip_signed_bit | history_tip_certified_bit,
+    };
+    const logged: LogHeadSeen = .{
+        .head16 = @splat('a'),
+        .close_time = 1_700_000_273,
+        .mask = bit(1) | bit(2),
+    };
+    try testing.expect(certifiedHistoryTipEvidenceOk(a, b, logged, bit(1) | bit(2)));
+
+    var wrong_head = b;
+    wrong_head.head[63] = 'b';
+    try testing.expect(!certifiedHistoryTipEvidenceOk(a, wrong_head, logged, bit(1) | bit(2)));
+    var merely_signed = b;
+    merely_signed.status = history_tip_signed_bit;
+    try testing.expect(!certifiedHistoryTipEvidenceOk(a, merely_signed, logged, bit(1) | bit(2)));
+    try testing.expect(!certifiedHistoryTipEvidenceOk(a, b, logged, all_mask));
+}
+
+test "newer cut-time tip has exact stopped-certifier evidence without an RPC sample" {
+    const head: [64]u8 = "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210".*;
+    const a: HistoryTipSeen = .{ .head = head, .status = history_tip_signed_bit };
+    var b: HistoryTipSeen = .{
+        .head = head,
+        .status = history_tip_signed_bit | history_tip_certified_bit,
+    };
+    const logged: LogHeadSeen = .{
+        .head16 = head[0..16].*,
+        .close_time = 1_700_000_274,
+        .mask = bit(0) | bit(1),
+    };
+
+    const frontier = certifiedHistoryFrontier(274, a, b, logged, bit(0) | bit(1)).?;
+    try testing.expectEqual(@as(u64, 274), frontier.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_274), frontier.close_time);
+    try testing.expectEqualSlices(u8, &head, &frontier.hash);
+
+    // Matching the old 16-hex diagnostic prefix is insufficient: a full-hash
+    // disagreement between the two stopped signers must reject the witness.
+    b.head[63] = 'f';
+    try testing.expect(certifiedHistoryFrontier(274, a, b, logged, bit(0) | bit(1)) == null);
 }
 
 test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
@@ -2435,7 +2689,7 @@ test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
         p.slot_times.deinit(gpa);
-        p.history_checkpoints.deinit(gpa);
+        p.history_tips.deinit(gpa);
     }
 
     p.noteLine("slot 7: close_time=1007 txs=1 ok=1 head=0123456789abcdef");
@@ -2458,7 +2712,7 @@ test "NodeProc rejects close-time disagreement and illegal adjacent steps in eit
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
         p.slot_times.deinit(gpa);
-        p.history_checkpoints.deinit(gpa);
+        p.history_tips.deinit(gpa);
     }
 
     // Observe the successor first: inserting its predecessor must still check
@@ -2475,7 +2729,7 @@ test "NodeProc rejects close-time disagreement and illegal adjacent steps in eit
     try testing.expect(p.bad != null);
 }
 
-test "NodeProc retains history attestations, certification, and boot source" {
+test "NodeProc retains history-tip certification and archive-replay source" {
     const gpa = testing.allocator;
     var empty_buf: [0]u8 = .{};
     var p: NodeProc = .{
@@ -2492,16 +2746,18 @@ test "NodeProc retains history attestations, certification, and boot source" {
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
         p.slot_times.deinit(gpa);
-        p.history_checkpoints.deinit(gpa);
+        p.history_tips.deinit(gpa);
     }
 
-    p.noteLine("history checkpoint slot 208 signed signer=aaa");
-    try testing.expectEqual(checkpoint_signed_bit, p.history_checkpoints.get(208).?);
-    p.noteLine("history checkpoint slot 208 certified signers=2");
-    try testing.expectEqual(checkpoint_signed_bit | checkpoint_certified_bit, p.history_checkpoints.get(208).?);
-    p.noteLine("registry: node abc; starting from history checkpoint at slot 208 close_time=1700000208");
-    try testing.expectEqual(@as(u64, 208), p.history_boot.?.slot);
-    try testing.expectEqual(@as(u64, 1_700_000_208), p.history_boot.?.close_time);
+    p.noteLine("history tip slot 273 signed head=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    try testing.expectEqual(history_tip_signed_bit, p.history_tips.get(273).?.status);
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &p.history_tips.get(273).?.head);
+    p.noteLine("history tip slot 273 certified head=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    try testing.expectEqual(history_tip_signed_bit | history_tip_certified_bit, p.history_tips.get(273).?.status);
+    p.noteLine("registry node: history replay anchor 256 through tip 273 (17 ledgers)");
+    try testing.expectEqual(@as(u64, 256), p.history_replay.?.anchor);
+    try testing.expectEqual(@as(u64, 273), p.history_replay.?.tip);
+    try testing.expectEqual(@as(u64, 17), p.history_replay.?.ledgers);
 }
 
 test "NodeProc restart argv preserves genesis and clock skew while replacing cadence" {
