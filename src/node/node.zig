@@ -354,8 +354,9 @@ pub const Options = struct {
     strict_canonical: bool = true,
     /// Largest value `propose` accepts; [1, 65536].
     max_value_bytes: u32 = 4096,
-    /// Recently delivered slots retained for native peer answering and
-    /// bounded catch-up. Valid range: 1..62. This is not archival history.
+    /// Recently delivered slots retained for native peer answering, and the
+    /// slot distance at which ordered delivery abandons a missing gap. Valid
+    /// range: 1..62. This is not archival history.
     answering_window_slots: u8 = default_answering_window_slots,
     /// First slot to nominate proposals for (default 1). Must be above the
     /// journal high-water mark of an existing data_dir.
@@ -427,10 +428,12 @@ pub const CatchupStats = struct {
     /// Slot immediately before the next ordered application delivery. Before
     /// the first delivery this is `start_slot - 1`.
     delivery_frontier: u64,
-    /// Actual local statement coverage, which can be shorter than the
-    /// configured window after widening a previously compacted data dir.
+    /// Delivered slots for which this node currently caches an own statement.
+    /// This set can contain holes and is not a quorum-availability promise.
     answerable_slots: usize,
+    /// Minimum slot in that cached delivered set, or null when it is empty.
     oldest_answerable_slot: ?u64,
+    /// Maximum slot in that cached delivered set, or null when it is empty.
     newest_answerable_slot: ?u64,
     /// First slot still admitted by the native host and Engine. This can be
     /// newer than `oldest_answerable_slot` after journal recovery.
@@ -2162,8 +2165,10 @@ pub const Node = struct {
         };
     }
 
-    /// Coherent bounded-catch-up snapshot. Experimental. Values describe
-    /// this node's local policy and state only; peers may use other windows.
+    /// Coherent bounded-catch-up snapshot. Experimental. Answerable coverage
+    /// counts cached own statements for delivered slots; it can contain holes
+    /// and does not prove that a quorum can supply any range. All values
+    /// describe this node only; peers may use other windows.
     pub fn catchupStats(self: *Node) CatchupStats {
         self.stats_mu.lockUncancelable(self.io);
         defer self.stats_mu.unlock(self.io);
@@ -2174,6 +2179,7 @@ pub const Node = struct {
     /// starts): take the live snapshots, then publish the POD copies.
     fn publishStats(self: *Node) void {
         const engine_stats = self.eng.stats();
+        const delivery_frontier = self.next_deliver - 1;
         var pending_lowest: ?u64 = null;
         var pending_highest: ?u64 = null;
         var pending_it = self.pending_ext.keyIterator();
@@ -2183,17 +2189,21 @@ pub const Node = struct {
         }
         var answerable_lowest: ?u64 = null;
         var answerable_highest: ?u64 = null;
+        var answerable_slots: usize = 0;
         self.own_mu.lockUncancelable(self.io);
         var answerable_it = self.own_latest.keyIterator();
         while (answerable_it.next()) |slot| {
+            // Current and transient far-ahead consensus slots are useful
+            // live state, but they are not retained delivered history.
+            if (slot.* > delivery_frontier) continue;
+            answerable_slots += 1;
             answerable_lowest = if (answerable_lowest) |lowest| @min(lowest, slot.*) else slot.*;
             answerable_highest = if (answerable_highest) |highest| @max(highest, slot.*) else slot.*;
         }
-        const answerable_slots = self.own_latest.count();
         self.own_mu.unlock(self.io);
         const catchup_stats = CatchupStats{
             .answering_window_slots = self.answering.slots,
-            .delivery_frontier = self.next_deliver - 1,
+            .delivery_frontier = delivery_frontier,
             .answerable_slots = answerable_slots,
             .oldest_answerable_slot = answerable_lowest,
             .newest_answerable_slot = answerable_highest,
@@ -4092,6 +4102,11 @@ test "restart recovery separates the closed admission floor from the retained ow
             return node.stats().live_slots == 63; // 62 restored + current
         }
     }.admitted);
+    const with_current = n.catchupStats();
+    try std.testing.expectEqual(@as(u64, 127), with_current.delivery_frontier);
+    try std.testing.expectEqual(@as(usize, 62), with_current.answerable_slots);
+    try std.testing.expectEqual(@as(?u64, 66), with_current.oldest_answerable_slot);
+    try std.testing.expectEqual(@as(?u64, 127), with_current.newest_answerable_slot);
 
     // Catch-up needs one more transient Engine slot beyond the retained
     // answers and ordinary current work. A v-blocking far-ahead decision must
