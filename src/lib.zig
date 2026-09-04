@@ -54,6 +54,8 @@ test {
 pub const app_node = @import("node/app_node.zig");
 pub const AppNode = app_node.AppNode;
 pub const Codec = app_node.Codec;
+/// Slot and typed nomination/ballot phase for contextual `App.validate`.
+pub const ValueContext = app_node.ValueContext;
 pub const Validity = core.driver.Validity;
 pub const Driver = core.driver.Driver;
 pub const DriverError = core.driver.DriverError;

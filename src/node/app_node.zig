@@ -5,6 +5,8 @@
 //! compiles a typed, pure state machine (`State`, `Command`, `validate`,
 //! `apply`, optional `combine` / `initialState` / `encode` + `decode`) down to
 //! the frozen §8.2 `Driver` vtable; the engine never learns it exists.
+//! `validate` may optionally accept `ValueContext` to observe the current slot
+//! and whether this is a nomination or ballot check.
 //!
 //! Every contract violation is a teaching `@compileError` (want-vs-got and
 //! the workaround), never a vtable type mismatch. Each message's first line
@@ -41,6 +43,20 @@ const store_mod = @import("store.zig");
 pub const Validity = core.driver.Validity;
 pub const Driver = core.driver.Driver;
 pub const DriverError = core.driver.DriverError;
+
+/// Slot and protocol phase supplied to the contextual `App.validate` shape.
+/// The raw driver's `is_nomination` bit is deliberately hidden behind this
+/// typed interface: nomination values use `.nomination`; ballot values and a
+/// combined candidate's self-validation use `.ballot`.
+pub const ValueContext = struct {
+    pub const Phase = enum(u1) {
+        nomination = 0,
+        ballot = 1,
+    };
+
+    slot: u64,
+    phase: Phase,
+};
 
 /// The frozen §4.5 cap: an auto-encoded Command above it can never be a
 /// legal value, so `Codec(T)` rejects it at comptime.
@@ -316,6 +332,22 @@ fn hasCustomCodec(comptime App: type) bool {
     return @hasDecl(App, "encode") or @hasDecl(App, "decode");
 }
 
+fn isThreeParameterFunction(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"fn" => |f| f.param_types.len == 3,
+        else => false,
+    };
+}
+
+/// One locality point for the two accepted App interfaces. Callers always
+/// provide context; legacy apps simply do not observe it.
+fn appValidate(comptime App: type, state: App.State, cmd: App.Command, context: ValueContext) Validity {
+    if (comptime @TypeOf(App.validate) == fn (App.State, App.Command, ValueContext) Validity) {
+        return App.validate(state, cmd, context);
+    }
+    return App.validate(state, cmd);
+}
+
 /// The comptime contract of §8.5. Checked in this order so a single
 /// violation produces a single teaching message (each one is pinned by
 /// tests/appnode_errors/). Every message's first line ends in its needle.
@@ -332,12 +364,22 @@ fn validateAppContract(comptime App: type) void {
 
     if (!@hasDecl(App, "validate"))
         contractError(App, "missing `pub fn validate(state: State, cmd: Command) slcp.Validity`." ++
+            "\n  Add `context: slcp.ValueContext` as a third parameter when validation needs the slot or phase." ++
             "\n  Return .valid / .invalid, or .maybe_valid when this node cannot judge yet" ++
             "\n  (e.g. it is behind) — NOT .invalid. Must be pure and deterministic.");
-    if (@TypeOf(App.validate) != fn (State, Command) Validity)
+    const Validate = @TypeOf(App.validate);
+    if (Validate != fn (State, Command) Validity and
+        Validate != fn (State, Command, ValueContext) Validity)
+    {
+        if (isThreeParameterFunction(Validate))
+            contractError(App, "validate context has the wrong signature." ++
+                "\n  want: fn (State, Command, slcp.ValueContext) slcp.Validity" ++
+                "\n  got:  " ++ @typeName(Validate));
         contractError(App, "validate has the wrong signature." ++
             "\n  want: fn (State, Command) slcp.Validity" ++
-            "\n  got:  " ++ @typeName(@TypeOf(App.validate)));
+            "\n    or: fn (State, Command, slcp.ValueContext) slcp.Validity" ++
+            "\n  got:  " ++ @typeName(Validate));
+    }
 
     if (!@hasDecl(App, "apply"))
         contractError(App, "missing `pub fn apply(state: State, cmd: Command) State`." ++
@@ -895,11 +937,12 @@ pub fn AppNode(comptime App: type) type {
         // ---- driver vtable (engine thread) ----
 
         fn driverValidate(ctx: *anyopaque, slot: u64, value: []const u8, is_nomination: bool) Validity {
-            _ = slot;
-            _ = is_nomination;
             const self: *Self = @ptrCast(@alignCast(ctx));
             const cmd = codec.decode(value) orelse return .invalid;
-            return App.validate(self.state, cmd);
+            return appValidate(App, self.state, cmd, .{
+                .slot = slot,
+                .phase = if (is_nomination) .nomination else .ballot,
+            });
         }
 
         fn driverCombine(ctx: *anyopaque, slot: u64, candidates: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) DriverError!void {
@@ -924,7 +967,7 @@ pub fn AppNode(comptime App: type) type {
                 // evidence — so it is the contract violation DriverFault is
                 // for (docs/determinism.md §6). `.maybe_valid` stays legal:
                 // a node behind on State cannot judge what it combines.
-                if (App.validate(self.state, best) == .invalid) {
+                if (appValidate(App, self.state, best, .{ .slot = slot, .phase = .ballot }) == .invalid) {
                     if (self.created.load(.acquire)) log.err(bad_composite_fmt, .{ @typeName(App), slot });
                     return error.DriverFault;
                 }
@@ -1241,6 +1284,32 @@ const Counter = struct {
     }
 };
 
+/// A contextual validator whose verdict makes every forwarded context field
+/// observable through the public Driver seam. Its combine result also pins
+/// the phase used for AppNode's composite self-validation.
+const ContextualValidation = struct {
+    pub const State = struct { applied: u64 = 0 };
+    pub const Command = struct {
+        expected_slot: u64,
+        expected_phase: ValueContext.Phase,
+    };
+    pub fn validate(state: State, cmd: Command, context: ValueContext) Validity {
+        _ = state;
+        return if (cmd.expected_slot == context.slot and cmd.expected_phase == context.phase)
+            .valid
+        else
+            .invalid;
+    }
+    pub fn apply(state: State, cmd: Command) State {
+        _ = state;
+        return .{ .applied = cmd.expected_slot };
+    }
+    pub fn combine(state: State, cmds: []const Command) Command {
+        _ = state;
+        return cmds[0];
+    }
+};
+
 const PtrApply = struct {
     pub const State = struct { total: u64 = 0, hist: [4]u8 = @splat(0) };
     pub const Command = struct { add: u8 };
@@ -1327,6 +1396,31 @@ test "contract acceptance: Counter, pointer-apply, initialState + defaultless St
     try std.testing.expectEqualSlices(u8, "hello", wire);
     try std.testing.expectEqual(@as(u8, 5), MemoNode.codec.decode(wire).?.len);
     try std.testing.expect(MemoNode.codec.decode("") == null);
+}
+
+// Non-vacuity: dropping slot forwarding, reversing the raw is_nomination
+// mapping, or continuing to call only the legacy two-argument validate makes
+// one of these four public-Driver observations fail.
+test "contextual validate receives the driver slot and typed nomination or ballot phase" {
+    const ContextNode = AppNode(ContextualValidation);
+    const n = try ContextNode.createDetached(testing.allocator, testing.io, 4096);
+    defer n.deinit();
+    const d = n.driver();
+    var buf: [ContextNode.codec.size]u8 = undefined;
+
+    const nomination = ContextNode.codec.encode(.{
+        .expected_slot = 37,
+        .expected_phase = .nomination,
+    }, &buf);
+    try testing.expectEqual(Validity.valid, d.validate_value(d.ctx, 37, nomination, true));
+    try testing.expectEqual(Validity.invalid, d.validate_value(d.ctx, 38, nomination, true));
+    try testing.expectEqual(Validity.invalid, d.validate_value(d.ctx, 37, nomination, false));
+
+    const ballot = ContextNode.codec.encode(.{
+        .expected_slot = 38,
+        .expected_phase = .ballot,
+    }, &buf);
+    try testing.expectEqual(Validity.valid, d.validate_value(d.ctx, 38, ballot, false));
 }
 
 // Non-vacuity: this is the README's narrowing idiom. `node.explain` takes
@@ -2387,6 +2481,40 @@ test "driverCombine: a composite that self-validates .invalid is DriverFault, .m
     try ad.combine_candidates(ad.ctx, 1, &cands, gpa, &out);
     try testing.expectEqual(@as(u64, 5), CounterNode.codec.decode(out.items).?.next);
     try testing.expectEqual(Validity.maybe_valid, ad.validate_value(ad.ctx, 1, out.items, false));
+}
+
+// Non-vacuity: combine runs during nomination, but its output is the value
+// immediately handed to ballot.bumpState. Passing `.nomination` to the
+// composite self-check makes the first arm fail; skipping the self-check
+// makes the second arm succeed instead of reporting DriverFault.
+test "driverCombine self-validates its composite for the target slot's ballot phase" {
+    const ContextNode = AppNode(ContextualValidation);
+    const n = try ContextNode.createDetached(testing.allocator, testing.io, 4096);
+    defer n.deinit();
+    const d = n.driver();
+    var encoded: [ContextNode.codec.size]u8 = undefined;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const ballot = ContextNode.codec.encode(.{
+        .expected_slot = 91,
+        .expected_phase = .ballot,
+    }, &encoded);
+    try d.combine_candidates(d.ctx, 91, &.{ballot}, testing.allocator, &out);
+    try testing.expectEqual(ContextualValidation.Command{
+        .expected_slot = 91,
+        .expected_phase = .ballot,
+    }, ContextNode.codec.decode(out.items).?);
+
+    out.clearRetainingCapacity();
+    const nomination = ContextNode.codec.encode(.{
+        .expected_slot = 92,
+        .expected_phase = .nomination,
+    }, &encoded);
+    try testing.expectError(
+        error.DriverFault,
+        d.combine_candidates(d.ctx, 92, &.{nomination}, testing.allocator, &out),
+    );
 }
 
 // -- custom encode: propose and combine trust the same bytes (S8 review, D3) ---

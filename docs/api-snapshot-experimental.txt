@@ -102,6 +102,9 @@ slcp.NodeOptions.watcher: field bool = false
 slcp.Validity.invalid: enumerant = 0
 slcp.Validity.maybe_valid: enumerant = 1
 slcp.Validity.valid: enumerant = 2
+slcp.ValueContext.phase: field node.app_node.ValueContext.Phase
+slcp.ValueContext.slot: field u64
+slcp.ValueContext: struct
 slcp.app_node.AppNode: fn (comptime type) type
 slcp.app_node.Codec: fn (comptime type) type
 slcp.app_node.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
@@ -114,6 +117,12 @@ slcp.app_node.Validity.invalid: enumerant = 0
 slcp.app_node.Validity.maybe_valid: enumerant = 1
 slcp.app_node.Validity.valid: enumerant = 2
 slcp.app_node.Validity: enum
+slcp.app_node.ValueContext.Phase.ballot: enumerant = 1
+slcp.app_node.ValueContext.Phase.nomination: enumerant = 0
+slcp.app_node.ValueContext.Phase: enum
+slcp.app_node.ValueContext.phase: field node.app_node.ValueContext.Phase
+slcp.app_node.ValueContext.slot: field u64
+slcp.app_node.ValueContext: struct
 slcp.app_node.max_encoded_bytes: const usize = 65536
 slcp.app_node: struct
 slcp.core.ballot.Error: type = error{AlreadyStarted,EffectBudgetExceeded,EngineFailed,InvalidValue,OutOfMemory,WrongProtocol}

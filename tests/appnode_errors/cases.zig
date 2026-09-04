@@ -37,6 +37,7 @@ pub const cases = [_]Case{
     .{ .stem = "err_missing_command", .needle = "): missing `pub const Command` — the value type the network agrees on.", .src = "missing `pub const Command` — the value type the network agrees on." },
     .{ .stem = "err_missing_validate", .needle = "): missing `pub fn validate(state: State, cmd: Command) slcp.Validity`.", .src = "missing `pub fn validate(state: State, cmd: Command) slcp.Validity`." },
     .{ .stem = "err_bad_validate_signature", .needle = "): validate has the wrong signature.", .src = "validate has the wrong signature." },
+    .{ .stem = "err_bad_validate_context_signature", .needle = "): validate context has the wrong signature.", .src = "validate context has the wrong signature." },
     .{ .stem = "err_missing_apply", .needle = "): missing `pub fn apply(state: State, cmd: Command) State`.", .src = "missing `pub fn apply(state: State, cmd: Command) State`." },
     .{ .stem = "err_bad_apply_signature", .needle = "): apply has the wrong signature.", .src = "apply has the wrong signature." },
     .{ .stem = "err_bad_combine_signature", .needle = "): combine has the wrong signature.", .src = "combine has the wrong signature." },
