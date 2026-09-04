@@ -473,172 +473,20 @@ fn CustomCodec(comptime App: type) type {
 }
 
 // ---------------------------------------------------------------------------
-// Options mirror (plan R8)
+// Shared adapter machinery (app_common.zig)
 // ---------------------------------------------------------------------------
 
-/// The two `node.Options` fields `AppNode` owns itself: it compiles the
-/// app into the driver and installs its own delivery hook.
-const owned_option_fields = [_][]const u8{ "driver", "delivery" };
-
-fn isOwnedOptionField(comptime name: []const u8) bool {
-    inline for (owned_option_fields) |o| if (std.mem.eql(u8, name, o)) return true;
-    return false;
-}
-
-/// The field lists of `AppNode.Options`: every `node.Options` field except
-/// `driver` and `delivery`, with the SAME types and defaults — taken from
-/// `node.Options` itself, so a field added to the bytes-level node appears
-/// in the mirror automatically. The `@Struct` call itself lives in
-/// `AppNode(App).Options` (not here) so the reified type's `@typeName` is
-/// the public path `…AppNode(App).Options…`, not a private helper's name:
-/// the Stable API snapshot pins that spelling on the `create` line.
-/// `checkOptionsParity` is the comptime guard that the mirror really is
-/// field-for-field the bytes-level set minus the two.
-const MirrorFields = struct {
-    names: []const [:0]const u8,
-    types: []const type,
-    attrs: []const std.builtin.Type.Struct.FieldAttributes,
-};
-
-fn mirrorOptionFields() MirrorFields {
-    const info = @typeInfo(node.Options).@"struct";
-    comptime var names: []const [:0]const u8 = &.{};
-    comptime var types: []const type = &.{};
-    comptime var attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
-    inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attr| {
-        if (isOwnedOptionField(name)) continue;
-        names = names ++ [_][:0]const u8{name};
-        types = types ++ [_]type{FT};
-        attrs = attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{attr};
-    }
-    return .{ .names = names, .types = types, .attrs = attrs };
-}
-
-/// Comptime parity: (a) every non-owned `node.Options` field exists in the
-/// mirror with an identical type and an identical default (or identically
-/// none); (b) the mirror has no other fields; (c) the two owned fields are
-/// really absent. A drift in either direction is a compile error naming
-/// the field.
-fn checkOptionsParity(comptime Mirror: type) void {
-    const src = @typeInfo(node.Options).@"struct";
-    const dst = @typeInfo(Mirror).@"struct";
-    comptime var expected: usize = 0;
-    inline for (src.field_names, src.field_types, src.field_attrs) |name, FT, attr| {
-        if (isOwnedOptionField(name)) {
-            if (@hasField(Mirror, name))
-                @compileError("AppNode.Options must not carry `" ++ name ++ "` (AppNode supplies it).");
-            continue;
-        }
-        expected += 1;
-        if (!@hasField(Mirror, name))
-            @compileError("AppNode.Options is missing node.Options field `" ++ name ++ "`.");
-        const idx = std.meta.fieldIndex(Mirror, name).?;
-        if (dst.field_types[idx] != FT)
-            @compileError("AppNode.Options field `" ++ name ++ "` has type " ++ @typeName(dst.field_types[idx]) ++ ", node.Options has " ++ @typeName(FT) ++ ".");
-        const have_default = dst.field_attrs[idx].default_value_ptr != null;
-        const want_default = attr.default_value_ptr != null;
-        if (have_default != want_default)
-            @compileError("AppNode.Options field `" ++ name ++ "` default presence differs from node.Options.");
-        if (want_default) {
-            const a = attr.defaultValue(FT).?;
-            const b = dst.field_attrs[idx].defaultValue(FT).?;
-            if (!std.meta.eql(a, b))
-                @compileError("AppNode.Options field `" ++ name ++ "` default differs from node.Options.");
-        }
-    }
-    if (dst.field_names.len != expected)
-        @compileError("AppNode.Options carries a field node.Options does not have.");
-}
-
-const create_log = std.log.scoped(.slcp_create);
+/// Internal helpers shared with `OwnedAppNode(App)`: the R8 `Options` mirror,
+/// the recovery-slot predicate, the create-failure reporter, and the teaching
+/// texts both adapters report identically.
+const common = @import("app_common.zig");
 const log = std.log.scoped(.slcp_app_node);
+const fail = common.fail;
+const initialSlotCanStart = common.initialSlotCanStart;
+const undecodable_fmt = common.undecodable_fmt;
+const delivery_gap_fmt = common.delivery_gap_fmt;
+const bad_composite_fmt = common.bad_composite_fmt;
 
-/// `AppNode.create`'s failure reporter: same contract as the Node's — the
-/// paragraph goes into `diagnostic` when given, else to the create log at
-/// err level. Generic over the error so each `AppNode(App).CreateError`
-/// member coerces at the `return`.
-fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
-    var local: node.Diagnostic = .{};
-    const d = diag orelse &local;
-    d.set(fmt, args);
-    if (diag == null) create_log.err("{s}", .{d.message()});
-    return err;
-}
-
-/// §8.5 delta-app recipe: can a `State` persisted at slot `s0` hand off to
-/// this Node? A snapshot at 0 claims nothing. Otherwise either the retained
-/// local journal must continue it, or an explicit start at its exact
-/// successor declares that the application verified an external checkpoint;
-/// the separate recovery check also requires its final Command when the
-/// journal cannot supply a newer predecessor.
-fn initialSlotCanStart(s0: u64, tail: ?node.Node.JournalTail, start_slot: u64) bool {
-    if (s0 == 0) {
-        if (start_slot != 1) return false;
-        const t = tail orelse return true;
-        return t.contiguous_from == 1;
-    }
-    const successor = std.math.add(u64, s0, 1) catch return false;
-    if (start_slot == successor) {
-        const t = tail orelse return true;
-        return t.last <= s0 or t.contiguous_from <= successor;
-    }
-    const t = tail orelse return false;
-    if (t.contiguous_from > successor or s0 > t.last) return false;
-    // The default lets Node derive the successor from the journal. An
-    // explicit start after replay may name only the exact tail successor;
-    // anything farther would silently skip a slot after the recovered tail.
-    if (start_slot == 1) return true;
-    const tail_successor = std.math.add(u64, t.last, 1) catch return false;
-    return start_slot == tail_successor;
-}
-
-/// The teaching text for a journaled value the current `Command` cannot
-/// decode (design §8.5: command evolution is consensus surface).
-const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
-const delivery_gap_fmt = "slot {d} arrived after applied slot {d}, but {s}.initialSlot() declares contiguous state transitions; the missing slot cannot be skipped, so the typed node is stopping before applying the out-of-order command.";
-
-/// The teaching text for a `combine` whose result does not self-validate
-/// (§8.5: the composite must be `.valid`, or `.maybe_valid` when this node is
-/// behind); the node goes inert with DriverFault rather than balloting a
-/// value every peer rejects.
-const bad_composite_fmt = "{s}.combine returned a Command that its own validate judges .invalid (slot {d}) — the composite must self-validate (§8.5); the node goes inert (DriverFault) instead of balloting a value every peer would reject.";
-
-/// The typed node (§8.5, §11.2): a comptime adapter that compiles `App` into
-/// the frozen §8.2 `Driver` and a §8.5 delivery hook over the bytes-level
-/// `node.Node`.
-///
-/// Threading: `validate` (driver) and `apply` (hook) both run on the engine
-/// thread and read/write the one `state` — no lock, no tearing. The user
-/// thread only ever sees value copies via `waitApplied`.
-///
-/// Restart (plan R17): `State` is NOT persisted by this module. After
-/// `create`, `state` = `initialState()` + `apply` over the replayed journal
-/// tail. In gap-free steady state with no already-journaled future
-/// externalizations, a successful compaction leaves at most W slots, growing
-/// to at most W+63 before the next frontier boundary (default W=16; valid
-/// 1..62). Future externalizations can extend the upper end; failed
-/// compaction can retain an older lower end until retry.
-/// Commands must therefore be full VALUES ("count becomes 3"), never deltas.
-/// An app with delta semantics
-/// persists State itself, keyed by the slot it was taken at (every
-/// `waitApplied` item carries one), and declares BOTH `initialState()` (the
-/// snapshot) and `pub fn initialSlot() u64` (that slot): `create` seeds its
-/// dedup floor from `initialSlot()` before the tail replays, so journaled
-/// slots at or below it are skipped, not re-applied (S8 D2). Ordinarily the
-/// retained tail must continue that slot, so persist at least every W applied
-/// slots. Widening after compaction cannot recreate deleted records; inspect
-/// `raw().catchupStats()` for cached own-statement count and bounds at or below
-/// the ordered-delivery frontier while the new window warms; those bounds may
-/// contain abandoned slots and holes. An application that independently
-/// verifies an external checkpoint through slot H also exposes
-/// `pub fn initialCommand() ?Command`, returning the exact consensus value at
-/// H, and sets `.start_slot` to H + 1. The value
-/// seeds the same next-slot nomination schedule incumbents use when the local
-/// journal is absent or stale; a newer continuing journal supersedes it.
-/// Continuity failures and a missing checkpoint command when the journal
-/// cannot supply it are `InitialSlotOutsideJournal`. A supplied command that
-/// conflicts byte-for-byte with the same retained journal slot is rejected by
-/// the underlying Node as `EngineFailed`.
 pub fn AppNode(comptime App: type) type {
     comptime validateAppContract(App);
     return struct {
@@ -654,13 +502,13 @@ pub fn AppNode(comptime App: type) type {
         /// Every `node.Options` field except `driver` and `delivery`
         /// (same types, same defaults; comptime parity-checked). Reified
         /// here so its `@typeName` is this public path (see
-        /// `mirrorOptionFields`).
+        /// `common.mirrorOptionFields`).
         pub const Options = blk: {
-            const f = mirrorOptionFields();
+            const f = common.mirrorOptionFields();
             break :blk @Struct(.auto, null, f.names, f.types, f.attrs);
         };
         comptime {
-            checkOptionsParity(Options);
+            common.checkOptionsParity(Options, "AppNode.Options");
         }
         pub const WaitOptions = node.Node.WaitOptions;
         /// One applied slot: the value copy of `State` taken on the engine
@@ -932,7 +780,7 @@ pub fn AppNode(comptime App: type) type {
         fn hookRecovered(ctx: *anyopaque, view: node.RecoveryView) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "initialSlot")) {
-                if (!initialSlotCanStart(self.applied_hwm, view.journal_tail, self.start_slot)) {
+                if (!common.initialSlotCanStart(self.applied_hwm, view.journal_tail, self.start_slot)) {
                     self.recovery_rejection = view;
                     return error.InitialSlotOutsideJournal;
                 }
@@ -2338,20 +2186,20 @@ test "external checkpoint start must be the checked exact successor" {
 test "initialSlot handoff through the retained journal: within, at either edge, ahead, behind, no journal" {
     // tail 49..70: a snapshot at 48 (tail starts right after it) through 70.
     const contiguous: node.Node.JournalTail = .{ .first = 49, .contiguous_from = 49, .last = 70 };
-    try testing.expect(initialSlotCanStart(48, contiguous, 1));
-    try testing.expect(initialSlotCanStart(60, contiguous, 1));
-    try testing.expect(initialSlotCanStart(70, contiguous, 1));
-    try testing.expect(initialSlotCanStart(48, contiguous, 71)); // replay then exact tail successor
-    try testing.expect(!initialSlotCanStart(48, contiguous, 72)); // skips slot 71
-    try testing.expect(!initialSlotCanStart(71, contiguous, 1)); // ahead
-    try testing.expect(!initialSlotCanStart(47, contiguous, 1)); // behind: 48 lost
-    try testing.expect(!initialSlotCanStart(1, null, 1)); // no journal
-    try testing.expect(initialSlotCanStart(0, null, 1)); // the default: nothing claimed
-    try testing.expect(!initialSlotCanStart(0, contiguous, 1));
+    try testing.expect(common.initialSlotCanStart(48, contiguous, 1));
+    try testing.expect(common.initialSlotCanStart(60, contiguous, 1));
+    try testing.expect(common.initialSlotCanStart(70, contiguous, 1));
+    try testing.expect(common.initialSlotCanStart(48, contiguous, 71)); // replay then exact tail successor
+    try testing.expect(!common.initialSlotCanStart(48, contiguous, 72)); // skips slot 71
+    try testing.expect(!common.initialSlotCanStart(71, contiguous, 1)); // ahead
+    try testing.expect(!common.initialSlotCanStart(47, contiguous, 1)); // behind: 48 lost
+    try testing.expect(!common.initialSlotCanStart(1, null, 1)); // no journal
+    try testing.expect(common.initialSlotCanStart(0, null, 1)); // the default: nothing claimed
+    try testing.expect(!common.initialSlotCanStart(0, contiguous, 1));
 
     const gapped: node.Node.JournalTail = .{ .first = 3, .contiguous_from = 5, .last = 7 };
-    try testing.expect(!initialSlotCanStart(3, gapped, 1)); // slot 4 is absent
-    try testing.expect(initialSlotCanStart(4, gapped, 1)); // 5..7 is contiguous
+    try testing.expect(!common.initialSlotCanStart(3, gapped, 1)); // slot 4 is absent
+    try testing.expect(common.initialSlotCanStart(4, gapped, 1)); // 5..7 is contiguous
 }
 
 test "delta snapshot recovery requires a gap-free journal continuation" {
