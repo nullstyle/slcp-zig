@@ -30,15 +30,25 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   Canonical, network-signed, correctly sequenced transactions are flooded on
   acceptance and reflooded every second while pending; the main loop drains at
   most 64 received messages per tick.
-- Registry quorum-authenticated checkpoint history. Validators sign the
-  network, slot, ledger head, and canonical snapshot digest into an untrusted
-  shared archive, with per-node durable signing fences against rollback and
-  equivocation. Recovery evaluates unique signers against the importing
-  node's current quorum and supports an explicit anti-rollback floor. Snapshot
-  V3 retains the exact timed LedgerValue at the checkpoint slot, and archive
-  publication runs on a coalescing worker so storage stalls do not stall the
-  consensus cadence loop. Pre-E2c V1/V2 snapshots are rejected because they
-  cannot preserve the versioned timed predecessor value.
+- Registry quorum-certified replayable history. Every applied slot produces a
+  cadence-independent immutable ledger record, while slot 1 and each configured
+  1–64-slot cadence boundary are deterministic Snapshot V3 anchor slots. Once a
+  newly applied state reaches an anchor, validators attest that exact tip and
+  every subsequent tip into an untrusted shared archive behind durable local
+  rollback/equivocation fences. A fresh non-genesis activation does not
+  republish its existing base, even at an anchor slot, and waits for the next
+  newly applied anchor before attesting. Recovery evaluates unique signers
+  against the importing node's current quorum, enforces an operator floor, and
+  strictly replays at most 63 records to the certified slot/hash/time without
+  a live peer. A trusted ordered 64-state outbox admits each state before the
+  ordinary snapshot and separates publication from durable acknowledgement.
+  Interrupted certified adoption uses a trusted install marker: startup
+  validates and installs target T in isolation, confirms it, then recovers any
+  newer U before joining peers. Domain-separated trusted boot provenance is
+  synchronized before marker removal and advances only after exact successor
+  snapshots, preserving the external handoff across later crashes without
+  granting the same trust to fresh local activation. Pre-E2c V1/V2 snapshots
+  and checkpoint-only history trees are rejected rather than reinterpreted.
 - Experimental `slcp.ValueContext`, allowing a typed application's
   deterministic `validate` function to opt into the checked slot and
   nomination/ballot phase without moving to the raw driver.
@@ -71,10 +81,11 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   submission node. It proves one-hop and two-hop propagation at ledger slot S,
   kills the source, and requires the two survivors to include exactly that
   transaction in the next slot, S+1. It then keeps that validator absent for
-  at least 201 slots, requires a certified checkpoint inside the live 16-slot window,
-  restores it from history, and proves its vote is necessary for a transaction
-  in the first later transaction-bearing ledger; any intervening ledgers must
-  be identical, empty, and contiguous on both validators.
+  at least 201 slots, selects an exact non-anchor certified tip 17–63 records
+  beyond its anchor, stops both certifying peers, and requires the validator to
+  replay and expose that same slot/hash/time alone. After one peer returns, the
+  recovered validator's vote is necessary for a transaction in the first later
+  transaction-bearing ledger before the third node rejoins.
 - Registry busy cadence now remains governed by `--min-slot-ms` whenever a
   transaction is pending; `--heartbeat-ms` applies only to idle slots.
 - Restart recovery now separates the 16-slot own-statement answer floor from
@@ -83,8 +94,9 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   journal-confirmed slot cannot recreate local consensus state.
 - The registry smoke runs -30/0/+30-second proposal clocks, verifies every
   observed close-time step and the complete long-outage time chain, restores
-  the exact timed checkpoint value, and proves that changing genesis time
-  under the same passphrase is a hard network-identity mismatch.
+  the exact timed non-anchor history tip by bounded replay, and proves that
+  changing genesis time under the same passphrase is a hard network-identity
+  mismatch.
 
 ### Fixed
 

@@ -65,9 +65,10 @@ example-build:
 
 # Build examples/registry once as a consumer package, run three registry
 # nodes over loopback (listen 47411-47413, RPC 47421-47423) through the real
-# CLI: source-death flooding, ordinary restart, then authenticated recovery
-# after node2 misses at least 201 slots and is required for the first later
-# transaction-bearing slot. Runs ALONE (fixed ports). Evidence line:
+# CLI: source-death flooding, ordinary restart, then peerless replay of at
+# least 17 archive records to an exact certified tip after node2 misses at
+# least 201 slots and both peers stop; node2 is then required for the first
+# later transaction-bearing slot. Runs ALONE (fixed ports). Evidence line:
 # `[registry-smoke] nodes=3 txs=8 slots=N head=<hex16>`.
 # Extra args pass through: `just registry-smoke --keep --deadline-s 600`.
 registry-smoke *ARGS:

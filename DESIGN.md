@@ -286,10 +286,18 @@ Applications with delta-like commands must persist their own snapshot and
 reconstruct state from that snapshot plus the retained journal tail. Long-gap
 catch-up requires an application-level archive or a future state-transfer
 interface. The registry example demonstrates the application-level path: a
-quorum-authenticated checkpoint supplies state through H, the exact-successor
-cutover starts at H + 1 with the exact value agreed at H as nomination
-context, and live peers supply only the short tail that still fits the
-answering window. This does not turn the Node journal into an archive.
+quorum-certified history tip authenticates an exact head H; recovery loads the
+tip's Snapshot V3 anchor and strictly replays its immutable per-slot ledger
+records through H before Node starts at H + 1 with the exact value agreed at H
+as nomination context. The replay span is bounded by the signed anchor cadence
+and needs no live peer. A trusted ordered outbox admits every applied state
+before the ordinary application snapshot, and an interrupted certified
+adoption is installed and confirmed before startup considers a newer shared
+tip. Confirmation durably records certified boot provenance before clearing
+the adoption marker, then advances it only after exact successor snapshots;
+fresh history activation cannot use that provenance to bypass journal checks.
+This application-owned mechanism does not turn the Node journal into an archive
+or enlarge its answering window.
 
 The qset cache is not write-ahead state. Remote entries use FIFO eviction;
 startup reconstructs a deterministic `(mtime, hash)` order, prunes owned

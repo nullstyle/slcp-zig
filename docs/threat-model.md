@@ -473,42 +473,62 @@ writes without stopping consensus.
 - No HSM / external signer in v1: ABI feature bit 1 (`external_signer`) is
   reserved and OFF.
 
-## 8. Registry checkpoint archive: application-owned trust
+## 8. Registry replayable history: application-owned trust
 
 The SLCP core has no archival/state-transfer protocol and does not authenticate
 application snapshots. Its native node answers only from the recent 16-slot
 window. `AppNode` performs a pre-live continuity check against recovered
-journal metadata. After an application has independently authenticated state
-through H, it may leave a stale or empty journal behind only by pairing
-`initialSlot() = H` with `.start_slot = H + 1` and the exact consensus value
-at H from `initialCommand()`; a later start is valid only when the journal
-supplies every intervening slot. Node recovery prefers a newer journal value
-and rejects a same-slot byte mismatch. The application still owns the
-checkpoint format, trust decision, rollback policy, and durable state
-installation.
+journal metadata. After an application has independently authenticated and
+reconstructed state through H, it may leave a stale or empty journal behind
+only by pairing `initialSlot() = H` with `.start_slot = H + 1` and the exact
+consensus value at H from `initialCommand()`; a later start is valid only when
+the journal supplies every intervening slot. Node recovery prefers a newer
+journal value and rejects a same-slot byte mismatch. The application still
+owns the history format, trust decision, rollback policy, replay, and durable
+state installation.
 
 The registry example is one such application adapter, not a core protocol
-guarantee. With `--history-dir` enabled, a validator signs a domain-separated
-assertion containing the registry network id, slot, ledger head, and exact
-snapshot digest. Import strictly validates that assertion and snapshot, counts
-each signer once, and evaluates the signer set recursively against the
-importing process's normalized local quorum set. No threshold or quorum set
-stored in the archive is trusted. A validator must itself be a member of that
-local set before it may publish.
+guarantee. With `--history-dir` enabled, every applied non-genesis slot gets an
+immutable, cadence-independent ledger record containing its exact canonical
+`LedgerValue` and the complete resulting Header V2. Slot 1 and every configured
+`--checkpoint-every N` boundary are deterministic Snapshot V3 anchor slots; N
+defaults to 8 and may be 1..64. Once a newly applied state reaches one, a
+validator signs a `REGISTRY-HIST-V1` assertion at that slot and every
+subsequent slot. The assertion contains the registry network id, exact tip
+slot/head, and its anchor slot/head/snapshot digest together with N. Binding
+the anchor policy prevents validators using different cadences from certifying
+one apparent history tip. On every fresh non-genesis activation, the existing
+base is not republished or treated as continuity-proven, even at slot 1 or an N
+boundary. Every newly applied successor gets a ledger record immediately, but
+the tree emits no assertion until one reaches the next anchor; it then attests
+every later slot. Import counts each valid signer once and evaluates the signer
+set recursively against the importing process's normalized local quorum set.
+No threshold or quorum set stored in the archive is trusted. A validator must
+itself be a member of that local set before it may publish.
 
-At every non-genesis slot, Registry Snapshot V3 carries the exact
-`LedgerValue`—close time plus transaction set—at the checkpoint slot. The
+A non-genesis Registry Snapshot V3 carries the exact
+`LedgerValue`—close time plus transaction set—at the anchor slot. The
 value is not part of the replicated state root, but import decodes it
 canonically and binds both its time and transaction-set hash to the signed
 ledger header before `AppNode` uses it as the next nomination's previous
 value. Slot 0 is a real network-bound header committing to configured genesis
 time G and the empty state root, with zero previous/transaction hashes; it has
-no predecessor value and is never a history checkpoint. Snapshot V3 is the
+no predecessor value and is never a history anchor or tip. Snapshot V3 is the
 sole accepted format. Pre-E2c V1/V2 snapshots cannot preserve this timed
-context and are rejected for local and external recovery. Checkpoint votes use
-the `REGISTRY-CKPT-V2` domain. Boot selection independently checks both local
-and authenticated heads against configured G's cumulative time interval before
-either can be installed.
+context and are rejected for local and external recovery. E2d tip votes use
+the `REGISTRY-HIST-V1` domain and reject old checkpoint-vote bytes. Boot
+selection independently checks both local and authenticated heads against
+configured G's cumulative time interval before either can be installed.
+
+An anchor accelerates materialization; it does not reset history continuity.
+Before signing a tip assertion, the publisher verifies the immutable
+header/value chain. For an anchor slot, that includes reconstructing and
+validating the anchor's own transition from the preceding segment and checking
+the resulting complete header, exact last value, and Snapshot V3. Startup may
+then materialize the latest signed anchor and replay at most `N-1` later ledger
+applications, while the certified assertion and publisher checks preserve
+continuity across the anchor boundary under the configured quorum-safety
+assumption.
 
 Close time is authenticated agreement, not trustworthy UTC. For every
 sequential ledger it must advance by 1..60 seconds. Contextual validation
@@ -529,20 +549,33 @@ private signing-fence state are not eligible for this epoch; validators use a
 fresh private data directory. Reusing a shared archive root only selects a new
 network-id namespace and provides no state migration.
 
+E2d is a separate history-storage migration boundary, not another network
+epoch. The E2c network descriptor, LedgerValue, Header V2, and Snapshot V3 are
+unchanged. New `history-v1` namespaces on both the shared and trusted sides
+hold ledger records and history-tip votes; the trusted side also persists the
+anchor policy and ordered publication outbox. Checkpoint-only archive objects
+and signing fences outside those namespaces are not reinterpreted. See
+[`ADR 0002`](adr/0002-registry-replayable-history.md).
+
 The adapter divides storage into two custody classes:
 
-- The shared archive is **untrusted**. It may contain malformed, torn,
-  replayed, wrong-network, bad-signature, non-member, symlink, FIFO, or other
-  adversarial objects. Network and object directories are opened no-follow and
-  pinned; generated basenames are read nonblocking and accepted only when they
-  are regular files. Integrity checks stop those objects from becoming boot
-  state, but the archive can always withhold or delete a valid snapshot or
-  vote and deny recovery.
+- The shared archive is **untrusted**. Its `history-v1` namespace contains
+  immutable ledger records, content-addressed Snapshot V3 anchors, immutable
+  validator votes, and mutable per-validator latest pointers. It may contain
+  malformed, torn, replayed, wrong-network, bad-signature, non-member, symlink,
+  FIFO, or other adversarial objects. Network and object directories are
+  opened no-follow and pinned; generated basenames are read nonblocking and
+  accepted only when they are regular files. Integrity and replay checks stop
+  those objects from becoming boot state, but the archive can always withhold
+  or delete a required anchor, ledger, or vote and deny recovery of that tip.
 - `<data-dir>/history-signing` is **trusted validator safety state**. Its
-  immutable per-slot vote and high-water fence prevent the local key from
-  signing two heads at one slot or signing backward. The entries and their
-  containing directories are synchronized before any shared vote is
-  published, and retries repeat both directory barriers. Operators must keep
+  immutable vote for each tip it attests and high-water fence prevent the
+  local key from signing two heads at one slot or signing backward. Its
+  persisted anchor cadence rejects a restart that silently changes history
+  policy, and its durable ordered outbox preserves admitted-but-unpublished
+  states across a crash. The entries and their containing directories are synchronized before
+  any shared vote is published, and retries repeat both directory barriers.
+  Operators must keep
   this tree private to the validator, preserve it with the key across restart
   or migration, and never restore or delete it independently. The archive and
   configured roots must have durable existing real parent directories. The
@@ -560,51 +593,85 @@ The adapter divides storage into two custody classes:
   contract is implemented only on Linux and macOS; history mode refuses
   startup elsewhere.
 
-The ordinary snapshot replacement is random temporary file → write → `fsync`
-and successful macOS `F_FULLFSYNC` → atomic replace → data-directory `fsync`.
-Any barrier failure propagates: an ordinary snapshot failure stops the
-registry because it may no longer advance safely. Archive publication owns the
-same strict barriers on a dedicated worker; an availability failure remains
-pending for retry or is superseded by a newer due checkpoint, so slow or
-hostile shared storage does not block the consensus cadence loop. A trusted
-signing-fence I/O, signing-fence semantic error, or state-integrity failure is
-latched and stops the node. Node-halt, history, and snapshot-write fatal paths
-first drain RPC handlers, then tear down Node and hard-exit without voluntarily
-joining the publisher; this avoids a userspace wait after consensus stops,
-though the OS may still delay final reaping of a kernel-stuck call. Ordinary
-cleanup stops the node before joining the worker.
+After each application transition, the registry first stages the full pending
+Snapshot V3 state in a crash-durable trusted ordered outbox and synchronizes
+its admitted watermark. Only then may the ordinary local snapshot advance via
+random temporary file → write → `fsync` and successful macOS `F_FULLFSYNC` →
+atomic replace → data-directory `fsync`. A sole worker publishes the oldest
+outbox entry, advances the durable published watermark, and removes it only
+after success. A retryable shared-history failure therefore remains at the
+head, and later states cannot overtake or replace it.
 
-The archive is also not a freshness oracle. Startup reads one derived latest
-pointer per validator, ignores candidates below
-`max(local snapshot slot, --history-min-slot)`, and refuses more than 16
-distinct valid candidate assertions rather than choosing from an incomplete
-set. Discovery reads and verifies each validator's latest pointer once; each
+Before creating the real peer-connected Node, startup validates the trusted
+outbox. If no certified adoption is unfinished, it synchronously drains all
+admitted publication work before consulting mutable shared latest pointers. A
+persisted adoption target T instead displaces any mutable shared proof U before
+anti-rollback-floor evaluation; the floor is then applied to T, and a too-old T stops boot rather
+than allowing U to replace the unfinished install. Startup creates an isolated
+no-peer AppNode to validate T against the local journal, writes T as the
+ordinary snapshot, confirms its trusted marker, and stages and snapshots the
+exact journal continuation. It then synchronously publishes that continuation,
+reruns certified recovery at or above the installed frontier, and may prepare
+a newer U. Only the resulting final selection is used to create the real
+peer-connected Node. A newly selected U is also installed and confirmed before
+its journal successors enter the outbox. During either startup journal replay
+only, a full outbox may synchronously publish its oldest entry and retry
+admission of the exact next successor. The background publisher starts only
+after RPC has bound. At runtime the backlog is capped at 64 pending states; a
+full backlog, corrupt or unavailable trusted outbox, signing-fence error, or
+invalid state stops the registry rather than losing history. After startup,
+shared storage can affect consensus only indirectly by keeping the durable
+backlog full. Node-halt, history, and snapshot-write fatal paths first drain
+RPC handlers, then tear down Node and hard-exit without voluntarily joining
+the publisher; this avoids a userspace wait after consensus stops, though the
+OS may still delay final reaping of a kernel-stuck call. Ordinary cleanup stops
+the node before joining the worker.
+
+Before deleting a certified-adoption marker, confirmation synchronizes a
+domain-separated trusted boot-provenance watermark. It advances only after an
+exact staged or published history state is also durable in the ordinary
+snapshot. On later restarts, an exact match preserves the explicit successor
+handoff even if shared pointers are withheld. Fresh history activation alone
+does not seed this provenance and therefore cannot bypass AppNode's journal
+continuity check.
+
+The archive is also not a freshness oracle. After any trusted adoption target
+has been completed, startup reads one derived latest pointer per validator,
+ignores candidates below `max(local snapshot slot, --history-min-slot)`, and refuses
+more than 16 distinct valid candidate assertions rather than choosing from an
+incomplete set. Discovery reads and verifies each validator's latest pointer once; each
 distinct candidate then evaluates the normalized quorum tree while reading and
 verifying at most one immutable vote per configured validator. Total work is
 O(V + C·V), with C capped at 16. The floor prevents selection of an older view,
-but cannot make a withheld checkpoint appear.
+but cannot make a withheld history tip or required object appear.
 Staggered newer latest pointers can also hide a previously discoverable older
 certificate, so the bounded scheme trades archive availability for bounded
 work.
 
 Fork detection is correspondingly narrow: startup fails if two
 **simultaneously discoverable** assertions at one slot each satisfy the local
-quorum. Separately, the selected authenticated checkpoint must agree with the
+quorum. Separately, the selected authenticated history tip must agree with the
 eligible local snapshot when they are at the same slot. This is not an
 arbitrary or continuous runtime fork detector; withheld objects and
 alternatives hidden behind latest pointers are outside its view. Likewise, a
-higher isolated certificate is a current-quorum attestation, not a proof that
-its header descends from the node's lower local head. Accepting it relies on
-the same quorum-safety assumption as live consensus: the configured quorum
-will not certify conflicting registry histories.
+higher isolated certificate proves its immutable chain only back through the
+asserted anchor, not that the anchor descends from the node's unrelated lower
+local head. Accepting it relies on the same quorum-safety assumption as live
+consensus: the configured quorum will not certify conflicting registry
+histories.
 
-Finally, these are state checkpoints, not full history. A recovered checkpoint
-must be no more than 15 slots behind a live peer, which supplies and agrees the
-short successor tail. There is no archive of every header and ledger value,
-no independent ancestry replay, and no guarantee of recovery when the archive
-withholds data or no suitable live peer remains. An unrecoverable gap observed
-while the registry is already running still stops that process rather than
-applying a discontinuous ledger value.
+Recovery strictly materializes a certified tip without a peer: it loads the
+asserted Snapshot V3 anchor, validates every subsequent ledger value in its
+exact slot context, applies it, checks the entire resulting header and exact
+last value, and ends at the signed tip hash. The configured interval bounds
+startup materialization to at most `N-1` ledger applications, or 63 at N=64.
+This does not guarantee availability. A hostile archive can withhold a needed
+object; the importer may choose a lower replayable certified candidate still
+above its floor, but it cannot recover a candidate whose anchor or ledger is
+missing. An unrecoverable gap observed while the registry is already running
+still stops that process rather than applying a discontinuous ledger value.
+Immutable shared ledgers, anchors, and votes—and trusted per-slot
+signing/frontier evidence—grow until a separate retention policy exists.
 
 ## 9. Out of scope
 
@@ -614,9 +681,8 @@ Not addressed by v1 and not claimed:
 - **Peer discovery** — you list peers explicitly; there is no gossip of
   addresses.
 - **Core history / archival** — the native answering window remains 16 slots;
-  the registry adapter in §8 can import authenticated application state plus a
-  short live tail, but SLCP still has no generic state transfer or complete
-  replayable ledger archive.
+  the registry adapter in §8 provides its own bounded, replayable archive, but
+  SLCP still has no generic state transfer or configurable retained history.
 - **DoS resistance beyond budgets** — a well-provisioned attacker on the
   port can degrade liveness of a small network (§2 is the mitigation).
 - **Driver nondeterminism** — a `validate` / `combine` / `apply` that gives

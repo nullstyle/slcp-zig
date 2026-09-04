@@ -154,6 +154,23 @@ A durable encoding of application state at one delivery frontier. Its local
 integrity does not establish that another node should trust its contents.
 _Avoid_: History checkpoint
 
+**Snapshot anchor**:
+An application snapshot chosen as the starting state for a bounded replay of
+later ledger records. It anchors application state, not validator agreement.
+_Avoid_: History tip
+
+**Ledger record**:
+The exact value externalized at one slot paired with the resulting ledger
+header. A contiguous sequence can reexecute state transitions and verify
+header ancestry.
+_Avoid_: Statement, application snapshot
+
+**History tip**:
+A ledger head attested by validators satisfying the importing node's quorum
+set. It authenticates the end of a history prefix whether or not that slot is
+a snapshot anchor.
+_Avoid_: Delivery frontier, history checkpoint
+
 **History checkpoint**:
 An application snapshot whose ledger head is attested by validators satisfying
 the importing node's quorum set, making it an authenticated external starting
@@ -161,16 +178,38 @@ point.
 _Avoid_: Snapshot, answering window
 
 **History archive**:
-An application-owned durable collection of history checkpoints and their
-validator attestations, used when the live answering window is insufficient.
+An application-owned durable collection of ledger records, snapshot anchors,
+history tips, and their validator attestations, used when the live answering
+window is insufficient.
 _Avoid_: Answering window
 
 **History signing fence**:
-Trusted per-validator state that records immutable checkpoint decisions and a
-monotonic high-water mark before any attestation enters a shared history
+Trusted per-validator state that records immutable history-tip decisions and
+a monotonic high-water mark before any attestation enters a shared history
 archive. It prevents one retained validator key from signing a rollback or
 same-slot fork across crashes and retries.
 _Avoid_: History archive, application snapshot
+
+**History outbox**:
+A trusted, crash-durable, per-validator sequence of full applied application
+states admitted for history publication but not yet acknowledged as published.
+Its admitted and published frontiers preserve publication order across crashes.
+_Avoid_: History archive, application snapshot, message queue
+
+**Certified-adoption marker**:
+A trusted local record of the exact quorum-certified application state whose
+installation has begun but has not yet been confirmed in the ordinary
+application snapshot. It makes certified history adoption resumable across
+crashes.
+_Avoid_: History tip, latest pointer, history outbox
+
+**Trusted boot provenance**:
+A durable local record that the exact ordinary application snapshot descends
+from independently certified history. It is established only by a confirmed
+certificate or certified adoption, then may advance across exact outbox states
+after their ordinary snapshots are durable. Fresh history activation does not
+establish it.
+_Avoid_: Certified-adoption marker, application snapshot
 
 **Answering window**:
 The recent span of externalized slots for which a node can still answer a

@@ -1,14 +1,15 @@
 # registry — signed transactions, timed ledger values and a header chain on slcp
 
 The second example covers E1, E2a transaction flooding, E2b authenticated
-checkpoint catch-up, and E2c deterministic close time from the examples
-roadmap: a **replicated name registry** with the shape of stellar-core and none
-of the money. Principals hold Ed25519 keys and sign transactions that carry a
-per-account sequence number; accepted transactions flood between validators
-before nomination; each slot's **ledger value** contains an agreed close time
-and transaction set; a node applies it to a bounded, sorted state and advances
-a timed ledger **header hash chain**; the state is snapshotted after every
-slot; a localhost **RPC** takes transactions from a small CLI. Three nodes,
+checkpoint catch-up, E2c deterministic close time, and E2d replayable history
+from the examples roadmap: a **replicated name registry** with the shape of
+stellar-core and none of the money. Principals hold Ed25519 keys and sign
+transactions that carry a per-account sequence number; accepted transactions
+flood between validators before nomination; each slot's **ledger value**
+contains an agreed close time and transaction set; a node applies it to a
+bounded, sorted state and advances a timed ledger **header hash chain**; every
+applied slot gets an immutable ledger record and quorum-certifiable history
+tip; a localhost **RPC** takes transactions from a small CLI. Three nodes,
 three processes, one binary.
 
 Where `examples/counter` is the 40-line program, this one is five files:
@@ -18,8 +19,8 @@ Where `examples/counter` is the 40-line program, this one is five files:
 | `src/registry.zig` | the pure state machine — transactions, sets, `validate` / `combine` / `apply`, the header chain, the snapshot format; standard library only, no I/O |
 | `src/app.zig` | the `slcp.AppNode` adapter (custom codec, in-place `apply`, and `initialState` / `initialSlot` / `initialCommand` from boot state) and a live 2-of-2 test |
 | `src/rpc.zig` | the shared RPC/gossip transaction-admission boundary, a line protocol on 127.0.0.1 (`head`, `get`, `account`, `submit`), and its client |
-| `src/history.zig` | the quorum-authenticated checkpoint archive, validator vote format, trusted signing fence, and hostile-storage tests |
-| `src/main.zig` | the process, checkpoint boot/publication, bounded gossip drain/reflood loop, and the client verbs `submit`, `get`, `account`, `head` |
+| `src/history.zig` | the quorum-authenticated replayable-history archive, ledger/tip-vote formats, trusted signing fence, and hostile-storage tests |
+| `src/main.zig` | the process, history replay/publication, bounded gossip drain/reflood loop, and the client verbs `submit`, `get`, `account`, `head` |
 
 Everything the node agrees on is deterministic and bounded. Domain and cadence
 limits are printed at startup; the transport/gossip bounds are fixed in code:
@@ -34,7 +35,7 @@ limits are printed at startup; the transport/gossip bounds are fixed in code:
 | outbound application writer per peer | 256 messages or 1 MiB; 256 items / 4 MiB of the unchanged aggregate stay reserved for ordinary traffic |
 | gossip work | immediate flood on acceptance, 1 s reflood while pending, at most 64 receives per main-loop tick |
 | cadence | busy slots ≥ 1 s apart (`--min-slot-ms`); idle heartbeat every 3 s (`--heartbeat-ms`) |
-| history cadence | every 8 slots by default; configurable from 1 through the 16-slot live answering window |
+| snapshot-anchor cadence | every 8 slots by default; `--checkpoint-every` accepts 1 through 64 |
 
 ## How it works
 
@@ -90,7 +91,7 @@ and its result (`ok`, `name_taken`, `not_owner`, `no_such_name`,
 prev_hash ‖ txset_hash ‖ state_root)`.
 Three nodes that applied the same history print the same `head`.
 
-**Snapshots, checkpoints, and restart.** After every applied slot the node
+**Snapshots, history, and restart.** After every applied slot the node
 writes `<data-dir>/snapshot` with a random temporary file → write → `fsync`
 and successful `F_FULLFSYNC` on macOS → atomic replace → data-directory
 `fsync`. Snapshot V3 contains the header, state, exact `LedgerValue` agreed at
@@ -106,75 +107,127 @@ is the sole accepted format; pre-E2c V1/V2 snapshots lack the timed predecessor
 value and are rejected. Before selecting either a local or authenticated boot
 state, the process also requires slot zero to equal configured G exactly and a
 later head to remain inside the cumulative `[G+slot,G+60·slot]` interval.
-Slot 0 is never a history checkpoint.
+Slot 0 is never a history anchor or tip.
 
 `--history-dir <dir>` adds long-outage recovery without trusting that shared
-directory. At each `--checkpoint-every N` boundary (default 8, allowed 1..16)
-a validator signs
-`SHA-256("REGISTRY-CKPT-V2" || network_id || slot || head_hash || snapshot_hash)`.
-Snapshots, immutable votes, and mutable per-validator latest pointers live in
-the network-scoped shared archive. On import, malformed or torn objects are
-ignored and unique valid signers must satisfy this process's current local
-quorum set. Quorum policy is never read from the archive. Each validator also
-keeps an independent durable signing fence under
-`<data-dir>/history-signing`; it refuses same-slot equivocation or a lower
-slot even if the shared archive asks for one.
+directory. Every applied non-genesis slot gets an immutable ledger record that
+binds the network id, the complete Header V2, and the exact canonical
+`LedgerValue`; the record format is independent of anchor cadence. Slot 1 and
+every `--checkpoint-every N` boundary (default 8, allowed 1..64) are
+deterministic Snapshot V3 anchor slots. Once a newly applied state reaches one,
+each validator signs a `REGISTRY-HIST-V1` assertion over that exact tip and
+every subsequent tip, binding its slot/head, anchor slot/head/snapshot digest,
+and N so validators with different anchor policies cannot certify one apparent
+tip. Each such slot can therefore become a quorum-certified history tip rather
+than only a periodic checkpoint. On every fresh non-genesis `history-v1`
+activation, the existing base is not republished or treated as
+continuity-proven, even at slot 1 or an N boundary. Every newly applied
+successor gets a ledger record immediately; attestation starts only when one
+reaches the next deterministic anchor and continues at every slot thereafter.
 
-Post-start checkpoint publication runs on a dedicated worker with one
-newest-wins pending State. The cadence loop first makes the ordinary snapshot
-durable, then only enqueues the due checkpoint. Slow or failing archive I/O
-therefore does not block consensus, RPC, or gossip; availability failures retry
-after a short delay or are superseded by a newer checkpoint. A signing-fence,
-certified-fork, state-integrity, or trusted-fence I/O failure is safety-critical
-and stops the node. Post-start fatal paths drain RPC handlers, stop the node,
-then hard-exit without voluntarily joining the publisher. This removes the
+Ledgers, anchors, immutable votes, and mutable per-validator latest pointers
+live below the network's shared `history-v1` namespace. On import, malformed,
+torn, or missing objects yield no recovery; unique valid signers must satisfy
+this process's current local quorum set. Quorum policy is never read from the
+archive. Each validator keeps an independent durable per-slot signing fence
+below `<data-dir>/history-signing/.../history-v1`; it refuses same-slot
+equivocation or a lower slot even if the shared archive asks for one. That
+trusted tree also persists the configured anchor policy and a durable ordered
+publication outbox.
+
+After each application transition, the process first stages the full pending
+Snapshot V3 state in that crash-durable outbox and synchronizes its admitted
+watermark; only then may the ordinary local snapshot advance. A dedicated
+worker publishes the oldest entry, advances the durable published watermark,
+and removes it only after success. A retryable shared-history failure stays at
+the head and successors cannot overtake it.
+
+Before creating the real peer-connected Node, startup validates the trusted
+outbox. With no unfinished certified adoption, it synchronously drains every
+admitted entry before consulting mutable shared history. A persisted adoption
+target T instead displaces any shared proof U before the operator floor is
+applied; the floor is then enforced against T, so a too-old T stops boot rather
+than being silently replaced by U. Startup completes T in an isolated no-peer
+AppNode: it validates the local journal as T's exact continuation, writes T as
+the ordinary snapshot and confirms its marker, then stages the journal
+successors and snapshots their final state. It synchronously publishes that
+continuation, re-runs shared recovery from the installed frontier, and may
+prepare a newer U before creating the real peer-connected Node. Any newly
+selected U is likewise
+written and confirmed before its journal successors enter the outbox. During
+either startup journal replay only, a full outbox may synchronously publish its
+oldest entry and retry admission; at runtime a full 64-state backlog is
+fail-stop. The background publisher starts only after RPC binds. A trusted
+publication gap, outbox or signing-fence corruption/unavailability, invalid
+state, or certified fork is likewise fail-stop. Post-start fatal paths drain
+RPC handlers, stop the node, then hard-exit without voluntarily joining the
+publisher. This removes the
 userspace shutdown wait after consensus has stopped, though the OS may still
 delay final reaping of a thread stuck inside a kernel syscall.
 
-Startup searches at or above `max(local snapshot slot, --history-min-slot)`.
-A newer certified checkpoint through H replaces the local snapshot only after
-`AppNode.create` accepts the checked handoff `.start_slot = H + 1` and seeds
-nomination with the exact ledger value externalized at H. A newer local
-journal value supersedes that seed; a same-slot mismatch fails startup. Live
-peers then supply H+1 through the current frontier, so H must still be within
-their 16-slot answering window; keeping the checkpoint cadence at most 16
-provides that bridge while a quorum is publishing normally. The explicit
-minimum is the anti-rollback control: signatures prove who attested state,
-not that an untrusted archive showed you its newest state.
+Confirmation writes domain-separated trusted boot provenance before removing
+an adoption marker. Once established by certified history, that provenance
+advances only after an exact represented outbox state is also durable as the
+ordinary snapshot. A later restart can therefore use the confirmed state with
+its explicit successor handoff even if shared latest pointers are withheld.
+Merely activating a fresh history tree from a local snapshot does not confer
+that trust; it still needs normal journal continuity until independently
+certified.
 
-Candidate discovery reads the derived latest pointer for each validator in
-the local quorum instead of scanning the archive. Startup accepts at most 16
-distinct valid pointer assertions; a larger set is
+After any pending adoption and backlog are reconciled, startup searches shared
+history at or above `max(installed snapshot slot, --history-min-slot)`.
+For a quorum-certified tip H, it loads the signed Snapshot V3 anchor, follows
+the immutable ledger ancestry backward without gaps, and replays forward to H.
+Each value must validate for its exact slot, application must reproduce the
+entire recorded header and last value, and the final hash must equal the signed
+tip. Replay is bounded by the configured anchor interval: at most `N-1`
+records after an anchor, hence at most 63. The replay-complete state at H then
+passes the checked `AppNode` handoff with `.start_slot = H + 1` and the exact
+ledger value at H; it can be installed and served without a live peer. For an
+ordinary shared-history selection, a newer eligible local snapshot remains
+preferred, a same-slot head mismatch fails, and a newer valid local journal
+may continue the selected state. The explicit minimum is the anti-rollback
+control: signatures prove who attested state, not that an untrusted archive
+showed you its newest state.
+
+Snapshot anchors accelerate startup but do not reset continuity. Before a
+validator signs an anchor-slot tip assertion, publication reconstructs the
+anchor's own transition from the preceding segment and checks its complete
+header, exact last value, and Snapshot V3. Startup need only materialize the
+asserted anchor and its bounded suffix; the certified assertion and publisher
+checks carry continuity across that boundary under the quorum-safety
+assumption.
+
+Shared candidate discovery then reads the derived latest pointer for each
+validator in the local quorum instead of scanning the archive. Startup accepts
+at most 16 distinct valid pointer assertions; a larger set is
 `TooManyCheckpointCandidates` and fails closed rather than allowing unbounded
 cross-reads or selecting from an incomplete fork set. This is an availability
-bound, not a claim that shared storage will show every signed checkpoint.
+bound, not a claim that shared storage will show every signed history tip.
 
-A certificate over a higher isolated snapshot is a quorum attestation, not an
-ancestry proof back to your lower local head. Import therefore makes the same
-assumption as live consensus: the configured quorum will not certify a
-conflicting registry history. Two simultaneously discoverable certified
-assertions at one slot fail closed. Separately, if the selected authenticated
-checkpoint is at the eligible local snapshot's slot, their heads must agree.
-Those checks are not an arbitrary or continuous runtime fork detector: a
-withheld object or a validator's newer latest pointer can hide an older
-alternative. Complete header/ledger-value history is needed to prove every
-intervening link.
+A certified tip is a current-quorum attestation. Its immutable records prove
+the contiguous ancestry from its signed anchor to that tip, but not ancestry
+back to an unrelated older local head. Import therefore still assumes that the
+configured quorum will not certify conflicting registry histories. Two
+simultaneously discoverable certified assertions at one slot fail closed.
+Separately, if the selected authenticated tip is at the eligible local
+snapshot's slot, their heads must agree. Those checks are not an arbitrary or
+continuous runtime fork detector: a withheld object or a validator's newer
+latest pointer can hide an older alternative.
 
 A process that encounters an unrecoverable gap while running still exits with
 code 3 rather than apply a discontinuous ledger value. Restart it after a
-recent certificate exists. This archive stores checkpoint state, not every
-intermediate ledger value or header, so it is not standalone ledger replay
-and cannot recover without a live peer holding the short post-checkpoint tail.
-A node stopped before its first slot still restarts from genesis; a compacted
-journal without either a usable local snapshot or configured certified
-history is refused.
+certified history tip covering the gap is available. A node stopped before its
+first slot still restarts from genesis; a compacted journal without either a
+usable local snapshot or configured certified history is refused. The shared
+history archive grows until an explicit retention design exists.
 
 **Cadence, time, and flooding.** After each applied slot a node proposes
 exactly once for the next: right away when it has pending transactions (after
 `--min-slot-ms`), otherwise at the idle heartbeat. Proposal construction alone
 samples Unix/POSIX whole seconds (leap seconds ignored), applies the optional
 `--proposal-clock-offset-s`, and clamps the result to `[T+1,T+60]`. Received
-values, combination, application, replay, and checkpoint recovery never read
+values, combination, application, replay, and history recovery never read
 local time. The minimum-time combination rule makes honest skew converge, but
 the result is an agreed bounded logical time—not an authenticated UTC oracle.
 A Byzantine quorum can choose any chain that advances 1..60 seconds per slot.
@@ -228,10 +281,12 @@ mesh — see *Security*). On every box:
    zig build -Doptimize=ReleaseSafe
    ```
 
-   This E2c example uses post-v0.2 Experimental `ValueContext`, application
-   messaging, and recovery seams. If you move it out of the repository, pin a
-   future revision that contains E2c rather than the v0.2.0 package. The build
-   produces `zig-out/bin/registry` and `zig-out/bin/slcp`.
+   This E2d example uses post-v0.2 Experimental `ValueContext`, application
+   messaging, and recovery seams, plus application-owned replayable history.
+   If you move it out of the repository, pin a
+   future revision that contains E2c rather than the v0.2.0 package; it must
+   also contain E2d. The build produces `zig-out/bin/registry` and
+   `zig-out/bin/slcp`.
 
 3. **Mint this machine's node key** (an Ed25519 seed, mode 0600; never copy
    it between machines, never commit it):
@@ -299,9 +354,16 @@ mesh — see *Security*). On every box:
    Carrying application state across this boundary requires an explicit
    migration that this example does not implement.
 
-   To enable checkpoint recovery, provision a durable shared or correctly
-   mirrored filesystem whose contents are visible to all three validators and
-   append:
+   **E2d does not create another SLCP network epoch.** The network descriptor,
+   LedgerValue, Header V2, and Snapshot V3 stay unchanged. Instead, both the
+   shared archive and trusted signing tree enter a separate `history-v1`
+   namespace with new ledger and tip-vote formats. Pre-E2d checkpoint-only
+   archive objects and signing fences are not reinterpreted. See
+   [`ADR 0002`](../../docs/adr/0002-registry-replayable-history.md).
+
+   To enable replayable-history recovery, provision a durable shared or
+   correctly mirrored filesystem whose contents are visible to all three
+   validators and append:
 
    ```sh
    --history-dir /mnt/registry-history --checkpoint-every 8
@@ -364,39 +426,54 @@ mesh — see *Security*). On every box:
    `--history-dir`, staying away longer than 16 slots still leaves it unable
    to rejoin. With history enabled, restart it with the same archive; optionally
    add `--history-min-slot <known-good-slot>` to refuse any older view. It
-   authenticates the newest eligible checkpoint, restores its exact final
-   LedgerValue (time plus transaction set) as nomination context, starts at
-   its successor, and catches the remaining short tail from a live peer.
+   selects the newest eligible quorum-certified history tip that it can fully
+   replay. An unfinished trusted adoption must first pass the configured floor,
+   complete in an isolated no-peer startup phase, publish any continuing local
+   journal, and only then recheck shared history for a newer tip. It checks the
+   selected Snapshot V3 anchor against the immutable anchor record and strictly
+   replays every later ledger record through the exact tip. It restores that
+   tip's final LedgerValue
+   (time plus transaction set) as
+   nomination context and starts at its successor. Recovery to the certified
+   tip does not require a live peer.
 
 ## Limits — what E2 still does not do
 
-Transaction flooding, authenticated checkpoint catch-up, and deterministic
-close time close three gaps recorded by E1. These remaining limits are
-deliberate:
+Transaction flooding, authenticated recovery, deterministic close time, and
+bounded replayable history close the four corresponding gaps recorded by E1.
+These remaining limits are deliberate:
 
 - **Flooding is best-effort, not history.** Pending queues and the generic
   Node inbox are memory-only. Immediate publication plus a 1 s reflood heals
   ordinary loss and reconnects; once another validator admits a transaction,
   loss of the submission node does not lose it. If the source dies before any
   peer admits the bytes, or every holder restarts before application, resubmit.
-- **Checkpoints are not replayable history.** The archive contains certified
-  snapshots, not all headers and ledger values. Recovery still needs a
-  checkpoint no more than 15 slots behind a live peer and that peer must help
-  agree the short tail. An untrusted archive can hide or withhold valid data;
-  `--history-min-slot` prevents accepting an older view but cannot make a
-  missing checkpoint appear. Per-validator latest pointers may also hide an
-  older certificate after validators advance at different rates, and more
-  than 16 distinct valid startup candidates is a fail-closed availability
-  error. Without history, the original 16-slot limit remains. A compacted
-  journal without a usable snapshot/checkpoint is refused.
+- **Replay is bounded and availability is external.** Each history tip is
+  replayable only from its signed Snapshot V3 anchor; the configured interval
+  bounds that suffix to at most 63 ledger applications. An untrusted archive
+  can hide, withhold, or delete any required anchor, ledger, or vote;
+  `--history-min-slot` prevents accepting an older view but cannot make missing
+  data appear. Per-validator latest pointers may hide an older certificate
+  after validators advance at different rates, and more than 16 distinct valid
+  startup candidates is a fail-closed availability error. Without history,
+  the native Node's original 16-slot answering limit remains. A compacted
+  journal without a usable local snapshot or certified history is refused.
+- **History has no retention policy yet.** Immutable shared ledgers and votes,
+  periodic anchors, and trusted per-slot signing/frontier evidence grow with
+  publication. A blocked publication head retries in order from the durable
+  outbox; if live consensus fills its 64-state backlog before storage recovers,
+  the registry stops rather than discard a history record or let a successor
+  overtake it. Boot-time journal replay may publish one oldest entry
+  synchronously when it needs that capacity for the exact next successor.
 - **Bounded state.** 64 accounts, 128 names, 32 transactions per slot. The
   typed layer copies the state after every applied slot and `initialState()`
   cannot read a file, which is why the state is plain data and the snapshot
   is loaded through a global before the node starts.
-- **No complete history, heap state, upgrades, quotas, watcher nodes, or
-  HTTP.** The remainder of E2 and E3. Node's answering window is still fixed
-  at 16 slots, and far-ahead drops/peer catch-up state have limited operator
-  visibility.
+- **No heap state, configurable core answering history, upgrades, quotas,
+  watcher nodes, or HTTP.** The remainder of E2 and E3. The application-owned
+  archive does not make history a generic SLCP protocol; Node's own answering
+  window is still fixed at 16 slots, and far-ahead drops/peer catch-up state
+  have limited operator visibility.
 
 ## Security
 
@@ -426,21 +503,31 @@ reachable attacker can still consume the transport budgets and force bounded
 parse/signature work, which is another reason the listen port remains an
 internal service.
 
-**Checkpoint storage has two different trust domains.** Treat the shared
+**Replayable-history storage has two different trust domains.** Treat the shared
 `--history-dir` as fully hostile: an archive writer may delete, replay,
 truncate, rename, or replace objects; create symlinks, directories, FIFOs, or
 other special files at expected names; withhold newer attestations; and arrange
 many valid old latest pointers. The reader pins no-follow directory handles,
 opens generated basenames nonblocking, accepts regular files only, validates
-every path/content/signature/network/head/snapshot relationship, uses only the
-local quorum policy, and caps startup candidates at 16. Those checks protect
-state integrity; archive manipulation can still deny recovery or publication.
+every path/content/signature/network/anchor/ledger/tip relationship, strictly
+replays the selected anchor-to-tip chain, uses only the local quorum policy,
+and caps startup candidates at 16. Those checks protect state integrity;
+archive manipulation can still deny recovery or publication. Mutable latest
+pointers are only bounded discovery hints, never a freshness oracle. Shared
+ledgers, anchors, and votes are not pruned yet, so operators must also provision
+and monitor storage growth.
 
 The signing fence at `<data-dir>/history-signing` is trusted validator safety
 state, like the validator key. Keep it local, writable only by that validator,
 preserve it across restarts or host migration, and never share, mirror, delete,
 or restore it independently to an older version while retaining the key. The
-implementation rejects filesystem-identity or ancestor overlap between the
+tree also persists the anchor cadence and the admitted/published watermarks and
+full pending Snapshot V3 states of the ordered outbox. Startup resolves a
+persisted adoption target in an isolated no-peer phase before mutable shared
+history, stages and snapshots its exact journal continuation, drains that work,
+and only then considers a newer shared tip. It confirms each certified
+selection in the ordinary snapshot before admitting its journal successors.
+The implementation rejects filesystem-identity or ancestor overlap between the
 archive and the whole private data root. It also rejects an archive that
 contains the validator key's pinned parent, requires a regular non-symlink key,
 and binds Node's later key-file read to the identity already used for history
@@ -450,9 +537,14 @@ fence and the high-water fence, including their containing directories; a
 retry repeats those directory barriers. Failure of `fsync`, the checked macOS
 `F_FULLFSYNC`, or a directory barrier in that trusted phase is explicitly
 fail-stop; the same low-level error in the shared archive remains an
-availability failure for retry or supersession. Ordinary snapshot failure also
-stops the registry. Post-start fatal paths drain RPC handlers, stop the
-consensus node, and then hard-exit without joining the publisher; ordinary
+availability failure for ordered retry at the durable outbox head. If the
+64-state backlog fills during live operation, the registry stops rather than
+skip history; boot-time journal replay may publish one oldest entry to make
+room for the exact next successor. Staging
+and synchronizing an applied state happens before the ordinary local snapshot
+advances; failure of either trusted step stops the registry. Post-start fatal
+paths drain RPC handlers, stop the consensus node, and then hard-exit without
+joining the publisher; ordinary
 cleanup still stops the node before any worker join. The OS can still delay
 final reaping of a kernel-stuck filesystem thread.
 In history mode, the immediate parent of `--data-dir` must already exist on
@@ -475,19 +567,21 @@ lines to report `slot S+1: txs=1`, proving propagation before consensus and
 survival of the source's death. Node2 subsequently restarts and participates
 in the remaining ordinary registry operations.
 
-For E2b/E2c, the three validators retain proposal-clock offsets of -30/0/+30
-seconds. The harness records a durable outage origin, stops node2 again, and
+For the E2c/E2d temporal and history witness, the three validators use
+proposal-clock offsets of -30/0/+30 seconds and a 64-slot archive-anchor
+interval. The harness records a durable outage origin, stops node2 again, and
 requires node0 and node1 to externalize at least 201 new transaction-free
-slots. It then kills node0, lets buffered work drain, freezes node1's exact
-head H, and recomputes the newest checkpoint both survivors signed no more
-than 15 slots behind H (at least one must have observed it certified). Node2
-restarts with that Snapshot V3 as its minimum, finite nomination cadence, and
-node1 as its sole live peer. It must explicitly report a history-checkpoint
-boot, restore the exact checkpoint LedgerValue as nomination context, and
-catch node1's exact H/hash/time through a tail shorter than 16 slots. Node2 is
-then a necessary voter with node1 for transaction 8 in the first later
-transaction-bearing ledger; every optional intervening ledger must appear on
-both logs, be empty, and extend one complete temporal chain.
+slots. The survivors must then agree on an exact non-anchor tip assertion H
+that both signed, that one observed as quorum-certified, and that lies at least
+17 ledger records beyond anchor A.
+That span is deliberately larger than the native Node's 16-slot answering
+window. The harness then stops **both** survivors. With both peers dead, node2
+restarts with floor H, must report strict archive replay from A through H, and
+must expose H's exact hash and close time over RPC before any peer returns.
+Only then does node1 restart. Node2 is a necessary voter with node1 for
+transaction 8 in the first later transaction-bearing ledger; every optional
+intervening ledger must appear on both logs, be empty, and extend one complete
+temporal chain.
 
 Across the run, each RPC head and durable slot line for the same ledger must
 agree on close time, every adjacent time step is 1..60 seconds, and every
@@ -505,12 +599,15 @@ the scratch under `.zig-cache/registry-smoke/`. Neither is part of
 `zig build test` — that runs `registry-tests` (the pure module, the RPC, and
 a live 2-of-2 pair with restart) and compiles the program (`registry-intree`).
 Inside this directory, `zig build test` runs the same tests as a consumer.
-The current 80-test registry root covers history and boot selection, timed
-value/header/snapshot invariants, directory durability, publisher failure
-policy, quorum evaluation, tampering, rollback, torn objects, hostile
-namespaces, special files, candidate bounds, and fork discovery. A separate
-18-test `registry-smoke-tests` target pins the harness predicates and argument
-rewrites.
+The focused registry suite covers history and boot selection, timed
+value/header/snapshot invariants, strict replay, directory durability,
+publisher ordering and failure policy, quorum evaluation, tampering, rollback,
+torn objects, hostile namespaces, special files, candidate bounds, and fork
+discovery. A separate `registry-smoke-tests` target pins the harness predicates
+and argument rewrites. The final E2d run passed 99/99 focused registry tests,
+25/25 smoke-harness tests, and the real three-node peerless-recovery smoke; its
+exact process evidence is recorded in the repository
+[`STATUS.md`](../../STATUS.md).
 
 ## Files
 

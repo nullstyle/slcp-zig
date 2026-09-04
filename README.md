@@ -45,8 +45,9 @@ halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
 - **This tree has moved beyond the local v0.2.0 candidate into post-candidate
   E2 feature work:** bounded Experimental application messaging, registry
   transaction flooding with a source-death proof, and application-owned
-  quorum-authenticated checkpoint recovery after a more-than-200-slot outage.
-  v0.1.0 remains the latest tag. Nothing here is supported.
+  per-slot history with activation-boundary-safe tip certification and bounded
+  peerless replay after a more-than-200-slot outage. v0.1.0 remains the latest
+  tag. Nothing here is supported.
 - The engine (`slcp-core`) has run a deterministic 1000-seed simulation
   matrix with Byzantine actors, a fuzz suite, a native-vs-wasm differential
   replay, and a real-socket 4-node end-to-end cluster with kill/restart and
@@ -336,7 +337,7 @@ mise exec -- zig build test
 | `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
 | `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
-| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three skewed-clock registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, deterministic close-time agreement, ordinary restart, then quorum-authenticated checkpoint recovery after one validator misses at least 201 slots and its necessary vote in the first later transaction-bearing ledger. It also proves the timed ledger chain and hard network epoch. Not part of `test` (which runs `registry-tests`, the example's own tests). |
+| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three skewed-clock registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, deterministic close-time agreement, ordinary restart, then exact peerless anchor-to-tip replay after one validator misses at least 201 slots and both certifying peers stop. The recovered validator must expose the same non-anchor slot/hash/time after replaying 17–63 immutable ledgers, then cast a necessary vote in the first later transaction-bearing ledger. It also proves the hard network epoch. Not part of `test` (which runs `registry-tests`, the example's own tests). |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
 | `zig build sim-matrix` / `zig build byz-matrix` | The full 1000-seed simulation and Byzantine matrices (long). |
@@ -419,8 +420,8 @@ in [`docs/stability.md`](docs/stability.md).
   unreleased, and current worktree state, including the verification ledger.
 - [`docs/examples-roadmap.md`](docs/examples-roadmap.md) — E1's registry,
   E2a's bounded transaction flooding, E2b's authenticated checkpoint catch-up,
-  E2c's deterministic ledger close time, and the remaining E2/E3 path toward
-  state, history, upgrades, and operations.
+  E2c's deterministic ledger close time, E2d's replayable certified history,
+  and the remaining E2/E3 path toward upgrades and operations.
 - `docs/protocol.md` — the normative byte-level definition of SLCP v1 as a
   citation index: domain tags, canonical form, quorum sets, leader election,
   frozen limits, statement sanity, the engine boundary, overlay and
@@ -441,8 +442,8 @@ in [`docs/stability.md`](docs/stability.md).
 - `examples/registry/README.md` — the second example: signed sequenced
   transactions, bounded pre-nomination flooding that survives source death
   once propagated, close-time-plus-transaction-set ledger values, a timed
-  header hash chain, authenticated checkpoint recovery, localhost RPC, and
-  CLI.
+  header hash chain, quorum-certified tips after a newly applied anchor with
+  bounded replay, crash-durable ordered publication, localhost RPC, and CLI.
 - `vectors/` — the cross-implementation conformance vectors; when prose and
   vectors disagree, the vectors win.
 

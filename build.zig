@@ -735,14 +735,14 @@ pub fn build(b: *std.Build) void {
     example_smoke_tests_step.dependOn(&run_example_smoke_tests.step);
     test_step.dependOn(&run_example_smoke_tests.step);
 
-    // ===== E1-E2c:registry =====
+    // ===== E1-E2d:registry =====
     // Examples-track stage anchor (registry through deterministic close time
-    // and authenticated recovery; docs/examples-roadmap.md acceptance gates):
+    // and replayable history; docs/examples-roadmap.md acceptance gates):
     // registry-intree compile, registry-tests, the registry_smoke tool and
     // its run steps. Insert under this anchor only; never above it.
     // Keep the blank line between anchors so parallel stages merge cleanly.
 
-    // registry-intree: the E1-E2c program (examples/registry/src/main.zig)
+    // registry-intree: the E1-E2d program (examples/registry/src/main.zig)
     // compiled against the in-tree `slcp` module. NOT installed and never
     // run here (it listens, dials its peers and serves an RPC): `zig build
     // test` proves the published program still compiles.
@@ -759,7 +759,7 @@ pub fn build(b: *std.Build) void {
 
     // registry-tests: the example's own tests, rooted at main.zig so the CLI
     // boot/history policy is covered alongside the pure state machine, RPC,
-    // checkpoint archive and in-process 2-of-2 AppNode restart test. They
+    // replayable-history archive and in-process 2-of-2 AppNode restart test. They
     // write scratch data dirs and read undeclared files: cwd pinned + side
     // effects. Part of `test`.
     const registry_tests = b.addTest(.{
@@ -783,8 +783,9 @@ pub fn build(b: *std.Build) void {
     // dependency), then three `registry node`s over loopback (listen
     // 47411-47413, RPC 47421-47423) driven through the real CLI: a
     // conflicting claim, set / transfer / release, head agreement, SIGKILL +
-    // ordinary restart, then authenticated recovery after at least 201 missed slots
-    // and a transaction whose next-slot quorum requires the recovered node.
+    // ordinary restart, then peerless replay of at least 17 records to an exact
+    // certified tip after at least 201 missed slots (both peers stopped), and a
+    // later transaction-bearing ledger whose quorum requires the recovered node.
     // Prints
     // `[registry-smoke] nodes=3 txs=N slots=M head=<hex16>`. Minutes-scale
     // and port-bound (it runs ALONE, like e2e and example-smoke): its own
