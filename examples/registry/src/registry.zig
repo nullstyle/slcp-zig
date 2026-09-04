@@ -8,8 +8,8 @@
 //!
 //! The shape is stellar-core's without money: principals hold Ed25519 keys
 //! and sign transactions carrying a per-account sequence number; a slot's
-//! value is a transaction SET; applying a set advances a ledger header hash
-//! chain over a bounded, sorted, plain-data state.
+//! value is a close time plus a transaction set; applying it advances a
+//! ledger header hash chain over a bounded, sorted, plain-data state.
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -30,9 +30,13 @@ pub const value_max: usize = 64;
 /// The fixed transaction encoding; the first 171 bytes are what is signed.
 pub const tx_bytes: usize = 235;
 pub const unsigned_tx_bytes: usize = 171;
-/// Largest encoded set: the count byte plus a full set.
+/// Largest encoded transaction set: the count byte plus a full set.
 pub const max_set_bytes: usize = 1 + max_txs * tx_bytes;
-/// The node option: raised from the library's 4096 default to fit a full set.
+/// A consensus value has a disjoint domain tag, its close time, and a set.
+pub const value_magic = "REGISTRY-VALUE-V1\n";
+pub const max_ledger_value_bytes: usize = value_magic.len + 8 + max_set_bytes;
+/// The node option: raised from the library's 4096 default to fit a full
+/// ledger value (7547 bytes at the transaction cap).
 pub const max_value_bytes: u32 = 8192;
 /// The node's submit queue.
 pub const max_pending: usize = 256;
@@ -55,27 +59,43 @@ pub fn nominationDue(has_pending: bool, elapsed_ms: u64, busy_min_ms: u64, idle_
         elapsed_ms >= idle_heartbeat_ms;
 }
 
-pub const tag_net = "REGISTRY-NET-V1";
+pub const max_close_time_step: u64 = 60;
+
+pub const tag_net = "REGISTRY-NET-V2";
 pub const tag_tx = "REGISTRY-TX-V1";
-pub const tag_hdr = "REGISTRY-HDR-V1";
-pub const snap_magic_v1 = "REGISTRY-SNAP-V1\n";
-pub const snap_magic = "REGISTRY-SNAP-V2\n";
+pub const tag_hdr = "REGISTRY-HDR-V2";
+pub const snap_magic = "REGISTRY-SNAP-V3\n";
 
 comptime {
-    std.debug.assert(max_set_bytes <= max_value_bytes);
+    std.debug.assert(max_ledger_value_bytes == 7547);
+    std.debug.assert(max_ledger_value_bytes <= max_value_bytes);
     std.debug.assert(max_txs <= 255 and max_accounts <= 255 and max_names <= 255);
-    std.debug.assert(snap_magic_v1.len == snap_magic.len);
 }
 
 pub const Key = [32]u8;
 pub const zero_key: Key = @splat(0);
 
-/// The registry's own network id: SHA-256(tag ‖ passphrase). Not the
+/// The canonical network descriptor: tag ‖ genesis close time ‖ passphrase.
+/// `out` must have room for the descriptor. The explicit genesis time makes
+/// two otherwise identical deployments distinct transaction-signing domains.
+pub fn networkDescriptor(genesis_close_time: u64, passphrase: []const u8, out: []u8) []u8 {
+    const len = tag_net.len + 8 + passphrase.len;
+    std.debug.assert(out.len >= len);
+    @memcpy(out[0..tag_net.len], tag_net);
+    std.mem.writeInt(u64, out[tag_net.len..][0..8], genesis_close_time, .big);
+    @memcpy(out[tag_net.len + 8 ..][0..passphrase.len], passphrase);
+    return out[0..len];
+}
+
+/// The registry's own network id: SHA-256 of `networkDescriptor`. Not the
 /// library's networkId (different tag) — a transaction signed for one
-/// passphrase is invalid on every other network.
-pub fn networkId(passphrase: []const u8) [32]u8 {
+/// descriptor is invalid on every other network.
+pub fn networkId(passphrase: []const u8, genesis_close_time: u64) [32]u8 {
     var h = Sha256.init(.{});
     h.update(tag_net);
+    var time_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &time_be, genesis_close_time, .big);
+    h.update(&time_be);
     h.update(passphrase);
     return h.finalResult();
 }
@@ -294,6 +314,36 @@ pub const TxSet = struct {
     }
 };
 
+/// The application value externalized by consensus. Its domain-tagged
+/// encoding is intentionally disjoint from both a bare transaction set and a
+/// transaction, so pre-E2c bytes cannot acquire a new meaning after upgrade.
+pub const LedgerValue = struct {
+    close_time: u64,
+    txs: TxSet,
+
+    pub fn encode(self: *const LedgerValue, buf: []u8) []u8 {
+        std.debug.assert(buf.len >= max_ledger_value_bytes);
+        @memcpy(buf[0..value_magic.len], value_magic);
+        std.mem.writeInt(u64, buf[value_magic.len..][0..8], self.close_time, .big);
+        const encoded_txs = self.txs.encode(buf[value_magic.len + 8 ..]);
+        return buf[0 .. value_magic.len + 8 + encoded_txs.len];
+    }
+
+    pub fn decode(bytes: []const u8) ?LedgerValue {
+        if (bytes.len < value_magic.len + 8 + 1) return null;
+        if (!std.mem.eql(u8, bytes[0..value_magic.len], value_magic)) return null;
+        return .{
+            .close_time = std.mem.readInt(u64, bytes[value_magic.len..][0..8], .big),
+            .txs = TxSet.decode(bytes[value_magic.len + 8 ..]) orelse return null,
+        };
+    }
+
+    pub fn hash(self: *const LedgerValue) [32]u8 {
+        var buf: [max_ledger_value_bytes]u8 = undefined;
+        return sha256(self.encode(&buf));
+    }
+};
+
 fn sha256(bytes: []const u8) [32]u8 {
     var h = Sha256.init(.{});
     h.update(bytes);
@@ -308,6 +358,7 @@ pub const Result = enum(u8) { ok = 0, name_taken = 1, not_owner = 2, no_such_nam
 
 pub const Header = struct {
     slot: u64 = 0,
+    close_time: u64 = 0,
     hash: [32]u8 = @splat(0),
     prev_hash: [32]u8 = @splat(0),
     txset_hash: [32]u8 = @splat(0),
@@ -349,7 +400,18 @@ pub const State = struct {
     last_results: [max_txs]Result = @splat(.ok),
     /// The exact consensus value that advanced `head` to its current slot.
     /// This is checkpoint context, not part of the replicated state root.
-    last_set: ?TxSet = null,
+    last_value: ?LedgerValue = null,
+
+    /// Construct the one canonical slot-zero ledger head for a network.
+    /// Genesis is a real header: it commits to the empty state and its
+    /// configured close time, but to no transaction set or previous header.
+    pub fn genesis(network_id: [32]u8, genesis_close_time: u64) State {
+        var state: State = .{ .network_id = network_id };
+        state.head.close_time = genesis_close_time;
+        state.head.state_root = state.stateRoot();
+        state.head.hash = headerHash(network_id, &state.head);
+        return state;
+    }
 
     pub fn accountsSlice(self: *const State) []const Account {
         return self.accounts[0..self.n_accounts];
@@ -523,11 +585,25 @@ pub const State = struct {
 
 pub const Verdict = enum { invalid, maybe_valid, valid };
 
-/// Judge a set against `state`. `.maybe_valid` = a source's first seq is
-/// ahead of what this state expects (this node may be behind) — never
-/// `.invalid` for that. `.invalid` beats `.maybe_valid` beats `.valid`.
-pub fn validate(state: *const State, set: *const TxSet) Verdict {
-    return judge(state, set, true);
+/// Judge a value for contextual slot `slot`. Close time must lie in the
+/// slot-derived interval `[T + d, T + 60d]`, where `(H,T)` is the local head
+/// and `d = slot - H`. A value for the immediate successor must be completely
+/// valid now; a value for a later slot is necessarily `.maybe_valid` even when
+/// its transaction set is otherwise valid, because the intervening state is
+/// not known locally.
+pub fn validate(state: *const State, value: *const LedgerValue, slot: u64) Verdict {
+    const head = state.head;
+    if (slot <= head.slot) return .invalid;
+    const d = slot - head.slot;
+    const lower = std.math.add(u64, head.close_time, d) catch return .invalid;
+    const upper = head.close_time +| (d *| max_close_time_step);
+    if (value.close_time < lower or value.close_time > upper) return .invalid;
+
+    return switch (judge(state, &value.txs, true)) {
+        .invalid => .invalid,
+        .valid => if (d == 1) .valid else .maybe_valid,
+        .maybe_valid => if (d == 1) .invalid else .maybe_valid,
+    };
 }
 
 /// The structural half of `validate` — order, per-source contiguity from
@@ -638,39 +714,56 @@ pub fn select(state: *const State, pool: []const Tx) TxSet {
     return out;
 }
 
-/// The nomination composite: the union of every candidate, deduplicated,
-/// selected against `state` (roadmap §3.6). Total and deterministic in
-/// `(state, cmds)`.
-pub fn combine(state: *const State, cmds: []const TxSet) TxSet {
+/// The nomination composite uses the minimum proposed close time and the
+/// union of every candidate's transactions, deduplicated and selected against
+/// `state`. Candidate order therefore cannot influence either field.
+/// `cmds` is non-empty because the consensus engine combines candidates only
+/// after nomination has produced at least one.
+pub fn combine(state: *const State, cmds: []const LedgerValue) LedgerValue {
+    std.debug.assert(cmds.len > 0);
+    var close_time = cmds[0].close_time;
     var pool: [pool_cap]Tx = undefined;
     var n: usize = 0;
-    for (cmds) |*set| for (set.slice()) |*tx| poolInsert(&pool, &n, tx);
-    return select(state, pool[0..n]);
+    for (cmds) |*value| {
+        close_time = @min(close_time, value.close_time);
+        for (value.txs.slice()) |*tx| poolInsert(&pool, &n, tx);
+    }
+    return .{ .close_time = close_time, .txs = select(state, pool[0..n]) };
 }
 
-/// The node's own proposal: the pending queue (sorted here, in place, then
-/// deduplicated) selected against `state`.
-pub fn proposal(state: *const State, pending: []Tx) TxSet {
-    std.mem.sort(Tx, pending, {}, Tx.lessThan);
+/// The node's own proposal: a read-only pending queue, sorted and deduplicated
+/// through the bounded local pool, selected against `state`, with wall time
+/// clamped into the immediate successor's deterministic legal interval.
+/// No successor exists once close time has reached `u64` maximum.
+pub fn proposal(state: *const State, pending: []const Tx, wall_s: u64) ?LedgerValue {
+    if (state.head.close_time == std.math.maxInt(u64)) return null;
     var pool: [pool_cap]Tx = undefined;
     var n: usize = 0;
     for (pending) |*tx| poolInsert(&pool, &n, tx);
-    return select(state, pool[0..n]);
+    const lower = state.head.close_time + 1;
+    const upper = state.head.close_time +| max_close_time_step;
+    return .{
+        .close_time = std.math.clamp(wall_s, lower, upper),
+        .txs = select(state, pool[0..n]),
+    };
 }
 
-/// Apply a set that `validate` judged `.valid` (roadmap §3.7): every
+/// Apply an immediate-successor value that `validate` judged `.valid`
+/// (roadmap §3.7): every
 /// transaction consumes its sequence number, even when its operation
 /// fails; then the header advances one slot.
 ///
-/// Total: a set that does NOT apply cleanly on `state` (seq runs that do
-/// not start where this state expects them) is skipped and the header
-/// stays put. The one way that happens in practice is the library handing
-/// the node a slot past a gap it could not recover (roadmap §2.1 gap 2):
-/// the node loop then sees `applied.slot != head.slot` and stops, instead
-/// of an assertion aborting the engine thread (review A).
-pub fn apply(state: *State, set: *const TxSet) void {
-    if (!appliesCleanly(state, set)) return;
-    const txs = set.slice();
+/// Total and defensive: a value whose close time is not in `(T, T + 60]`,
+/// whose transactions do not apply cleanly, or whose successor slot would
+/// overflow is skipped and the state stays put.
+pub fn apply(state: *State, value: *const LedgerValue) void {
+    if (state.head.slot == std.math.maxInt(u64) or
+        state.head.close_time == std.math.maxInt(u64) or
+        value.close_time <= state.head.close_time or
+        value.close_time > state.head.close_time +| max_close_time_step or
+        !appliesCleanly(state, &value.txs)) return;
+
+    const txs = value.txs.slice();
     for (txs, 0..) |*tx, i| {
         const acct = state.accountFor(tx.source);
         std.debug.assert(tx.seq == acct.seq + 1);
@@ -679,14 +772,15 @@ pub fn apply(state: *State, set: *const TxSet) void {
     }
     state.last_count = @intCast(txs.len);
     for (state.last_results[txs.len..]) |*r| r.* = .ok;
-    state.last_set = set.*;
+    state.last_value = value.*;
 
     const h = &state.head;
     h.slot += 1;
+    h.close_time = value.close_time;
     h.prev_hash = h.hash;
-    h.txset_hash = set.hash();
+    h.txset_hash = value.txs.hash();
     h.state_root = state.stateRoot();
-    h.hash = headerHash(h);
+    h.hash = headerHash(state.network_id, h);
 }
 
 fn execute(state: *State, tx: *const Tx) Result {
@@ -726,13 +820,18 @@ fn execute(state: *State, tx: *const Tx) Result {
     }
 }
 
-/// SHA-256(tag ‖ slot ‖ prev_hash ‖ txset_hash ‖ state_root).
-pub fn headerHash(h: *const Header) [32]u8 {
+/// SHA-256(tag ‖ network_id ‖ slot ‖ close_time ‖ prev_hash ‖
+/// txset_hash ‖ state_root).
+pub fn headerHash(network_id: [32]u8, h: *const Header) [32]u8 {
     var hh = Sha256.init(.{});
     hh.update(tag_hdr);
+    hh.update(&network_id);
     var slot_be: [8]u8 = undefined;
     std.mem.writeInt(u64, &slot_be, h.slot, .big);
     hh.update(&slot_be);
+    var close_time_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &close_time_be, h.close_time, .big);
+    hh.update(&close_time_be);
     hh.update(&h.prev_hash);
     hh.update(&h.txset_hash);
     hh.update(&h.state_root);
@@ -743,11 +842,12 @@ pub fn headerHash(h: *const Header) [32]u8 {
 // Snapshot (roadmap §3.8)
 // ---------------------------------------------------------------------------
 
-/// V2: magic ‖ network_id ‖ slot ‖ hash ‖ prev_hash ‖ txset_hash ‖
-/// state_root ‖ last-set length ‖ last-set bytes ‖ state bytes ‖ SHA-256
-/// of everything before it. A zero last-set length is reserved for genesis.
-pub const snapshot_max_bytes: usize = snap_magic.len + 32 + 8 + 4 * 32 + 2 + max_set_bytes + state_bytes_max + 32;
-const snapshot_fixed_prefix: usize = snap_magic.len + 32 + 8 + 4 * 32;
+/// V3: magic ‖ network_id ‖ slot ‖ close_time ‖ hash ‖ prev_hash ‖
+/// txset_hash ‖ state_root ‖ last-value length ‖ last-value bytes ‖
+/// state bytes ‖ SHA-256 of everything before it. A zero last-value length
+/// is reserved for the canonical, real genesis header.
+pub const snapshot_max_bytes: usize = snap_magic.len + 32 + 8 + 8 + 4 * 32 + 2 + max_ledger_value_bytes + state_bytes_max + 32;
+const snapshot_fixed_prefix: usize = snap_magic.len + 32 + 8 + 8 + 4 * 32;
 
 /// `buf.len >= snapshot_max_bytes`.
 pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
@@ -759,15 +859,18 @@ pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
     off += 32;
     std.mem.writeInt(u64, buf[off..][0..8], state.head.slot, .big);
     off += 8;
+    std.mem.writeInt(u64, buf[off..][0..8], state.head.close_time, .big);
+    off += 8;
     inline for (.{ &state.head.hash, &state.head.prev_hash, &state.head.txset_hash, &state.head.state_root }) |f| {
         @memcpy(buf[off..][0..32], f);
         off += 32;
     }
-    if (state.last_set) |*set| {
+    if (state.last_value) |*value| {
         std.debug.assert(state.head.slot > 0);
-        std.debug.assert(std.mem.eql(u8, &state.head.txset_hash, &set.hash()));
-        var set_buf: [max_set_bytes]u8 = undefined;
-        const encoded = set.encode(&set_buf);
+        std.debug.assert(value.close_time == state.head.close_time);
+        std.debug.assert(std.mem.eql(u8, &state.head.txset_hash, &value.txs.hash()));
+        var value_buf: [max_ledger_value_bytes]u8 = undefined;
+        const encoded = value.encode(&value_buf);
         std.mem.writeInt(u16, buf[off..][0..2], @intCast(encoded.len), .big);
         off += 2;
         @memcpy(buf[off..][0..encoded.len], encoded);
@@ -785,16 +888,15 @@ pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
     return buf[0..off];
 }
 
-/// Strict: checksum, canonical state bytes, and the header's `state_root`
-/// must equal the root of the state read back. V2 also requires the exact
-/// canonical last consensus set at every non-genesis slot and binds its hash
-/// to `head.txset_hash`. V1 remains readable with `last_set = null`. Results
-/// are zeroed (they are not persisted).
+/// Strict V3 only: checksum, canonical state bytes, and the header's
+/// `state_root` must equal the root of the state read back. Every non-genesis
+/// snapshot carries the exact canonical last consensus value and binds both
+/// its close time and transaction-set hash to the head. Genesis must be the
+/// exact real header constructed by `State.genesis`. Results are zeroed (they
+/// are not persisted).
 pub fn readSnapshot(bytes: []const u8) ?State {
     if (bytes.len < snapshot_fixed_prefix + 2 + 32) return null;
-    const is_v2 = std.mem.eql(u8, bytes[0..snap_magic.len], snap_magic);
-    const is_v1 = std.mem.eql(u8, bytes[0..snap_magic_v1.len], snap_magic_v1);
-    if (!is_v2 and !is_v1) return null;
+    if (!std.mem.eql(u8, bytes[0..snap_magic.len], snap_magic)) return null;
     const body_end = bytes.len - 32;
     const sum = sha256(bytes[0..body_end]);
     if (!std.mem.eql(u8, &sum, bytes[body_end..])) return null;
@@ -804,45 +906,41 @@ pub fn readSnapshot(bytes: []const u8) ?State {
     var head: Header = .{};
     head.slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
     off += 8;
+    head.close_time = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
     head.hash = bytes[off..][0..32].*;
     head.prev_hash = bytes[off + 32 ..][0..32].*;
     head.txset_hash = bytes[off + 64 ..][0..32].*;
     head.state_root = bytes[off + 96 ..][0..32].*;
     off = snapshot_fixed_prefix;
 
-    var last_set: ?TxSet = null;
-    if (is_v2) {
-        if (body_end < off + 2 + 2) return null;
-        const set_len: usize = std.mem.readInt(u16, bytes[off..][0..2], .big);
-        off += 2;
-        if (set_len > max_set_bytes or body_end < off + set_len + 2) return null;
-        if (head.slot == 0) {
-            if (set_len != 0) return null;
-        } else {
-            if (set_len == 0) return null;
-            const set = TxSet.decode(bytes[off..][0..set_len]) orelse return null;
-            if (!std.mem.eql(u8, &head.txset_hash, &set.hash())) return null;
-            last_set = set;
-        }
-        off += set_len;
+    if (body_end < off + 2 + 2) return null;
+    const value_len: usize = std.mem.readInt(u16, bytes[off..][0..2], .big);
+    off += 2;
+    if (value_len > max_ledger_value_bytes or body_end < off + value_len + 2) return null;
+    var last_value: ?LedgerValue = null;
+    if (head.slot == 0) {
+        if (value_len != 0) return null;
+    } else {
+        if (value_len == 0) return null;
+        const value = LedgerValue.decode(bytes[off..][0..value_len]) orelse return null;
+        if (value.close_time != head.close_time or
+            !std.mem.eql(u8, &head.txset_hash, &value.txs.hash())) return null;
+        last_value = value;
     }
+    off += value_len;
 
     var state = State.deserialize(bytes[off..body_end]) orelse return null;
     state.network_id = network_id;
     state.head = head;
-    state.last_set = last_set;
+    state.last_value = last_value;
     if (state.head.slot == 0) {
-        // Genesis has no ledger header yet: apply(slot 1) must continue from
-        // the all-zero hash used by every fresh State. Accept only that exact
-        // empty form rather than inventing a slot-zero header hash/root.
-        if (state.n_accounts != 0 or state.n_names != 0 or
-            !isZero(&state.head.hash) or
-            !isZero(&state.head.prev_hash) or
-            !isZero(&state.head.txset_hash) or
-            !isZero(&state.head.state_root)) return null;
+        if (state.n_accounts != 0 or state.n_names != 0) return null;
+        const canonical = State.genesis(network_id, state.head.close_time);
+        if (!std.meta.eql(state.head, canonical.head)) return null;
     } else {
         if (!std.mem.eql(u8, &state.head.state_root, &state.stateRoot())) return null;
-        if (!std.mem.eql(u8, &state.head.hash, &headerHash(&state.head))) return null;
+        if (!std.mem.eql(u8, &state.head.hash, &headerHash(state.network_id, &state.head))) return null;
     }
     return state;
 }
@@ -875,12 +973,14 @@ pub fn parseKey(hex: []const u8) ?Key {
 const testing = std.testing;
 
 const TestNet = struct {
+    const genesis_close_time: u64 = 1_700_000_000;
+
     id: [32]u8,
     seeds: [3][32]u8,
     keys: [3]Key,
 
     fn init() TestNet {
-        var t: TestNet = .{ .id = networkId("registry test net"), .seeds = undefined, .keys = undefined };
+        var t: TestNet = .{ .id = networkId("registry test net", genesis_close_time), .seeds = undefined, .keys = undefined };
         for (0..3) |i| {
             t.seeds[i] = @splat(@intCast(i + 11));
             const kp = Ed25519.KeyPair.generateDeterministic(t.seeds[i]) catch unreachable;
@@ -902,7 +1002,21 @@ const TestNet = struct {
     }
 
     fn genesis(self: *const TestNet) State {
-        return .{ .network_id = self.id };
+        return State.genesis(self.id, genesis_close_time);
+    }
+
+    fn nextValue(state: *const State, set_value: TxSet) LedgerValue {
+        return .{ .close_time = state.head.close_time + 1, .txs = set_value };
+    }
+
+    fn validateNext(state: *const State, set_value: *const TxSet) Verdict {
+        const value = nextValue(state, set_value.*);
+        return validate(state, &value, state.head.slot + 1);
+    }
+
+    fn applyNext(state: *State, set_value: *const TxSet) void {
+        const value = nextValue(state, set_value.*);
+        apply(state, &value);
     }
 };
 
@@ -910,10 +1024,11 @@ const TestNet = struct {
 // digest, makes the cross-network signature verify.
 test "network id: passphrases differ; a signature does not carry across networks" {
     const t = TestNet.init();
-    try testing.expect(!std.mem.eql(u8, &networkId("a"), &networkId("b")));
+    try testing.expect(!std.mem.eql(u8, &networkId("a", TestNet.genesis_close_time), &networkId("b", TestNet.genesis_close_time)));
+    try testing.expect(!std.mem.eql(u8, &networkId("a", TestNet.genesis_close_time), &networkId("a", TestNet.genesis_close_time + 1)));
     const tx = t.tx(0, 1, .claim, "alice", "", zero_key);
     try testing.expect(tx.verify(t.id));
-    try testing.expect(!tx.verify(networkId("some other net")));
+    try testing.expect(!tx.verify(networkId("some other net", TestNet.genesis_close_time)));
     var tampered = tx;
     tampered.seq = 2;
     try testing.expect(!tampered.verify(t.id));
@@ -987,7 +1102,7 @@ test "tx set: empty set is one byte; round-trip; unsorted, duplicate, oversize a
     try testing.expectEqual(1 + 3 * tx_bytes, enc.len);
     const back = TxSet.decode(enc).?;
     try testing.expectEqual(@as(u8, 3), back.count);
-    try testing.expectEqual(Verdict.valid, validate(&t.genesis(), &back));
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&t.genesis(), &back));
 
     const swapped = if (first_is_0) TestNet.set(&.{ a2, a1, b1 }) else TestNet.set(&.{ b1, a2, a1 });
     var buf2: [max_set_bytes]u8 = undefined;
@@ -1019,10 +1134,10 @@ test "seq range: 2^64−1 is not a transaction; a run at the top of the range do
     var s = t.genesis();
     _ = s.accountFor(t.keys[0]);
     s.accounts[s.locateAccount(t.keys[0]).found].seq = Tx.max_seq - 1;
-    try testing.expectEqual(Verdict.valid, validate(&s, &TestNet.set(&.{top})));
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{top})));
     top = t.tx(0, Tx.max_seq - 1, .claim, "top", "", zero_key);
-    try testing.expectEqual(Verdict.invalid, validate(&s, &TestNet.set(&.{top}))); // replay
-    apply(&s, &TestNet.set(&.{t.tx(0, Tx.max_seq, .claim, "top", "", zero_key)}));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{top}))); // replay
+    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, Tx.max_seq, .claim, "top", "", zero_key)}));
     try testing.expectEqual(Tx.max_seq, s.accountSeq(t.keys[0]));
     // Nothing more can ever come from this account (validate says replay
     // or ahead, never valid), and `select` drops it: no overflow anywhere.
@@ -1035,19 +1150,19 @@ test "seq range: 2^64−1 is not a transaction; a run at the top of the range do
 test "apply is total: a set from a later state is skipped and the header stays put" {
     const t = TestNet.init();
     var s = t.genesis();
-    apply(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
-    apply(&s, &TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)}));
+    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
+    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)}));
     const later = TestNet.set(&.{t.tx(0, 3, .set, "alice", "w", zero_key)}); // valid on s (slot 2)
-    try testing.expectEqual(Verdict.valid, validate(&s, &later));
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &later));
     var stale = t.genesis(); // a node that missed slots 1–2
-    try testing.expectEqual(Verdict.maybe_valid, validate(&stale, &later));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&stale, &later));
     try testing.expect(!appliesCleanly(&stale, &later));
-    apply(&stale, &later);
+    TestNet.applyNext(&stale, &later);
     try testing.expectEqual(@as(u64, 0), stale.head.slot);
     try testing.expectEqual(@as(u8, 0), stale.n_accounts);
     try testing.expectEqual(@as(u8, 0), stale.last_count);
     // The right state applies it as usual.
-    apply(&s, &later);
+    TestNet.applyNext(&s, &later);
     try testing.expectEqual(@as(u64, 3), s.head.slot);
     try testing.expectEqualStrings("w", s.findName("alice").?.valueSlice());
 }
@@ -1060,15 +1175,15 @@ test "validate: contiguous runs are valid; replay/gap/bad signature invalid; a r
     const a1 = t.tx(0, 1, .claim, "alice", "", zero_key);
     const a2 = t.tx(0, 2, .set, "alice", "v", zero_key);
     const a3 = t.tx(0, 3, .set, "alice", "w", zero_key);
-    try testing.expectEqual(Verdict.valid, validate(&s, &TestNet.set(&.{ a1, a2 })));
-    try testing.expectEqual(Verdict.invalid, validate(&s, &TestNet.set(&.{ a1, a3 }))); // gap inside the run
-    try testing.expectEqual(Verdict.maybe_valid, validate(&s, &TestNet.set(&.{ a2, a3 }))); // starts ahead
-    apply(&s, &TestNet.set(&.{a1}));
-    try testing.expectEqual(Verdict.invalid, validate(&s, &TestNet.set(&.{a1}))); // replay
-    try testing.expectEqual(Verdict.valid, validate(&s, &TestNet.set(&.{ a2, a3 })));
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{ a1, a2 })));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{ a1, a3 }))); // gap inside the run
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{ a2, a3 }))); // immediate successor cannot defer a seq gap
+    TestNet.applyNext(&s, &TestNet.set(&.{a1}));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{a1}))); // replay
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{ a2, a3 })));
     var forged = a2;
     forged.value[0] = 'x'; // signed bytes changed; signature stale
-    try testing.expectEqual(Verdict.invalid, validate(&s, &TestNet.set(&.{forged})));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{forged})));
 
     // Fill the account table: the 65th new source is invalid, a known one fine.
     var full = t.genesis();
@@ -1078,7 +1193,7 @@ test "validate: contiguous runs are valid; replay/gap/bad signature invalid; a r
         _ = full.accountFor(k);
     }
     try testing.expectEqual(@as(u8, max_accounts), full.n_accounts);
-    try testing.expectEqual(Verdict.invalid, validate(&full, &TestNet.set(&.{a1})));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&full, &TestNet.set(&.{a1})));
     // A table with room for exactly one more: one new source fine, two not.
     var almost = t.genesis();
     for (0..max_accounts - 1) |i| {
@@ -1087,10 +1202,10 @@ test "validate: contiguous runs are valid; replay/gap/bad signature invalid; a r
         _ = almost.accountFor(k);
     }
     const b1 = t.tx(1, 1, .claim, "bob", "", zero_key);
-    try testing.expectEqual(Verdict.valid, validate(&almost, &TestNet.set(&.{a1})));
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&almost, &TestNet.set(&.{a1})));
     const first_is_0 = std.mem.order(u8, &t.keys[0], &t.keys[1]) == .lt;
     const two = if (first_is_0) TestNet.set(&.{ a1, b1 }) else TestNet.set(&.{ b1, a1 });
-    try testing.expectEqual(Verdict.invalid, validate(&almost, &two));
+    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&almost, &two));
     try testing.expectEqual(@as(u8, 1), select(&almost, two.slice()).count); // combine keeps the first that fits
 }
 
@@ -1106,8 +1221,8 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     const set_b = t.tx(1, 2, .set, "alice", "hi", zero_key); // not the owner
     const first_is_0 = std.mem.order(u8, &t.keys[0], &t.keys[1]) == .lt;
     const set1 = if (first_is_0) TestNet.set(&.{ claim_a, claim_b_alice, set_b }) else TestNet.set(&.{ claim_b_alice, set_b, claim_a });
-    try testing.expectEqual(Verdict.valid, validate(&s, &set1));
-    apply(&s, &set1);
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &set1));
+    TestNet.applyNext(&s, &set1);
     try testing.expectEqual(@as(u64, 1), s.head.slot);
     try testing.expectEqualSlices(u8, &genesis_hash, &s.head.prev_hash);
     try testing.expectEqual(@as(u64, 1), s.accountSeq(t.keys[0]));
@@ -1142,17 +1257,17 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     const other: usize = 1 - owner_seed;
     const owner_seq = s.accountSeq(t.keys[owner_seed]) + 1;
     const s2 = TestNet.set(&.{t.tx(owner_seed, owner_seq, .set, "alice", "v1", zero_key)});
-    apply(&s, &s2);
+    TestNet.applyNext(&s, &s2);
     try testing.expectEqualStrings("v1", s.findName("alice").?.valueSlice());
     const s3 = TestNet.set(&.{t.tx(owner_seed, owner_seq + 1, .transfer, "alice", "", t.keys[other])});
-    apply(&s, &s3);
+    TestNet.applyNext(&s, &s3);
     try testing.expectEqualSlices(u8, &t.keys[other], &s.findName("alice").?.owner);
-    apply(&s, &TxSet.empty);
+    TestNet.applyNext(&s, &TxSet.empty);
     const root_before_empty = s.head.state_root;
     try testing.expectEqualSlices(u8, &root_before_empty, &s.stateRoot()); // empty slot: root unchanged
     const other_seq = s.accountSeq(t.keys[other]) + 1;
     const s5 = TestNet.set(&.{ t.tx(other, other_seq, .release, "alice", "", zero_key), t.tx(other, other_seq + 1, .set, "alice", "x", zero_key) });
-    apply(&s, &s5);
+    TestNet.applyNext(&s, &s5);
     try testing.expect(s.findName("alice") == null);
     try testing.expectEqual(Result.ok, s.lastResults()[0]);
     try testing.expectEqual(Result.no_such_name, s.lastResults()[1]);
@@ -1165,30 +1280,32 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     for (0..max_names) |i| {
         var name_buf: [8]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "n{d}", .{i}) catch unreachable;
-        apply(&full, &TestNet.set(&.{t.tx(2, seq, .claim, name, "", zero_key)}));
+        TestNet.applyNext(&full, &TestNet.set(&.{t.tx(2, seq, .claim, name, "", zero_key)}));
         try testing.expectEqual(Result.ok, full.lastResults()[0]);
         seq += 1;
     }
-    apply(&full, &TestNet.set(&.{t.tx(2, seq, .claim, "one-more", "", zero_key)}));
+    TestNet.applyNext(&full, &TestNet.set(&.{t.tx(2, seq, .claim, "one-more", "", zero_key)}));
     try testing.expectEqual(Result.registry_full, full.lastResults()[0]);
     try testing.expectEqual(@as(u8, max_names), full.n_names);
 }
 
-test "apply: records the exact last consensus set, including an empty set" {
+test "apply: records the exact last consensus value, including an empty set" {
     const t = TestNet.init();
     var s = t.genesis();
     const set1 = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
 
-    apply(&s, &set1);
-    var expected_buf: [max_set_bytes]u8 = undefined;
-    var actual_buf: [max_set_bytes]u8 = undefined;
-    try testing.expectEqualSlices(u8, set1.encode(&expected_buf), s.last_set.?.encode(&actual_buf));
+    TestNet.applyNext(&s, &set1);
+    var expected_buf: [max_ledger_value_bytes]u8 = undefined;
+    var actual_buf: [max_ledger_value_bytes]u8 = undefined;
+    const expected = TestNet.nextValue(&t.genesis(), set1);
+    try testing.expectEqualSlices(u8, expected.encode(&expected_buf), s.last_value.?.encode(&actual_buf));
 
-    apply(&s, &TxSet.empty);
-    try testing.expectEqual(@as(u8, 0), s.last_set.?.count);
+    TestNet.applyNext(&s, &TxSet.empty);
+    try testing.expectEqual(@as(u8, 0), s.last_value.?.txs.count);
+    try testing.expectEqual(TestNet.genesis_close_time + 2, s.last_value.?.close_time);
 
     var without_context = s;
-    without_context.last_set = null;
+    without_context.last_value = null;
     var with_buf: [state_bytes_max]u8 = undefined;
     var without_buf: [state_bytes_max]u8 = undefined;
     try testing.expectEqualSlices(u8, s.serialize(&with_buf), without_context.serialize(&without_buf));
@@ -1203,17 +1320,17 @@ test "determinism: identical histories give identical roots and header hashes" {
     var y = t.genesis();
     const s1 = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
     const s2 = TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)});
-    apply(&x, &s1);
-    apply(&x, &s2);
-    apply(&y, &s1);
-    apply(&y, &s2);
+    TestNet.applyNext(&x, &s1);
+    TestNet.applyNext(&x, &s2);
+    TestNet.applyNext(&y, &s1);
+    TestNet.applyNext(&y, &s2);
     var bx: [state_bytes_max]u8 = undefined;
     var by: [state_bytes_max]u8 = undefined;
     try testing.expectEqualSlices(u8, x.serialize(&bx), y.serialize(&by));
     try testing.expectEqualSlices(u8, &x.head.hash, &y.head.hash);
     var z = t.genesis();
-    apply(&z, &s1);
-    apply(&z, &TxSet.empty);
+    TestNet.applyNext(&z, &s1);
+    TestNet.applyNext(&z, &TxSet.empty);
     try testing.expect(!std.mem.eql(u8, &z.head.hash, &y.head.hash));
     try testing.expectEqualSlices(u8, &y.head.prev_hash, &z.head.prev_hash); // same slot-1 header
 }
@@ -1231,19 +1348,25 @@ test "combine: union, dedup by (source, seq) keeps the smaller encoding, contigu
     const b3 = t.tx(1, 3, .claim, "bob", "", zero_key); // bob starts ahead: dropped
     const c1 = t.tx(2, 1, .claim, "carol", "", zero_key);
 
-    const cands = [_]TxSet{ TestNet.set(&.{ a1, a4 }), TestNet.set(&.{ a1_alt, a2 }), TestNet.set(&.{b3}), TestNet.set(&.{c1}) };
+    const next_time = s.head.close_time + 1;
+    const cands = [_]LedgerValue{
+        .{ .close_time = next_time, .txs = TestNet.set(&.{ a1, a4 }) },
+        .{ .close_time = next_time, .txs = TestNet.set(&.{ a1_alt, a2 }) },
+        .{ .close_time = next_time, .txs = TestNet.set(&.{b3}) },
+        .{ .close_time = next_time, .txs = TestNet.set(&.{c1}) },
+    };
     // Candidate order must not matter.
     const merged = combine(&s, &cands);
-    const cands_rev = [_]TxSet{ cands[3], cands[2], cands[1], cands[0] };
+    const cands_rev = [_]LedgerValue{ cands[3], cands[2], cands[1], cands[0] };
     const merged_rev = combine(&s, &cands_rev);
-    var b1: [max_set_bytes]u8 = undefined;
-    var b2: [max_set_bytes]u8 = undefined;
+    var b1: [max_ledger_value_bytes]u8 = undefined;
+    var b2: [max_ledger_value_bytes]u8 = undefined;
     try testing.expectEqualSlices(u8, merged.encode(&b1), merged_rev.encode(&b2));
-    try testing.expectEqual(@as(u8, 3), merged.count); // a1 or a1_alt, a2, c1
-    try testing.expectEqual(Verdict.valid, validate(&s, &merged));
+    try testing.expectEqual(@as(u8, 3), merged.txs.count); // a1 or a1_alt, a2, c1
+    try testing.expectEqual(Verdict.valid, validate(&s, &merged, s.head.slot + 1));
     var saw_alt = false;
     var saw_a1 = false;
-    for (merged.slice()) |*tx| {
+    for (merged.txs.slice()) |*tx| {
         if (std.mem.eql(u8, tx.nameSlice(), "alice-alt")) saw_alt = true;
         if (std.mem.eql(u8, tx.nameSlice(), "alice") and tx.seq == 1) saw_a1 = true;
         try testing.expect(tx.seq != 4 and !std.mem.eql(u8, tx.nameSlice(), "bob"));
@@ -1258,15 +1381,21 @@ test "combine: union, dedup by (source, seq) keeps the smaller encoding, contigu
     // Cap: 40 contiguous txs from one source select to 32, still contiguous.
     var many: [40]Tx = undefined;
     for (0..40) |i| many[i] = t.tx(2, @intCast(i + 1), .claim, "carol", "", zero_key);
-    const capped = combine(&s, &.{ TestNet.set(many[0..32]), TestNet.set(many[32..40]) });
-    try testing.expectEqual(@as(u8, max_txs), capped.count);
-    try testing.expectEqual(Verdict.valid, validate(&s, &capped));
+    const capped = combine(&s, &.{
+        LedgerValue{ .close_time = next_time, .txs = TestNet.set(many[0..32]) },
+        LedgerValue{ .close_time = next_time, .txs = TestNet.set(many[32..40]) },
+    });
+    try testing.expectEqual(@as(u8, max_txs), capped.txs.count);
+    try testing.expectEqual(Verdict.valid, validate(&s, &capped, s.head.slot + 1));
     apply(&s, &capped);
     try testing.expectEqual(@as(u64, 32), s.accountSeq(t.keys[2]));
     // Now the rest is selectable from the same candidates; the first 32 are replays.
-    const rest = combine(&s, &.{ TestNet.set(many[0..32]), TestNet.set(many[32..40]) });
-    try testing.expectEqual(@as(u8, 8), rest.count);
-    try testing.expectEqual(@as(u64, 33), rest.txs[0].seq);
+    const rest = combine(&s, &.{
+        LedgerValue{ .close_time = s.head.close_time + 1, .txs = TestNet.set(many[0..32]) },
+        LedgerValue{ .close_time = s.head.close_time + 1, .txs = TestNet.set(many[32..40]) },
+    });
+    try testing.expectEqual(@as(u8, 8), rest.txs.count);
+    try testing.expectEqual(@as(u64, 33), rest.txs.txs[0].seq);
 }
 
 // Non-vacuity: `proposal` must sort and deduplicate a pending queue the RPC
@@ -1280,11 +1409,11 @@ test "proposal: pending queue in arrival order becomes a sorted, contiguous set"
         t.tx(0, 1, .claim, "alice", "", zero_key),
         t.tx(0, 1, .claim, "alice", "", zero_key), // duplicate
     };
-    const p = proposal(&s, &pending);
-    try testing.expectEqual(@as(u8, 3), p.count);
-    try testing.expectEqual(Verdict.valid, validate(&s, &p));
-    var buf: [max_set_bytes]u8 = undefined;
-    try testing.expect(TxSet.decode(p.encode(&buf)) != null);
+    const p = proposal(&s, &pending, s.head.close_time + 1).?;
+    try testing.expectEqual(@as(u8, 3), p.txs.count);
+    try testing.expectEqual(Verdict.valid, validate(&s, &p, s.head.slot + 1));
+    var buf: [max_ledger_value_bytes]u8 = undefined;
+    try testing.expect(LedgerValue.decode(p.encode(&buf)) != null);
 }
 
 // The heartbeat is an idle liveness mechanism, not a second busy cadence.
@@ -1300,11 +1429,11 @@ test "nomination cadence: pending work observes the busy minimum while only idle
 
 // Non-vacuity: flipping any byte of the snapshot (checksum, an entry, the
 // recorded root) makes readSnapshot return null.
-test "snapshot: round-trip; checksum, tampering and a wrong root are refused; results are not persisted" {
+test "snapshot V3: round-trip; checksum, tampering and a wrong root are refused; results are not persisted" {
     const t = TestNet.init();
     var s = t.genesis();
-    apply(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
-    apply(&s, &TestNet.set(&.{ t.tx(0, 2, .set, "alice", "v", zero_key), t.tx(0, 3, .claim, "alice", "", zero_key) }));
+    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
+    TestNet.applyNext(&s, &TestNet.set(&.{ t.tx(0, 2, .set, "alice", "v", zero_key), t.tx(0, 3, .claim, "alice", "", zero_key) }));
     try testing.expectEqual(@as(u8, 2), s.last_count);
     var buf: [snapshot_max_bytes]u8 = undefined;
     const snap = writeSnapshot(&s, &buf);
@@ -1316,9 +1445,9 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     try testing.expectEqualStrings("v", back.findName("alice").?.valueSlice());
     try testing.expectEqual(@as(u64, 3), back.accountSeq(t.keys[0]));
     try testing.expectEqual(@as(u8, 0), back.last_count);
-    var expected_set_buf: [max_set_bytes]u8 = undefined;
-    var actual_set_buf: [max_set_bytes]u8 = undefined;
-    try testing.expectEqualSlices(u8, s.last_set.?.encode(&expected_set_buf), back.last_set.?.encode(&actual_set_buf));
+    var expected_value_buf: [max_ledger_value_bytes]u8 = undefined;
+    var actual_value_buf: [max_ledger_value_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, s.last_value.?.encode(&expected_value_buf), back.last_value.?.encode(&actual_value_buf));
     var bx: [state_bytes_max]u8 = undefined;
     var by: [state_bytes_max]u8 = undefined;
     try testing.expectEqualSlices(u8, s.serialize(&bx), back.serialize(&by));
@@ -1329,104 +1458,104 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     try testing.expect(readSnapshot(snap[0 .. snap.len - 1]) == null); // short
     // Tamper with an entry AND fix the checksum: the recorded root disagrees.
     var tampered = buf;
-    const last_set_len: usize = std.mem.readInt(u16, snap[snapshot_fixed_prefix..][0..2], .big);
-    const state_offset = snapshot_fixed_prefix + 2 + last_set_len;
+    const last_value_len: usize = std.mem.readInt(u16, snap[snapshot_fixed_prefix..][0..2], .big);
+    const state_offset = snapshot_fixed_prefix + 2 + last_value_len;
     tampered[state_offset + 1 + 40 + 1 + 66] ^= 1; // first name's first value byte
     const fixed = sha256(tampered[0 .. snap.len - 32]);
     @memcpy(tampered[snap.len - 32 ..][0..32], &fixed);
     try testing.expect(readSnapshot(tampered[0..snap.len]) == null);
     // A lone valid state body with an unrelated header hash is refused too.
     var wrong_head = buf;
-    wrong_head[snap_magic.len + 32 + 8] ^= 1; // head.hash byte
+    wrong_head[snap_magic.len + 32 + 8 + 8] ^= 1; // head.hash byte
     const fixed2 = sha256(wrong_head[0 .. snap.len - 32]);
     @memcpy(wrong_head[snap.len - 32 ..][0..32], &fixed2);
     try testing.expect(readSnapshot(wrong_head[0..snap.len]) == null);
 }
 
-test "snapshot V2: replacing the canonical last set is refused even with a repaired checksum" {
+test "snapshot V3: replacing the canonical last value is refused even with a repaired checksum" {
     const t = TestNet.init();
     var s = t.genesis();
     const original = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
-    apply(&s, &original);
+    TestNet.applyNext(&s, &original);
 
     var snapshot_buf: [snapshot_max_bytes]u8 = undefined;
     const snapshot = writeSnapshot(&s, &snapshot_buf);
-    const set_len: usize = std.mem.readInt(u16, snapshot[snapshot_fixed_prefix..][0..2], .big);
-    try testing.expectEqual(@as(usize, 1 + tx_bytes), set_len);
+    const value_len: usize = std.mem.readInt(u16, snapshot[snapshot_fixed_prefix..][0..2], .big);
+    try testing.expectEqual(@as(usize, value_magic.len + 8 + 1 + tx_bytes), value_len);
 
-    const replacement = TestNet.set(&.{t.tx(0, 1, .claim, "mallory", "", zero_key)});
-    var replacement_buf: [max_set_bytes]u8 = undefined;
+    const replacement: LedgerValue = .{
+        .close_time = s.head.close_time,
+        .txs = TestNet.set(&.{t.tx(0, 1, .claim, "mallory", "", zero_key)}),
+    };
+    var replacement_buf: [max_ledger_value_bytes]u8 = undefined;
     const replacement_bytes = replacement.encode(&replacement_buf);
-    try testing.expectEqual(set_len, replacement_bytes.len);
+    try testing.expectEqual(value_len, replacement_bytes.len);
 
     var tampered = snapshot_buf;
-    @memcpy(tampered[snapshot_fixed_prefix + 2 ..][0..set_len], replacement_bytes);
+    @memcpy(tampered[snapshot_fixed_prefix + 2 ..][0..value_len], replacement_bytes);
     const repaired = sha256(tampered[0 .. snapshot.len - 32]);
     @memcpy(tampered[snapshot.len - 32 ..][0..32], &repaired);
     try testing.expect(readSnapshot(tampered[0..snapshot.len]) == null);
 }
 
-test "snapshot V1: legacy snapshots remain readable without prior consensus context" {
+test "snapshot V3: legacy magic is rejected rather than reinterpreted" {
     const t = TestNet.init();
     var s = t.genesis();
-    apply(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
+    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
 
-    var v2_buf: [snapshot_max_bytes]u8 = undefined;
-    const v2 = writeSnapshot(&s, &v2_buf);
-    const set_len: usize = std.mem.readInt(u16, v2[snapshot_fixed_prefix..][0..2], .big);
-    const state_offset = snapshot_fixed_prefix + 2 + set_len;
-
-    var v1_buf: [snapshot_max_bytes]u8 = undefined;
-    @memcpy(v1_buf[0..snap_magic_v1.len], snap_magic_v1);
-    @memcpy(v1_buf[snap_magic_v1.len..snapshot_fixed_prefix], v2[snap_magic.len..snapshot_fixed_prefix]);
-    const state_len = v2.len - 32 - state_offset;
-    @memcpy(v1_buf[snapshot_fixed_prefix..][0..state_len], v2[state_offset..][0..state_len]);
-    const body_end = snapshot_fixed_prefix + state_len;
-    const checksum = sha256(v1_buf[0..body_end]);
-    @memcpy(v1_buf[body_end..][0..32], &checksum);
-
-    const restored = readSnapshot(v1_buf[0 .. body_end + 32]).?;
-    try testing.expectEqual(s.head.slot, restored.head.slot);
-    try testing.expectEqualSlices(u8, &s.head.hash, &restored.head.hash);
-    try testing.expectEqualStrings("alice", restored.findName("alice").?.nameSlice());
-    try testing.expect(restored.last_set == null);
+    var buf: [snapshot_max_bytes]u8 = undefined;
+    const snapshot = writeSnapshot(&s, &buf);
+    var legacy = buf;
+    @memcpy(legacy[0..snap_magic.len], "REGISTRY-SNAP-V2\n");
+    const checksum = sha256(legacy[0 .. snapshot.len - 32]);
+    @memcpy(legacy[snapshot.len - 32 ..][0..32], &checksum);
+    try testing.expect(readSnapshot(legacy[0..snapshot.len]) == null);
 }
 
-test "snapshot V2: canonical genesis round-trips without inventing a slot-zero header" {
-    const network_id = networkId("snapshot genesis");
-    const genesis: State = .{ .network_id = network_id };
+test "snapshot V3: canonical real genesis round-trips and forged genesis is refused" {
+    const network_id = networkId("snapshot genesis", TestNet.genesis_close_time);
+    const genesis = State.genesis(network_id, TestNet.genesis_close_time);
     var buf: [snapshot_max_bytes]u8 = undefined;
     const encoded = writeSnapshot(&genesis, &buf);
     const restored = readSnapshot(encoded).?;
     try testing.expectEqual(@as(u64, 0), restored.head.slot);
     try testing.expectEqualSlices(u8, &network_id, &restored.network_id);
-    try testing.expect(isZero(&restored.head.hash));
+    try testing.expect(!isZero(&restored.head.hash));
+    try testing.expectEqual(TestNet.genesis_close_time, restored.head.close_time);
     try testing.expectEqual(@as(u8, 0), restored.n_accounts);
     try testing.expectEqual(@as(u8, 0), restored.n_names);
-    try testing.expect(restored.last_set == null);
+    try testing.expect(restored.last_value == null);
 
-    var invalid = genesis;
-    invalid.head.prev_hash = @splat(0x01);
-    const bad = writeSnapshot(&invalid, &buf);
-    try testing.expect(readSnapshot(bad) == null);
+    var forged = buf;
+    const prev_hash_offset = snap_magic.len + 32 + 8 + 8 + 32;
+    forged[prev_hash_offset] ^= 1;
+    const checksum = sha256(forged[0 .. encoded.len - 32]);
+    @memcpy(forged[encoded.len - 32 ..][0..32], &checksum);
+    try testing.expect(readSnapshot(forged[0..encoded.len]) == null);
 }
 
 // Non-vacuity: the golden bytes pin the header format (tag, field order,
 // big-endian slot) and the genesis state root. Change the format on
 // purpose only, and change these with it.
-test "golden: the header chain after one empty slot from genesis" {
-    var s: State = .{ .network_id = networkId("golden") };
-    apply(&s, &TxSet.empty);
+test "E2c golden: canonical genesis and the header after one empty ledger" {
+    const network_id = networkId("testnet", TestNet.genesis_close_time);
+    var s = State.genesis(network_id, TestNet.genesis_close_time);
     const root = std.fmt.bytesToHex(s.head.state_root, .lower);
-    const txset = std.fmt.bytesToHex(s.head.txset_hash, .lower);
-    const head = std.fmt.bytesToHex(s.head.hash, .lower);
     // state root of `00 00` (no accounts, no names)
     try testing.expectEqualStrings("96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7", &root);
+    try testing.expect(isZero(&s.head.txset_hash));
+    try testing.expectEqualStrings(
+        "0ac47307b63113dc84b47d582540229b11198aa5a6175340942f3809479e9474",
+        &std.fmt.bytesToHex(s.head.hash, .lower),
+    );
+
+    apply(&s, &.{ .close_time = TestNet.genesis_close_time + 1, .txs = .empty });
+    const txset = std.fmt.bytesToHex(s.head.txset_hash, .lower);
+    const head = std.fmt.bytesToHex(s.head.hash, .lower);
     // txset hash of the single byte `00`
     try testing.expectEqualStrings("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d", &txset);
-    try testing.expectEqualStrings(golden_head_hash, &head);
+    try testing.expectEqualStrings("15dbc342c6c0942315b5c55422aea3ab62539b699d3cd7f214b97bf0311131c7", &head);
 }
-const golden_head_hash = "bc04bd8fd364882276cd6b2a612a3d5362caa4310d63cf1ca9a892f511b08573";
 
 test "hex helpers" {
     const k: Key = @splat(0xab);
@@ -1436,4 +1565,144 @@ test "hex helpers" {
     try testing.expect(parseKey("zz") == null);
     const not_hex: [64]u8 = @splat('g');
     try testing.expect(parseKey(&not_hex) == null);
+}
+
+test "E2c golden: network descriptor and ledger value use disjoint canonical domains" {
+    const genesis_close_time: u64 = 1_700_000_000;
+    var descriptor_buf: [128]u8 = undefined;
+    const descriptor = networkDescriptor(genesis_close_time, "testnet", &descriptor_buf);
+    try testing.expectEqual(@as(usize, 30), descriptor.len);
+    try testing.expectEqualStrings(
+        "52454749535452592d4e45542d5632000000006553f100746573746e6574",
+        &std.fmt.bytesToHex(descriptor[0..30].*, .lower),
+    );
+    const nid = networkId("testnet", genesis_close_time);
+    try testing.expectEqualStrings(
+        "f43d2c05072db41167a6b75274d123e37df41109114d7ef8793d99b3c96b0bd9",
+        &std.fmt.bytesToHex(nid, .lower),
+    );
+
+    const value: LedgerValue = .{ .close_time = genesis_close_time + 1, .txs = .empty };
+    var value_buf: [max_ledger_value_bytes]u8 = undefined;
+    const encoded = value.encode(&value_buf);
+    try testing.expectEqual(@as(usize, 27), encoded.len);
+    try testing.expectEqualStrings(
+        "52454749535452592d56414c55452d56310a000000006553f10100",
+        &std.fmt.bytesToHex(encoded[0..27].*, .lower),
+    );
+    try testing.expectEqualStrings(
+        "2910206993ce0098f0ce4d10ea9e3c2138212301d42ee4978d1782d042dfdbe0",
+        &std.fmt.bytesToHex(value.hash(), .lower),
+    );
+    try testing.expect(LedgerValue.decode(encoded) != null);
+    try testing.expect(LedgerValue.decode(value.txs.encode(value_buf[0..max_set_bytes])) == null);
+    try testing.expect(TxSet.decode(encoded) == null);
+}
+
+test "E2c contextual validation enforces the exact slot-derived close-time interval" {
+    const t = TestNet.init();
+    var state = t.genesis();
+    state.head.slot = 10;
+    state.head.close_time = 1000;
+
+    const clean = TestNet.set(&.{});
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1001, .txs = clean }, 10));
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1000, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.valid, validate(&state, &.{ .close_time = 1001, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.valid, validate(&state, &.{ .close_time = 1060, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1061, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1002, .txs = clean }, 13));
+    try testing.expectEqual(Verdict.maybe_valid, validate(&state, &.{ .close_time = 1003, .txs = clean }, 13));
+    try testing.expectEqual(Verdict.maybe_valid, validate(&state, &.{ .close_time = 1180, .txs = clean }, 13));
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1181, .txs = clean }, 13));
+
+    const ahead = TestNet.set(&.{t.tx(0, 2, .claim, "ahead", "", zero_key)});
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1001, .txs = ahead }, 11));
+    try testing.expectEqual(Verdict.maybe_valid, validate(&state, &.{ .close_time = 1003, .txs = ahead }, 13));
+    var forged = ahead;
+    forged.txs[0].name[0] = 'x';
+    try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1003, .txs = forged }, 13));
+
+    var near_end = state;
+    near_end.head.close_time = std.math.maxInt(u64) - 5;
+    try testing.expectEqual(Verdict.invalid, validate(&near_end, &.{ .close_time = std.math.maxInt(u64) - 5, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.valid, validate(&near_end, &.{ .close_time = std.math.maxInt(u64) - 4, .txs = clean }, 11));
+    try testing.expectEqual(Verdict.valid, validate(&near_end, &.{ .close_time = std.math.maxInt(u64), .txs = clean }, 11));
+
+    var at_end = state;
+    at_end.head.close_time = std.math.maxInt(u64);
+    try testing.expectEqual(Verdict.invalid, validate(&at_end, &.{ .close_time = std.math.maxInt(u64), .txs = clean }, 11));
+}
+
+test "E2c proposal clamps wall time and combination chooses the minimum candidate time" {
+    const t = TestNet.init();
+    const state = t.genesis();
+    const pending = [_]Tx{
+        t.tx(0, 2, .set, "alice", "v", zero_key),
+        t.tx(0, 1, .claim, "alice", "", zero_key),
+    };
+    const original_pending = pending;
+    const low = proposal(&state, &pending, 1_699_999_900).?;
+    const inside = proposal(&state, &.{}, 1_700_000_025).?;
+    const high = proposal(&state, &.{}, 1_700_009_999).?;
+    try testing.expectEqual(@as(u64, 1_700_000_001), low.close_time);
+    try testing.expectEqual(@as(u64, 1_700_000_025), inside.close_time);
+    try testing.expectEqual(@as(u64, 1_700_000_060), high.close_time);
+    try testing.expect(std.meta.eql(original_pending, pending));
+
+    const combined = combine(&state, &.{
+        LedgerValue{ .close_time = 5, .txs = .empty },
+        LedgerValue{ .close_time = 2, .txs = .empty },
+        LedgerValue{ .close_time = 4, .txs = .empty },
+    });
+    try testing.expectEqual(@as(u64, 2), combined.close_time);
+    const permuted = combine(&state, &.{
+        LedgerValue{ .close_time = 4, .txs = .empty },
+        LedgerValue{ .close_time = 5, .txs = .empty },
+        LedgerValue{ .close_time = 2, .txs = .empty },
+    });
+    try testing.expectEqualSlices(u8, &combined.hash(), &permuted.hash());
+
+    var at_end = state;
+    at_end.head.close_time = std.math.maxInt(u64);
+    try testing.expect(proposal(&at_end, &.{}, 0) == null);
+
+    var near_end = state;
+    near_end.head.close_time = std.math.maxInt(u64) - 5;
+    try testing.expectEqual(std.math.maxInt(u64), proposal(&near_end, &.{}, std.math.maxInt(u64)).?.close_time);
+}
+
+test "E2c apply is a no-op unless value is an exact clean close-time successor" {
+    const t = TestNet.init();
+    const genesis = t.genesis();
+    const clean = TxSet.empty;
+
+    var stale_time = genesis;
+    apply(&stale_time, &.{ .close_time = genesis.head.close_time, .txs = clean });
+    try testing.expect(std.meta.eql(genesis, stale_time));
+
+    var far_time = genesis;
+    apply(&far_time, &.{ .close_time = genesis.head.close_time + max_close_time_step + 1, .txs = clean });
+    try testing.expect(std.meta.eql(genesis, far_time));
+
+    var seq_gap = genesis;
+    apply(&seq_gap, &.{
+        .close_time = genesis.head.close_time + 1,
+        .txs = TestNet.set(&.{t.tx(0, 2, .claim, "ahead", "", zero_key)}),
+    });
+    try testing.expect(std.meta.eql(genesis, seq_gap));
+
+    var exhausted_slot = genesis;
+    exhausted_slot.head.slot = std.math.maxInt(u64);
+    const before_hash = exhausted_slot.head.hash;
+    apply(&exhausted_slot, &.{ .close_time = genesis.head.close_time + 1, .txs = clean });
+    try testing.expectEqual(std.math.maxInt(u64), exhausted_slot.head.slot);
+    try testing.expectEqualSlices(u8, &before_hash, &exhausted_slot.head.hash);
+    try testing.expect(exhausted_slot.last_value == null);
+
+    var applied = genesis;
+    apply(&applied, &.{ .close_time = genesis.head.close_time + max_close_time_step, .txs = clean });
+    try testing.expectEqual(@as(u64, 1), applied.head.slot);
+    try testing.expectEqual(genesis.head.close_time + max_close_time_step, applied.head.close_time);
+    try testing.expectEqual(applied.head.close_time, applied.last_value.?.close_time);
 }
