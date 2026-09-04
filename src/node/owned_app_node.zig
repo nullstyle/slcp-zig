@@ -1328,19 +1328,33 @@ fn pumpSnap(a: *HeapSnapNode, b: *HeapSnapNode, target: u64, deadline_ms: u64) !
         if (res.a) |it| a.release(it);
         if (res.b) |it| b.release(it);
     }
+    var a_value: u64 = 1;
+    var b_value: u64 = 1;
     while (waited < deadline_ms) {
         if (try a.waitApplied(.{ .timeout_ms = 20 })) |item| {
             if (res.a) |old| a.release(old);
             res.a = item;
-            if (item.slot < target) try a.propose(.{ .x = item.obs.entries[item.obs.entries.len - 1] + 1 });
+            a_value = item.obs.entries[item.obs.entries.len - 1] + 1;
+            if (item.slot < target) try a.propose(.{ .x = a_value });
         }
         if (try b.waitApplied(.{ .timeout_ms = 20 })) |item| {
             if (res.b) |old| b.release(old);
             res.b = item;
-            if (item.slot < target) try b.propose(.{ .x = item.obs.entries[item.obs.entries.len - 1] + 1 });
+            b_value = item.obs.entries[item.obs.entries.len - 1] + 1;
+            if (item.slot < target) try b.propose(.{ .x = b_value });
         }
         if ((res.a != null and res.a.?.slot >= target) or (res.b != null and res.b.?.slot >= target))
             return res;
+        // Starvation re-propose: a 2-of-2 pair needs BOTH nodes nominating,
+        // and re-proposing only after an applied item leaves a single stalled
+        // nomination round silent forever (the machine-load flake this
+        // closes — reproduced at the parent commit too). Every ~2 s without
+        // target progress each side re-issues its pending value; nomination
+        // dedups repeats.
+        if (waited % 2000 < 40) {
+            try a.propose(.{ .x = a_value });
+            try b.propose(.{ .x = b_value });
+        }
         waited += 40;
     }
     return error.PumpTimeout;
