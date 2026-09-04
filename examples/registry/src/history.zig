@@ -7,7 +7,7 @@
 //! trusted local storage; immutable per-slot votes plus a monotonic high-water
 //! vote prevent this validator from signing a rollback or equivocation.
 //!
-//! A vote signs SHA-256("REGISTRY-CKPT-V1" || network_id || slot_be ||
+//! A vote signs SHA-256("REGISTRY-CKPT-V2" || network_id || slot_be ||
 //! head_hash || snapshot_hash). Imported votes are evaluated only against the
 //! caller-supplied, normalized quorum set. No quorum policy comes from the
 //! archive.
@@ -31,8 +31,9 @@
 //! after materialization. Archive history is therefore supported only on
 //! Linux and macOS, where these directory barriers exist.
 //! The archive also may not contain the caller-pinned validator-key parent.
-//! Non-genesis legacy Snapshot V1 objects are local-restart inputs only and
-//! are not eligible external checkpoints because they lack nomination context.
+//! Pre-E2c Snapshot V1/V2 objects are not eligible external checkpoints:
+//! neither carries the versioned ledger value and close time required for
+//! exact previous-value recovery. Snapshot V3 is the sole accepted format.
 //!
 //! Candidate discovery deliberately reads only the configured validators'
 //! latest pointers, so work is bounded and no untrusted directory is scanned.
@@ -51,7 +52,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 extern "c" fn mkfifoat(dir_fd: std.posix.fd_t, path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
-const tag: *const [16]u8 = "REGISTRY-CKPT-V1";
+const tag: *const [16]u8 = "REGISTRY-CKPT-V2";
 const assertion_bytes = tag.len + 32 + 8 + 32 + 32;
 const vote_bytes = assertion_bytes + 32 + 64;
 const max_candidates = 16;
@@ -257,11 +258,10 @@ pub const Archive = struct {
     pub fn recordApplied(self: *Archive, state: *const registry.State) !RecordStatus {
         if (state.head.slot == 0 or state.head.slot % self.checkpoint_every != 0) return .not_due;
         if (state.head.slot == std.math.maxInt(u64)) return error.CheckpointSlotOverflow;
-        const last_set = state.last_set orelse return error.InvalidAppliedState;
         if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
             !std.mem.eql(u8, &state.head.state_root, &state.stateRoot()) or
-            !std.mem.eql(u8, &state.head.hash, &registry.headerHash(&state.head)) or
-            !std.mem.eql(u8, &state.head.txset_hash, &last_set.hash()))
+            !std.mem.eql(u8, &state.head.hash, &registry.headerHash(state.network_id, &state.head)) or
+            !hasExactLastValue(state))
             return error.InvalidAppliedState;
 
         var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
@@ -375,11 +375,10 @@ pub const Archive = struct {
         if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
             state.head.slot != assertion.slot or
             !std.mem.eql(u8, &state.head.hash, &assertion.head_hash)) return null;
-        // V1 remains a local restart format, where the journal can supply the
-        // predecessor value. Never import it as an external checkpoint: main
-        // must be able to install every authenticated state directly as V2,
-        // including the exact command needed for next-slot nomination.
-        if (state.head.slot > 0 and state.last_set == null) return null;
+        // Every external checkpoint must carry the exact value needed as the
+        // next slot's previous-value context. Pre-E2c snapshots cannot supply
+        // that value and are therefore never eligible for import.
+        if (!hasExactLastValue(&state)) return null;
         return state;
     }
 
@@ -689,6 +688,13 @@ fn hash(bytes: []const u8) [32]u8 {
     return h.finalResult();
 }
 
+fn hasExactLastValue(state: *const registry.State) bool {
+    if (state.head.slot == 0) return state.last_value == null;
+    const last_value = state.last_value orelse return false;
+    return state.head.close_time == last_value.close_time and
+        std.mem.eql(u8, &state.head.txset_hash, &last_value.txs.hash());
+}
+
 fn nodeLessThan(_: void, a: slcp.NodeId, b: slcp.NodeId) bool {
     return std.mem.order(u8, &a, &b) == .lt;
 }
@@ -727,6 +733,35 @@ fn writeHex(bytes: []const u8, out: []u8) void {
 }
 
 const testing = std.testing;
+const test_genesis_close_time: u64 = 1_700_000_000;
+
+fn testNetworkId(passphrase: []const u8) [32]u8 {
+    return registry.networkId(passphrase, test_genesis_close_time);
+}
+
+test "history checkpoint: V2 signing domain has a fixed digest and rejects V1 vote bytes" {
+    const assertion: Assertion = .{
+        .network_id = @splat(0x11),
+        .slot = 0x0102030405060708,
+        .head_hash = @splat(0x22),
+        .snapshot_hash = @splat(0x33),
+    };
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "85c437499c76a987150ce38fca3098c8deb6571ebc72a710ec55cf6df2188028");
+    try testing.expectEqualSlices(u8, &expected, &assertion.digest());
+
+    var encoded: [vote_bytes]u8 = undefined;
+    encodeVote(.{
+        .assertion = assertion,
+        .signer = @splat(0x44),
+        .signature = @splat(0x55),
+    }, &encoded);
+    try testing.expectEqualStrings("REGISTRY-CKPT-V2", encoded[0..tag.len]);
+
+    var legacy = encoded;
+    @memcpy(legacy[0..tag.len], "REGISTRY-CKPT-V1");
+    try testing.expect(decodeVote(&legacy) == null);
+}
 
 fn testPath(tmp: *std.testing.TmpDir, io: std.Io, suffix: []const u8, buf: []u8) ![]const u8 {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -735,9 +770,17 @@ fn testPath(tmp: *std.testing.TmpDir, io: std.Io, suffix: []const u8, buf: []u8)
 }
 
 fn stateAt(network_id: [32]u8, slot: u64) registry.State {
-    var state: registry.State = .{ .network_id = network_id };
-    for (0..slot) |_| registry.apply(&state, &registry.TxSet.empty);
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    for (0..slot) |_| applySet(&state, &registry.TxSet.empty);
     return state;
+}
+
+fn applySet(state: *registry.State, set: *const registry.TxSet) void {
+    const value: registry.LedgerValue = .{
+        .close_time = state.head.close_time + 1,
+        .txs = set.*,
+    };
+    registry.apply(state, &value);
 }
 
 fn overwriteTestFileAt(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
@@ -783,7 +826,7 @@ test "history archive: checkpoint cadence defaults to eight and is bounded by th
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x08);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history checkpoint cadence");
+    const network_id = testNetworkId("history checkpoint cadence");
     const base: Config = .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -807,6 +850,58 @@ test "history archive: checkpoint cadence defaults to eight and is bounded by th
     try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&eight));
 }
 
+test "history archive: recordApplied requires the exact last ledger value time and transaction hash" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x19);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history exact last value");
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 1,
+    });
+    defer archive.deinit();
+
+    const canonical = stateAt(network_id, 1);
+
+    var missing = canonical;
+    missing.last_value = null;
+    try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&missing));
+
+    var wrong_value_time = canonical;
+    wrong_value_time.last_value.?.close_time += 1;
+    try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_value_time));
+
+    var wrong_head_time = canonical;
+    wrong_head_time.head.close_time += 1;
+    wrong_head_time.head.hash = registry.headerHash(network_id, &wrong_head_time.head);
+    try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_head_time));
+
+    var wrong_txs = canonical;
+    wrong_txs.last_value.?.txs = .{ .count = 1 };
+    wrong_txs.last_value.?.txs.txs[0] = registry.Tx.init(
+        @splat(0x55),
+        1,
+        .claim,
+        "other",
+        "",
+        registry.zero_key,
+    ).?;
+    try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_txs));
+
+    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&canonical));
+}
+
 test "history archive: a persistently blocked checkpoint does not pin the signing fence" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -818,7 +913,7 @@ test "history archive: a persistently blocked checkpoint does not pin the signin
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x18);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history skip blocked checkpoint");
+    const network_id = testNetworkId("history skip blocked checkpoint");
 
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
@@ -868,7 +963,7 @@ test "history archive: trusted signing custody must not overlap the untrusted ar
     try tmp.dir.createDirPath(io, "trusted");
     const seed: [32]u8 = @splat(0x09);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history root separation");
+    const network_id = testNetworkId("history root separation");
     const quorum = slcp.Quorum.of(1, &.{id});
 
     const cases = [_][2][]const u8{
@@ -908,7 +1003,7 @@ test "history archive: the untrusted archive must be disjoint from the entire pr
 
     const seed: [32]u8 = @splat(0x0a);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history private data separation");
+    const network_id = testNetworkId("history private data separation");
     const network_hex = registry.hex32(network_id);
     const cases = [_]struct {
         data_rel: []const u8,
@@ -970,7 +1065,7 @@ test "history archive: the untrusted archive may share a parent with, but cannot
     const signing_path = try testPath(&tmp, io, "signing-contained-key", &signing_buf);
     const seed: [32]u8 = @splat(0x0b);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history key custody separation");
+    const network_id = testNetworkId("history key custody separation");
 
     try testing.expectError(error.HistoryRootsOverlap, Archive.open(gpa, io, .{
         .archive_dir = archive_path,
@@ -1018,7 +1113,7 @@ test "history archive: a flat 2-of-3 checkpoint needs two distinct validator sig
         try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
     };
     const quorum = slcp.Quorum.of(2, &ids);
-    const network_id = registry.networkId("history flat 2-of-3");
+    const network_id = testNetworkId("history flat 2-of-3");
     const state = stateAt(network_id, 1);
 
     var a = try Archive.open(gpa, io, .{
@@ -1072,7 +1167,7 @@ test "history archive: nested quorum satisfaction is not a flat signer count" {
     };
     const inner = [_]slcp.Quorum{slcp.Quorum.of(2, ids[1..3])};
     const quorum = slcp.Quorum{ .threshold = 2, .validators = ids[0..1], .inner_sets = &inner };
-    const network_id = registry.networkId("history nested quorum");
+    const network_id = testNetworkId("history nested quorum");
     const state = stateAt(network_id, 1);
 
     var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
@@ -1105,7 +1200,7 @@ test "history archive: candidate discovery fails closed beyond its linear-work c
         id.* = try slcp.core.crypto.publicKeyFromSeed(seed.*);
     }
     const quorum = slcp.Quorum.of(max_candidates + 1, &ids);
-    const network_id = registry.networkId("history candidate cap");
+    const network_id = testNetworkId("history candidate cap");
 
     for (seeds, 0..) |seed, i| {
         var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1150,7 +1245,7 @@ test "history archive: bootstrap floor prevents rollback to an older valid check
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x41);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history rollback floor");
+    const network_id = testNetworkId("history rollback floor");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1177,7 +1272,7 @@ test "history archive: durable signing fences reject same-slot equivocation and 
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x51);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history signing fence");
+    const network_id = testNetworkId("history signing fence");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1200,12 +1295,12 @@ test "history archive: durable signing fences reject same-slot equivocation and 
         .checkpoint_every = 1,
     });
 
-    var conflicting: registry.State = .{ .network_id = network_id };
+    var conflicting = registry.State.genesis(network_id, test_genesis_close_time);
     const source: registry.Key = @splat(0x61);
     const tx = registry.Tx.init(source, 1, .claim, "fork", "", registry.zero_key).?;
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    registry.apply(&conflicting, &set);
+    applySet(&conflicting, &set);
     try testing.expectError(error.SigningEquivocation, archive.recordApplied(&conflicting));
 
     const two = stateAt(network_id, 2);
@@ -1232,7 +1327,7 @@ test "history archive: duplicate, outsider, and misnamed votes do not satisfy 2-
         try slcp.core.crypto.publicKeyFromSeed(seeds[1]),
         try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
     };
-    const network_id = registry.networkId("history distinct signers");
+    const network_id = testNetworkId("history distinct signers");
     const quorum = slcp.Quorum.of(2, &ids);
     var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer a.deinit();
@@ -1295,7 +1390,7 @@ test "history archive: snapshot hash and signed network/head bind imported state
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x81);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history snapshot binding");
+    const network_id = testNetworkId("history snapshot binding");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1311,12 +1406,12 @@ test "history archive: snapshot hash and signed network/head bind imported state
     // Replace the object with a different snapshot that is internally
     // canonical and self-consistent. Its checksum, state root and head all
     // verify, but the old signed assertion names the original snapshot hash.
-    var substitute: registry.State = .{ .network_id = network_id };
+    var substitute = registry.State.genesis(network_id, test_genesis_close_time);
     const source: registry.Key = @splat(0x82);
     const tx = registry.Tx.init(source, 1, .claim, "substitute", "", registry.zero_key).?;
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    registry.apply(&substitute, &set);
+    applySet(&substitute, &set);
     var original_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const original = registry.writeSnapshot(&state, &original_buf);
     var snapshot_name_buf: [max_name_bytes]u8 = undefined;
@@ -1332,7 +1427,7 @@ test "history archive: snapshot hash and signed network/head bind imported state
     var latest_name_buf: [max_name_bytes]u8 = undefined;
     const latest_name = latestName(id, &latest_name_buf);
     const foreign_assertion = Assertion{
-        .network_id = registry.networkId("foreign assertion network"),
+        .network_id = testNetworkId("foreign assertion network"),
         .slot = 1,
         .head_hash = state.head.hash,
         .snapshot_hash = hash(original),
@@ -1396,21 +1491,21 @@ test "history archive: snapshot hash and signed network/head bind imported state
     try archive.writeAtomic(archive.latest_dir, latest_name, &vote_buf);
     try testing.expect((try archive.loadLatest(1)) == null);
 
-    const wrong_network = stateAt(registry.networkId("other history network"), 1);
+    const wrong_network = stateAt(testNetworkId("other history network"), 1);
     try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_network));
 
     var missing_context = state;
-    missing_context.last_set = null;
+    missing_context.last_value = null;
     try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&missing_context));
 
     var wrong_context = state;
     var other_set: registry.TxSet = .{ .count = 1 };
     other_set.txs[0] = registry.Tx.init(@splat(0x55), 1, .claim, "other", "", registry.zero_key).?;
-    wrong_context.last_set = other_set;
+    wrong_context.last_value.?.txs = other_set;
     try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_context));
 }
 
-test "history archive: legacy snapshots are local-restart only, never external checkpoints" {
+test "history archive: pre-E2c snapshot versions are never external checkpoints" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1421,7 +1516,7 @@ test "history archive: legacy snapshots are local-restart only, never external c
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x83);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history rejects V1 checkpoint");
+    const network_id = testNetworkId("history rejects pre-E2c checkpoint");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1433,31 +1528,104 @@ test "history archive: legacy snapshots are local-restart only, never external c
     defer archive.deinit();
 
     const state = stateAt(network_id, 1);
-    var v2_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const v2 = registry.writeSnapshot(&state, &v2_buf);
-    const fixed_prefix = registry.snap_magic.len + 32 + 8 + 4 * 32;
-    const set_len: usize = std.mem.readInt(u16, v2[fixed_prefix..][0..2], .big);
-    const state_offset = fixed_prefix + 2 + set_len;
-    var v1_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    @memcpy(v1_buf[0..registry.snap_magic_v1.len], registry.snap_magic_v1);
-    @memcpy(v1_buf[registry.snap_magic_v1.len..fixed_prefix], v2[registry.snap_magic.len..fixed_prefix]);
-    const state_len = v2.len - 32 - state_offset;
-    @memcpy(v1_buf[fixed_prefix..][0..state_len], v2[state_offset..][0..state_len]);
-    const body_end = fixed_prefix + state_len;
-    const checksum = hash(v1_buf[0..body_end]);
-    @memcpy(v1_buf[body_end..][0..32], &checksum);
-    const v1 = v1_buf[0 .. body_end + 32];
-    try testing.expect(registry.readSnapshot(v1).?.last_set == null);
+    var current_buf: [registry.snapshot_max_bytes]u8 = undefined;
+    const current = registry.writeSnapshot(&state, &current_buf);
+    var legacy_buf = current_buf;
+    const legacy_magic = "REGISTRY-SNAP-V2\n";
+    comptime std.debug.assert(legacy_magic.len == registry.snap_magic.len);
+    @memcpy(legacy_buf[0..legacy_magic.len], legacy_magic);
+    const body_end = current.len - 32;
+    const checksum = hash(legacy_buf[0..body_end]);
+    @memcpy(legacy_buf[body_end..][0..32], &checksum);
+    const legacy = legacy_buf[0..current.len];
+    try testing.expect(registry.readSnapshot(legacy) == null);
 
     const assertion: Assertion = .{
         .network_id = network_id,
         .slot = state.head.slot,
         .head_hash = state.head.hash,
-        .snapshot_hash = hash(v1),
+        .snapshot_hash = hash(legacy),
     };
     var name_buf: [max_name_bytes]u8 = undefined;
-    try archive.writeImmutable(archive.snapshots_dir, snapshotName(assertion.snapshot_hash, &name_buf), v1);
+    try archive.writeImmutable(archive.snapshots_dir, snapshotName(assertion.snapshot_hash, &name_buf), legacy);
     try testing.expect((try archive.loadSnapshot(assertion)) == null);
+}
+
+test "history archive: imported snapshots bind the last value close time and transaction hash" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x84);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history last value snapshot binding");
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 1,
+    });
+    defer archive.deinit();
+
+    const fixed_prefix = registry.snap_magic.len + 32 + 8 + 8 + 4 * 32;
+    const value_offset = fixed_prefix + 2;
+
+    const empty = stateAt(network_id, 1);
+    var time_buf: [registry.snapshot_max_bytes]u8 = undefined;
+    const time_snapshot = registry.writeSnapshot(&empty, &time_buf);
+    time_buf[value_offset + registry.value_magic.len + 7] ^= 1;
+    var body_end = time_snapshot.len - 32;
+    var checksum = hash(time_buf[0..body_end]);
+    @memcpy(time_buf[body_end..][0..32], &checksum);
+    const tampered_time = time_buf[0..time_snapshot.len];
+    const time_value_len: usize = std.mem.readInt(u16, time_buf[fixed_prefix..][0..2], .big);
+    try testing.expect(registry.LedgerValue.decode(time_buf[value_offset..][0..time_value_len]) != null);
+    const time_assertion: Assertion = .{
+        .network_id = network_id,
+        .slot = empty.head.slot,
+        .head_hash = empty.head.hash,
+        .snapshot_hash = hash(tampered_time),
+    };
+    var name_buf: [max_name_bytes]u8 = undefined;
+    try archive.writeImmutable(
+        archive.snapshots_dir,
+        snapshotName(time_assertion.snapshot_hash, &name_buf),
+        tampered_time,
+    );
+    try testing.expect((try archive.loadSnapshot(time_assertion)) == null);
+
+    var with_tx = registry.State.genesis(network_id, test_genesis_close_time);
+    var txs: registry.TxSet = .{ .count = 1 };
+    txs.txs[0] = registry.Tx.init(@splat(0x85), 1, .claim, "bound", "", registry.zero_key).?;
+    applySet(&with_tx, &txs);
+    var tx_buf: [registry.snapshot_max_bytes]u8 = undefined;
+    const tx_snapshot = registry.writeSnapshot(&with_tx, &tx_buf);
+    const first_signature = value_offset + registry.value_magic.len + 8 + 1 + registry.unsigned_tx_bytes;
+    tx_buf[first_signature] ^= 1;
+    body_end = tx_snapshot.len - 32;
+    checksum = hash(tx_buf[0..body_end]);
+    @memcpy(tx_buf[body_end..][0..32], &checksum);
+    const tampered_tx = tx_buf[0..tx_snapshot.len];
+    const tx_value_len: usize = std.mem.readInt(u16, tx_buf[fixed_prefix..][0..2], .big);
+    try testing.expect(registry.LedgerValue.decode(tx_buf[value_offset..][0..tx_value_len]) != null);
+    const tx_assertion: Assertion = .{
+        .network_id = network_id,
+        .slot = with_tx.head.slot,
+        .head_hash = with_tx.head.hash,
+        .snapshot_hash = hash(tampered_tx),
+    };
+    try archive.writeImmutable(
+        archive.snapshots_dir,
+        snapshotName(tx_assertion.snapshot_hash, &name_buf),
+        tampered_tx,
+    );
+    try testing.expect((try archive.loadSnapshot(tx_assertion)) == null);
 }
 
 test "history archive: torn untrusted pointer, snapshot, or vote is ignored" {
@@ -1471,7 +1639,7 @@ test "history archive: torn untrusted pointer, snapshot, or vote is ignored" {
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x91);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history torn archive files");
+    const network_id = testNetworkId("history torn archive files");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1518,7 +1686,7 @@ test "history archive: a torn trusted signing fence fails closed" {
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x99);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history torn signing fence");
+    const network_id = testNetworkId("history torn signing fence");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1535,6 +1703,50 @@ test "history archive: a torn trusted signing fence fails closed" {
     try testing.expectError(error.SigningFenceCorrupt, archive.recordApplied(&two));
 }
 
+test "history archive: a V1 trusted signing fence fails closed during migration" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x98);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history V1 signing fence");
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 1,
+    });
+    defer archive.deinit();
+
+    const state = stateAt(network_id, 1);
+    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    const assertion: Assertion = .{
+        .network_id = network_id,
+        .slot = state.head.slot,
+        .head_hash = state.head.hash,
+        .snapshot_hash = hash(snapshot),
+    };
+    var legacy: [vote_bytes]u8 = undefined;
+    encodeVote(.{
+        .assertion = assertion,
+        .signer = id,
+        .signature = try slcp.core.crypto.sign(seed, assertion.digest()),
+    }, &legacy);
+    @memcpy(legacy[0..tag.len], "REGISTRY-CKPT-V1");
+    try overwriteTestFileAt(io, archive.signing_dir, "high-water.vote", &legacy);
+
+    try testing.expectError(error.SigningFenceCorrupt, archive.recordApplied(&state));
+    try testing.expect((try archive.loadLatest(1)) == null);
+}
+
 test "history archive: each trusted directory barrier precedes shared publication" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1542,7 +1754,7 @@ test "history archive: each trusted directory barrier precedes shared publicatio
     defer tmp.cleanup();
     const seed: [32]u8 = @splat(0x9a);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history directory barriers");
+    const network_id = testNetworkId("history directory barriers");
     const state = stateAt(network_id, 1);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
@@ -1603,7 +1815,7 @@ test "history archive: a trusted file-sync failure precedes shared publication" 
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0x9b);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history file sync barrier");
+    const network_id = testNetworkId("history file sync barrier");
     const state = stateAt(network_id, 1);
 
     var archive = try Archive.open(gpa, io, .{
@@ -1647,7 +1859,7 @@ test "history archive: two quorum-certified heads at one slot fail closed" {
         try slcp.core.crypto.publicKeyFromSeed(seeds[1]),
         try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
     };
-    const network_id = registry.networkId("history certified fork");
+    const network_id = testNetworkId("history certified fork");
     const quorum = slcp.Quorum.of(2, &ids);
     var ax = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[0], .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer ax.deinit();
@@ -1668,7 +1880,7 @@ test "history archive: two quorum-certified heads at one slot fail closed" {
     const tx = registry.Tx.init(source, 1, .claim, "other-head", "", registry.zero_key).?;
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    registry.apply(&y, &set);
+    applySet(&y, &set);
     _ = try by.recordApplied(&y);
     _ = try cy.recordApplied(&y);
 
@@ -1688,7 +1900,7 @@ test "history archive: untrusted namespace directories may not be symlinks" {
     defer tmp.cleanup();
     const seed: [32]u8 = @splat(0xb1);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history namespace symlinks");
+    const network_id = testNetworkId("history namespace symlinks");
     const network_hex = registry.hex32(network_id);
     const cases = [_]?[]const u8{ null, "snapshots", "votes", "latest" };
     var archive_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
@@ -1741,7 +1953,7 @@ test "history archive: replacing an opened namespace with symlinks cannot redire
     defer tmp.cleanup();
     const seed: [32]u8 = @splat(0xb2);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history namespace replacement");
+    const network_id = testNetworkId("history namespace replacement");
     const network_hex = registry.hex32(network_id);
     const state = stateAt(network_id, 1);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
@@ -1831,7 +2043,7 @@ test "history archive: exact object symlinks are never followed" {
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0xb3);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history object symlinks");
+    const network_id = testNetworkId("history object symlinks");
     const state = stateAt(network_id, 1);
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
@@ -1885,7 +2097,7 @@ test "history archive: a FIFO object is rejected without blocking discovery" {
     const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
     const seed: [32]u8 = @splat(0xb4);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("history fifo object");
+    const network_id = testNetworkId("history fifo object");
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
