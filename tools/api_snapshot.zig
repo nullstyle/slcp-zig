@@ -148,6 +148,45 @@ const RefInst = struct { path: []const u8, ty: type };
 const reference_instantiations = [_]RefInst{
     .{ .path = "slcp.Codec(Counter.Command)", .ty = slcp.Codec(Counter.Command) },
     .{ .path = "slcp.AppNode(Counter)", .ty = slcp.AppNode(Counter) },
+    // The heap-state adapter is Experimental: NO stable rule covers this
+    // instantiation, so its members land in the Experimental file by the
+    // default tier. Walking it keeps that file an honest change detector for
+    // the surface a consumer calls (create/propose/waitApplied/release).
+    .{ .path = "slcp.OwnedAppNode(OwnedCounter)", .ty = slcp.OwnedAppNode(OwnedCounter) },
+};
+
+/// The reference heap application for `OwnedAppNode`: the §0 counter with an
+/// owned log and a plain-data observation — the minimal honest shape of the
+/// owned contract (allocation in apply, nothing to free in Obs).
+const OwnedCounter = struct {
+    pub const State = struct { count: u64 = 0, log: std.ArrayListUnmanaged(u64) = .empty };
+    pub const Command = struct { next: u64 };
+    pub const Obs = struct { count: u64 };
+    pub const Context = void;
+    pub const InitError = error{OutOfMemory};
+
+    pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State {
+        _ = context;
+        _ = gpa;
+        return .{};
+    }
+    pub fn deinitState(state: *State, gpa: std.mem.Allocator) void {
+        state.log.deinit(gpa);
+    }
+    pub fn validate(state: *const State, cmd: Command, context: slcp.ValueContext) slcp.Validity {
+        _ = context;
+        if (cmd.next == state.count + 1) return .valid;
+        if (cmd.next > state.count + 1) return .maybe_valid; // this node may be behind
+        return .invalid;
+    }
+    pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        try state.log.append(gpa, cmd.next);
+        state.count = cmd.next;
+    }
+    pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs {
+        _ = gpa;
+        return .{ .count = state.count };
+    }
 };
 
 const stable_rules = [_]Rule{

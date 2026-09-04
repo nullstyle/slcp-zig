@@ -63,6 +63,14 @@ pub const DriverError = core.driver.DriverError;
 /// what `AppNode` installs for itself.
 pub const DeliveryHook = node.DeliveryHook;
 
+// ===== heap-state adapter exports =====
+// OwnedAppNode (Experimental): the opt-in heap-state sibling of AppNode —
+// initState/deinitState ownership, in-place allocating apply, and an
+// app-defined observation instead of a per-slot State copy. AppNode's
+// Stable surface is unchanged; see src/node/owned_app_node.zig.
+pub const owned_app_node = @import("node/owned_app_node.zig");
+pub const OwnedAppNode = owned_app_node.OwnedAppNode;
+
 test {
     // Discover every node-layer module's tests under `zig build node-tests`.
     std.testing.refAllDecls(@This());

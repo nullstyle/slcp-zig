@@ -655,6 +655,31 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(appnode_errors_step);
 
+    // owned-appnode-errors: the same pinning discipline for the heap-state
+    // adapter's contract (src/node/owned_app_node.zig, Experimental). Every
+    // `contractError(App, "…")` site there has one expected-fail object
+    // (tests/appnode_errors/owned_*.zig); the auto-codec's own rejections
+    // fire from app_node.zig's Codec(T) and stay pinned by the rows above.
+    // The docs-smoke "owned-appnode-errors liveness" unit test counts the
+    // sites in owned_app_node.zig against this table.
+    const owned_appnode_error_cases = @import("tests/appnode_errors/cases.zig").owned_cases;
+    comptime std.debug.assert(owned_appnode_error_cases.len == 25);
+    const owned_appnode_errors_step = b.step("owned-appnode-errors", "Expected-fail compile of every OwnedAppNode contract teaching error (part of `test`)");
+    for (owned_appnode_error_cases) |case| {
+        const obj = b.addObject(.{
+            .name = b.fmt("owned-appnode-err-{s}", .{case.stem}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("tests/appnode_errors/{s}.zig", .{case.stem})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
+            }),
+        });
+        obj.expect_errors = .{ .contains = case.needle };
+        owned_appnode_errors_step.dependOn(&obj.step);
+    }
+    test_step.dependOn(owned_appnode_errors_step);
+
     // Codec fuzz target (§8.5 strict-canonical + order-preserving auto-codec):
     // one std.testing.fuzz target + a 5000-iteration deterministic smoke,
     // under both `fuzz-smoke` (part of `test`) and `fuzz`.

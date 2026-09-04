@@ -105,6 +105,81 @@ slcp.NodeOptions.secret_seed: field ?[32]u8 = null
 slcp.NodeOptions.start_slot: field u64 = 1
 slcp.NodeOptions.strict_canonical: field bool = true
 slcp.NodeOptions.watcher: field bool = false
+slcp.OwnedAppNode(OwnedCounter).Applied.obs: field api_snapshot.OwnedCounter.Obs
+slcp.OwnedAppNode(OwnedCounter).Applied.slot: field u64
+slcp.OwnedAppNode(OwnedCounter).Applied: struct
+slcp.OwnedAppNode(OwnedCounter).Command.next: field u64
+slcp.OwnedAppNode(OwnedCounter).Command: struct
+slcp.OwnedAppNode(OwnedCounter).Context: type = void
+slcp.OwnedAppNode(OwnedCounter).CreateError: type = error{AnsweringWindowSlotsOutOfRange,AppInitFailed,BadPeerSpec,CommandExceedsMaxValueBytes,ConflictingIdentity,DataDirAccessDenied,DataDirBusy,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,InitialSlotOutsideJournal,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,KeyFileTooPermissive,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UndecodableExternalizedValue,UnsafeQuorum,WatcherHasIdentity}
+slcp.OwnedAppNode(OwnedCounter).InitError: type = error{OutOfMemory}
+slcp.OwnedAppNode(OwnedCounter).Obs.count: field u64
+slcp.OwnedAppNode(OwnedCounter).Obs: struct
+slcp.OwnedAppNode(OwnedCounter).Options.allow_unsafe_quorum: field bool = false
+slcp.OwnedAppNode(OwnedCounter).Options.answering_window_slots: field u8 = 16
+slcp.OwnedAppNode(OwnedCounter).Options.data_dir: field []const u8
+slcp.OwnedAppNode(OwnedCounter).Options.diagnostic: field ?*node.node.Diagnostic = null
+slcp.OwnedAppNode(OwnedCounter).Options.include_self: field bool = true
+slcp.OwnedAppNode(OwnedCounter).Options.key_file: field ?[]const u8 = null
+slcp.OwnedAppNode(OwnedCounter).Options.listen_port: field u16
+slcp.OwnedAppNode(OwnedCounter).Options.max_value_bytes: field u32 = 4096
+slcp.OwnedAppNode(OwnedCounter).Options.network: field []const u8
+slcp.OwnedAppNode(OwnedCounter).Options.node_id: field ?[32]u8 = null
+slcp.OwnedAppNode(OwnedCounter).Options.peers: field []const []const u8 = <default>
+slcp.OwnedAppNode(OwnedCounter).Options.quorum: field quorum.Quorum
+slcp.OwnedAppNode(OwnedCounter).Options.secret_seed: field ?[32]u8 = null
+slcp.OwnedAppNode(OwnedCounter).Options.start_slot: field u64 = 1
+slcp.OwnedAppNode(OwnedCounter).Options.strict_canonical: field bool = true
+slcp.OwnedAppNode(OwnedCounter).Options.watcher: field bool = false
+slcp.OwnedAppNode(OwnedCounter).Options: struct
+slcp.OwnedAppNode(OwnedCounter).ProposeError: type = error{OutOfMemory,ValueEmpty,ValueTooLarge,WatcherCannotPropose}
+slcp.OwnedAppNode(OwnedCounter).State.count: field u64 = 0
+slcp.OwnedAppNode(OwnedCounter).State.log: field array_list.Aligned(u64,null) = <default>
+slcp.OwnedAppNode(OwnedCounter).State: struct
+slcp.OwnedAppNode(OwnedCounter).WaitError: type = error{NodeHalted}
+slcp.OwnedAppNode(OwnedCounter).WaitOptions.timeout_ms: field ?u64 = null
+slcp.OwnedAppNode(OwnedCounter).WaitOptions: struct
+slcp.OwnedAppNode(OwnedCounter).applied_hwm: field u64 = 0
+slcp.OwnedAppNode(OwnedCounter).apply_failed_slot: field ?u64 = null
+slcp.OwnedAppNode(OwnedCounter).closed: field bool = false
+slcp.OwnedAppNode(OwnedCounter).codec.Value.next: field u64
+slcp.OwnedAppNode(OwnedCounter).codec.Value: struct
+slcp.OwnedAppNode(OwnedCounter).codec.decode: fn ([]const u8) ?api_snapshot.OwnedCounter.Command
+slcp.OwnedAppNode(OwnedCounter).codec.encode: fn (api_snapshot.OwnedCounter.Command, []u8) []u8
+slcp.OwnedAppNode(OwnedCounter).codec.is_custom: const bool = false
+slcp.OwnedAppNode(OwnedCounter).codec.order: fn (api_snapshot.OwnedCounter.Command, api_snapshot.OwnedCounter.Command) math.Order
+slcp.OwnedAppNode(OwnedCounter).codec.size: const usize = 8
+slcp.OwnedAppNode(OwnedCounter).codec: struct
+slcp.OwnedAppNode(OwnedCounter).cond: field Io.Condition = <default>
+slcp.OwnedAppNode(OwnedCounter).create: fn (mem.Allocator, Io, node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter).Options__struct_*, void) error{AnsweringWindowSlotsOutOfRange,AppInitFailed,BadPeerSpec,CommandExceedsMaxValueBytes,ConflictingIdentity,DataDirAccessDenied,DataDirBusy,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,InitialSlotOutsideJournal,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,KeyFileTooPermissive,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UndecodableExternalizedValue,UnsafeQuorum,WatcherHasIdentity}!*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)
+slcp.OwnedAppNode(OwnedCounter).created: field atomic.Value(bool) = <default>
+slcp.OwnedAppNode(OwnedCounter).deinit: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)) void
+slcp.OwnedAppNode(OwnedCounter).drained: field Io.Condition = <default>
+slcp.OwnedAppNode(OwnedCounter).driver: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)) driver.Driver
+slcp.OwnedAppNode(OwnedCounter).gpa: field mem.Allocator
+slcp.OwnedAppNode(OwnedCounter).haltError: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)) ?anyerror
+slcp.OwnedAppNode(OwnedCounter).halt_err: field ?anyerror = null
+slcp.OwnedAppNode(OwnedCounter).head: field usize = 0
+slcp.OwnedAppNode(OwnedCounter).initial_command_missing: field bool = false
+slcp.OwnedAppNode(OwnedCounter).initial_command_present: field bool = false
+slcp.OwnedAppNode(OwnedCounter).io: field Io
+slcp.OwnedAppNode(OwnedCounter).max_value_bytes: field u32
+slcp.OwnedAppNode(OwnedCounter).mu: field Io.Mutex = <default>
+slcp.OwnedAppNode(OwnedCounter).n: field ?*node.node.Node = null
+slcp.OwnedAppNode(OwnedCounter).obs_owns_memory: const bool = false
+slcp.OwnedAppNode(OwnedCounter).observe_failed_slot: field ?u64 = null
+slcp.OwnedAppNode(OwnedCounter).propose: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter), api_snapshot.OwnedCounter.Command) error{OutOfMemory,ValueEmpty,ValueTooLarge,WatcherCannotPropose}!void
+slcp.OwnedAppNode(OwnedCounter).queue: field array_list.Aligned(node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter).Applied,null) = <default>
+slcp.OwnedAppNode(OwnedCounter).raw: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)) *node.node.Node
+slcp.OwnedAppNode(OwnedCounter).recovery_rejection: field ?node.node.RecoveryView = null
+slcp.OwnedAppNode(OwnedCounter).release: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter), node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter).Applied) void
+slcp.OwnedAppNode(OwnedCounter).start_slot: field u64 = 1
+slcp.OwnedAppNode(OwnedCounter).state: field api_snapshot.OwnedCounter.State
+slcp.OwnedAppNode(OwnedCounter).undecodable: field ?node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter)__struct_* = null
+slcp.OwnedAppNode(OwnedCounter).waitApplied: fn (*node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter), node.node.Node.WaitOptions) error{NodeHalted}!?node.owned_app_node.OwnedAppNode(api_snapshot.OwnedCounter).Applied
+slcp.OwnedAppNode(OwnedCounter).waiters: field usize = 0
+slcp.OwnedAppNode(OwnedCounter): struct
+slcp.OwnedAppNode: fn (comptime type) type
 slcp.Validity.invalid: enumerant = 0
 slcp.Validity.maybe_valid: enumerant = 1
 slcp.Validity.valid: enumerant = 2
@@ -1420,6 +1495,8 @@ slcp.overlay.reserved_write_queue_items: const usize = 256
 slcp.overlay.setTestLinkFilter: fn (?*const fn ([32]u8, [32]u8) bool) void
 slcp.overlay.validatePeerSpec: fn ([]const u8) error{BadHost,BadPort,EmptyHost,MissingPort}!void
 slcp.overlay: struct
+slcp.owned_app_node.OwnedAppNode: fn (comptime type) type
+slcp.owned_app_node: struct
 slcp.store.Error: type = error{BadRecord,Busy,IoFailed,OutOfMemory}
 slcp.store.ExtRecord.slot: field u64
 slcp.store.ExtRecord.value: field []u8

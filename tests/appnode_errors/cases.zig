@@ -60,3 +60,38 @@ pub const cases = [_]Case{
     .{ .stem = "err_wide_int", .needle = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode.", .src = ") is wider than 65528 bits, the widest whole-byte integer the auto-codec can encode." },
     .{ .stem = "err_comptime_field", .needle = "` is a comptime field — it has one fixed value and no wire representation.", .src = "` is a comptime field — it has one fixed value and no wire representation." },
 };
+
+/// Every OwnedAppNode contract error is raised through the same
+/// `contractError(App, "…")` site marker, in src/node/owned_app_node.zig.
+/// The auto-codec's own rejections fire from app_node.zig's `Codec(T)` and
+/// stay pinned by the rows above.
+pub const owned_contract_site = "contractError(App, \"";
+
+/// One row per `contractError` site in src/node/owned_app_node.zig.
+pub const owned_cases = [_]Case{
+    .{ .stem = "owned_err_missing_state", .needle = "): missing `pub const State` — the owned replicated state type.", .src = "missing `pub const State` — the owned replicated state type." },
+    .{ .stem = "owned_err_missing_command", .needle = "): missing `pub const Command` — the value type the network agrees on.", .src = "missing `pub const Command` — the value type the network agrees on." },
+    .{ .stem = "owned_err_missing_obs", .needle = "): missing `pub const Obs` — the per-slot observation type.", .src = "missing `pub const Obs` — the per-slot observation type." },
+    .{ .stem = "owned_err_missing_context", .needle = "): missing `pub const Context` — the startup context type.", .src = "missing `pub const Context` — the startup context type." },
+    .{ .stem = "owned_err_missing_init_error", .needle = "): missing `pub const InitError` — the explicit error set initState returns.", .src = "missing `pub const InitError` — the explicit error set initState returns." },
+    .{ .stem = "owned_err_missing_init_state", .needle = "): missing `pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State`.", .src = "missing `pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State`." },
+    .{ .stem = "owned_err_bad_init_state", .needle = "): initState has the wrong signature.", .src = "initState has the wrong signature." },
+    .{ .stem = "owned_err_missing_deinit_state", .needle = "): missing `pub fn deinitState(state: *State, gpa: std.mem.Allocator) void`.", .src = "missing `pub fn deinitState(state: *State, gpa: std.mem.Allocator) void`." },
+    .{ .stem = "owned_err_bad_deinit_state", .needle = "): deinitState has the wrong signature.", .src = "deinitState has the wrong signature." },
+    .{ .stem = "owned_err_missing_validate", .needle = "): missing `pub fn validate(state: *const State, cmd: Command, context: slcp.ValueContext) slcp.Validity`.", .src = "missing `pub fn validate(state: *const State, cmd: Command, context: slcp.ValueContext) slcp.Validity`." },
+    .{ .stem = "owned_err_bad_validate", .needle = "): validate has the wrong signature.", .src = "validate has the wrong signature." },
+    .{ .stem = "owned_err_missing_apply", .needle = "): missing `pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void`.", .src = "missing `pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void`." },
+    .{ .stem = "owned_err_bad_apply", .needle = "): apply has the wrong signature.", .src = "apply has the wrong signature." },
+    .{ .stem = "owned_err_missing_observe", .needle = "): missing `pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs`.", .src = "missing `pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs`." },
+    .{ .stem = "owned_err_bad_observe", .needle = "): observe has the wrong signature.", .src = "observe has the wrong signature." },
+    .{ .stem = "owned_err_obs_owns_no_deinit", .needle = "): Obs owns memory (it contains a pointer) but has no deinitObs.", .src = "Obs owns memory (it contains a pointer) but has no deinitObs." },
+    .{ .stem = "owned_err_bad_deinit_obs", .needle = "): deinitObs has the wrong signature.", .src = "deinitObs has the wrong signature." },
+    .{ .stem = "owned_err_deinit_obs_plain", .needle = "): deinitObs is declared, but Obs is plain by-value data — there is nothing to free.", .src = "deinitObs is declared, but Obs is plain by-value data — there is nothing to free." },
+    .{ .stem = "owned_err_bad_combine", .needle = "): combine has the wrong signature.", .src = "combine has the wrong signature." },
+    .{ .stem = "owned_err_bad_initial_slot", .needle = "): initialSlot has the wrong signature.", .src = "initialSlot has the wrong signature." },
+    .{ .stem = "owned_err_initial_command_without_slot", .needle = "): initialCommand requires initialSlot.", .src = "initialCommand requires initialSlot." },
+    .{ .stem = "owned_err_bad_initial_command", .needle = "): initialCommand has the wrong signature.", .src = "initialCommand has the wrong signature." },
+    .{ .stem = "owned_err_lone_encode", .needle = "): a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`.", .src = "a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." },
+    .{ .stem = "owned_err_bad_encode", .needle = "): encode has the wrong signature.", .src = "encode has the wrong signature." },
+    .{ .stem = "owned_err_bad_decode", .needle = "): decode has the wrong signature.", .src = "decode has the wrong signature." },
+};

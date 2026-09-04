@@ -1751,3 +1751,27 @@ test "appnode-errors liveness: every case fragment is in app_node.zig and the si
     }
     try testing.expect(cases.cases.len >= 20);
 }
+
+// Same liveness pin for the heap-state adapter's contract: every teaching
+// `contractError(App, "…")` site in src/node/owned_app_node.zig must have a
+// row in the owned table, and no row may go stale.
+test "owned-appnode-errors liveness: every owned case fragment is in owned_app_node.zig and the site count equals the table length" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const cases = @import("appnode_error_cases");
+    const src = try std.Io.Dir.cwd().readFileAlloc(io, "src/node/owned_app_node.zig", gpa, read_limit);
+    defer gpa.free(src);
+
+    for (cases.owned_cases) |c| {
+        if (std.mem.indexOf(u8, src, c.src) == null) {
+            std.debug.print("owned-appnode-errors: case `{s}` fragment not found in src/node/owned_app_node.zig: {s}\n", .{ c.stem, c.src });
+            return error.OwnedAppNodeErrorCaseNotLive;
+        }
+    }
+    const contract = std.mem.count(u8, src, cases.owned_contract_site);
+    if (contract != cases.owned_cases.len) {
+        std.debug.print("owned-appnode-errors: {d} contractError sites in src/node/owned_app_node.zig, but the owned case table has {d} rows — pin the new rule in tests/appnode_errors/ and cases.zig\n", .{ contract, cases.owned_cases.len });
+        return error.OwnedAppNodeErrorSiteUnpinned;
+    }
+    try testing.expect(cases.owned_cases.len >= 20);
+}
