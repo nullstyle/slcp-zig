@@ -1135,8 +1135,12 @@ pub const Node = struct {
     /// once before go-live, then read-only: `AppNode` checks an app's
     /// `initialSlot()` against it (§8.5 delta-app recipe, S8 D2).
     journal_tail: ?JournalTail = null,
-    /// Slots below this are purged; the timer wheel drops stale fires for
-    /// them (read on the wheel thread).
+    /// Oldest slot retained in `own_latest` and the durable logs for outbound
+    /// catch-up. Engine-thread-only after synchronous recovery.
+    answer_floor: u64 = 1,
+    /// Inbound and Engine slots below this are closed/purged; the timer wheel
+    /// drops stale fires for them (read on the wheel thread). This may be
+    /// newer than `answer_floor` after journal recovery.
     purge_floor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Correlates requested qset responses before either queue admission or
@@ -1642,14 +1646,26 @@ pub const Node = struct {
             // Consensus delivery resumes after the journal high-water mark.
             if (hwm + 1 > self.next_deliver) self.next_deliver = hwm + 1;
         }
-        // Rebuild the same host admission floor live delivery would have
-        // published. Recovery can contain up to 79 slots just before the next
-        // 64-slot compaction; restoring them all oldest-first would fill the
-        // Engine's 64-slot budget before reaching current state. An explicit
-        // start_slot also declares all earlier slots out of scope, including
-        // when the journal is empty or ends below it.
-        const recovery_floor = @max(opts.start_slot, purgeFloorForFrontier(self.next_deliver - 1));
-        self.purge_floor.store(recovery_floor, .release);
+        // Two recovery floors have deliberately different jobs:
+        //
+        // * answer_floor retains the last 16 own statements so this node can
+        //   send them to a lagging peer;
+        // * admission_floor rejects inbound protocol traffic for every slot
+        //   the externalized journal already proves closed. Re-admitting such
+        //   traffic can resurrect a pre-restart NOMINATE/CONFIRM slot even
+        //   though the application state is already at the journal HWM.
+        //
+        // Recovery can contain up to 79 slots just before the next 64-slot
+        // compaction, so answer_floor also keeps old restores within the
+        // Engine's 64-slot budget. An explicit start_slot remains a permanent
+        // inbound floor when it is newer than the journal.
+        const restored_answer_floor = @max(opts.start_slot, purgeFloorForFrontier(self.next_deliver - 1));
+        const admission_floor = if (rec.externalized_hwm) |hwm|
+            @max(opts.start_slot, hwm +| 1)
+        else
+            opts.start_slot;
+        self.answer_floor = restored_answer_floor;
+        self.purge_floor.store(admission_floor, .release);
         // §10: externalized.log is the app-visible journal. A crash can land
         // between journal append and app consumption, so REPLAY the (compaction
         // -bounded) journal tail into the app stream — the app dedups by slot
@@ -1664,7 +1680,7 @@ pub const Node = struct {
         }
         if (!rec.own_log_corrupt) {
             for (rec.own_latest) |r| {
-                if (r.slot < recovery_floor) continue;
+                if (r.slot < restored_answer_floor) continue;
                 const clean = self.feedInput(.{
                     .input = .{ .restore_own_envelope = .{ .bytes = try gpa.dupe(u8, r.envelope) } },
                     .source_peer = null,
@@ -2457,10 +2473,15 @@ pub const Node = struct {
             // `start_slot` may establish a later permanent floor than the
             // ordinary 16-slot calculation. GC can advance that declaration,
             // never lower it after the first delivery.
-            const max_slot = @max(self.purge_floor.load(.acquire), window_floor);
-            self.purge_floor.store(max_slot, .release);
-            self.pruneOwnLatest(max_slot);
-            self.q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null });
+            const engine_floor = @max(self.purge_floor.load(.acquire), window_floor);
+            self.purge_floor.store(engine_floor, .release);
+            // `purge_floor` may be the recovered journal successor, which is
+            // intentionally newer than the outbound answering window. Keep
+            // cache retention tied to the latter; only Engine/admission state
+            // uses the stronger floor.
+            self.answer_floor = @max(self.answer_floor, window_floor);
+            self.pruneOwnLatest(self.answer_floor);
+            self.q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = engine_floor } }, .source_peer = null });
             // §10 "and compacts": rewrite the logs occasionally so they do
             // not grow without bound (every 64 delivered slots). A drain may
             // deliver several buffered slots at once and land past a
@@ -2468,7 +2489,7 @@ pub const Node = struct {
             // compaction instead of testing the frontier itself; a failed
             // compaction leaves the mark alone so the next drain retries.
             if (frontier / 64 > self.last_compact_frontier / 64) {
-                if (self.store.compact(max_slot)) |_| {
+                if (self.store.compact(self.answer_floor)) |_| {
                     self.last_compact_frontier = frontier;
                 } else |e| {
                     log.warn("log compaction failed (will retry later): {s}", .{@errorName(e)});
@@ -3819,11 +3840,13 @@ test "recovery predecessor merges an external checkpoint with the durable journa
 
 // A normal compaction at frontier 64 leaves slots 49..64, after which a
 // crash just before frontier 128 can leave slots 49..127 in both logs. The
-// restart must derive the answering floor from the durable high-water mark
-// before restoring own.log. Otherwise the oldest 64 slots fill the Engine,
-// the newest statements are silently rejected as over-limit, and slot 128
-// cannot be nominated.
-test "restart recovery rebuilds the purge floor before restoring the retained own-log window" {
+// restart must derive both floors from the durable high-water mark before
+// restoring own.log. The answer cache keeps the newest 16 historical slots,
+// while inbound traffic through the journal HWM is already closed. Without
+// the bounded answer floor, the oldest 64 slots fill the Engine and slot 128
+// cannot be nominated; without the stronger admission floor, stale peer
+// traffic can reactivate a slot the application has already applied.
+test "restart recovery separates the closed admission floor from the retained own-log window" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3833,8 +3856,9 @@ test "restart recovery rebuilds the purge floor before restoring the retained ow
 
     const passphrase = "restart purge-floor recovery v1";
     const seed: [32]u8 = @splat(0x43);
+    const peer_seed: [32]u8 = @splat(0x77);
     const me = try crypto.publicKeyFromSeed(seed);
-    const peer_a: [32]u8 = @splat(0x77);
+    const peer_a = try crypto.publicKeyFromSeed(peer_seed);
     const peer_b: [32]u8 = @splat(0x78);
     const network_id = crypto.networkIdFromPassphrase(passphrase);
 
@@ -3866,10 +3890,30 @@ test "restart recovery rebuilds the purge floor before restoring the retained ow
     });
     defer n.deinit();
 
-    const expected_floor: u64 = 127 - (purge_window - 1);
+    const expected_answer_floor: u64 = 127 - (purge_window - 1);
     try std.testing.expectEqual(@as(u64, 128), n.next_deliver);
-    try std.testing.expectEqual(expected_floor, n.purge_floor.load(.acquire));
+    try std.testing.expectEqual(expected_answer_floor, n.answer_floor);
+    try std.testing.expectEqual(@as(u64, 128), n.purge_floor.load(.acquire));
     try std.testing.expectEqual(@as(usize, purge_window), n.stats().live_slots);
+    {
+        n.own_mu.lockUncancelable(io);
+        defer n.own_mu.unlock(io);
+        try std.testing.expect(n.own_latest.contains(expected_answer_floor));
+        try std.testing.expect(n.own_latest.contains(127));
+    }
+
+    // A peer's stale nomination at a journal-confirmed slot is rejected at
+    // host admission. It must not reactivate that Engine slot and call an
+    // application driver whose State has already advanced through 127.
+    const stale = try buildSignedStatement(gpa, peer_seed, n.network_id, n.local_qset_hash, 127, .{ .nominate = "stale" });
+    defer gpa.free(stale);
+    n.q.push(try envelopeItem(gpa, stale));
+    try pollUntil(io, 2_000, n, struct {
+        fn rejected(node: *Node) bool {
+            return node.hold.dropped_behind.load(.acquire) == 1;
+        }
+    }.rejected);
+    try std.testing.expect(!n.stats().failed);
 
     // The current proposal must still fit: before the fix, stale restored
     // slots consumed all 64 live-slot entries and this never reached 65.
