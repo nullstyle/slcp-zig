@@ -10,10 +10,14 @@
 //! set / transfer / release apply everywhere, `head` hashes agree across
 //! nodes at the same slot, node2 is SIGKILLed and restarted from its
 //! snapshot + journal and catches up to the same hash, and a transaction
-//! submitted to the restarted node lands everywhere. Every step polls
-//! `get` / `head` / `account` (bounded) instead of sleeping a fixed time: a
-//! transaction submitted to node X lands only when X leads a nomination
-//! round (roadmap §2.1 gap 3), so the latency is a few seconds, not a slot.
+//! submitted to the restarted node lands everywhere. Before the crash the
+//! nodes form the deliberate line node2→node1→node0. One transaction is
+//! submitted only to nomination-disabled node2; `head pending=1` proves it
+//! crossed one and two overlay hops while both survivors remain at slot S,
+//! then their `slot S+1: txs=1` lines prove it survived node2's SIGKILL and
+//! landed in exactly the next slot. The restarted node gets a second recovery
+//! peer because consensus envelopes are not relayed across that line. Every
+//! wait is a bounded state poll rather than a fixed sleep.
 //!
 //! The scratch copy is the published example with ONE line rewritten — the
 //! `.path = "../.."` dependency in build.zig.zon, re-pointed at the repo from
@@ -33,8 +37,10 @@
 //! Environment: the nested build inherits this process's environment.
 //! `ZIG_LOCAL_PKG_DIR` is pointed at `<repo>/zig-pkg` when unset, so the
 //! nested build reuses the packages the root build already fetched instead
-//! of fetching capnp-zig's dependency tree again; the local cache is shared
-//! via `--cache-dir <repo>/.zig-cache`.
+//! of fetching capnp-zig's dependency tree again. The nested build gets a
+//! scratch-local Zig cache: sharing one local cache among different build
+//! roots can replay another example's cached build graph (for example,
+//! installing `counter` here instead of `registry`).
 
 const std = @import("std");
 const slcp = @import("slcp");
@@ -62,6 +68,11 @@ const cli_timeout_ms: u64 = 10_000;
 const agreement_min_ms: u64 = 3_000;
 const report_every_ms: u64 = 10_000;
 const all_mask: u8 = (1 << n_nodes) - 1;
+/// The survivors close slowly enough for the smoke to observe propagated
+/// pending state before nomination. The source's cadence is disabled: its
+/// transaction can only land if it crosses the line to a survivor.
+const survivor_cadence_ms = "5000";
+const disabled_cadence_ms = "18446744073709551615";
 
 pub fn listenPort(i: usize) u16 {
     return listen_base + @as(u16, @intCast(i));
@@ -226,7 +237,7 @@ pub fn parseAccount(raw: []const u8) ?AccountReply {
     return .{ .key = key orelse return null, .seq = seq orelse return null };
 }
 
-pub const SlotLine = struct { slot: u64, head16: ?[16]u8 };
+pub const SlotLine = struct { slot: u64, txs: u64, head16: ?[16]u8 };
 
 /// A node's stderr `slot N: txs=K ok=J head=<hex16>` line (the `head=` field
 /// is taken when present and well-formed), or null for any other line.
@@ -237,13 +248,18 @@ pub fn parseSlotLine(raw: []const u8) ?SlotLine {
     const rest = line[prefix.len..];
     const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
     const slot = std.fmt.parseInt(u64, rest[0..colon], 10) catch return null;
+    var txs: ?u64 = null;
     var head16: ?[16]u8 = null;
     var it = std.mem.tokenizeScalar(u8, rest[colon + 1 ..], ' ');
     while (it.next()) |tok| {
         const f = kv(tok) orelse continue;
-        if (std.mem.eql(u8, f.key, "head") and f.val.len == 16 and isLowerHex(f.val)) head16 = f.val[0..16].*;
+        if (std.mem.eql(u8, f.key, "txs")) {
+            txs = std.fmt.parseInt(u64, f.val, 10) catch return null;
+        } else if (std.mem.eql(u8, f.key, "head") and f.val.len == 16 and isLowerHex(f.val)) {
+            head16 = f.val[0..16].*;
+        }
     }
-    return .{ .slot = slot, .head16 = head16 };
+    return .{ .slot = slot, .txs = txs orelse return null, .head16 = head16 };
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +318,14 @@ const NodeProc = struct {
     /// slot → the printed `head=` prefix, across restarts (cross-node
     /// agreement is checked against this on the main thread).
     slot_heads: std.AutoHashMapUnmanaged(u64, [16]u8) = .empty,
+    /// slot → the number of transactions printed for that externalization.
+    /// Kept across restarts so the crash-survival proof can name the exact
+    /// successor slot and show that it carried precisely the flooded tx.
+    slot_txs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     eof: bool = false,
     expect_eof: bool = false,
     /// The first line that contradicted an earlier print of the same slot by
-    /// this node.
+    /// this node (head or transaction count).
     bad: ?[]u8 = null,
     tail: [tail_lines]?[]u8 = @splat(null),
     tail_next: usize = 0,
@@ -337,6 +357,7 @@ const NodeProc = struct {
         for (&self.tail) |*t| if (t.*) |s| gpa.free(s);
         if (self.bad) |b| gpa.free(b);
         self.slot_heads.deinit(gpa);
+        self.slot_txs.deinit(gpa);
         for (self.argv) |s| gpa.free(s);
         gpa.free(self.argv);
         gpa.free(self.dir);
@@ -366,6 +387,24 @@ const NodeProc = struct {
             self.child = null;
             return err;
         };
+    }
+
+    /// Add one configured dial before a restart. The flooding proof keeps a
+    /// strict line; catch-up subsequently needs statements from two quorum
+    /// members because consensus envelopes are not transitively relayed.
+    fn appendPeer(self: *NodeProc, spec: []const u8) !void {
+        std.debug.assert(self.child == null and self.thread == null);
+        const grown = try self.gpa.alloc([]const u8, self.argv.len + 2);
+        errdefer self.gpa.free(grown);
+        const flag = try self.gpa.dupe(u8, "--peer");
+        errdefer self.gpa.free(flag);
+        const peer = try self.gpa.dupe(u8, spec);
+        errdefer self.gpa.free(peer);
+        @memcpy(grown[0..self.argv.len], self.argv);
+        grown[self.argv.len] = flag;
+        grown[self.argv.len + 1] = peer;
+        self.gpa.free(self.argv);
+        self.argv = grown;
     }
 
     /// SIGKILL (not the SIGTERM of `Child.kill`), join the reader (its EOF
@@ -402,6 +441,11 @@ const NodeProc = struct {
         self.tail_next = (self.tail_next + 1) % tail_lines;
         const p = parsed orelse return;
         if (p.slot > self.max_slot) self.max_slot = p.slot;
+        if (self.slot_txs.get(p.slot)) |prev| {
+            if (prev != p.txs and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+        } else {
+            self.slot_txs.put(self.gpa, p.slot, p.txs) catch {};
+        }
         const h = p.head16 orelse return;
         if (self.slot_heads.get(p.slot)) |prev| {
             if (!std.mem.eql(u8, &prev, &h) and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
@@ -570,7 +614,7 @@ const Cluster = struct {
             p.mu.lockUncancelable(self.io);
             defer p.mu.unlock(self.io);
             if (p.bad) |line| {
-                std.debug.print("[registry-smoke] node{d} contradicted its own earlier head for a slot: {s}\n", .{ p.index, line });
+                std.debug.print("[registry-smoke] node{d} contradicted its own earlier evidence for a slot: {s}\n", .{ p.index, line });
                 return error.NodeSelfContradiction;
             }
             if (p.eof and !p.expect_eof) {
@@ -836,7 +880,7 @@ const Cluster = struct {
     /// Sample `head` from all three for at least `agreement_min_ms` and until
     /// some slot > 0 was reported by all three within this sweep. Equal
     /// hashes for equal slots are enforced by `queryHead` on every sample.
-    fn headAgreement(self: *Cluster) !void {
+    fn headAgreement(self: *Cluster) !u64 {
         var poll = Poll.init(self.io, poll_bound_ms, "a slot reported by all three nodes with one hash");
         var fresh: std.AutoHashMapUnmanaged(u64, u8) = .empty;
         defer fresh.deinit(self.gpa);
@@ -859,8 +903,128 @@ const Cluster = struct {
                 if (full) |slot| {
                     const seen = self.rpc_heads.get(slot).?;
                     std.debug.print("[registry-smoke] head agreement: slot {d} hash={s}… reported by all three ({d} samples, {d} distinct slots)\n", .{ slot, seen.hash[0..16], samples, fresh.count() });
-                    return;
+                    return slot;
                 }
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// Wait until every named node reports the same head at or beyond
+    /// `min_slot`, with exactly `want_pending` transactions queued. This is
+    /// used to start the flooding proof immediately after a fresh idle close,
+    /// leaving almost a full cadence interval in which to observe the queues.
+    fn waitCommonHead(
+        self: *Cluster,
+        nodes: []const usize,
+        min_slot: u64,
+        want_pending: u64,
+        what: []const u8,
+    ) !Head {
+        var poll = Poll.init(self.io, poll_bound_ms, what);
+        while (true) {
+            var common: ?Head = null;
+            var all_met = true;
+            for (nodes) |i| {
+                const maybe = try self.queryHead(i);
+                const h = maybe orelse {
+                    all_met = false;
+                    continue;
+                };
+                if (h.slot < min_slot or h.pending != want_pending) all_met = false;
+                if (common) |first| {
+                    if (h.slot != first.slot or !std.mem.eql(u8, &h.hash, &first.hash)) all_met = false;
+                } else {
+                    common = h;
+                }
+            }
+            if (all_met) {
+                const h = common orelse return error.NoNodes;
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (slot {d}, pending={d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, h.slot, h.pending, h.hash[0..16],
+                });
+                return h;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// Prove application-message propagation before consensus can hide it:
+    /// every node must expose the expected pending count while still exactly
+    /// at `slot`. Advancing past the observation slot is a hard failure, not a
+    /// reason to weaken the assertion and accept eventual application.
+    fn waitPendingAtExactSlot(
+        self: *Cluster,
+        nodes: []const usize,
+        slot: u64,
+        want_pending: u64,
+        what: []const u8,
+    ) !void {
+        var poll = Poll.init(self.io, poll_bound_ms, what);
+        while (true) {
+            var all_met = true;
+            for (nodes) |i| {
+                const maybe = try self.queryHead(i);
+                const h = maybe orelse {
+                    all_met = false;
+                    continue;
+                };
+                if (h.slot > slot) {
+                    std.debug.print("[registry-smoke] node{d} advanced to slot {d} before pending={d} was proved at slot {d}\n", .{
+                        i, h.slot, want_pending, slot,
+                    });
+                    return error.GossipObservationMissed;
+                }
+                if (h.slot != slot or h.pending != want_pending) all_met = false;
+            }
+            if (all_met) {
+                std.debug.print("[registry-smoke] ok after {d} ms: {s}\n", .{ poll.elapsed(self.io), what });
+                return;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// Wait for the stderr evidence for one exact externalization. If a node
+    /// prints the target slot with another transaction count, or advances
+    /// without retaining its line, fail immediately.
+    fn waitSlotTxs(
+        self: *Cluster,
+        nodes: []const usize,
+        slot: u64,
+        want_txs: u64,
+        what: []const u8,
+    ) !void {
+        var poll = Poll.init(self.io, poll_bound_ms, what);
+        while (true) {
+            try self.checkProcs();
+            var all_met = true;
+            for (nodes) |i| {
+                const p = self.procs[i];
+                p.mu.lockUncancelable(self.io);
+                const got = p.slot_txs.get(slot);
+                const max_slot = p.max_slot;
+                p.mu.unlock(self.io);
+                if (got) |n| {
+                    if (n != want_txs) {
+                        std.debug.print("[registry-smoke] node{d} externalized slot {d} with txs={d}, expected {d}\n", .{
+                            i, slot, n, want_txs,
+                        });
+                        return error.WrongSlotTxCount;
+                    }
+                } else {
+                    if (max_slot >= slot) {
+                        std.debug.print("[registry-smoke] node{d} reached slot {d} without retained tx-count evidence for slot {d}\n", .{
+                            i, max_slot, slot,
+                        });
+                        return error.MissingSlotEvidence;
+                    }
+                    all_met = false;
+                }
+            }
+            if (all_met) {
+                std.debug.print("[registry-smoke] ok after {d} ms: {s}\n", .{ poll.elapsed(self.io), what });
+                return;
             }
             try poll.tick(self);
         }
@@ -936,12 +1100,35 @@ const Cluster = struct {
         _ = try self.submit(.alice, 0, &.{ "transfer", "alice", bob_hex });
         try self.waitGet("alice", .{ .owner = self.pk(.bob) }, &all, "get alice → owner=bob on every node");
 
-        // (6) identical heads at the same slot.
-        try self.headAgreement();
+        // (6) First retain the broad head-agreement sweep, then wait for one
+        // newer common idle close. That fresh pending=0 head is slot S for
+        // the deterministic flooding proof and leaves almost the whole 5 s
+        // survivor cadence as an observation window.
+        const agreed_slot = try self.headAgreement();
+        const settled = try self.waitCommonHead(
+            &all,
+            agreed_slot + 1,
+            0,
+            "a fresh common pending=0 head after the initial work",
+        );
 
-        // (7) SIGKILL node2; the survivors keep applying; restart node2 from
-        // its snapshot + journal with the identical command; it catches up.
-        std.debug.print("[registry-smoke] SIGKILL node2 (slot {d})\n", .{self.procs[2].maxSlot()});
+        // tx6 enters ONLY nomination-disabled node2. In the line topology,
+        // node1 is one overlay hop from the source and node0 is two. Seeing
+        // pending=1 on both while their ledger heads remain exactly S proves
+        // application-message flooding itself, before consensus can make the
+        // transaction visible indirectly.
+        _ = try self.submit(.bob, 2, &.{ "set", "bob", "x" });
+        try self.waitPendingAtExactSlot(
+            &.{ 1, 0 },
+            settled.slot,
+            1,
+            "tx6 pending on node1 (one hop) and node0 (two hops), both still at S",
+        );
+
+        // (7) Kill the sole submission node before any nomination. The two
+        // survivors are the quorum; their own per-slot lines must show the
+        // flooded transaction in exactly S+1, not merely some later slot.
+        std.debug.print("[registry-smoke] SIGKILL source node2 at proof slot S={d}\n", .{settled.slot});
         {
             const p2 = self.procs[2];
             p2.mu.lockUncancelable(self.io);
@@ -949,32 +1136,39 @@ const Cluster = struct {
             p2.mu.unlock(self.io);
             p2.stop();
         }
-        // Queued on BOTH survivors (the same seq → the same signed bytes → one
-        // transaction): a transaction known to one node lands only when that
-        // node leads a round, and every slot that closes while node2 is down
-        // counts against the 16-slot answering window — with one holder the
-        // wait exceeds 15 slots with P ≈ (2/3)^15 ≈ 0.2 %, with two it is
-        // (1/3)^15. E2's flooding does this for every transaction.
-        _ = try self.submit(.bob, 0, &.{ "set", "bob", "x" });
-        _ = try self.submit(.bob, 1, &.{ "set", "bob", "x" });
+        try self.waitSlotTxs(
+            &.{ 0, 1 },
+            settled.slot + 1,
+            1,
+            "node0 and node1 externalized exactly S+1 with txs=1 after the source died",
+        );
         try self.waitGet("bob", .{ .value = "78" }, &.{ 0, 1 }, "get bob → value=78 on node0 and node1 (node2 down)");
         const at_restart = try self.headRetry(0, "node0 to answer `head` before node2 restarts");
-        std.debug.print("[registry-smoke] restarting node2 from its data dir (node0 at slot {d})\n", .{at_restart.slot});
+        // The application-flooding proof above requires the line, but a
+        // recovering SCP participant needs statements from both members of
+        // its 2-of-3 quorum: node1 does not relay node0's consensus envelopes.
+        // Widen only the restarted process with a direct recovery dial.
+        var recovery_peer_buf: [24]u8 = undefined;
+        const recovery_peer = try std.fmt.bufPrint(&recovery_peer_buf, "127.0.0.1:{d}", .{listenPort(0)});
+        try self.procs[2].appendPeer(recovery_peer);
+        std.debug.print("[registry-smoke] restarting node2 from its data dir with node0 recovery peer (node0 at slot {d})\n", .{at_restart.slot});
         self.procs[2].spawn() catch |err| {
             std.debug.print("[registry-smoke] cannot respawn node2: {t}\n", .{err});
             return err;
         };
         try self.waitCatchUp(2, at_restart.slot);
 
-        // (8) a transaction through the restarted node.
+        // (8) A second single-source transaction through the restarted,
+        // nomination-disabled end of the line. It can land only by flooding
+        // to a survivor that can nominate it.
         _ = try self.submit(.bob, 2, &.{ "release", "bob" });
         try self.waitGet("bob", .none, &all, "get bob → none on every node (released via the restarted node2)");
 
         // A last sweep so the evidence names the newest slot every node agrees on.
         for (all) |i| _ = try self.headRetry(i, "a final `head` from every node");
         try self.checkProcs();
-        if (self.txs < n_txs) {
-            std.debug.print("[registry-smoke] submitted {d} distinct transactions, the script has {d}\n", .{ self.txs, n_txs });
+        if (self.txs != n_txs) {
+            std.debug.print("[registry-smoke] submitted {d} distinct transactions, expected exactly {d}\n", .{ self.txs, n_txs });
             return error.TxCountDrift;
         }
         const top = self.highestHead() orelse return error.NoHeadSeen;
@@ -1112,7 +1306,7 @@ fn run(init: std.process.Init, args: Args) !void {
         std.debug.print("[registry-smoke] scratch copy of {s} in {s} ({d} sources)\n", .{ args.registry_src, build_dir, n });
     }
 
-    // ---- (2) ONE nested consumer build (shared local cache) ----
+    // ---- (2) ONE nested consumer build (isolated local cache) ----
     var env = try init.environ_map.clone(gpa);
     defer env.deinit();
     if (env.get("ZIG_LOCAL_PKG_DIR") == null) {
@@ -1120,7 +1314,7 @@ fn run(init: std.process.Init, args: Args) !void {
         defer gpa.free(pkg_dir);
         try env.put("ZIG_LOCAL_PKG_DIR", pkg_dir);
     }
-    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache", .{root});
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache", .{build_dir});
     defer gpa.free(cache_dir);
     std.debug.print("[registry-smoke] building (zig build -Doptimize=ReleaseSafe in {s})\n", .{build_dir});
     {
@@ -1205,33 +1399,39 @@ fn run(init: std.process.Init, args: Args) !void {
         var rpc_buf: [8]u8 = undefined;
         const listen_s = try std.fmt.bufPrint(&listen_buf, "{d}", .{listenPort(i)});
         const rpc_s = try std.fmt.bufPrint(&rpc_buf, "{d}", .{rpcPort(i)});
-        var peer_bufs: [n_nodes - 1][24]u8 = undefined;
-        var peers: [n_nodes - 1][]const u8 = undefined;
-        var n: usize = 0;
-        for (0..n_nodes) |k| {
-            if (k == i) continue;
-            peers[n] = try std.fmt.bufPrint(&peer_bufs[n], "127.0.0.1:{d}", .{listenPort(k)});
-            n += 1;
+        const cadence = if (i == 2) disabled_cadence_ms else survivor_cadence_ms;
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{
+            exe,              "node",
+            "--network",      network,
+            "--key",          node_key_paths[i],
+            "--data-dir",     "data",
+            "--quorum",       quorum_path,
+            "--listen",       listen_s,
+            "--rpc",          rpc_s,
+            "--min-slot-ms",  cadence,
+            "--heartbeat-ms", cadence,
+        });
+        // A deliberate line, with arrows denoting the only configured dial:
+        // node2 --peer node1; node1 --peer node0; node0 has no peer argument.
+        // Overlay connections are duplex, but node2 and node0 have no direct
+        // path, so the pending proof below necessarily includes a relay.
+        var peer_buf: [24]u8 = undefined;
+        if (i > 0) {
+            const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{listenPort(i - 1)});
+            try argv.appendSlice(gpa, &.{ "--peer", peer });
         }
-        const argv = [_][]const u8{
-            exe,          "node",
-            "--network",  network,
-            "--key",      node_key_paths[i],
-            "--data-dir", "data",
-            "--quorum",   quorum_path,
-            "--listen",   listen_s,
-            "--rpc",      rpc_s,
-            "--peer",     peers[0],
-            "--peer",     peers[1],
-        };
-        procs[i] = try NodeProc.create(gpa, io, i, dir, &argv);
+        procs[i] = try NodeProc.create(gpa, io, i, dir, argv.items);
         procs_made += 1;
     }
     for (procs) |p| p.spawn() catch |err| {
         std.debug.print("[registry-smoke] cannot spawn node{d} ({s}): {t}\n", .{ p.index, p.argv[0], err });
         return err;
     };
-    std.debug.print("[registry-smoke] 3 nodes spawned: listen {d}..{d}, rpc {d}..{d}\n", .{ listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1) });
+    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; survivor cadence {s} ms; node2 nomination disabled\n", .{
+        listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), survivor_cadence_ms,
+    });
 
     // ---- (5)–(9) the acceptance script ----
     const now = std.Io.Timestamp.now(io, .awake);
@@ -1357,13 +1557,44 @@ test "parseAccount: account key=<hex64> seq=<n>" {
 test "parseSlotLine: the node's `slot N: txs=K ok=J head=<hex16>` line" {
     const p = parseSlotLine("slot 12: txs=2 ok=2 head=0123456789abcdef").?;
     try testing.expectEqual(@as(u64, 12), p.slot);
+    try testing.expectEqual(@as(u64, 2), p.txs);
     try testing.expectEqualStrings("0123456789abcdef", &p.head16.?);
     const no_head = parseSlotLine("slot 3: txs=0 ok=0").?;
     try testing.expectEqual(@as(u64, 3), no_head.slot);
+    try testing.expectEqual(@as(u64, 0), no_head.txs);
     try testing.expect(no_head.head16 == null);
+    try testing.expect(parseSlotLine("slot 3: ok=0 head=0123456789abcdef") == null);
+    try testing.expect(parseSlotLine("slot 3: txs=x ok=0 head=0123456789abcdef") == null);
     try testing.expect(parseSlotLine("info(slcp_node): slot 3 externalized") == null);
     try testing.expect(parseSlotLine("slot x: txs=0 ok=0") == null);
     try testing.expect(parseSlotLine("") == null);
+}
+
+test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
+    const gpa = testing.allocator;
+    var empty_buf: [0]u8 = .{};
+    var p: NodeProc = .{
+        .gpa = gpa,
+        .io = testing.io,
+        .index = 0,
+        .dir = "",
+        .argv = &.{},
+        .rdr_buf = &empty_buf,
+    };
+    defer {
+        for (&p.tail) |*line| if (line.*) |s| gpa.free(s);
+        if (p.bad) |s| gpa.free(s);
+        p.slot_heads.deinit(gpa);
+        p.slot_txs.deinit(gpa);
+    }
+
+    p.noteLine("slot 7: txs=1 ok=1 head=0123456789abcdef");
+    try testing.expectEqual(@as(?u64, 1), p.slot_txs.get(7));
+    try testing.expect(p.bad == null);
+    p.noteLine("slot 7: txs=1 ok=1 head=0123456789abcdef");
+    try testing.expect(p.bad == null);
+    p.noteLine("slot 7: txs=2 ok=1 head=0123456789abcdef");
+    try testing.expect(p.bad != null);
 }
 
 // Non-vacuity: the evidence literal is what `just preflight` greps; a typo
