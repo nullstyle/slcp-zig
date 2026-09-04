@@ -212,6 +212,9 @@ const Conn = struct {
     /// The peer's advertised (unauthenticated) nodeId from its Hello. Used
     /// only by the test link filter to simulate network partitions.
     peer_node_id: [32]u8 = @splat(0),
+    /// The peer's advertised Hello capability bits. Read only after
+    /// `hello_done` is published under `Overlay.conns_mu`.
+    peer_feature_flags: u64 = 0,
 
     // Async write queue drained by the writer thread. Bounded by
     // `max_write_queue_items` / `max_write_queue_bytes` (`wq_bytes` tracks
@@ -525,6 +528,11 @@ pub const Overlay = struct {
                 .all => {},
                 .one => |id| if (conn.id != id) continue,
                 .except => |id| if (conn.id == id) continue,
+            }
+            if (frame == .app_message and
+                conn.peer_feature_flags & wire.feature_app_messages == 0)
+            {
+                continue;
             }
             // Test-only partition simulation; a no-op in production.
             if (!linkAllowed(self.cfg.node_id, conn.peer_node_id)) continue;
@@ -951,6 +959,7 @@ pub const Overlay = struct {
                     return false;
                 }
                 conn.peer_node_id = h.node_id; // advisory; used by the test link filter
+                conn.peer_feature_flags = h.feature_flags;
                 return true;
             },
             else => {
@@ -963,6 +972,7 @@ pub const Overlay = struct {
     fn sendHello(self: *Overlay, conn: *Conn) !void {
         const frame: wire.OverlayFrame = .{ .hello = .{
             .protocol_version = wire.protocol_version,
+            .feature_flags = wire.feature_app_messages,
             .network_id_prefix = self.cfg.network_id_prefix,
             .node_id = self.cfg.node_id,
             .current_slot = 0,
@@ -1432,6 +1442,46 @@ fn readBounded(io: std.Io, handle: net.Socket.Handle, buf: []u8, ms: i64) !usize
     return result.net_read;
 }
 
+/// Read one complete overlay frame from a raw loopback peer under a bounded
+/// wait. The returned frame owns its decoded payloads.
+fn readTestFrame(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stream: net.Stream,
+    framer: *framing.Framer,
+    timeout_ms: i64,
+) !wire.OverlayFrame {
+    while (true) {
+        if (try framer.popFrame()) |raw| {
+            defer gpa.free(raw);
+            return wire.decode(gpa, raw);
+        }
+        var buf: [4096]u8 = undefined;
+        const n = try readBounded(io, stream.socket.handle, &buf, timeout_ms);
+        if (n == 0) return error.EndOfStream;
+        try framer.push(buf[0..n]);
+    }
+}
+
+fn writeTestHello(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stream: net.Stream,
+    feature_flags: u64,
+    node_id_byte: u8,
+) !void {
+    const hello = try wire.encode(gpa, .{ .hello = .{
+        .protocol_version = wire.protocol_version,
+        .feature_flags = feature_flags,
+        .network_id_prefix = test_prefix,
+        .node_id = @as([32]u8, @splat(node_id_byte)),
+        .current_slot = 0,
+        .listen_port = 0,
+    } });
+    defer gpa.free(hello);
+    try writeAll(io, stream.socket.handle, hello);
+}
+
 fn buildEnvelope(gpa: std.mem.Allocator, statement: []const u8, sig: []const u8) ![]u8 {
     var mb = core.capnpc.message.MessageBuilder.init(gpa);
     defer mb.deinit();
@@ -1450,6 +1500,85 @@ fn testConfig(port: u16, peers: []const []const u8, prefix: [8]u8, id_byte: u8) 
         .network_id_prefix = prefix,
         .node_id = @as([32]u8, @splat(id_byte)),
     };
+}
+
+test "overlay negotiation: our Hello advertises app messages" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xAA), rec.callbacks());
+    rec.ov = &ov;
+    try ov.start();
+    defer ov.deinit();
+    defer ov.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov.boundPort());
+    const raw_peer = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer raw_peer.close(io);
+    var framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer framer.deinit();
+
+    var hello = try readTestFrame(gpa, io, raw_peer, &framer, 2_000);
+    defer hello.deinit(gpa);
+    try testing.expect(hello == .hello);
+    try testing.expectEqual(
+        wire.feature_app_messages,
+        hello.hello.feature_flags & wire.feature_app_messages,
+    );
+}
+
+test "overlay negotiation: app messages reach only capable peers; ordinary frames still reach both" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xAA), rec.callbacks());
+    rec.ov = &ov;
+    try ov.start();
+    defer ov.deinit();
+    defer ov.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov.boundPort());
+    const capable = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer capable.close(io);
+    const legacy = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer legacy.close(io);
+    var capable_framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer capable_framer.deinit();
+    var legacy_framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer legacy_framer.deinit();
+
+    // Consume our Hellos before answering with distinct advertised features.
+    var capable_hello = try readTestFrame(gpa, io, capable, &capable_framer, 2_000);
+    capable_hello.deinit(gpa);
+    var legacy_hello = try readTestFrame(gpa, io, legacy, &legacy_framer, 2_000);
+    legacy_hello.deinit(gpa);
+    try writeTestHello(gpa, io, capable, wire.feature_app_messages | (@as(u64, 1) << 63), 0xC1);
+    try writeTestHello(gpa, io, legacy, 0, 0xD1);
+    try waitPeerCount(io, &ov, 2);
+
+    ov.broadcast(.{ .app_message = "negotiated-only" });
+    var got_capable = try readTestFrame(gpa, io, capable, &capable_framer, 2_000);
+    defer got_capable.deinit(gpa);
+    try testing.expect(got_capable == .app_message);
+    try testing.expectEqualSlices(u8, "negotiated-only", got_capable.app_message);
+
+    // The capability gate is app-message-specific: existing routing is not
+    // narrowed for peers that omit the new bit. Queue order makes this
+    // non-vacuous without a timed negative read: if the app frame were sent
+    // to the legacy peer, it would be observed before this later ping.
+    ov.broadcast(.{ .ping = 0xACCE55 });
+    var capable_ping = try readTestFrame(gpa, io, capable, &capable_framer, 2_000);
+    defer capable_ping.deinit(gpa);
+    try testing.expect(capable_ping == .ping);
+    try testing.expectEqual(@as(u64, 0xACCE55), capable_ping.ping);
+    var legacy_ping = try readTestFrame(gpa, io, legacy, &legacy_framer, 2_000);
+    defer legacy_ping.deinit(gpa);
+    try testing.expect(legacy_ping == .ping);
+    try testing.expectEqual(@as(u64, 0xACCE55), legacy_ping.ping);
 }
 
 test "two overlays connect and exchange ping/pong" {
