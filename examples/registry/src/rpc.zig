@@ -67,6 +67,17 @@ pub const Shared = struct {
         self.mu.unlock(self.io);
     }
 
+    /// Under `mu`: take ownership of a new applied state, freeing the one it
+    /// held. The caller loses the state it passed.
+    pub fn replaceState(self: *Shared, gpa: std.mem.Allocator, new_state: registry.State) void {
+        self.state.deinit(gpa);
+        self.state = new_state;
+    }
+
+    pub fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
+        self.state.deinit(gpa);
+    }
+
     pub fn pendingSlice(self: *Shared) []Tx {
         return self.pending[0..self.n_pending];
     }
@@ -190,7 +201,7 @@ pub fn handle(shared: *Shared, line: []const u8, out: []u8) []const u8 {
         defer shared.unlock();
         const s = &shared.state;
         return fmt(out, "head slot={d} close_time={d} hash={s} accounts={d} names={d} pending={d} network={s}", .{
-            s.head.slot, s.head.close_time, &registry.hex32(s.head.hash), s.n_accounts, s.n_names, shared.n_pending, &registry.hex32(s.network_id),
+            s.head.slot, s.head.close_time, &registry.hex32(s.head.hash), s.accounts.items.len, s.names.items.len, shared.n_pending, &registry.hex32(s.network_id),
         });
     }
     if (std.mem.eql(u8, verb, "get")) {
@@ -516,9 +527,9 @@ pub fn field(line: []const u8, key: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-fn testShared() Shared {
+fn testShared(gpa: std.mem.Allocator) Shared {
     const network_id = registry.networkId("rpc test", 0);
-    return .{ .io = testing.io, .state = registry.State.genesis(network_id, 0) };
+    return .{ .io = testing.io, .state = registry.State.genesis(network_id, 0, gpa) catch unreachable };
 }
 
 fn signedTx(seed_byte: u8, seq: u64, name: []const u8, nid: [32]u8) Tx {
@@ -563,7 +574,8 @@ const PublishRecorder = struct {
 };
 
 test "shared admission accepts a canonical network transaction and publishes after unlocking" {
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     var recorder = PublishRecorder{ .shared = &sh };
     sh.publisher = recorder.publisher();
     const tx = signedTx(0x20, 1, "alice", sh.state.network_id);
@@ -580,7 +592,8 @@ test "shared admission accepts a canonical network transaction and publishes aft
 }
 
 test "RPC submit crosses the same admission and publisher boundary" {
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     var recorder = PublishRecorder{ .shared = &sh };
     sh.publisher = recorder.publisher();
     const tx = signedTx(0x22, 1, "rpc", sh.state.network_id);
@@ -599,7 +612,8 @@ test "RPC submit crosses the same admission and publisher boundary" {
 }
 
 test "admission rejects malformed, wrong-network, out-of-sequence, duplicate, and full input without publishing" {
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     var recorder = PublishRecorder{ .shared = &sh };
     sh.publisher = recorder.publisher();
 
@@ -628,7 +642,8 @@ test "admission rejects malformed, wrong-network, out-of-sequence, duplicate, an
     try testing.expectEqual(Admission.duplicate, sh.admit(&raw));
     try testing.expectEqual(@as(usize, 1), recorder.calls);
 
-    var full = testShared();
+    var full = testShared(testing.allocator);
+    defer full.deinit(testing.allocator);
     for (0..registry.max_pending) |i| {
         const item = signedIndexedTx(i, full.state.network_id);
         var item_raw: [registry.tx_bytes]u8 = undefined;
@@ -645,7 +660,8 @@ test "admission rejects malformed, wrong-network, out-of-sequence, duplicate, an
 }
 
 test "reflood snapshots the bounded pending set and publishes outside the lock" {
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     const tx1 = signedTx(0x23, 1, "one", sh.state.network_id);
     const tx2 = signedTx(0x23, 2, "two", sh.state.network_id);
     var raw1: [registry.tx_bytes]u8 = undefined;
@@ -668,7 +684,8 @@ test "reflood snapshots the bounded pending set and publishes outside the lock" 
 // `prune` must drop exactly the applied/superseded entries while retaining a
 // later accepted transaction from the same source.
 test "shared: prune drops applied pending transactions and retains later ones" {
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     const nid = sh.state.network_id;
     const t1 = signedTx(0x21, 1, "a", nid);
     const t2 = signedTx(0x21, 2, "b", nid);
@@ -685,7 +702,7 @@ test "shared: prune drops applied pending transactions and retains later ones" {
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = t1;
     const value: registry.LedgerValue = .{ .close_time = 1, .txs = set };
-    registry.apply(&sh.state, &value);
+    try registry.apply(&sh.state, &value, testing.allocator);
     sh.prune();
     try testing.expectEqual(@as(usize, 1), sh.n_pending);
     try testing.expectEqual(@as(u64, 2), sh.pending[0].seq);
@@ -699,8 +716,9 @@ test "handle: head/get/account/submit lines and every error code" {
     const network_id = registry.networkId("rpc handle test", genesis_close_time);
     var sh: Shared = .{
         .io = testing.io,
-        .state = registry.State.genesis(network_id, genesis_close_time),
+        .state = try registry.State.genesis(network_id, genesis_close_time, testing.allocator),
     };
+    defer sh.deinit(testing.allocator);
     const nid = sh.state.network_id;
     var out: [max_line]u8 = undefined;
     var r = handle(&sh, "head", &out);
@@ -771,14 +789,14 @@ test "handle: head/get/account/submit lines and every error code" {
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = t1;
     const value1: registry.LedgerValue = .{ .close_time = 1_234_567_891, .txs = set };
-    registry.apply(&sh.state, &value1);
+    try registry.apply(&sh.state, &value1, testing.allocator);
     var v = signedTx(0x31, 2, "alice", nid);
     v = Tx.init(v.source, 2, .set, "alice", "hi", registry.zero_key).?;
     v.sign(@splat(0x31), nid) catch unreachable;
     var set2: registry.TxSet = .{ .count = 1 };
     set2.txs[0] = v;
     const value2: registry.LedgerValue = .{ .close_time = 1_234_567_892, .txs = set2 };
-    registry.apply(&sh.state, &value2);
+    try registry.apply(&sh.state, &value2, testing.allocator);
     r = handle(&sh, "get alice", &out);
     try testing.expectEqualStrings("alice", field(r, "name").?);
     try testing.expectEqualStrings("6869", field(r, "value").?);
@@ -792,7 +810,8 @@ test "handle: head/get/account/submit lines and every error code" {
 test "server + client: one request line, one response line over loopback; stop joins" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     const srv = try Server.start(gpa, io, &sh, 0);
     defer srv.stop();
     var spec_buf: [32]u8 = undefined;
@@ -812,7 +831,8 @@ test "server + client: one request line, one response line over loopback; stop j
 test "server: a port somebody already answers on is refused" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     const first = try Server.start(gpa, io, &sh, 0);
     defer first.stop();
     if (Server.start(gpa, io, &sh, first.port)) |second| {
@@ -830,7 +850,8 @@ test "server caps outstanding teardown and stop waits through allocator deinit" 
     defer if (allocator_live) {
         _ = da.deinit();
     };
-    var sh = testShared();
+    var sh = testShared(testing.allocator);
+    defer sh.deinit(testing.allocator);
     const srv = try Server.start(da.allocator(), io, &sh, 0);
     var server_live = true;
     defer if (server_live) srv.stop();

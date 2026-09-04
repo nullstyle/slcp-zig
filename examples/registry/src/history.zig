@@ -281,6 +281,11 @@ pub const Archive = struct {
     }
 
     pub fn deinit(self: *Archive) void {
+        if (self.stage_frontier) |*s| s.deinit(self.gpa);
+        if (self.publish_frontier) |*s| s.deinit(self.gpa);
+        if (self.ready) |*s| s.deinit(self.gpa);
+        if (self.inflight) |*i| i.state.deinit(self.gpa);
+        if (self.recovered_proof) |*proof| proof.recovery.state.deinit(self.gpa);
         self.outbox_dir.close(self.io);
         self.signing_votes_dir.close(self.io);
         self.signing_dir.close(self.io);
@@ -327,6 +332,13 @@ pub const Archive = struct {
         }
 
         var best: ?RecoveredProof = null;
+        var best_owned = true;
+        defer {
+            if (best_owned and best != null) {
+                var b = best.?;
+                b.recovery.state.deinit(self.gpa);
+            }
+        }
         var certified: [max_candidates]Assertion = undefined;
         var n_certified: usize = 0;
         for (candidates[0..n_candidates]) |candidate| {
@@ -338,14 +350,31 @@ pub const Archive = struct {
             certified[n_certified] = candidate.assertion;
             n_certified += 1;
 
-            const recovered = (try self.recoverAssertion(candidate.assertion)) orelse continue;
+            var recovered = (try self.recoverAssertion(candidate.assertion)) orelse continue;
             if (best) |current| {
-                if (recovered.state.head.slot < current.recovery.state.head.slot) continue;
+                if (recovered.state.head.slot < current.recovery.state.head.slot) {
+                    recovered.state.deinit(self.gpa);
+                    continue;
+                }
+                var superseded = current;
+                superseded.recovery.state.deinit(self.gpa);
             }
             best = .{ .recovery = recovered, .assertion = candidate.assertion };
         }
-        self.recovered_proof = best;
-        return if (best) |proof| proof.recovery else null;
+        // The archive owns the retained proof; the caller gets a clone so
+        // the two never share storage.
+        if (best) |proof| {
+            self.recovered_proof = proof; // moves the retained state in
+            const out = try self.recovered_proof.?.recovery.state.clone(self.gpa);
+            best_owned = false; // the archive owns it now
+            return .{
+                .state = out,
+                .anchor_slot = proof.recovery.anchor_slot,
+                .replayed_ledgers = proof.recovery.replayed_ledgers,
+            };
+        }
+        self.recovered_proof = null;
+        return null;
     }
 
     /// Compatibility wrapper for the E2c caller. New code should retain the
@@ -362,12 +391,12 @@ pub const Archive = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.validateState(base);
-        if (self.stage_frontier) |frontier| {
-            if (sameDurableState(&frontier, base)) return;
+        if (self.stage_frontier) |*frontier| {
+            if (sameDurableState(frontier, base)) return;
             const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
             const published = self.published orelse return error.HistoryOutboxCorrupt;
             if (admitted.slot == published.slot) {
-                if (self.recovered_proof) |proof| {
+                if (self.recovered_proof) |*proof| {
                     if (proof.recovery.state.head.slot > published.slot and
                         sameDurableState(base, &proof.recovery.state))
                     {
@@ -377,8 +406,11 @@ pub const Archive = struct {
                         try self.beginCertifiedAdoption(target, base);
                         self.admitted = target;
                         self.published = target;
-                        self.stage_frontier = base.*;
-                        self.publish_frontier = base.*;
+                        if (self.stage_frontier) |*s| s.deinit(self.gpa);
+                        self.stage_frontier = try base.clone(self.gpa);
+                        if (self.publish_frontier) |*s| s.deinit(self.gpa);
+                        self.publish_frontier = try base.clone(self.gpa);
+                        if (self.ready) |*s| s.deinit(self.gpa);
                         self.ready = null;
                         self.publish_assertion = if (proof.assertion.anchor_every == self.checkpoint_every)
                             proof.assertion
@@ -417,7 +449,8 @@ pub const Archive = struct {
         if (!watermarkMatchesState(trusted, state)) return false;
         const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
         const published = self.published orelse return error.HistoryOutboxCorrupt;
-        const represented = try self.loadRepresentedState(trusted, published, admitted);
+        var represented = try self.loadRepresentedState(trusted, published, admitted);
+        defer represented.deinit(self.gpa);
         return sameDurableState(&represented, state);
     }
 
@@ -428,7 +461,7 @@ pub const Archive = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.adoption_pending != null) return error.HistoryAdoptionNotInstalled;
-        const previous = self.stage_frontier orelse return error.HistoryFrontierUnprepared;
+        const previous: *const registry.State = &(self.stage_frontier orelse return error.HistoryFrontierUnprepared);
         const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
         const published = self.published orelse return error.HistoryOutboxCorrupt;
 
@@ -447,10 +480,10 @@ pub const Archive = struct {
             return error.HistoryOutboxSequence;
         if (state.head.slot - published.slot > max_backlog)
             return error.HistoryBacklogFull;
-        try self.validateSuccessor(&previous, state, true);
+        try self.validateSuccessor(previous, state, true);
 
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+        const snapshot = try registry.writeSnapshot(state, self.gpa);
+        defer self.gpa.free(snapshot);
         var name_buf: [max_name_bytes]u8 = undefined;
         try self.writeTrustedImmutableFixed(
             self.outbox_dir,
@@ -462,7 +495,8 @@ pub const Archive = struct {
         try self.writeWatermark("admitted", next);
         try self.sync_directory(self.outbox_dir);
         self.admitted = next;
-        self.stage_frontier = state.*;
+        if (self.stage_frontier) |*s| s.deinit(self.gpa);
+        self.stage_frontier = try state.clone(self.gpa);
     }
 
     /// Confirms that the application has durably installed `state`. A pending
@@ -506,9 +540,10 @@ pub const Archive = struct {
         if (published.slot == admitted.slot) return null;
         if (published.slot == std.math.maxInt(u64)) return error.HistoryOutboxCorrupt;
         const state = try self.loadStagedState(published.slot + 1);
-        const previous = self.publish_frontier orelse return error.HistoryOutboxCorrupt;
-        try self.validateSuccessor(&previous, &state, false);
-        self.ready = state;
+        const previous: *const registry.State = &(self.publish_frontier orelse return error.HistoryOutboxCorrupt);
+        try self.validateSuccessor(previous, &state, false);
+        if (self.ready) |*s| s.deinit(self.gpa);
+        self.ready = try state.clone(self.gpa);
         return state;
     }
 
@@ -526,7 +561,7 @@ pub const Archive = struct {
                 return error.HistoryOutboxSequence;
             const staged = self.ready orelse return error.HistoryStagedStateNotLoaded;
             if (!sameDurableState(&staged, state)) return error.HistoryOutboxStateMismatch;
-            const previous = self.publish_frontier orelse return error.HistoryOutboxCorrupt;
+            const previous: *const registry.State = &(self.publish_frontier orelse return error.HistoryOutboxCorrupt);
             break :blk .{
                 .previous = previous,
                 .prior_assertion = self.publish_assertion,
@@ -534,7 +569,7 @@ pub const Archive = struct {
                 .published = published,
             };
         };
-        try self.validateSuccessor(&context.previous, state, false);
+        try self.validateSuccessor(context.previous, state, false);
 
         const record: LedgerRecord = .{
             .network_id = self.network_id,
@@ -548,11 +583,11 @@ pub const Archive = struct {
         try self.sync_directory(self.ledgers_dir);
 
         const anchor_slot = expectedAnchor(state.head.slot, self.checkpoint_every);
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
         var anchor_head_hash: [32]u8 = undefined;
         var anchor_snapshot_hash: [32]u8 = undefined;
         if (anchor_slot == state.head.slot) {
-            const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+            const snapshot = try registry.writeSnapshot(state, self.gpa);
+            defer self.gpa.free(snapshot);
             anchor_head_hash = state.head.hash;
             anchor_snapshot_hash = hash(snapshot);
             if (context.fenced_pending) |pending| {
@@ -598,8 +633,9 @@ pub const Archive = struct {
             .anchor_head_hash = anchor_head_hash,
             .snapshot_hash = anchor_snapshot_hash,
         };
-        const recovered = (try self.recoverAssertion(assertion)) orelse
+        var recovered = (try self.recoverAssertion(assertion)) orelse
             return error.HistoryChainUnavailable;
+        defer recovered.state.deinit(self.gpa);
         // `state` came from durable Snapshot V3 outbox bytes, which omit the
         // transient result vector. Admission already compared those results
         // before persistence; publication compares only durable semantics.
@@ -641,11 +677,11 @@ pub const Archive = struct {
         if (slot == published.slot and self.inflight == null) return;
         if (published.slot == std.math.maxInt(u64) or slot != published.slot + 1)
             return error.HistoryOutboxSequence;
-        const inflight = self.inflight orelse return error.HistoryNotPublished;
+        const inflight: *const Inflight = &(self.inflight orelse return error.HistoryNotPublished);
         if (inflight.state.head.slot != slot) return error.HistoryOutboxSequence;
 
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const snapshot = registry.writeSnapshot(&inflight.state, &snapshot_buf);
+        const snapshot = try registry.writeSnapshot(&inflight.state, self.gpa);
+        defer self.gpa.free(snapshot);
         var frontier_name_buf: [max_name_bytes]u8 = undefined;
         try self.writeTrustedImmutableFixed(
             self.outbox_dir,
@@ -664,13 +700,15 @@ pub const Archive = struct {
         };
         try self.sync_directory(self.outbox_dir);
         self.published = next;
-        self.publish_frontier = inflight.state;
+        if (self.publish_frontier) |*s| s.deinit(self.gpa);
+        self.publish_frontier = inflight.state; // moves the inflight state
         if (inflight.assertion) |assertion| self.publish_assertion = assertion;
         if (self.fenced_pending) |pending| {
             if (pending.slot == slot) self.fenced_pending = null;
         }
+        if (self.ready) |*s| s.deinit(self.gpa);
         self.ready = null;
-        self.inflight = null;
+        self.inflight = null; // its state moved into publish_frontier
     }
 
     fn loadPolicyAndWatermarks(self: *Archive) !void {
@@ -696,7 +734,10 @@ pub const Archive = struct {
         self.boot_provenance = self.readBootProvenance() catch return error.HistoryOutboxCorrupt;
         const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
         const published = self.published orelse return error.HistoryOutboxCorrupt;
-        _ = self.loadFrontierState(policy.activation) catch return error.HistoryOutboxCorrupt;
+        if (self.loadFrontierState(policy.activation)) |probe| {
+            var probe_state = probe;
+            probe_state.deinit(self.gpa);
+        } else |_| return error.HistoryOutboxCorrupt;
         if (published.slot > admitted.slot) return error.HistoryOutboxCorrupt;
         if (self.adoption_pending) |target| {
             if (!adoptionWatermarksReachable(target, published, admitted))
@@ -706,8 +747,10 @@ pub const Archive = struct {
             return error.HistoryOutboxCorrupt;
         if (self.boot_provenance) |trusted| {
             if (trusted.slot < policy.activation.slot) return error.HistoryOutboxCorrupt;
-            _ = self.loadRepresentedState(trusted, published, admitted) catch
-                return error.HistoryOutboxCorrupt;
+            if (self.loadRepresentedState(trusted, published, admitted)) |probe| {
+                var probe_state = probe;
+                probe_state.deinit(self.gpa);
+            } else |_| return error.HistoryOutboxCorrupt;
             if (self.adoption_pending) |target| {
                 if (trusted.slot > target.slot or
                     (trusted.slot == target.slot and !sameWatermark(trusted, target)))
@@ -724,8 +767,8 @@ pub const Archive = struct {
             if (!sameWatermark(watermark, initial)) return error.HistoryActivationMismatch;
         };
 
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const snapshot = registry.writeSnapshot(base, &snapshot_buf);
+        const snapshot = try registry.writeSnapshot(base, self.gpa);
+        defer self.gpa.free(snapshot);
         var frontier_name_buf: [max_name_bytes]u8 = undefined;
         try self.writeTrustedImmutableFixed(
             self.outbox_dir,
@@ -752,8 +795,8 @@ pub const Archive = struct {
         self.boot_provenance = null;
         self.admitted = initial;
         self.published = initial;
-        self.stage_frontier = base.*;
-        self.publish_frontier = base.*;
+        self.stage_frontier = try base.clone(self.gpa);
+        self.publish_frontier = try base.clone(self.gpa);
         self.ready = null;
         try self.restorePublicationAssertions(initial, initial);
     }
@@ -766,7 +809,8 @@ pub const Archive = struct {
             if (!adoptionWatermarksReachable(target, published, admitted))
                 return error.HistoryOutboxCorrupt;
             var target_name_buf: [max_name_bytes]u8 = undefined;
-            const target_state = try self.loadOptionalTrustedState(frontierName(target.head_hash, &target_name_buf));
+            var target_state = try self.loadOptionalTrustedState(frontierName(target.head_hash, &target_name_buf));
+            defer if (target_state) |*t| t.deinit(self.gpa);
             if (target_state == null) {
                 // `beginCertifiedAdoption` writes the trusted marker before
                 // materializing its frontier. A crash in that first window
@@ -780,36 +824,45 @@ pub const Archive = struct {
             } else if (!watermarkMatchesState(target, &target_state.?)) {
                 return error.HistoryOutboxCorrupt;
             } else {
-                const trusted_target = target_state.?;
-                try self.finishCertifiedAdoption(target, &trusted_target);
+                try self.finishCertifiedAdoption(target, &target_state.?);
                 admitted = target;
                 published = target;
             }
         }
 
         var published_state = try self.loadFrontierState(published);
-        var staged_state = published_state;
+        var published_owned = true;
+        defer if (published_owned) published_state.deinit(self.gpa);
+        var staged_state = try published_state.clone(self.gpa);
+        var staged_owned = true;
+        defer if (staged_owned) staged_state.deinit(self.gpa);
         var slot = published.slot;
         while (slot < admitted.slot) {
             slot += 1;
-            const next = try self.loadStagedState(slot);
+            var next = try self.loadStagedState(slot);
             try self.validateSuccessor(&staged_state, &next, false);
+            staged_state.deinit(self.gpa);
             staged_state = next;
         }
 
         var represented = sameDurableState(base, &staged_state) or
             sameDurableState(base, &published_state);
         if (!represented and base.head.slot > published.slot and base.head.slot <= admitted.slot) {
-            const pending = try self.loadStagedState(base.head.slot);
+            var pending = try self.loadStagedState(base.head.slot);
+            defer pending.deinit(self.gpa);
             represented = sameDurableState(base, &pending);
         }
         if (!represented and base.head.slot <= published.slot) {
             var name_buf: [max_name_bytes]u8 = undefined;
             const ancestor = self.loadTrustedState(frontierName(base.head.hash, &name_buf)) catch null;
-            if (ancestor) |state| represented = sameDurableState(base, &state);
+            if (ancestor) |state| {
+                represented = sameDurableState(base, &state);
+                var owned = state;
+                owned.deinit(self.gpa);
+            }
         }
         if (!represented) {
-            const proof = self.recovered_proof orelse return error.HistoryFrontierMismatch;
+            const proof: *const RecoveredProof = &(self.recovered_proof orelse return error.HistoryFrontierMismatch);
             if (admitted.slot != published.slot or
                 proof.recovery.state.head.slot <= published.slot or
                 !sameDurableState(base, &proof.recovery.state))
@@ -818,14 +871,21 @@ pub const Archive = struct {
             try self.beginCertifiedAdoption(target, base);
             admitted = target;
             published = target;
-            published_state = base.*;
-            staged_state = base.*;
+            published_state.deinit(self.gpa);
+            published_state = try base.clone(self.gpa);
+            staged_state.deinit(self.gpa);
+            staged_state = try base.clone(self.gpa);
         }
 
         self.admitted = admitted;
         self.published = published;
+        if (self.stage_frontier) |*s| s.deinit(self.gpa);
         self.stage_frontier = staged_state;
+        staged_owned = false; // moved into the archive
+        if (self.publish_frontier) |*s| s.deinit(self.gpa);
         self.publish_frontier = published_state;
+        published_owned = false; // moved into the archive
+        if (self.ready) |*s| s.deinit(self.gpa);
         self.ready = null;
         try self.restorePublicationAssertions(published, admitted);
     }
@@ -854,8 +914,8 @@ pub const Archive = struct {
         try self.writeTrustedImmutableFixed(self.outbox_dir, "adoption", &marker_buf);
         try self.sync_directory(self.outbox_dir);
         self.adoption_pending = target;
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+        const snapshot = try registry.writeSnapshot(state, self.gpa);
+        defer self.gpa.free(snapshot);
         var name_buf: [max_name_bytes]u8 = undefined;
         try self.writeTrustedImmutableFixed(self.outbox_dir, frontierName(target.head_hash, &name_buf), snapshot);
         try self.sync_directory(self.outbox_dir);
@@ -868,8 +928,8 @@ pub const Archive = struct {
         if (!watermarkMatchesState(target, state) or
             !adoptionWatermarksReachable(target, published, admitted))
             return error.HistoryOutboxCorrupt;
-        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+        const snapshot = try registry.writeSnapshot(state, self.gpa);
+        defer self.gpa.free(snapshot);
         var name_buf: [max_name_bytes]u8 = undefined;
         try self.writeTrustedImmutableFixed(self.outbox_dir, frontierName(target.head_hash, &name_buf), snapshot);
         try self.sync_directory(self.outbox_dir);
@@ -908,7 +968,8 @@ pub const Archive = struct {
             {
                 if (vote.assertion.anchor_every != self.checkpoint_every)
                     return error.SigningFenceCorrupt;
-                const staged = try self.loadStagedState(vote.assertion.slot);
+                var staged = try self.loadStagedState(vote.assertion.slot);
+                defer staged.deinit(self.gpa);
                 if (!std.mem.eql(u8, &staged.head.hash, &vote.assertion.head_hash))
                     return error.SigningFenceCorrupt;
                 self.fenced_pending = vote.assertion;
@@ -924,23 +985,23 @@ pub const Archive = struct {
         const published = self.published orelse return error.HistoryOutboxCorrupt;
         if (!sameWatermark(published, expected) or self.inflight != null)
             return error.HistoryPublisherRace;
-        self.inflight = .{ .state = state.*, .assertion = assertion };
+        self.inflight = .{ .state = try state.clone(self.gpa), .assertion = assertion };
     }
 
     fn validateState(self: *const Archive, state: *const registry.State) !void {
-        if (state.n_accounts > registry.max_accounts or
-            state.n_names > registry.max_names or
-            state.last_count > registry.max_txs or
+        if (state.last_count > registry.max_txs or
             (state.last_value != null and state.last_value.?.txs.count > registry.max_txs))
             return error.InvalidAppliedState;
+        const root = try state.stateRoot(self.gpa);
         if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
-            !std.mem.eql(u8, &state.head.state_root, &state.stateRoot()) or
+            !std.mem.eql(u8, &state.head.state_root, &root) or
             !std.mem.eql(u8, &state.head.hash, &registry.headerHash(state.network_id, &state.head)) or
             !registry.closeTimeAtSlotOk(self.genesis_close_time, state.head.slot, state.head.close_time) or
             !hasExactLastValue(state))
             return error.InvalidAppliedState;
         if (state.head.slot == 0) {
-            const genesis = registry.State.genesis(self.network_id, self.genesis_close_time);
+            var genesis = try registry.State.genesis(self.network_id, self.genesis_close_time, self.gpa);
+            defer genesis.deinit(self.gpa);
             if (!sameDurableState(&genesis, state)) return error.InvalidGenesisState;
         } else if (state.head.slot == std.math.maxInt(u64)) {
             return error.CheckpointSlotOverflow;
@@ -962,8 +1023,9 @@ pub const Archive = struct {
         const value = state.last_value orelse return error.InvalidAppliedState;
         if (registry.validate(previous, &value, state.head.slot) != .valid)
             return error.HistoryTransitionInvalid;
-        var rebuilt = previous.*;
-        registry.apply(&rebuilt, &value);
+        var rebuilt = try previous.clone(self.gpa);
+        defer rebuilt.deinit(self.gpa);
+        try registry.apply(&rebuilt, &value, self.gpa);
         if (!sameRecoveredState(&rebuilt, state, compare_results))
             return error.HistoryTransitionInvalid;
     }
@@ -1003,12 +1065,14 @@ pub const Archive = struct {
     ) !bool {
         if (state.head.slot > admitted.slot) return false;
         if (state.head.slot > published.slot) {
-            const staged = try self.loadStagedState(state.head.slot);
+            var staged = try self.loadStagedState(state.head.slot);
+            defer staged.deinit(self.gpa);
             return sameDurableState(&staged, state);
         }
         var name_buf: [max_name_bytes]u8 = undefined;
-        const represented = (try self.loadOptionalTrustedState(frontierName(state.head.hash, &name_buf))) orelse
+        var represented = (try self.loadOptionalTrustedState(frontierName(state.head.hash, &name_buf))) orelse
             return false;
+        defer represented.deinit(self.gpa);
         return sameDurableState(&represented, state);
     }
 
@@ -1035,14 +1099,45 @@ pub const Archive = struct {
     }
 
     fn loadOptionalTrustedState(self: *Archive, name: []const u8) !?registry.State {
-        var buf: [registry.snapshot_max_bytes]u8 = undefined;
-        const raw = self.readTrustedFixed(self.outbox_dir, name, &buf) catch |err| switch (err) {
+        const raw = self.readTrustedAlloc(self.outbox_dir, name) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return error.HistoryOutboxCorrupt,
         };
-        const state = registry.readSnapshot(raw) orelse return error.HistoryOutboxCorrupt;
+        defer self.gpa.free(raw);
+        var state = (try registry.readSnapshot(self.gpa, raw)) orelse return error.HistoryOutboxCorrupt;
+        var kept = false;
+        defer if (!kept) state.deinit(self.gpa);
         self.validateState(&state) catch return error.HistoryOutboxCorrupt;
+        kept = true;
         return state;
+    }
+
+    /// The trusted-state read with a dynamic buffer: V4 snapshots have no
+    /// fixed maximum, so the file is read into an allocation bounded by the
+    /// registry's hostile-input read limit.
+    fn readTrustedAlloc(self: *Archive, dir: std.Io.Dir, name: []const u8) ![]u8 {
+        if (comptime !durabilitySupported(builtin.os.tag))
+            return error.UnsupportedHistoryDurability;
+        var flags: std.posix.O = .{ .ACCMODE = .RDONLY };
+        flags.NONBLOCK = true;
+        flags.NOFOLLOW = true;
+        if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+        if (@hasField(std.posix.O, "RESOLVE_BENEATH")) flags.RESOLVE_BENEATH = true;
+        const fd = try std.posix.openat(dir.handle, name, flags, 0);
+        var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        if (stat.size > registry.snapshot_read_limit) return error.HistoryOutboxCorrupt;
+        const out = try self.gpa.alloc(u8, @intCast(stat.size));
+        errdefer self.gpa.free(out);
+        var off: usize = 0;
+        while (off < out.len) {
+            const n = try std.posix.read(fd, out[off..]);
+            if (n == 0) return error.HistoryOutboxCorrupt; // shorter than its stat: torn
+            off += n;
+        }
+        return out;
     }
 
     fn readWatermark(self: *Archive, name: []const u8) !?Watermark {
@@ -1100,8 +1195,9 @@ pub const Archive = struct {
     }
 
     fn writeTrustedImmutableFixed(self: *Archive, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
-        var old_buf: [registry.snapshot_max_bytes]u8 = undefined;
-        if (self.readTrustedFixed(dir, name, old_buf[0..@min(old_buf.len, bytes.len)])) |old| {
+        const old_buf = try self.gpa.alloc(u8, bytes.len);
+        defer self.gpa.free(old_buf);
+        if (self.readTrustedFixed(dir, name, old_buf)) |old| {
             if (!std.mem.eql(u8, old, bytes)) return error.ImmutableFileConflict;
             return;
         } else |err| switch (err) {
@@ -1156,6 +1252,8 @@ pub const Archive = struct {
             return error.CertifiedHistoryInvalid;
 
         var state = (try self.loadAnchorSnapshot(assertion)) orelse return null;
+        var state_owned = true;
+        defer if (state_owned) state.deinit(self.gpa);
         if (!std.meta.eql(state.head, current.header) or
             state.last_value == null or
             !sameLedgerValue(&state.last_value.?, &current.value))
@@ -1171,7 +1269,7 @@ pub const Archive = struct {
                 return error.HistoryTransitionInvalid;
             if (registry.validate(&state, &next.value, next.header.slot) != .valid)
                 return error.HistoryTransitionInvalid;
-            registry.apply(&state, &next.value);
+            try registry.apply(&state, &next.value, self.gpa);
             if (!std.meta.eql(state.head, next.header) or
                 state.last_value == null or
                 !sameLedgerValue(&state.last_value.?, &next.value))
@@ -1179,6 +1277,7 @@ pub const Archive = struct {
         }
         if (!std.mem.eql(u8, &state.head.hash, &assertion.head_hash))
             return error.CertifiedHistoryInvalid;
+        state_owned = false; // ownership transfers to the caller
         return .{
             .state = state,
             .anchor_slot = assertion.anchor_slot,
@@ -1246,11 +1345,11 @@ pub const Archive = struct {
     fn loadAnchorSnapshot(self: *Archive, assertion: Assertion) !?registry.State {
         var name_buf: [max_name_bytes]u8 = undefined;
         const name = snapshotName(assertion.snapshot_hash, &name_buf);
-        const raw = try self.readUntrusted(self.snapshots_dir, name, registry.snapshot_max_bytes);
+        const raw = try self.readUntrusted(self.snapshots_dir, name, registry.snapshot_read_limit);
         defer if (raw) |bytes| self.gpa.free(bytes);
         const bytes = raw orelse return null;
         if (!std.mem.eql(u8, &hash(bytes), &assertion.snapshot_hash)) return null;
-        const state = registry.readSnapshot(bytes) orelse return null;
+        var state = (try registry.readSnapshot(self.gpa, bytes)) orelse return null;
         if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
             state.head.slot != assertion.anchor_slot or
             !std.mem.eql(u8, &state.head.hash, &assertion.anchor_head_hash)) return null;
@@ -1820,7 +1919,7 @@ fn recordMatchesAssertion(record: *const LedgerRecord, assertion: Assertion) boo
 fn sameRecoveredState(a: *const registry.State, b: *const registry.State, compare_results: bool) bool {
     const durable_equal = std.mem.eql(u8, &a.network_id, &b.network_id) and
         std.meta.eql(a.head, b.head) and
-        std.mem.eql(u8, &a.stateRoot(), &b.stateRoot()) and
+        sameDurableState(a, b) and
         a.last_value != null and b.last_value != null and
         sameLedgerValue(&a.last_value.?, &b.last_value.?);
     if (!durable_equal) return false;
@@ -1835,9 +1934,9 @@ fn sameRecoveredState(a: *const registry.State, b: *const registry.State, compar
 fn sameDurableState(a: *const registry.State, b: *const registry.State) bool {
     if (!std.mem.eql(u8, &a.network_id, &b.network_id) or
         !std.meta.eql(a.head, b.head) or
-        a.n_accounts != b.n_accounts or a.n_names != b.n_names or
-        !std.mem.eql(u8, std.mem.sliceAsBytes(a.accountsSlice()), std.mem.sliceAsBytes(b.accountsSlice())) or
-        !std.mem.eql(u8, std.mem.sliceAsBytes(a.namesSlice()), std.mem.sliceAsBytes(b.namesSlice())))
+        a.accounts.items.len != b.accounts.items.len or a.names.items.len != b.names.items.len or
+        !std.mem.eql(u8, std.mem.sliceAsBytes(a.accounts.items), std.mem.sliceAsBytes(b.accounts.items)) or
+        !std.mem.eql(u8, std.mem.sliceAsBytes(a.names.items), std.mem.sliceAsBytes(b.names.items)))
         return false;
     if (a.last_value == null or b.last_value == null)
         return a.last_value == null and b.last_value == null;
@@ -1977,8 +2076,10 @@ test "history tip: V1 signing domain has a fixed digest and rejects checkpoint v
 }
 
 test "history ledger: V1 record is canonical and binds its full header and exact value" {
+    const gpa = testing.allocator;
     const network_id = testNetworkId("history ledger encoding");
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
     const record: LedgerRecord = .{
         .network_id = network_id,
         .header = state.head,
@@ -2013,18 +2114,19 @@ fn testPath(tmp: *std.testing.TmpDir, io: std.Io, suffix: []const u8, buf: []u8)
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, suffix });
 }
 
-fn stateAt(network_id: [32]u8, slot: u64) registry.State {
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
-    for (0..slot) |_| applySet(&state, &registry.TxSet.empty);
+fn stateAt(gpa: std.mem.Allocator, network_id: [32]u8, slot: u64) !registry.State {
+    var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    errdefer state.deinit(gpa);
+    for (0..slot) |_| try applySet(gpa, &state, &registry.TxSet.empty);
     return state;
 }
 
-fn applySet(state: *registry.State, set: *const registry.TxSet) void {
+fn applySet(gpa: std.mem.Allocator, state: *registry.State, set: *const registry.TxSet) !void {
     const value: registry.LedgerValue = .{
         .close_time = state.head.close_time + 1,
         .txs = set.*,
     };
-    registry.apply(state, &value);
+    try registry.apply(state, &value, gpa);
 }
 
 fn anchorAssertion(state: *const registry.State, snapshot: []const u8) Assertion {
@@ -2045,12 +2147,14 @@ fn recordAndAck(archive: *Archive, state: *const registry.State) !RecordStatus {
             const durable = try archive.loadFrontierState(published);
             try archive.prepareFrontier(&durable);
         } else {
-            const genesis = registry.State.genesis(archive.network_id, archive.genesis_close_time);
+            var genesis = try registry.State.genesis(archive.network_id, archive.genesis_close_time, archive.gpa);
+            defer genesis.deinit(archive.gpa);
             try archive.prepareFrontier(&genesis);
         }
     }
     try archive.stageApplied(state);
-    const staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer staged.deinit(archive.gpa);
     if (staged.head.slot != state.head.slot) return error.UnexpectedStagedState;
     const status = try archive.recordApplied(&staged);
     try archive.ackStaged(staged.head.slot);
@@ -2081,12 +2185,14 @@ test "history boot provenance: fresh activation is not independently trusted" {
     var archive = try Archive.open(gpa, io, cfg);
     defer archive.deinit();
 
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     try archive.prepareFrontier(&genesis);
     try archive.confirmInstalled(&genesis);
     try testing.expect(!try archive.hasTrustedBootProvenance(&genesis));
 
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     try archive.stageApplied(&one);
     try archive.confirmInstalled(&one);
     try testing.expect(!try archive.hasTrustedBootProvenance(&one));
@@ -2123,11 +2229,12 @@ test "history boot provenance: certified install survives restart and advances o
     var reader_cfg = writer_cfg;
     reader_cfg.signing_dir = reader_path;
 
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     var tip = genesis;
     var writer = try Archive.open(gpa, io, writer_cfg);
     for (0..3) |_| {
-        applySet(&tip, &registry.TxSet.empty);
+        try applySet(gpa, &tip, &registry.TxSet.empty);
         _ = try recordAndAck(&writer, &tip);
     }
     writer.deinit();
@@ -2147,7 +2254,7 @@ test "history boot provenance: certified install survives restart and advances o
     try testing.expect(try reader.hasTrustedBootProvenance(&recovered.state));
     try reader.prepareFrontier(&recovered.state);
     var successor = recovered.state;
-    applySet(&successor, &registry.TxSet.empty);
+    try applySet(gpa, &successor, &registry.TxSet.empty);
     try reader.stageApplied(&successor);
     try testing.expect(try reader.hasTrustedBootProvenance(&recovered.state));
     try testing.expect(!try reader.hasTrustedBootProvenance(&successor));
@@ -2159,14 +2266,15 @@ test "history boot provenance: certified install survives restart and advances o
         reader.confirmInstalled(&recovered.state),
     );
     var unrepresented = successor;
-    applySet(&unrepresented, &registry.TxSet.empty);
+    try applySet(gpa, &unrepresented, &registry.TxSet.empty);
     try testing.expectError(error.HistoryFrontierMismatch, reader.confirmInstalled(&unrepresented));
     reader.deinit();
 
     reader = try Archive.open(gpa, io, reader_cfg);
     try testing.expect(try reader.hasTrustedBootProvenance(&successor));
     try reader.prepareFrontier(&successor);
-    const staged = (try reader.nextStaged()) orelse return error.ExpectedStagedState;
+    var staged = (try reader.nextStaged()) orelse return error.ExpectedStagedState;
+    defer staged.deinit(gpa);
     _ = try reader.recordApplied(&staged);
     try reader.ackStaged(staged.head.slot);
     try testing.expect(try reader.hasTrustedBootProvenance(&successor));
@@ -2203,7 +2311,8 @@ test "history boot provenance: exact certified activation becomes trusted only o
     var reader_cfg = writer_cfg;
     reader_cfg.signing_dir = reader_path;
 
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     var writer = try Archive.open(gpa, io, writer_cfg);
     _ = try recordAndAck(&writer, &one);
     writer.deinit();
@@ -2249,8 +2358,10 @@ test "history boot provenance: crash after provenance write retains an idempoten
     };
     var reader_cfg = writer_cfg;
     reader_cfg.signing_dir = reader_path;
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
-    const one = stateAt(network_id, 1);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
 
     var writer = try Archive.open(gpa, io, writer_cfg);
     _ = try recordAndAck(&writer, &one);
@@ -2322,7 +2433,8 @@ test "history boot provenance: corrupt or unrepresented trusted watermark fails 
         .signer_seed = seed,
         .checkpoint_every = 8,
     };
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
 
     var archive = try Archive.open(gpa, io, base);
     try archive.prepareFrontier(&genesis);
@@ -2364,8 +2476,10 @@ test "history adoption: stale lower marker cannot roll durable watermarks backwa
     };
 
     var archive = try Archive.open(gpa, io, cfg);
-    const one = stateAt(network_id, 1);
-    const two = stateAt(network_id, 2);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
     _ = try recordAndAck(&archive, &one);
     _ = try recordAndAck(&archive, &two);
     try archive.writeWatermark("adoption", .{ .slot = one.head.slot, .head_hash = one.head.hash });
@@ -2416,10 +2530,11 @@ test "history archive: certified per-ledger tip replays a long outage without a 
     var b = try Archive.open(gpa, io, cfg_b);
     defer b.deinit();
 
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer state.deinit(gpa);
     var slot_34_hash: [32]u8 = undefined;
     for (1..36) |slot| {
-        applySet(&state, &registry.TxSet.empty);
+        try applySet(gpa, &state, &registry.TxSet.empty);
         if (slot == 34) slot_34_hash = state.head.hash;
         _ = try recordAndAck(&a, &state);
         _ = try recordAndAck(&b, &state);
@@ -2433,7 +2548,8 @@ test "history archive: certified per-ledger tip replays a long outage without a 
     var reader = try Archive.open(gpa, io, cfg_reader);
     defer reader.deinit();
 
-    const recovered = (try reader.recoverLatest(35)) orelse return error.ExpectedCertifiedHistory;
+    var recovered = (try reader.recoverLatest(35)) orelse return error.ExpectedCertifiedHistory;
+    defer recovered.state.deinit(gpa);
     try testing.expectEqual(@as(u64, 35), recovered.state.head.slot);
     try testing.expectEqualSlices(u8, &state.head.hash, &recovered.state.head.hash);
     try testing.expectEqual(@as(u64, 1), recovered.anchor_slot);
@@ -2468,26 +2584,31 @@ test "history archive: every boundary is contiguous and replay remains bounded a
     });
     defer archive.deinit();
 
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     _ = try recordAndAck(&archive, &one);
-    const eight = stateAt(network_id, 8);
+    var eight = try stateAt(gpa, network_id, 8);
+    defer eight.deinit(gpa);
     try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&eight));
 
     var state = one;
     for (2..128) |slot| {
-        applySet(&state, &registry.TxSet.empty);
+        try applySet(gpa, &state, &registry.TxSet.empty);
         try testing.expectEqual(@as(u64, slot), state.head.slot);
         _ = try recordAndAck(&archive, &state);
         if (slot == 63) {
-            const recovered = (try archive.recoverLatest(63)) orelse return error.ExpectedCertifiedHistory;
+            var recovered = (try archive.recoverLatest(63)) orelse return error.ExpectedCertifiedHistory;
+            defer recovered.state.deinit(gpa);
             try testing.expectEqual(@as(u64, 1), recovered.anchor_slot);
             try testing.expectEqual(@as(u64, 62), recovered.replayed_ledgers);
         } else if (slot == 64) {
-            const recovered = (try archive.recoverLatest(64)) orelse return error.ExpectedCertifiedHistory;
+            var recovered = (try archive.recoverLatest(64)) orelse return error.ExpectedCertifiedHistory;
+            defer recovered.state.deinit(gpa);
             try testing.expectEqual(@as(u64, 64), recovered.anchor_slot);
             try testing.expectEqual(@as(u64, 0), recovered.replayed_ledgers);
         } else if (slot == 127) {
-            const recovered = (try archive.recoverLatest(127)) orelse return error.ExpectedCertifiedHistory;
+            var recovered = (try archive.recoverLatest(127)) orelse return error.ExpectedCertifiedHistory;
+            defer recovered.state.deinit(gpa);
             try testing.expectEqual(@as(u64, 64), recovered.anchor_slot);
             try testing.expectEqual(@as(u64, 63), recovered.replayed_ledgers);
         }
@@ -2517,9 +2638,11 @@ test "history archive: slot one must extend the configured canonical genesis" {
         .checkpoint_every = 8,
     });
     defer archive.deinit();
-    const wrong_genesis = registry.State.genesis(network_id, wrong_g);
+    var wrong_genesis = try registry.State.genesis(network_id, wrong_g, gpa);
+    defer wrong_genesis.deinit(gpa);
     try archive.prepareFrontier(&wrong_genesis);
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     try testing.expectError(error.HistoryTransitionInvalid, archive.stageApplied(&one));
 }
 
@@ -2553,9 +2676,10 @@ test "history ledger: cadence is absent from canonical bytes and trusted policy 
     defer a.deinit();
     var b = try Archive.open(gpa, io, cfg_16);
     defer b.deinit();
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer state.deinit(gpa);
     for (1..18) |_| {
-        applySet(&state, &registry.TxSet.empty);
+        try applySet(gpa, &state, &registry.TxSet.empty);
         _ = try recordAndAck(&a, &state);
         _ = try recordAndAck(&b, &state);
     }
@@ -2593,9 +2717,12 @@ test "history outbox: restart accepts pending and published snapshot ancestors" 
         .signer_seed = seed,
         .checkpoint_every = 8,
     };
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
-    const one = stateAt(network_id, 1);
-    const two = stateAt(network_id, 2);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
 
     var archive = try Archive.open(gpa, io, cfg);
     try archive.prepareFrontier(&genesis);
@@ -2607,9 +2734,11 @@ test "history outbox: restart accepts pending and published snapshot ancestors" 
     try archive.prepareFrontier(&one); // ordinary snapshot at P+1
     try archive.stageApplied(&one); // journal re-delivery is exact/idempotent
     try archive.stageApplied(&two);
-    const pending_one = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var pending_one = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer pending_one.deinit(gpa);
     _ = try recordAndAck(&archive, &pending_one);
-    const pending_two = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var pending_two = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer pending_two.deinit(gpa);
     _ = try recordAndAck(&archive, &pending_two);
     archive.deinit();
 
@@ -2641,15 +2770,16 @@ test "history outbox: missing trusted pending state and backlog overflow fail cl
         .signer_seed = seed,
         .checkpoint_every = 64,
     };
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     var archive = try Archive.open(gpa, io, cfg);
     try archive.prepareFrontier(&genesis);
     var state = genesis;
     for (1..65) |_| {
-        applySet(&state, &registry.TxSet.empty);
+        try applySet(gpa, &state, &registry.TxSet.empty);
         try archive.stageApplied(&state);
     }
-    applySet(&state, &registry.TxSet.empty);
+    try applySet(gpa, &state, &registry.TxSet.empty);
     try testing.expectError(error.HistoryBacklogFull, archive.stageApplied(&state));
     var name_buf: [max_name_bytes]u8 = undefined;
     try archive.outbox_dir.deleteFile(io, stagedName(34, &name_buf));
@@ -2683,16 +2813,18 @@ test "history archive: recordApplied validates the immediate predecessor at an a
     });
     defer archive.deinit();
     for (1..8) |slot| {
-        const state = stateAt(network_id, slot);
+        var state = try stateAt(gpa, network_id, slot);
+        defer state.deinit(gpa);
         _ = try recordAndAck(&archive, &state);
     }
-    const eight = stateAt(network_id, 8);
+    var eight = try stateAt(gpa, network_id, 8);
+    defer eight.deinit(gpa);
     try archive.stageApplied(&eight);
     _ = try archive.nextStaged();
     // This private-seam corruption models an implementation that tries to
     // treat slot 8 as an independent snapshot reset. Publication must still
     // reject it before signing.
-    archive.publish_frontier = stateAt(network_id, 6);
+    archive.publish_frontier = try stateAt(gpa, network_id, 6);
     try testing.expectError(error.HistoryTransitionInvalid, archive.recordApplied(&eight));
 }
 
@@ -2717,12 +2849,15 @@ test "history outbox: a fenced pending non-anchor is retried identically after r
         .signer_seed = seed,
         .checkpoint_every = 8,
     };
-    const one = stateAt(network_id, 1);
-    const two = stateAt(network_id, 2);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
     var archive = try Archive.open(gpa, io, cfg);
     _ = try recordAndAck(&archive, &one);
     try archive.stageApplied(&two);
-    const pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer pending.deinit(gpa);
     try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&pending));
     const fenced = (try archive.readTrustedVote(archive.signing_dir, "high-water.vote")) orelse
         return error.ExpectedSigningFence;
@@ -2734,7 +2869,8 @@ test "history outbox: a fenced pending non-anchor is retried identically after r
     archive = try Archive.open(gpa, io, cfg);
     defer archive.deinit();
     try archive.prepareFrontier(&one);
-    const retry = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var retry = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer retry.deinit(gpa);
     try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&retry));
     try archive.ackStaged(2);
     try testing.expectEqual(@as(u64, 2), (try archive.recoverLatest(2)).?.state.head.slot);
@@ -2761,8 +2897,9 @@ test "history outbox: transaction results are validated before admission but not
         .signer_seed = seed,
         .checkpoint_every = 8,
     };
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
-    applySet(&state, &registry.TxSet.empty);
+    var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer state.deinit(gpa);
+    try applySet(gpa, &state, &registry.TxSet.empty);
     var archive = try Archive.open(gpa, io, cfg);
     _ = try recordAndAck(&archive, &state);
 
@@ -2770,20 +2907,23 @@ test "history outbox: transaction results are validated before admission but not
     try tx.sign(seed, network_id);
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    applySet(&state, &set);
+    try applySet(gpa, &state, &set);
     try testing.expectEqual(@as(u8, 1), state.last_count);
     try archive.stageApplied(&state);
     archive.deinit();
 
     archive = try Archive.open(gpa, io, cfg);
     defer archive.deinit();
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     try archive.prepareFrontier(&one);
-    const staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer staged.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), staged.last_count);
     try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&staged));
     try archive.ackStaged(2);
-    const recovered = (try archive.recoverLatest(2)) orelse return error.ExpectedCertifiedHistory;
+    var recovered = (try archive.recoverLatest(2)) orelse return error.ExpectedCertifiedHistory;
+    defer recovered.state.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), recovered.state.last_count);
     try testing.expectEqual(registry.Result.ok, recovered.state.lastResults()[0]);
 }
@@ -2829,16 +2969,19 @@ test "history outbox: drain may be followed by adoption of newer certified histo
     defer b.deinit();
     var c = try Archive.open(gpa, io, cfg_c);
     defer c.deinit();
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     try a.prepareFrontier(&genesis);
-    const one = stateAt(network_id, 1);
-    const two = stateAt(network_id, 2);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
     try a.stageApplied(&one);
     try a.stageApplied(&two);
 
     var remote = genesis;
     for (1..6) |_| {
-        applySet(&remote, &registry.TxSet.empty);
+        try applySet(gpa, &remote, &registry.TxSet.empty);
         _ = try recordAndAck(&b, &remote);
         _ = try recordAndAck(&c, &remote);
     }
@@ -2846,7 +2989,8 @@ test "history outbox: drain may be followed by adoption of newer certified histo
         _ = try a.recordApplied(&pending);
         try a.ackStaged(pending.head.slot);
     }
-    const recovered = (try a.recoverLatest(5)) orelse return error.ExpectedCertifiedHistory;
+    var recovered = (try a.recoverLatest(5)) orelse return error.ExpectedCertifiedHistory;
+    defer recovered.state.deinit(gpa);
     try testing.expectEqual(@as(u64, 5), recovered.state.head.slot);
     try a.prepareFrontier(&recovered.state);
     try testing.expect((try a.nextStaged()) == null);
@@ -2855,16 +2999,17 @@ test "history outbox: drain may be followed by adoption of newer certified histo
     // Advance the remote certificate again, then model a crash after the
     // adoption marker and admitted watermark but before published advances.
     for (6..8) |_| {
-        applySet(&remote, &registry.TxSet.empty);
+        try applySet(gpa, &remote, &registry.TxSet.empty);
         _ = try recordAndAck(&b, &remote);
         _ = try recordAndAck(&c, &remote);
     }
-    const seven = (try a.recoverLatest(7)) orelse return error.ExpectedCertifiedHistory;
+    var seven = (try a.recoverLatest(7)) orelse return error.ExpectedCertifiedHistory;
+    defer seven.state.deinit(gpa);
     const target: Watermark = .{ .slot = seven.state.head.slot, .head_hash = seven.state.head.hash };
     try a.writeWatermark("adoption", target);
     try a.sync_directory(a.outbox_dir);
-    var adopted_snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const adopted_snapshot = registry.writeSnapshot(&seven.state, &adopted_snapshot_buf);
+    const adopted_snapshot = try registry.writeSnapshot(&seven.state, gpa);
+    defer gpa.free(adopted_snapshot);
     var adopted_name_buf: [max_name_bytes]u8 = undefined;
     try a.writeTrustedImmutableFixed(
         a.outbox_dir,
@@ -2874,22 +3019,25 @@ test "history outbox: drain may be followed by adoption of newer certified histo
     try a.sync_directory(a.outbox_dir);
     try a.writeWatermark("admitted", target);
     try a.sync_directory(a.outbox_dir);
-    applySet(&remote, &registry.TxSet.empty); // latest proof U advances beyond marker T
+    try applySet(gpa, &remote, &registry.TxSet.empty); // latest proof U advances beyond marker T
     _ = try recordAndAck(&b, &remote);
     _ = try recordAndAck(&c, &remote);
     a.deinit();
 
     a = try Archive.open(gpa, io, base);
-    const newer = (try a.recoverLatest(8)) orelse return error.ExpectedCertifiedHistory;
+    var newer = (try a.recoverLatest(8)) orelse return error.ExpectedCertifiedHistory;
+    defer newer.state.deinit(gpa);
     try a.prepareFrontier(&recovered.state); // represented local snapshot at 5
     try testing.expectEqual(@as(u64, 7), a.published.?.slot);
     try testing.expectEqual(@as(u64, 7), (try a.pendingInstall()).?.head.slot);
-    const eight = stateAt(network_id, 8);
+    var eight = try stateAt(gpa, network_id, 8);
+    defer eight.deinit(gpa);
     try testing.expectError(error.HistoryAdoptionNotInstalled, a.stageApplied(&eight));
     try a.confirmInstalled(&seven.state);
     try a.prepareFrontier(&newer.state);
     try a.confirmInstalled(&newer.state);
-    const nine = stateAt(network_id, 9);
+    var nine = try stateAt(gpa, network_id, 9);
+    defer nine.deinit(gpa);
     try a.stageApplied(&nine);
     try testing.expectEqual(@as(u64, 9), (try a.nextStaged()).?.head.slot);
 }
@@ -2956,10 +3104,12 @@ test "history archive: anchor cadence defaults to eight and is bounded at sixty-
 
     var archive = try Archive.open(gpa, io, base);
     defer archive.deinit();
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &one));
     for (2..9) |slot| {
-        const state = stateAt(network_id, slot);
+        var state = try stateAt(gpa, network_id, slot);
+        defer state.deinit(gpa);
         try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &state));
     }
 }
@@ -2987,7 +3137,8 @@ test "history archive: recordApplied requires the exact last ledger value time a
     });
     defer archive.deinit();
 
-    const canonical = stateAt(network_id, 1);
+    var canonical = try stateAt(gpa, network_id, 1);
+    defer canonical.deinit(gpa);
 
     var missing = canonical;
     missing.last_value = null;
@@ -3041,22 +3192,26 @@ test "history archive: a blocked anchor remains the oldest durable outbox item" 
     });
     defer archive.deinit();
 
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     _ = try recordAndAck(&archive, &one);
     for (2..8) |slot| {
-        const state = stateAt(network_id, slot);
+        var state = try stateAt(gpa, network_id, slot);
+        defer state.deinit(gpa);
         _ = try recordAndAck(&archive, &state);
     }
-    const eight = stateAt(network_id, 8);
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&eight, &snapshot_buf);
+    var eight = try stateAt(gpa, network_id, 8);
+    defer eight.deinit(gpa);
+    const snapshot = try registry.writeSnapshot(&eight, gpa);
+    defer gpa.free(snapshot);
     var name_buf: [max_name_bytes]u8 = undefined;
     const name = snapshotName(hash(snapshot), &name_buf);
     try overwriteTestFileAt(io, archive.snapshots_dir, name, "hostile immutable occupant");
     try archive.stageApplied(&eight);
     _ = try archive.nextStaged();
     try testing.expectError(error.ImmutableFileConflict, archive.recordApplied(&eight));
-    const pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    var pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    defer pending.deinit(gpa);
     try testing.expectEqual(@as(u64, 8), pending.head.slot);
 }
 
@@ -3235,7 +3390,8 @@ test "history archive: a flat 2-of-3 checkpoint needs two distinct validator sig
     };
     const quorum = slcp.Quorum.of(2, &ids);
     const network_id = testNetworkId("history flat 2-of-3");
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
 
     var a = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
@@ -3262,7 +3418,8 @@ test "history archive: a flat 2-of-3 checkpoint needs two distinct validator sig
     defer b.deinit();
     try testing.expectEqual(RecordStatus.certified, try recordAndAck(&b, &state));
 
-    const restored = (try a.loadLatest(1)) orelse return error.ExpectedCertifiedCheckpoint;
+    var restored = (try a.loadLatest(1)) orelse return error.ExpectedCertifiedCheckpoint;
+    defer restored.deinit(gpa);
     try testing.expectEqual(@as(u64, 1), restored.head.slot);
     try testing.expectEqualSlices(u8, &state.head.hash, &restored.head.hash);
 }
@@ -3291,7 +3448,8 @@ test "history archive: nested quorum satisfaction is not a flat signer count" {
     const inner = [_]slcp.Quorum{slcp.Quorum.of(2, ids[1..3])};
     const quorum = slcp.Quorum{ .threshold = 2, .validators = ids[0..1], .inner_sets = &inner };
     const network_id = testNetworkId("history nested quorum");
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
 
     var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer a.deinit();
@@ -3340,9 +3498,11 @@ test "history archive: candidate discovery fails closed beyond its linear-work c
             .checkpoint_every = 1,
         });
         defer writer.deinit();
-        const base = stateAt(network_id, i);
+        var base = try stateAt(gpa, network_id, i);
+        defer base.deinit(gpa);
         try writer.prepareFrontier(&base);
-        const state = stateAt(network_id, i + 1);
+        var state = try stateAt(gpa, network_id, i + 1);
+        defer state.deinit(gpa);
         try testing.expectEqual(RecordStatus.published, try recordAndAck(&writer, &state));
     }
 
@@ -3383,9 +3543,10 @@ test "history archive: bootstrap floor prevents rollback to an older valid check
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer state.deinit(gpa);
     for (1..4) |slot| {
-        state = stateAt(network_id, slot);
+        state = try stateAt(gpa, network_id, slot);
         _ = try recordAndAck(&archive, &state);
     }
     try testing.expect((try archive.loadLatest(4)) == null);
@@ -3415,7 +3576,8 @@ test "history archive: durable signing fences reject same-slot equivocation and 
     });
     defer archive.deinit();
 
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     _ = try recordAndAck(&archive, &one);
     archive.deinit();
     archive = try Archive.open(gpa, io, .{
@@ -3428,15 +3590,17 @@ test "history archive: durable signing fences reject same-slot equivocation and 
         .checkpoint_every = 1,
     });
 
-    var conflicting = registry.State.genesis(network_id, test_genesis_close_time);
+    var conflicting = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer conflicting.deinit(gpa);
     const source: registry.Key = @splat(0x61);
     const tx = registry.Tx.init(source, 1, .claim, "fork", "", registry.zero_key).?;
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    applySet(&conflicting, &set);
+    try applySet(gpa, &conflicting, &set);
     try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&conflicting));
 
-    const two = stateAt(network_id, 2);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
     _ = try recordAndAck(&archive, &two);
     try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&one));
 }
@@ -3475,13 +3639,14 @@ test "history archive: duplicate, outsider, and misnamed votes do not satisfy 2-
         .signer_seed = seeds[3],
         .checkpoint_every = 1,
     }));
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
     _ = try recordAndAck(&a, &state);
     _ = try recordAndAck(&a_copy, &state);
     try testing.expect((try a.loadLatest(1)) == null);
 
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    const snapshot = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(snapshot);
     const assertion = anchorAssertion(&state, snapshot);
     const outsider_id = try slcp.core.crypto.publicKeyFromSeed(seeds[3]);
     const outsider_vote: Vote = .{
@@ -3530,24 +3695,27 @@ test "history archive: snapshot hash and signed network/head bind imported state
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
     _ = try recordAndAck(&archive, &state);
 
     // Replace the object with a different snapshot that is internally
     // canonical and self-consistent. Its checksum, state root and head all
     // verify, but the old signed assertion names the original snapshot hash.
-    var substitute = registry.State.genesis(network_id, test_genesis_close_time);
+    var substitute = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer substitute.deinit(gpa);
     const source: registry.Key = @splat(0x82);
     const tx = registry.Tx.init(source, 1, .claim, "substitute", "", registry.zero_key).?;
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    applySet(&substitute, &set);
-    var original_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const original = registry.writeSnapshot(&state, &original_buf);
+    try applySet(gpa, &substitute, &set);
+    const original = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(original);
     var snapshot_name_buf: [max_name_bytes]u8 = undefined;
     const snapshot_name = snapshotName(hash(original), &snapshot_name_buf);
-    var substitute_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    try overwriteTestFileAt(io, archive.snapshots_dir, snapshot_name, registry.writeSnapshot(&substitute, &substitute_buf));
+    const substitute_bytes = try registry.writeSnapshot(&substitute, gpa);
+    defer gpa.free(substitute_bytes);
+    try overwriteTestFileAt(io, archive.snapshots_dir, snapshot_name, substitute_bytes);
     try testing.expect((try archive.loadLatest(1)) == null);
 
     // Restore the original object, then exercise hostile full-width votes.
@@ -3620,7 +3788,8 @@ test "history archive: snapshot hash and signed network/head bind imported state
     try archive.writeAtomic(archive.latest_dir, latest_name, &vote_buf);
     try testing.expect((try archive.loadLatest(1)) == null);
 
-    const wrong_network = stateAt(testNetworkId("other history network"), 1);
+    var wrong_network = try stateAt(gpa, testNetworkId("other history network"), 1);
+    defer wrong_network.deinit(gpa);
     try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_network));
 
     var missing_context = state;
@@ -3657,10 +3826,12 @@ test "history archive: pre-E2c snapshot versions are never external checkpoints"
     });
     defer archive.deinit();
 
-    const state = stateAt(network_id, 1);
-    var current_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const current = registry.writeSnapshot(&state, &current_buf);
-    var legacy_buf = current_buf;
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
+    const current = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(current);
+    var legacy_buf = try gpa.dupe(u8, current);
+    defer gpa.free(legacy_buf);
     const legacy_magic = "REGISTRY-SNAP-V2\n";
     comptime std.debug.assert(legacy_magic.len == registry.snap_magic.len);
     @memcpy(legacy_buf[0..legacy_magic.len], legacy_magic);
@@ -3668,7 +3839,7 @@ test "history archive: pre-E2c snapshot versions are never external checkpoints"
     const checksum = hash(legacy_buf[0..body_end]);
     @memcpy(legacy_buf[body_end..][0..32], &checksum);
     const legacy = legacy_buf[0..current.len];
-    try testing.expect(registry.readSnapshot(legacy) == null);
+    try testing.expect((try registry.readSnapshot(gpa, legacy)) == null);
 
     const assertion = anchorAssertion(&state, legacy);
     var name_buf: [max_name_bytes]u8 = undefined;
@@ -3702,16 +3873,17 @@ test "history archive: imported snapshots bind the last value close time and tra
     const fixed_prefix = registry.snap_magic.len + 32 + 8 + 8 + 4 * 32;
     const value_offset = fixed_prefix + 2;
 
-    const empty = stateAt(network_id, 1);
-    var time_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const time_snapshot = registry.writeSnapshot(&empty, &time_buf);
-    time_buf[value_offset + registry.value_magic.len + 7] ^= 1;
+    var empty = try stateAt(gpa, network_id, 1);
+    defer empty.deinit(gpa);
+    const time_snapshot = try registry.writeSnapshot(&empty, gpa);
+    defer gpa.free(time_snapshot);
+    time_snapshot[value_offset + registry.value_magic.len + 7] ^= 1;
     var body_end = time_snapshot.len - 32;
-    var checksum = hash(time_buf[0..body_end]);
-    @memcpy(time_buf[body_end..][0..32], &checksum);
-    const tampered_time = time_buf[0..time_snapshot.len];
-    const time_value_len: usize = std.mem.readInt(u16, time_buf[fixed_prefix..][0..2], .big);
-    try testing.expect(registry.LedgerValue.decode(time_buf[value_offset..][0..time_value_len]) != null);
+    var checksum = hash(time_snapshot[0..body_end]);
+    @memcpy(time_snapshot[body_end..][0..32], &checksum);
+    const tampered_time = time_snapshot[0..time_snapshot.len];
+    const time_value_len: usize = std.mem.readInt(u16, time_snapshot[fixed_prefix..][0..2], .big);
+    try testing.expect(registry.LedgerValue.decode(time_snapshot[value_offset..][0..time_value_len]) != null);
     const time_assertion = anchorAssertion(&empty, tampered_time);
     var name_buf: [max_name_bytes]u8 = undefined;
     try archive.writeImmutable(
@@ -3721,20 +3893,23 @@ test "history archive: imported snapshots bind the last value close time and tra
     );
     try testing.expect((try archive.loadSnapshot(time_assertion)) == null);
 
-    var with_tx = registry.State.genesis(network_id, test_genesis_close_time);
+    var with_tx = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer with_tx.deinit(gpa);
     var txs: registry.TxSet = .{ .count = 1 };
     txs.txs[0] = registry.Tx.init(@splat(0x85), 1, .claim, "bound", "", registry.zero_key).?;
-    applySet(&with_tx, &txs);
-    var tx_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const tx_snapshot = registry.writeSnapshot(&with_tx, &tx_buf);
+    try applySet(gpa, &with_tx, &txs);
+    const tx_bytes = try registry.writeSnapshot(&with_tx, gpa);
+    defer gpa.free(tx_bytes);
+    var tx_snapshot = try gpa.dupe(u8, tx_bytes);
+    defer gpa.free(tx_snapshot);
     const first_signature = value_offset + registry.value_magic.len + 8 + 1 + registry.unsigned_tx_bytes;
-    tx_buf[first_signature] ^= 1;
+    tx_snapshot[first_signature] ^= 1;
     body_end = tx_snapshot.len - 32;
-    checksum = hash(tx_buf[0..body_end]);
-    @memcpy(tx_buf[body_end..][0..32], &checksum);
-    const tampered_tx = tx_buf[0..tx_snapshot.len];
-    const tx_value_len: usize = std.mem.readInt(u16, tx_buf[fixed_prefix..][0..2], .big);
-    try testing.expect(registry.LedgerValue.decode(tx_buf[value_offset..][0..tx_value_len]) != null);
+    checksum = hash(tx_snapshot[0..body_end]);
+    @memcpy(tx_snapshot[body_end..][0..32], &checksum);
+    const tampered_tx = tx_snapshot[0..tx_snapshot.len];
+    const tx_value_len: usize = std.mem.readInt(u16, tx_snapshot[fixed_prefix..][0..2], .big);
+    try testing.expect(registry.LedgerValue.decode(tx_snapshot[value_offset..][0..tx_value_len]) != null);
     const tx_assertion = anchorAssertion(&with_tx, tampered_tx);
     try archive.writeImmutable(
         archive.snapshots_dir,
@@ -3766,7 +3941,8 @@ test "history archive: torn untrusted pointer, snapshot, or vote is ignored" {
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
     _ = try recordAndAck(&archive, &state);
 
     var latest_name_buf: [max_name_bytes]u8 = undefined;
@@ -3775,11 +3951,12 @@ test "history archive: torn untrusted pointer, snapshot, or vote is ignored" {
     try testing.expect((try archive.loadLatest(1)) == null);
 
     // A subsequent publication repairs the mutable pointer.
-    const state_two = stateAt(network_id, 2);
+    var state_two = try stateAt(gpa, network_id, 2);
+    defer state_two.deinit(gpa);
     _ = try recordAndAck(&archive, &state_two);
     try testing.expect((try archive.loadLatest(2)) != null);
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state_two, &snapshot_buf);
+    const snapshot = try registry.writeSnapshot(&state_two, gpa);
+    defer gpa.free(snapshot);
     const assertion = anchorAssertion(&state_two, snapshot);
     var snapshot_name_buf: [max_name_bytes]u8 = undefined;
     const snapshot_name = snapshotName(assertion.snapshot_hash, &snapshot_name_buf);
@@ -3815,9 +3992,11 @@ test "history archive: a torn trusted signing fence fails closed" {
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    const one = stateAt(network_id, 1);
+    var one = try stateAt(gpa, network_id, 1);
+    defer one.deinit(gpa);
     _ = try recordAndAck(&archive, &one);
-    const two = stateAt(network_id, 2);
+    var two = try stateAt(gpa, network_id, 2);
+    defer two.deinit(gpa);
     try archive.stageApplied(&two);
     _ = try archive.nextStaged();
     try overwriteTestFileAt(io, archive.signing_dir, "high-water.vote", "torn");
@@ -3847,11 +4026,13 @@ test "history archive: a V1 trusted signing fence fails closed during migration"
     });
     defer archive.deinit();
 
-    const state = stateAt(network_id, 1);
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
+    const snapshot = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(snapshot);
     const assertion = anchorAssertion(&state, snapshot);
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     try archive.prepareFrontier(&genesis);
     try archive.stageApplied(&state);
     _ = try archive.nextStaged();
@@ -3876,9 +4057,10 @@ test "history archive: each trusted directory barrier precedes shared publicatio
     const seed: [32]u8 = @splat(0x9a);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
     const network_id = testNetworkId("history directory barriers");
-    const state = stateAt(network_id, 1);
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
+    const snapshot = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(snapshot);
 
     // First fail the per-slot-vote directory fsync, then the high-water
     // directory fsync. Ledger and anchor objects deliberately precede the
@@ -3903,7 +4085,8 @@ test "history archive: each trusted directory barrier precedes shared publicatio
             .checkpoint_every = 1,
         });
         defer archive.deinit();
-        const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+        var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+        defer genesis.deinit(gpa);
         try archive.prepareFrontier(&genesis);
         try archive.stageApplied(&state);
         _ = try archive.nextStaged();
@@ -3953,7 +4136,8 @@ test "history archive: a shared object file-sync failure precedes signing" {
     const seed: [32]u8 = @splat(0x9b);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
     const network_id = testNetworkId("history file sync barrier");
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
 
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
@@ -3965,7 +4149,8 @@ test "history archive: a shared object file-sync failure precedes signing" {
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var genesis = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     try archive.prepareFrontier(&genesis);
     try archive.stageApplied(&state);
     _ = try archive.nextStaged();
@@ -4007,7 +4192,8 @@ test "history archive: two quorum-certified heads at one slot fail closed" {
     defer ax.deinit();
     var bx = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[1], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
     defer bx.deinit();
-    const x = stateAt(network_id, 1);
+    var x = try stateAt(gpa, network_id, 1);
+    defer x.deinit(gpa);
     _ = try recordAndAck(&ax, &x);
     _ = try recordAndAck(&bx, &x);
 
@@ -4017,21 +4203,22 @@ test "history archive: two quorum-certified heads at one slot fail closed" {
     defer by.deinit();
     var cy = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[3], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[2], .checkpoint_every = 1 });
     defer cy.deinit();
-    var y = registry.State.genesis(network_id, test_genesis_close_time);
+    var y = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+    defer y.deinit(gpa);
     const fork_seed: [32]u8 = @splat(0xa9);
     const source = try slcp.core.crypto.publicKeyFromSeed(fork_seed);
     var tx = registry.Tx.init(source, 1, .claim, "other-head", "", registry.zero_key).?;
     try tx.sign(fork_seed, network_id);
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
-    applySet(&y, &set);
+    try applySet(gpa, &y, &set);
     _ = try recordAndAck(&by, &y);
     _ = try recordAndAck(&cy, &y);
 
     // The signatures themselves are enough to prove a same-slot safety fork;
     // an attacker cannot suppress that hard failure by tearing one snapshot.
-    var y_snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const y_snapshot = registry.writeSnapshot(&y, &y_snapshot_buf);
+    const y_snapshot = try registry.writeSnapshot(&y, gpa);
+    defer gpa.free(y_snapshot);
     var y_snapshot_name_buf: [max_name_bytes]u8 = undefined;
     try overwriteTestFileAt(io, ax.snapshots_dir, snapshotName(hash(y_snapshot), &y_snapshot_name_buf), "torn");
     try testing.expectError(error.CertifiedFork, ax.loadLatest(1));
@@ -4112,9 +4299,10 @@ test "history archive: replacing an opened namespace with symlinks cannot redire
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
     const network_id = testNetworkId("history namespace replacement");
     const network_hex = registry.hex32(network_id);
-    const state = stateAt(network_id, 1);
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
+    const snapshot = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(snapshot);
     const assertion = anchorAssertion(&state, snapshot);
     const cases = [_]?[]const u8{
         null,
@@ -4210,7 +4398,8 @@ test "history archive: exact object symlinks are never followed" {
     const seed: [32]u8 = @splat(0xb3);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
     const network_id = testNetworkId("history object symlinks");
-    const state = stateAt(network_id, 1);
+    var state = try stateAt(gpa, network_id, 1);
+    defer state.deinit(gpa);
     var archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -4224,8 +4413,8 @@ test "history archive: exact object symlinks are never followed" {
     _ = try recordAndAck(&archive, &state);
     try testing.expect((try archive.loadLatest(1)) != null);
 
-    var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
+    const snapshot = try registry.writeSnapshot(&state, gpa);
+    defer gpa.free(snapshot);
     const assertion = anchorAssertion(&state, snapshot);
     const dirs = [_]std.Io.Dir{ archive.snapshots_dir, archive.ledgers_dir, archive.votes_dir, archive.latest_dir };
     var name_bufs: [4][max_name_bytes]u8 = undefined;

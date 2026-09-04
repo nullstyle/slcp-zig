@@ -1,15 +1,19 @@
 //! registry.zig — the pure state machine of `examples/registry`
 //! (docs/examples-roadmap.md "E1 — Registry").
 //!
-//! Standard library only: no slcp import, no I/O, no clock, no allocator.
-//! Everything here is deterministic and bounded so it can run inside
-//! `validate` / `apply` / `combine` on the engine thread. `app.zig` adapts it
-//! to `slcp.AppNode`; `main.zig` and `rpc.zig` are the process around it.
+//! Standard library only: no slcp import, no I/O, no clock. Mutation takes an
+//! allocator; reads do not, so `validate` / `combine` verdicts stay
+//! allocation-free and deterministic on the engine thread. `app.zig` adapts
+//! it to `slcp.OwnedAppNode`; `main.zig` and `rpc.zig` are the process around
+//! it.
 //!
 //! The shape is stellar-core's without money: principals hold Ed25519 keys
 //! and sign transactions carrying a per-account sequence number; a slot's
 //! value is a close time plus a transaction set; applying it advances a
-//! ledger header hash chain over a bounded, sorted, plain-data state.
+//! ledger header hash chain over a heap-backed, sorted, unbounded state.
+//! Accounts and names grow with use (the old 64/128 inline caps are gone —
+//! the capacity epoch); every State owns its storage and travels by pointer
+//! or explicit clone.
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -20,10 +24,9 @@ const Ed25519 = std.crypto.sign.Ed25519;
 // ---------------------------------------------------------------------------
 
 /// Transactions per set. 1 + 32 × 235 = 7521 bytes ≤ `max_value_bytes`.
+/// This bounds the consensus VALUE, not the state: a value is what the
+/// network agrees on each slot, and the state grows by applying values.
 pub const max_txs: usize = 32;
-/// Bounded plain-data state (roadmap §2.1 gap 1): accounts and names.
-pub const max_accounts: usize = 64;
-pub const max_names: usize = 128;
 /// Names are `[a-z0-9-]`, 1..32 bytes; values are any bytes, 0..64.
 pub const name_max: usize = 32;
 pub const value_max: usize = 64;
@@ -72,15 +75,27 @@ pub fn closeTimeAtSlotOk(genesis_close_time: u64, slot: u64, close_time: u64) bo
     return close_time >= lower and close_time <= upper;
 }
 
-pub const tag_net = "REGISTRY-NET-V2";
+/// V3 is the heap-state capacity epoch: Snapshot V4 state encodings and the
+/// removal of the inline account/name caps. Joining an older deployment's
+/// passphrase under a new tag produces a different network identity, so a
+/// mixed-version archive cannot silently lose recovery availability — the
+/// same loud-epoch rule E2c applied to timed ledger values.
+pub const tag_net = "REGISTRY-NET-V3";
 pub const tag_tx = "REGISTRY-TX-V1";
 pub const tag_hdr = "REGISTRY-HDR-V2";
-pub const snap_magic = "REGISTRY-SNAP-V3\n";
+/// The largest snapshot `readSnapshot` accepts: the state is unbounded in
+/// principle, but a local file larger than this is operator corruption or a
+/// hostile object, not a registry snapshot to parse.
+pub const snapshot_read_limit: usize = 64 << 20;
+
+/// V4: identical framing to V3 except the embedded state section carries
+/// u32 account/name counts and a dynamic length (V3 was fixed-capacity with
+/// u8 counts). V3 bytes fail the magic check; there is no migration.
+pub const snap_magic = "REGISTRY-SNAP-V4\n";
 
 comptime {
     std.debug.assert(max_ledger_value_bytes == 7547);
     std.debug.assert(max_ledger_value_bytes <= max_value_bytes);
-    std.debug.assert(max_txs <= 255 and max_accounts <= 255 and max_names <= 255);
 }
 
 pub const Key = [32]u8;
@@ -365,7 +380,7 @@ fn sha256(bytes: []const u8) [32]u8 {
 // State (roadmap §3.4)
 // ---------------------------------------------------------------------------
 
-pub const Result = enum(u8) { ok = 0, name_taken = 1, not_owner = 2, no_such_name = 3, registry_full = 4 };
+pub const Result = enum(u8) { ok = 0, name_taken = 1, not_owner = 2, no_such_name = 3 };
 
 pub const Header = struct {
     slot: u64 = 0,
@@ -393,20 +408,16 @@ pub const Entry = struct {
     }
 };
 
-/// The canonical state bytes: `n_accounts ‖ accounts ‖ n_names ‖ names`.
-pub const state_bytes_max: usize = 1 + max_accounts * 40 + 1 + max_names * 130;
-
 pub const State = struct {
     /// Set at genesis from the passphrase plus genesis close time; identical
     /// on every node.
     network_id: [32]u8 = @splat(0),
     head: Header = .{},
-    n_accounts: u8 = 0,
-    /// Sorted by key.
-    accounts: [max_accounts]Account = @splat(Account{}),
-    n_names: u8 = 0,
+    /// Sorted by key. Heap-backed since the capacity epoch; the State owns
+    /// it (see `deinit` / `clone`).
+    accounts: std.ArrayListUnmanaged(Account) = .empty,
     /// Sorted by (padded) name.
-    names: [max_names]Entry = @splat(Entry{}),
+    names: std.ArrayListUnmanaged(Entry) = .empty,
     /// The results of the last applied set, in set order.
     last_count: u8 = 0,
     last_results: [max_txs]Result = @splat(.ok),
@@ -417,20 +428,38 @@ pub const State = struct {
     /// Construct the one canonical slot-zero ledger head for a network.
     /// Genesis is a real header: it commits to the empty state and its
     /// configured close time, but to no transaction set or previous header.
-    pub fn genesis(network_id: [32]u8, genesis_close_time: u64) State {
+    pub fn genesis(network_id: [32]u8, genesis_close_time: u64, gpa: std.mem.Allocator) std.mem.Allocator.Error!State {
         var state: State = .{ .network_id = network_id };
+        errdefer state.deinit(gpa);
         state.head.close_time = genesis_close_time;
-        state.head.state_root = state.stateRoot();
+        state.head.state_root = try state.stateRoot(gpa);
         state.head.hash = headerHash(network_id, &state.head);
         return state;
     }
 
-    pub fn accountsSlice(self: *const State) []const Account {
-        return self.accounts[0..self.n_accounts];
+    /// Free the owned account and name storage. Exactly once per State; a
+    /// State returned by value from this module's allocating functions is
+    /// the caller's to free.
+    pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
+        self.accounts.deinit(gpa);
+        self.names.deinit(gpa);
     }
-    pub fn namesSlice(self: *const State) []const Entry {
-        return self.names[0..self.n_names];
+
+    /// Deep copy: the clone owns its own storage and shares nothing.
+    pub fn clone(self: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!State {
+        var out: State = .{
+            .network_id = self.network_id,
+            .head = self.head,
+            .last_count = self.last_count,
+            .last_results = self.last_results,
+            .last_value = self.last_value,
+        };
+        errdefer out.deinit(gpa);
+        try out.accounts.appendSlice(gpa, self.accounts.items);
+        try out.names.appendSlice(gpa, self.names.items);
+        return out;
     }
+
     pub fn lastResults(self: *const State) []const Result {
         return self.last_results[0..self.last_count];
     }
@@ -439,10 +468,10 @@ pub const State = struct {
     /// point wrapped as `.missing`.
     fn locateAccount(self: *const State, key: Key) union(enum) { found: usize, missing: usize } {
         var lo: usize = 0;
-        var hi: usize = self.n_accounts;
+        var hi: usize = self.accounts.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, &self.accounts[mid].key, &key)) {
+            switch (std.mem.order(u8, &self.accounts.items[mid].key, &key)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return .{ .found = mid },
@@ -453,10 +482,10 @@ pub const State = struct {
 
     fn locateName(self: *const State, padded: *const [name_max]u8) union(enum) { found: usize, missing: usize } {
         var lo: usize = 0;
-        var hi: usize = self.n_names;
+        var hi: usize = self.names.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, &self.names[mid].name, padded)) {
+            switch (std.mem.order(u8, &self.names.items[mid].name, padded)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return .{ .found = mid },
@@ -467,7 +496,7 @@ pub const State = struct {
 
     pub fn findAccount(self: *const State, key: Key) ?*const Account {
         return switch (self.locateAccount(key)) {
-            .found => |i| &self.accounts[i],
+            .found => |i| &self.accounts.items[i],
             .missing => null,
         };
     }
@@ -482,57 +511,50 @@ pub const State = struct {
         var padded: [name_max]u8 = @splat(0);
         @memcpy(padded[0..name.len], name);
         return switch (self.locateName(&padded)) {
-            .found => |i| &self.names[i],
+            .found => |i| &self.names.items[i],
             .missing => null,
         };
     }
 
     /// The account for `key`, created (seq 0) at its sorted position when
-    /// absent. Asserts room: `validate` refused sets that need more.
-    fn accountFor(self: *State, key: Key) *Account {
+    /// absent. Storage grows; running out of memory fails `apply`, which
+    /// halts the node (never the agreed value).
+    fn accountFor(self: *State, key: Key, gpa: std.mem.Allocator) std.mem.Allocator.Error!*Account {
         switch (self.locateAccount(key)) {
-            .found => |i| return &self.accounts[i],
+            .found => |i| return &self.accounts.items[i],
             .missing => |at| {
-                std.debug.assert(self.n_accounts < max_accounts);
-                var i: usize = self.n_accounts;
-                while (i > at) : (i -= 1) self.accounts[i] = self.accounts[i - 1];
-                self.accounts[at] = .{ .key = key, .seq = 0 };
-                self.n_accounts += 1;
-                return &self.accounts[at];
+                try self.accounts.insert(gpa, at, .{ .key = key, .seq = 0 });
+                return &self.accounts.items[at];
             },
         }
     }
 
-    fn insertName(self: *State, at: usize, e: Entry) void {
-        std.debug.assert(self.n_names < max_names);
-        var i: usize = self.n_names;
-        while (i > at) : (i -= 1) self.names[i] = self.names[i - 1];
-        self.names[at] = e;
-        self.n_names += 1;
+    fn insertName(self: *State, at: usize, e: Entry, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        try self.names.insert(gpa, at, e);
     }
 
     fn removeName(self: *State, at: usize) void {
-        var i: usize = at;
-        while (i + 1 < self.n_names) : (i += 1) self.names[i] = self.names[i + 1];
-        self.n_names -= 1;
-        self.names[self.n_names] = .{};
+        _ = self.names.orderedRemove(at);
     }
 
     /// The canonical state bytes (what `state_root` hashes and what the
-    /// snapshot stores). `buf.len >= state_bytes_max`.
-    pub fn serialize(self: *const State, buf: []u8) []u8 {
-        std.debug.assert(buf.len >= state_bytes_max);
+    /// snapshot stores): `u32 account count ‖ accounts ‖ u32 name count ‖
+    /// names`, big-endian counts (V4: the capacity epoch widened them from
+    /// u8). Caller frees.
+    pub fn serialize(self: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const len = 4 + self.accounts.items.len * 40 + 4 + self.names.items.len * 130;
+        const buf = try gpa.alloc(u8, len);
         var off: usize = 0;
-        buf[off] = self.n_accounts;
-        off += 1;
-        for (self.accountsSlice()) |a| {
+        std.mem.writeInt(u32, buf[off..][0..4], @intCast(self.accounts.items.len), .big);
+        off += 4;
+        for (self.accounts.items) |a| {
             @memcpy(buf[off..][0..32], &a.key);
             std.mem.writeInt(u64, buf[off + 32 ..][0..8], a.seq, .big);
             off += 40;
         }
-        buf[off] = self.n_names;
-        off += 1;
-        for (self.namesSlice()) |e| {
+        std.mem.writeInt(u32, buf[off..][0..4], @intCast(self.names.items.len), .big);
+        off += 4;
+        for (self.names.items) |e| {
             buf[off] = e.name_len;
             @memcpy(buf[off + 1 ..][0..32], &e.name);
             @memcpy(buf[off + 33 ..][0..32], &e.owner);
@@ -540,31 +562,38 @@ pub const State = struct {
             @memcpy(buf[off + 66 ..][0..64], &e.value);
             off += 130;
         }
-        return buf[0..off];
+        return buf;
     }
 
     /// Strict inverse of `serialize`: exact length, sorted and unique keys
     /// and names, canonical padding. Header, network id and results are the
-    /// caller's (see the snapshot functions).
-    pub fn deserialize(bytes: []const u8) ?State {
+    /// caller's (see the snapshot functions). The returned State owns its
+    /// storage; rejected bytes free everything before returning null.
+    pub fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!?State {
         var s: State = .{};
-        if (bytes.len < 1) return null;
-        const na = bytes[0];
-        if (na > max_accounts) return null;
-        var off: usize = 1;
-        if (bytes.len < off + @as(usize, na) * 40 + 1) return null;
+        var owned = false;
+        defer if (owned) s.deinit(gpa);
+        if (bytes.len < 8) return null;
+        const na = std.mem.readInt(u32, bytes[0..4], .big);
+        var off: usize = 4;
+        // Exact length up front: the count cannot lie about what follows.
+        const names_at = off + @as(usize, na) * 40;
+        if (names_at + 4 > bytes.len) return null;
+        const nn = std.mem.readInt(u32, bytes[names_at..][0..4], .big);
+        if (bytes.len != names_at + 4 + @as(usize, nn) * 130) return null;
+        owned = true;
+        try s.accounts.ensureTotalCapacity(gpa, na);
+        s.accounts.items.len = na;
         for (0..na) |i| {
-            s.accounts[i] = .{ .key = bytes[off..][0..32].*, .seq = std.mem.readInt(u64, bytes[off + 32 ..][0..8], .big) };
-            if (i > 0 and std.mem.order(u8, &s.accounts[i - 1].key, &s.accounts[i].key) != .lt) return null;
+            s.accounts.items[i] = .{ .key = bytes[off..][0..32].*, .seq = std.mem.readInt(u64, bytes[off + 32 ..][0..8], .big) };
+            if (i > 0 and std.mem.order(u8, &s.accounts.items[i - 1].key, &s.accounts.items[i].key) != .lt) return null;
             off += 40;
         }
-        s.n_accounts = na;
-        const nn = bytes[off];
-        off += 1;
-        if (nn > max_names) return null;
-        if (bytes.len != off + @as(usize, nn) * 130) return null;
+        off = names_at + 4;
+        try s.names.ensureTotalCapacity(gpa, nn);
+        s.names.items.len = nn;
         for (0..nn) |i| {
-            var e: Entry = .{
+            const e: Entry = .{
                 .name_len = bytes[off],
                 .name = bytes[off + 1 ..][0..32].*,
                 .owner = bytes[off + 33 ..][0..32].*,
@@ -574,20 +603,20 @@ pub const State = struct {
             if (e.name_len == 0 or e.name_len > name_max or e.value_len > value_max) return null;
             if (!nameOk(e.name[0..e.name_len]) or !isZero(e.name[e.name_len..])) return null;
             if (!isZero(e.value[e.value_len..])) return null;
-            if (i > 0 and std.mem.order(u8, &s.names[i - 1].name, &e.name) != .lt) return null;
-            s.names[i] = e;
-            e = undefined;
+            if (i > 0 and std.mem.order(u8, &s.names.items[i - 1].name, &e.name) != .lt) return null;
+            s.names.items[i] = e;
             off += 130;
         }
-        s.n_names = nn;
+        owned = false; // ownership transfers to the caller
         return s;
     }
 
     /// SHA-256 of `serialize`: excludes the header, the network id, the last
     /// results, and the last consensus ledger value.
-    pub fn stateRoot(self: *const State) [32]u8 {
-        var buf: [state_bytes_max]u8 = undefined;
-        return sha256(self.serialize(&buf));
+    pub fn stateRoot(self: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error![32]u8 {
+        const buf = try self.serialize(gpa);
+        defer gpa.free(buf);
+        return sha256(buf);
     }
 };
 
@@ -628,16 +657,11 @@ pub fn appliesCleanly(state: *const State, set: *const TxSet) bool {
 fn judge(state: *const State, set: *const TxSet, check_sigs: bool) Verdict {
     const txs = set.slice();
     var verdict: Verdict = .valid;
-    var new_accounts: usize = 0;
     var i: usize = 0;
     while (i < txs.len) {
         const src = txs[i].source;
         const known = state.findAccount(src);
         var expected: u64 = if (known) |a| a.seq +| 1 else 1;
-        if (known == null) {
-            new_accounts += 1;
-            if (@as(usize, state.n_accounts) + new_accounts > max_accounts) return .invalid;
-        }
         var first = true;
         while (i < txs.len and std.mem.eql(u8, &txs[i].source, &src)) : (i += 1) {
             const tx = &txs[i];
@@ -694,7 +718,6 @@ fn poolInsert(pool: []Tx, n: *usize, tx: *const Tx) void {
 /// validates `.valid` on `state` by construction.
 pub fn select(state: *const State, pool: []const Tx) TxSet {
     var out: TxSet = .{ .count = 0 };
-    var new_accounts: usize = 0;
     var i: usize = 0;
     while (i < pool.len and out.count < max_txs) {
         const src = pool[i].source;
@@ -702,10 +725,9 @@ pub fn select(state: *const State, pool: []const Tx) TxSet {
         const expected0: u64 = if (known) |a| a.seq +| 1 else 1;
         var expected = expected0;
         var taken: usize = 0;
-        const room = known != null or @as(usize, state.n_accounts) + new_accounts < max_accounts;
         while (i < pool.len and std.mem.eql(u8, &pool[i].source, &src)) : (i += 1) {
             const tx = &pool[i];
-            if (!room or out.count >= max_txs) continue;
+            if (out.count >= max_txs) continue;
             if (tx.seq < expected) continue; // replay
             if (tx.seq != expected) {
                 // Ahead (or the run broke): nothing more from this source.
@@ -721,7 +743,6 @@ pub fn select(state: *const State, pool: []const Tx) TxSet {
             taken += 1;
             expected +|= 1;
         }
-        if (known == null and taken > 0) new_accounts += 1;
     }
     return out;
 }
@@ -767,8 +788,10 @@ pub fn proposal(state: *const State, pending: []const Tx, wall_s: u64) ?LedgerVa
 ///
 /// Total and defensive: a value whose close time is not in `(T, T + 60]`,
 /// whose transactions do not apply cleanly, or whose successor slot would
-/// overflow is skipped and the state stays put.
-pub fn apply(state: *State, value: *const LedgerValue) void {
+/// overflow is skipped and the state stays put. Storage grows on demand;
+/// `OutOfMemory` fails the call mid-application — the caller halts on it
+/// and never consults the partial state again (ADR 0003).
+pub fn apply(state: *State, value: *const LedgerValue, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
     if (state.head.slot == std.math.maxInt(u64) or
         state.head.close_time == std.math.maxInt(u64) or
         value.close_time <= state.head.close_time or
@@ -777,10 +800,10 @@ pub fn apply(state: *State, value: *const LedgerValue) void {
 
     const txs = value.txs.slice();
     for (txs, 0..) |*tx, i| {
-        const acct = state.accountFor(tx.source);
+        const acct = try state.accountFor(tx.source, gpa);
         std.debug.assert(tx.seq == acct.seq + 1);
         acct.seq = tx.seq;
-        state.last_results[i] = execute(state, tx);
+        state.last_results[i] = try execute(state, tx, gpa);
     }
     state.last_count = @intCast(txs.len);
     for (state.last_results[txs.len..]) |*r| r.* = .ok;
@@ -791,14 +814,14 @@ pub fn apply(state: *State, value: *const LedgerValue) void {
     h.close_time = value.close_time;
     h.prev_hash = h.hash;
     h.txset_hash = value.txs.hash();
-    h.state_root = state.stateRoot();
+    h.state_root = try state.stateRoot(gpa);
     h.hash = headerHash(state.network_id, h);
 }
 
-fn execute(state: *State, tx: *const Tx) Result {
+fn execute(state: *State, tx: *const Tx, gpa: std.mem.Allocator) std.mem.Allocator.Error!Result {
     switch (state.locateName(&tx.name)) {
         .found => |i| {
-            const e = &state.names[i];
+            const e = &state.names.items[i];
             switch (tx.op) {
                 .claim => return .name_taken,
                 .set => {
@@ -822,8 +845,7 @@ fn execute(state: *State, tx: *const Tx) Result {
         .missing => |at| {
             switch (tx.op) {
                 .claim => {
-                    if (state.n_names >= max_names) return .registry_full;
-                    state.insertName(at, .{ .name_len = tx.name_len, .name = tx.name, .owner = tx.source });
+                    try state.insertName(at, .{ .name_len = tx.name_len, .name = tx.name, .owner = tx.source }, gpa);
                     return .ok;
                 },
                 .set, .transfer, .release => return .no_such_name,
@@ -854,16 +876,31 @@ pub fn headerHash(network_id: [32]u8, h: *const Header) [32]u8 {
 // Snapshot (roadmap §3.8)
 // ---------------------------------------------------------------------------
 
-/// V3: magic ‖ network_id ‖ slot ‖ close_time ‖ hash ‖ prev_hash ‖
+/// V4: magic ‖ network_id ‖ slot ‖ close_time ‖ hash ‖ prev_hash ‖
 /// txset_hash ‖ state_root ‖ last-value length ‖ last-value bytes ‖
 /// state bytes ‖ SHA-256 of everything before it. A zero last-value length
-/// is reserved for the canonical, real genesis header.
-pub const snapshot_max_bytes: usize = snap_magic.len + 32 + 8 + 8 + 4 * 32 + 2 + max_ledger_value_bytes + state_bytes_max + 32;
-const snapshot_fixed_prefix: usize = snap_magic.len + 32 + 8 + 8 + 4 * 32;
+/// is reserved for the canonical, real genesis header. The state section is
+/// `State.serialize` output (u32 counts, dynamic length) — V3 snapshots
+/// (fixed capacity, u8 counts) fail the magic check and are not migrated.
+/// Caller frees the returned bytes.
+pub fn writeSnapshot(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    var value_buf: [max_ledger_value_bytes]u8 = undefined;
+    var value_len: usize = 0;
+    if (state.last_value) |*value| {
+        std.debug.assert(state.head.slot > 0);
+        std.debug.assert(value.close_time == state.head.close_time);
+        std.debug.assert(std.mem.eql(u8, &state.head.txset_hash, &value.txs.hash()));
+        const encoded = value.encode(&value_buf);
+        value_len = encoded.len;
+    } else {
+        std.debug.assert(state.head.slot == 0);
+    }
+    const state_bytes = try state.serialize(gpa);
+    defer gpa.free(state_bytes);
 
-/// `buf.len >= snapshot_max_bytes`.
-pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
-    std.debug.assert(buf.len >= snapshot_max_bytes);
+    const total = snapshot_fixed_prefix + 2 + value_len + state_bytes.len + 32;
+    const buf = try gpa.alloc(u8, total);
+    errdefer gpa.free(buf);
     var off: usize = 0;
     @memcpy(buf[off..][0..snap_magic.len], snap_magic);
     off += snap_magic.len;
@@ -877,36 +914,29 @@ pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
         @memcpy(buf[off..][0..32], f);
         off += 32;
     }
-    if (state.last_value) |*value| {
-        std.debug.assert(state.head.slot > 0);
-        std.debug.assert(value.close_time == state.head.close_time);
-        std.debug.assert(std.mem.eql(u8, &state.head.txset_hash, &value.txs.hash()));
-        var value_buf: [max_ledger_value_bytes]u8 = undefined;
-        const encoded = value.encode(&value_buf);
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(encoded.len), .big);
-        off += 2;
-        @memcpy(buf[off..][0..encoded.len], encoded);
-        off += encoded.len;
-    } else {
-        std.debug.assert(state.head.slot == 0);
-        std.mem.writeInt(u16, buf[off..][0..2], 0, .big);
-        off += 2;
-    }
-    const body = state.serialize(buf[off..]);
-    off += body.len;
+    std.mem.writeInt(u16, buf[off..][0..2], @intCast(value_len), .big);
+    off += 2;
+    @memcpy(buf[off..][0..value_len], value_buf[0..value_len]);
+    off += value_len;
+    @memcpy(buf[off..][0..state_bytes.len], state_bytes);
+    off += state_bytes.len;
     const sum = sha256(buf[0..off]);
     @memcpy(buf[off..][0..32], &sum);
     off += 32;
-    return buf[0..off];
+    std.debug.assert(off == total);
+    return buf;
 }
 
-/// Strict V3 only: checksum, canonical state bytes, and the header's
+const snapshot_fixed_prefix: usize = snap_magic.len + 32 + 8 + 8 + 4 * 32;
+
+/// Strict V4 only: checksum, canonical state bytes, and the header's
 /// `state_root` must equal the root of the state read back. Every non-genesis
 /// snapshot carries the exact canonical last consensus value and binds both
 /// its close time and transaction-set hash to the head. Genesis must be the
 /// exact real header constructed by `State.genesis`. Results are zeroed (they
-/// are not persisted).
-pub fn readSnapshot(bytes: []const u8) ?State {
+/// are not persisted). The returned State owns its storage; rejected bytes
+/// allocate nothing that outlives the call.
+pub fn readSnapshot(gpa: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!?State {
     if (bytes.len < snapshot_fixed_prefix + 2 + 32) return null;
     if (!std.mem.eql(u8, bytes[0..snap_magic.len], snap_magic)) return null;
     const body_end = bytes.len - 32;
@@ -942,18 +972,22 @@ pub fn readSnapshot(bytes: []const u8) ?State {
     }
     off += value_len;
 
-    var state = State.deserialize(bytes[off..body_end]) orelse return null;
+    var state: State = (try State.deserialize(gpa, bytes[off..body_end])) orelse return null;
+    var done = false;
+    defer if (!done) state.deinit(gpa);
     state.network_id = network_id;
     state.head = head;
     state.last_value = last_value;
     if (state.head.slot == 0) {
-        if (state.n_accounts != 0 or state.n_names != 0) return null;
-        const canonical = State.genesis(network_id, state.head.close_time);
+        if (state.accounts.items.len != 0 or state.names.items.len != 0) return null;
+        var canonical = try State.genesis(network_id, state.head.close_time, gpa);
+        defer canonical.deinit(gpa);
         if (!std.meta.eql(state.head, canonical.head)) return null;
     } else {
-        if (!std.mem.eql(u8, &state.head.state_root, &state.stateRoot())) return null;
+        if (!std.mem.eql(u8, &state.head.state_root, &(try state.stateRoot(gpa)))) return null;
         if (!std.mem.eql(u8, &state.head.hash, &headerHash(state.network_id, &state.head))) return null;
     }
+    done = true;
     return state;
 }
 
@@ -1013,8 +1047,8 @@ const TestNet = struct {
         return s;
     }
 
-    fn genesis(self: *const TestNet) State {
-        return State.genesis(self.id, genesis_close_time);
+    fn genesis(self: *const TestNet, gpa: std.mem.Allocator) std.mem.Allocator.Error!State {
+        return State.genesis(self.id, genesis_close_time, gpa);
     }
 
     fn nextValue(state: *const State, set_value: TxSet) LedgerValue {
@@ -1026,9 +1060,9 @@ const TestNet = struct {
         return validate(state, &value, state.head.slot + 1);
     }
 
-    fn applyNext(state: *State, set_value: *const TxSet) void {
+    fn applyNext(state: *State, set_value: *const TxSet, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
         const value = nextValue(state, set_value.*);
-        apply(state, &value);
+        try apply(state, &value, gpa);
     }
 };
 
@@ -1114,7 +1148,9 @@ test "tx set: empty set is one byte; round-trip; unsorted, duplicate, oversize a
     try testing.expectEqual(1 + 3 * tx_bytes, enc.len);
     const back = TxSet.decode(enc).?;
     try testing.expectEqual(@as(u8, 3), back.count);
-    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&t.genesis(), &back));
+    var genesis_state = try t.genesis(testing.allocator);
+    defer genesis_state.deinit(testing.allocator);
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&genesis_state, &back));
 
     const swapped = if (first_is_0) TestNet.set(&.{ a2, a1, b1 }) else TestNet.set(&.{ b1, a2, a1 });
     var buf2: [max_set_bytes]u8 = undefined;
@@ -1143,13 +1179,14 @@ test "seq range: 2^64−1 is not a transaction; a run at the top of the range do
     try testing.expect(Tx.decode(&enc) == null);
     // An account one below the top: the next seq is `max_seq`, valid; the
     // saturating arithmetic keeps `expected` in range.
-    var s = t.genesis();
-    _ = s.accountFor(t.keys[0]);
-    s.accounts[s.locateAccount(t.keys[0]).found].seq = Tx.max_seq - 1;
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
+    _ = try s.accountFor(t.keys[0], testing.allocator);
+    s.accounts.items[s.locateAccount(t.keys[0]).found].seq = Tx.max_seq - 1;
     try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{top})));
     top = t.tx(0, Tx.max_seq - 1, .claim, "top", "", zero_key);
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{top}))); // replay
-    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, Tx.max_seq, .claim, "top", "", zero_key)}));
+    try TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, Tx.max_seq, .claim, "top", "", zero_key)}), testing.allocator);
     try testing.expectEqual(Tx.max_seq, s.accountSeq(t.keys[0]));
     // Nothing more can ever come from this account (validate says replay
     // or ahead, never valid), and `select` drops it: no overflow anywhere.
@@ -1161,71 +1198,75 @@ test "seq range: 2^64−1 is not a transaction; a run at the top of the range do
 // engine thread abort the library's gap-jump used to cause.
 test "apply is total: a set from a later state is skipped and the header stays put" {
     const t = TestNet.init();
-    var s = t.genesis();
-    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
-    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)}));
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
+    try TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}), testing.allocator);
+    try TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)}), testing.allocator);
     const later = TestNet.set(&.{t.tx(0, 3, .set, "alice", "w", zero_key)}); // valid on s (slot 2)
     try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &later));
-    var stale = t.genesis(); // a node that missed slots 1–2
+    var stale = try t.genesis(testing.allocator);
+    defer stale.deinit(testing.allocator); // a node that missed slots 1–2
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&stale, &later));
     try testing.expect(!appliesCleanly(&stale, &later));
-    TestNet.applyNext(&stale, &later);
+    try TestNet.applyNext(&stale, &later, testing.allocator);
     try testing.expectEqual(@as(u64, 0), stale.head.slot);
-    try testing.expectEqual(@as(u8, 0), stale.n_accounts);
+    try testing.expectEqual(@as(usize, 0), stale.accounts.items.len);
     try testing.expectEqual(@as(u8, 0), stale.last_count);
     // The right state applies it as usual.
-    TestNet.applyNext(&s, &later);
+    try TestNet.applyNext(&s, &later, testing.allocator);
     try testing.expectEqual(@as(u64, 3), s.head.slot);
     try testing.expectEqualStrings("w", s.findName("alice").?.valueSlice());
 }
 
 // Non-vacuity: each verdict rule in `validate` is hit once; turning the
 // "ahead" branch into `.invalid` fails the maybe case (roadmap §2.1 gap 5).
-test "validate: contiguous runs are valid; replay/gap/bad signature invalid; a run starting ahead is maybe_valid; account capacity" {
+// The capacity section became the cap-removal proof of the heap-state epoch:
+// the old 64-account table made the 65th new source invalid; the heap table
+// keeps validating far past it.
+test "validate: contiguous runs are valid; replay/gap/bad signature invalid; a run starting ahead is maybe_valid; accounts are unbounded" {
     const t = TestNet.init();
-    var s = t.genesis();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
     const a1 = t.tx(0, 1, .claim, "alice", "", zero_key);
     const a2 = t.tx(0, 2, .set, "alice", "v", zero_key);
     const a3 = t.tx(0, 3, .set, "alice", "w", zero_key);
     try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{ a1, a2 })));
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{ a1, a3 }))); // gap inside the run
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{ a2, a3 }))); // immediate successor cannot defer a seq gap
-    TestNet.applyNext(&s, &TestNet.set(&.{a1}));
+    try TestNet.applyNext(&s, &TestNet.set(&.{a1}), testing.allocator);
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{a1}))); // replay
     try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &TestNet.set(&.{ a2, a3 })));
     var forged = a2;
     forged.value[0] = 'x'; // signed bytes changed; signature stale
     try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&s, &TestNet.set(&.{forged})));
 
-    // Fill the account table: the 65th new source is invalid, a known one fine.
-    var full = t.genesis();
-    for (0..max_accounts) |i| {
+    // Far past the old 64-account cap: new sources keep validating and the
+    // table stays sorted (binary search still finds every key).
+    var full = try t.genesis(testing.allocator);
+    defer full.deinit(testing.allocator);
+    for (0..500) |i| {
         var k: Key = @splat(0);
         std.mem.writeInt(u64, k[24..32], @intCast(i + 1000), .big);
-        _ = full.accountFor(k);
+        _ = try full.accountFor(k, testing.allocator);
     }
-    try testing.expectEqual(@as(u8, max_accounts), full.n_accounts);
-    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&full, &TestNet.set(&.{a1})));
-    // A table with room for exactly one more: one new source fine, two not.
-    var almost = t.genesis();
-    for (0..max_accounts - 1) |i| {
-        var k: Key = @splat(0);
-        std.mem.writeInt(u64, k[24..32], @intCast(i + 1000), .big);
-        _ = almost.accountFor(k);
-    }
+    try testing.expectEqual(@as(usize, 500), full.accounts.items.len);
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&full, &TestNet.set(&.{a1})));
     const b1 = t.tx(1, 1, .claim, "bob", "", zero_key);
-    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&almost, &TestNet.set(&.{a1})));
     const first_is_0 = std.mem.order(u8, &t.keys[0], &t.keys[1]) == .lt;
     const two = if (first_is_0) TestNet.set(&.{ a1, b1 }) else TestNet.set(&.{ b1, a1 });
-    try testing.expectEqual(Verdict.invalid, TestNet.validateNext(&almost, &two));
-    try testing.expectEqual(@as(u8, 1), select(&almost, two.slice()).count); // combine keeps the first that fits
+    try testing.expectEqual(Verdict.valid, TestNet.validateNext(&full, &two));
+    try testing.expectEqual(@as(u8, 2), select(&full, two.slice()).count);
+    for (full.accounts.items, 0..) |acct, i| {
+        if (i > 0) try testing.expect(std.mem.order(u8, &full.accounts.items[i - 1].key, &acct.key) == .lt);
+    }
 }
 
 // Non-vacuity: every Result variant is produced; the "seq consumed on
 // failure" line is what keeps validate and apply in agreement.
 test "apply: operations, results, sequence numbers consumed on failure, header chain" {
     const t = TestNet.init();
-    var s = t.genesis();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
     const genesis_hash = s.head.hash;
 
     const claim_a = t.tx(0, 1, .claim, "alice", "", zero_key);
@@ -1234,7 +1275,7 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     const first_is_0 = std.mem.order(u8, &t.keys[0], &t.keys[1]) == .lt;
     const set1 = if (first_is_0) TestNet.set(&.{ claim_a, claim_b_alice, set_b }) else TestNet.set(&.{ claim_b_alice, set_b, claim_a });
     try testing.expectEqual(Verdict.valid, TestNet.validateNext(&s, &set1));
-    TestNet.applyNext(&s, &set1);
+    try TestNet.applyNext(&s, &set1, testing.allocator);
     try testing.expectEqual(@as(u64, 1), s.head.slot);
     try testing.expectEqualSlices(u8, &genesis_hash, &s.head.prev_hash);
     try testing.expectEqual(@as(u64, 1), s.accountSeq(t.keys[0]));
@@ -1269,80 +1310,93 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     const other: usize = 1 - owner_seed;
     const owner_seq = s.accountSeq(t.keys[owner_seed]) + 1;
     const s2 = TestNet.set(&.{t.tx(owner_seed, owner_seq, .set, "alice", "v1", zero_key)});
-    TestNet.applyNext(&s, &s2);
+    try TestNet.applyNext(&s, &s2, testing.allocator);
     try testing.expectEqualStrings("v1", s.findName("alice").?.valueSlice());
     const s3 = TestNet.set(&.{t.tx(owner_seed, owner_seq + 1, .transfer, "alice", "", t.keys[other])});
-    TestNet.applyNext(&s, &s3);
+    try TestNet.applyNext(&s, &s3, testing.allocator);
     try testing.expectEqualSlices(u8, &t.keys[other], &s.findName("alice").?.owner);
-    TestNet.applyNext(&s, &TxSet.empty);
+    try TestNet.applyNext(&s, &TxSet.empty, testing.allocator);
     const root_before_empty = s.head.state_root;
-    try testing.expectEqualSlices(u8, &root_before_empty, &s.stateRoot()); // empty slot: root unchanged
+    try testing.expectEqualSlices(u8, &root_before_empty, &(try s.stateRoot(testing.allocator))); // empty slot: root unchanged
     const other_seq = s.accountSeq(t.keys[other]) + 1;
     const s5 = TestNet.set(&.{ t.tx(other, other_seq, .release, "alice", "", zero_key), t.tx(other, other_seq + 1, .set, "alice", "x", zero_key) });
-    TestNet.applyNext(&s, &s5);
+    try TestNet.applyNext(&s, &s5, testing.allocator);
     try testing.expect(s.findName("alice") == null);
     try testing.expectEqual(Result.ok, s.lastResults()[0]);
     try testing.expectEqual(Result.no_such_name, s.lastResults()[1]);
     try testing.expectEqual(@as(u64, 5), s.head.slot);
     try testing.expect(!std.mem.eql(u8, &hash1, &s.head.hash));
 
-    // registry_full: claim names until the table is full.
-    var full = t.genesis();
+    // Far past the old 128-name cap: claims keep succeeding (the
+    // registry_full result no longer exists) and the table stays sorted.
+    var full = try t.genesis(testing.allocator);
+    defer full.deinit(testing.allocator);
     var seq: u64 = 1;
-    for (0..max_names) |i| {
+    for (0..300) |i| {
         var name_buf: [8]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "n{d}", .{i}) catch unreachable;
-        TestNet.applyNext(&full, &TestNet.set(&.{t.tx(2, seq, .claim, name, "", zero_key)}));
+        try TestNet.applyNext(&full, &TestNet.set(&.{t.tx(2, seq, .claim, name, "", zero_key)}), testing.allocator);
         try testing.expectEqual(Result.ok, full.lastResults()[0]);
         seq += 1;
     }
-    TestNet.applyNext(&full, &TestNet.set(&.{t.tx(2, seq, .claim, "one-more", "", zero_key)}));
-    try testing.expectEqual(Result.registry_full, full.lastResults()[0]);
-    try testing.expectEqual(@as(u8, max_names), full.n_names);
+    try testing.expectEqual(@as(usize, 300), full.names.items.len);
+    try testing.expect(full.findName("n299") != null);
+    for (full.names.items, 0..) |e, i| {
+        if (i > 0) try testing.expect(std.mem.order(u8, &full.names.items[i - 1].name, &e.name) == .lt);
+    }
 }
 
 test "apply: records the exact last consensus value, including an empty set" {
     const t = TestNet.init();
-    var s = t.genesis();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
     const set1 = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
 
-    TestNet.applyNext(&s, &set1);
+    try TestNet.applyNext(&s, &set1, testing.allocator);
     var expected_buf: [max_ledger_value_bytes]u8 = undefined;
     var actual_buf: [max_ledger_value_bytes]u8 = undefined;
-    const expected = TestNet.nextValue(&t.genesis(), set1);
+    const expected: LedgerValue = .{ .close_time = TestNet.genesis_close_time + 1, .txs = set1 };
     try testing.expectEqualSlices(u8, expected.encode(&expected_buf), s.last_value.?.encode(&actual_buf));
 
-    TestNet.applyNext(&s, &TxSet.empty);
+    try TestNet.applyNext(&s, &TxSet.empty, testing.allocator);
     try testing.expectEqual(@as(u8, 0), s.last_value.?.txs.count);
     try testing.expectEqual(TestNet.genesis_close_time + 2, s.last_value.?.close_time);
 
-    var without_context = s;
+    var without_context = try s.clone(testing.allocator);
+    defer without_context.deinit(testing.allocator);
     without_context.last_value = null;
-    var with_buf: [state_bytes_max]u8 = undefined;
-    var without_buf: [state_bytes_max]u8 = undefined;
-    try testing.expectEqualSlices(u8, s.serialize(&with_buf), without_context.serialize(&without_buf));
-    try testing.expectEqualSlices(u8, &s.stateRoot(), &without_context.stateRoot());
+    const with_bytes = try s.serialize(testing.allocator);
+    defer testing.allocator.free(with_bytes);
+    const without_bytes = try without_context.serialize(testing.allocator);
+    defer testing.allocator.free(without_bytes);
+    try testing.expectEqualSlices(u8, with_bytes, without_bytes);
+    try testing.expectEqualSlices(u8, &(try s.stateRoot(testing.allocator)), &(try without_context.stateRoot(testing.allocator)));
 }
 
 // Non-vacuity: two states fed the same sets must serialize identically and
 // carry the same head; a different set in the middle must not.
 test "determinism: identical histories give identical roots and header hashes" {
     const t = TestNet.init();
-    var x = t.genesis();
-    var y = t.genesis();
+    var x = try t.genesis(testing.allocator);
+    defer x.deinit(testing.allocator);
+    var y = try t.genesis(testing.allocator);
+    defer y.deinit(testing.allocator);
     const s1 = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
     const s2 = TestNet.set(&.{t.tx(0, 2, .set, "alice", "v", zero_key)});
-    TestNet.applyNext(&x, &s1);
-    TestNet.applyNext(&x, &s2);
-    TestNet.applyNext(&y, &s1);
-    TestNet.applyNext(&y, &s2);
-    var bx: [state_bytes_max]u8 = undefined;
-    var by: [state_bytes_max]u8 = undefined;
-    try testing.expectEqualSlices(u8, x.serialize(&bx), y.serialize(&by));
+    try TestNet.applyNext(&x, &s1, testing.allocator);
+    try TestNet.applyNext(&x, &s2, testing.allocator);
+    try TestNet.applyNext(&y, &s1, testing.allocator);
+    try TestNet.applyNext(&y, &s2, testing.allocator);
+    const bx = try x.serialize(testing.allocator);
+    defer testing.allocator.free(bx);
+    const by = try y.serialize(testing.allocator);
+    defer testing.allocator.free(by);
+    try testing.expectEqualSlices(u8, bx, by);
     try testing.expectEqualSlices(u8, &x.head.hash, &y.head.hash);
-    var z = t.genesis();
-    TestNet.applyNext(&z, &s1);
-    TestNet.applyNext(&z, &TxSet.empty);
+    var z = try t.genesis(testing.allocator);
+    defer z.deinit(testing.allocator);
+    try TestNet.applyNext(&z, &s1, testing.allocator);
+    try TestNet.applyNext(&z, &TxSet.empty, testing.allocator);
     try testing.expect(!std.mem.eql(u8, &z.head.hash, &y.head.hash));
     try testing.expectEqualSlices(u8, &y.head.prev_hash, &z.head.prev_hash); // same slot-1 header
 }
@@ -1352,7 +1406,8 @@ test "determinism: identical histories give identical roots and header hashes" {
 // self-validate `.valid` (§8.1).
 test "combine: union, dedup by (source, seq) keeps the smaller encoding, contiguity per source, cap at max_txs, self-validates" {
     const t = TestNet.init();
-    var s = t.genesis();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
     const a1 = t.tx(0, 1, .claim, "alice", "", zero_key);
     const a1_alt = t.tx(0, 1, .claim, "alice-alt", "", zero_key); // same (source, seq), other tx
     const a2 = t.tx(0, 2, .set, "alice", "v", zero_key);
@@ -1399,7 +1454,7 @@ test "combine: union, dedup by (source, seq) keeps the smaller encoding, contigu
     });
     try testing.expectEqual(@as(u8, max_txs), capped.txs.count);
     try testing.expectEqual(Verdict.valid, validate(&s, &capped, s.head.slot + 1));
-    apply(&s, &capped);
+    try apply(&s, &capped, testing.allocator);
     try testing.expectEqual(@as(u64, 32), s.accountSeq(t.keys[2]));
     // Now the rest is selectable from the same candidates; the first 32 are replays.
     const rest = combine(&s, &.{
@@ -1414,7 +1469,8 @@ test "combine: union, dedup by (source, seq) keeps the smaller encoding, contigu
 // filled in arrival order.
 test "proposal: pending queue in arrival order becomes a sorted, contiguous set" {
     const t = TestNet.init();
-    const s = t.genesis();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
     var pending = [_]Tx{
         t.tx(0, 2, .set, "alice", "v", zero_key),
         t.tx(1, 1, .claim, "bob", "", zero_key),
@@ -1441,16 +1497,18 @@ test "nomination cadence: pending work observes the busy minimum while only idle
 
 // Non-vacuity: flipping any byte of the snapshot (checksum, an entry, the
 // recorded root) makes readSnapshot return null.
-test "snapshot V3: round-trip; checksum, tampering and a wrong root are refused; results are not persisted" {
+test "snapshot V4: round-trip; checksum, tampering and a wrong root are refused; results are not persisted" {
     const t = TestNet.init();
-    var s = t.genesis();
-    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
-    TestNet.applyNext(&s, &TestNet.set(&.{ t.tx(0, 2, .set, "alice", "v", zero_key), t.tx(0, 3, .claim, "alice", "", zero_key) }));
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
+    try TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}), testing.allocator);
+    try TestNet.applyNext(&s, &TestNet.set(&.{ t.tx(0, 2, .set, "alice", "v", zero_key), t.tx(0, 3, .claim, "alice", "", zero_key) }), testing.allocator);
     try testing.expectEqual(@as(u8, 2), s.last_count);
-    var buf: [snapshot_max_bytes]u8 = undefined;
-    const snap = writeSnapshot(&s, &buf);
+    const snap = try writeSnapshot(&s, testing.allocator);
+    defer testing.allocator.free(snap);
     try testing.expectEqualStrings(snap_magic, snap[0..snap_magic.len]);
-    const back = readSnapshot(snap).?;
+    var back = (try readSnapshot(testing.allocator, snap)).?;
+    defer back.deinit(testing.allocator);
     try testing.expectEqual(s.head.slot, back.head.slot);
     try testing.expectEqualSlices(u8, &s.head.hash, &back.head.hash);
     try testing.expectEqualSlices(u8, &s.network_id, &back.network_id);
@@ -1460,38 +1518,99 @@ test "snapshot V3: round-trip; checksum, tampering and a wrong root are refused;
     var expected_value_buf: [max_ledger_value_bytes]u8 = undefined;
     var actual_value_buf: [max_ledger_value_bytes]u8 = undefined;
     try testing.expectEqualSlices(u8, s.last_value.?.encode(&expected_value_buf), back.last_value.?.encode(&actual_value_buf));
-    var bx: [state_bytes_max]u8 = undefined;
-    var by: [state_bytes_max]u8 = undefined;
-    try testing.expectEqualSlices(u8, s.serialize(&bx), back.serialize(&by));
+    const bx = try s.serialize(testing.allocator);
+    defer testing.allocator.free(bx);
+    const by = try back.serialize(testing.allocator);
+    defer testing.allocator.free(by);
+    try testing.expectEqualSlices(u8, bx, by);
 
-    var bad = buf;
+    var bad = try testing.allocator.dupe(u8, snap);
+    defer testing.allocator.free(bad);
     bad[snap.len - 1] ^= 1; // checksum
-    try testing.expect(readSnapshot(bad[0..snap.len]) == null);
-    try testing.expect(readSnapshot(snap[0 .. snap.len - 1]) == null); // short
+    try testing.expect((try readSnapshot(testing.allocator, bad)) == null);
+    try testing.expect((try readSnapshot(testing.allocator, snap[0 .. snap.len - 1])) == null); // short
     // Tamper with an entry AND fix the checksum: the recorded root disagrees.
-    var tampered = buf;
+    var tampered = try testing.allocator.dupe(u8, snap);
+    defer testing.allocator.free(tampered);
     const last_value_len: usize = std.mem.readInt(u16, snap[snapshot_fixed_prefix..][0..2], .big);
     const state_offset = snapshot_fixed_prefix + 2 + last_value_len;
-    tampered[state_offset + 1 + 40 + 1 + 66] ^= 1; // first name's first value byte
+    tampered[state_offset + 4 + 40 + 4 + 1 + 66] ^= 1; // first name's first value byte (past two u32 counts)
     const fixed = sha256(tampered[0 .. snap.len - 32]);
     @memcpy(tampered[snap.len - 32 ..][0..32], &fixed);
-    try testing.expect(readSnapshot(tampered[0..snap.len]) == null);
+    try testing.expect((try readSnapshot(testing.allocator, tampered)) == null);
     // A lone valid state body with an unrelated header hash is refused too.
-    var wrong_head = buf;
+    var wrong_head = try testing.allocator.dupe(u8, snap);
+    defer testing.allocator.free(wrong_head);
     wrong_head[snap_magic.len + 32 + 8 + 8] ^= 1; // head.hash byte
     const fixed2 = sha256(wrong_head[0 .. snap.len - 32]);
     @memcpy(wrong_head[snap.len - 32 ..][0..32], &fixed2);
-    try testing.expect(readSnapshot(wrong_head[0..snap.len]) == null);
+    try testing.expect((try readSnapshot(testing.allocator, wrong_head)) == null);
 }
 
-test "snapshot V3: replacing the canonical last value is refused even with a repaired checksum" {
+// Non-vacuity for the capacity epoch itself: the old fixed-capacity format
+// could not represent this state (u8 counts, fixed buffers). V4 round-trips
+// it byte-exactly and the root matches the recomputed root.
+test "capacity epoch: a snapshot round-trips far beyond the old 64/128 caps" {
+    const gpa = testing.allocator;
     const t = TestNet.init();
-    var s = t.genesis();
-    const original = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
-    TestNet.applyNext(&s, &original);
+    var s = try t.genesis(gpa);
+    defer s.deinit(gpa);
 
-    var snapshot_buf: [snapshot_max_bytes]u8 = undefined;
-    const snapshot = writeSnapshot(&s, &snapshot_buf);
+    // One set per slot; each slot claims one name from a distinct account,
+    // until far past both old caps (names: one per slot; accounts: each new
+    // source claims once).
+    var seqs = std.AutoHashMap(u64, u64).init(gpa);
+    defer seqs.deinit();
+    var claimed: usize = 0;
+    var slot: u64 = 0;
+    while (claimed < 300) : (slot += 1) {
+        var set: TxSet = .{ .count = 0 };
+        while (set.count < max_txs and claimed < 300) {
+            const who: u64 = claimed; // a distinct source per claim
+            const next_seq = (seqs.get(who) orelse 0) + 1;
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "n{d}", .{claimed}) catch unreachable;
+            const key: Key = blk: {
+                var k: Key = @splat(0);
+                std.mem.writeInt(u64, k[24..32], @intCast(who + 1), .big);
+                break :blk k;
+            };
+            var signed = Tx.init(key, next_seq, .claim, name, "", zero_key) orelse break;
+            var seed: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, seed[24..32], @intCast(who + 1), .big);
+            signed.sign(seed, t.id) catch break;
+            set.txs[set.count] = signed;
+            set.count += 1;
+            claimed += 1;
+            // seq consumed even on failure; claim succeeds for new names.
+            try seqs.put(who, next_seq);
+        }
+        try TestNet.applyNext(&s, &set, gpa);
+    }
+    try testing.expect(s.names.items.len >= 300);
+    try testing.expect(s.accounts.items.len >= 300);
+    try testing.expect(s.head.slot >= 10); // 300 claims in ≤32-tx sets
+
+    const snap = try writeSnapshot(&s, gpa);
+    defer gpa.free(snap);
+    var back = (try readSnapshot(gpa, snap)).?;
+    defer back.deinit(gpa);
+    const back_snap = try writeSnapshot(&back, gpa);
+    defer gpa.free(back_snap);
+    try testing.expectEqualSlices(u8, snap, back_snap);
+    try testing.expectEqualSlices(u8, &s.head.hash, &back.head.hash);
+    try testing.expectEqualSlices(u8, &(try s.stateRoot(gpa)), &(try back.stateRoot(gpa)));
+}
+
+test "snapshot V4: replacing the canonical last value is refused even with a repaired checksum" {
+    const t = TestNet.init();
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
+    const original = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
+    try TestNet.applyNext(&s, &original, testing.allocator);
+
+    const snapshot = try writeSnapshot(&s, testing.allocator);
+    defer testing.allocator.free(snapshot);
     const value_len: usize = std.mem.readInt(u16, snapshot[snapshot_fixed_prefix..][0..2], .big);
     try testing.expectEqual(@as(usize, value_magic.len + 8 + 1 + tx_bytes), value_len);
 
@@ -1503,70 +1622,81 @@ test "snapshot V3: replacing the canonical last value is refused even with a rep
     const replacement_bytes = replacement.encode(&replacement_buf);
     try testing.expectEqual(value_len, replacement_bytes.len);
 
-    var tampered = snapshot_buf;
+    var tampered = try testing.allocator.dupe(u8, snapshot);
+    defer testing.allocator.free(tampered);
     @memcpy(tampered[snapshot_fixed_prefix + 2 ..][0..value_len], replacement_bytes);
     const repaired = sha256(tampered[0 .. snapshot.len - 32]);
     @memcpy(tampered[snapshot.len - 32 ..][0..32], &repaired);
-    try testing.expect(readSnapshot(tampered[0..snapshot.len]) == null);
+    try testing.expect((try readSnapshot(testing.allocator, tampered)) == null);
 }
 
-test "snapshot V3: legacy magic is rejected rather than reinterpreted" {
+test "snapshot V4: legacy magic is rejected rather than reinterpreted" {
     const t = TestNet.init();
-    var s = t.genesis();
-    TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
+    var s = try t.genesis(testing.allocator);
+    defer s.deinit(testing.allocator);
+    try TestNet.applyNext(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}), testing.allocator);
 
-    var buf: [snapshot_max_bytes]u8 = undefined;
-    const snapshot = writeSnapshot(&s, &buf);
-    var legacy = buf;
-    @memcpy(legacy[0..snap_magic.len], "REGISTRY-SNAP-V2\n");
-    const checksum = sha256(legacy[0 .. snapshot.len - 32]);
-    @memcpy(legacy[snapshot.len - 32 ..][0..32], &checksum);
-    try testing.expect(readSnapshot(legacy[0..snapshot.len]) == null);
+    const snapshot = try writeSnapshot(&s, testing.allocator);
+    defer testing.allocator.free(snapshot);
+    var legacy = try testing.allocator.dupe(u8, snapshot);
+    defer testing.allocator.free(legacy);
+    // Both older magics: the fixed-capacity V3 and the pre-epoch V2.
+    for ([_][]const u8{ "REGISTRY-SNAP-V3\n", "REGISTRY-SNAP-V2\n" }) |old| {
+        @memcpy(legacy[0..old.len], old);
+        const checksum = sha256(legacy[0 .. snapshot.len - 32]);
+        @memcpy(legacy[snapshot.len - 32 ..][0..32], &checksum);
+        try testing.expect((try readSnapshot(testing.allocator, legacy)) == null);
+    }
 }
 
-test "snapshot V3: canonical real genesis round-trips and forged genesis is refused" {
+test "snapshot V4: canonical real genesis round-trips and forged genesis is refused" {
     const network_id = networkId("snapshot genesis", TestNet.genesis_close_time);
-    const genesis = State.genesis(network_id, TestNet.genesis_close_time);
-    var buf: [snapshot_max_bytes]u8 = undefined;
-    const encoded = writeSnapshot(&genesis, &buf);
-    const restored = readSnapshot(encoded).?;
+    var genesis = try State.genesis(network_id, TestNet.genesis_close_time, testing.allocator);
+    defer genesis.deinit(testing.allocator);
+    const encoded = try writeSnapshot(&genesis, testing.allocator);
+    defer testing.allocator.free(encoded);
+    var restored = (try readSnapshot(testing.allocator, encoded)).?;
+    defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 0), restored.head.slot);
     try testing.expectEqualSlices(u8, &network_id, &restored.network_id);
     try testing.expect(!isZero(&restored.head.hash));
     try testing.expectEqual(TestNet.genesis_close_time, restored.head.close_time);
-    try testing.expectEqual(@as(u8, 0), restored.n_accounts);
-    try testing.expectEqual(@as(u8, 0), restored.n_names);
+    try testing.expectEqual(@as(usize, 0), restored.accounts.items.len);
+    try testing.expectEqual(@as(usize, 0), restored.names.items.len);
     try testing.expect(restored.last_value == null);
 
-    var forged = buf;
+    var forged = try testing.allocator.dupe(u8, encoded);
+    defer testing.allocator.free(forged);
     const prev_hash_offset = snap_magic.len + 32 + 8 + 8 + 32;
     forged[prev_hash_offset] ^= 1;
     const checksum = sha256(forged[0 .. encoded.len - 32]);
     @memcpy(forged[encoded.len - 32 ..][0..32], &checksum);
-    try testing.expect(readSnapshot(forged[0..encoded.len]) == null);
+    try testing.expect((try readSnapshot(testing.allocator, forged)) == null);
 }
 
 // Non-vacuity: the golden bytes pin the header format (tag, field order,
 // big-endian slot) and the genesis state root. Change the format on
 // purpose only, and change these with it.
-test "E2c golden: canonical genesis and the header after one empty ledger" {
+test "epoch golden: canonical genesis and the header after one empty ledger" {
     const network_id = networkId("testnet", TestNet.genesis_close_time);
-    var s = State.genesis(network_id, TestNet.genesis_close_time);
+    var s = try State.genesis(network_id, TestNet.genesis_close_time, testing.allocator);
+    defer s.deinit(testing.allocator);
     const root = std.fmt.bytesToHex(s.head.state_root, .lower);
-    // state root of `00 00` (no accounts, no names)
-    try testing.expectEqualStrings("96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7", &root);
+    // state root of `00 00 00 00 00 00 00 00` (two u32 zero counts, no
+    // accounts, no names — the capacity epoch widened the counts from u8)
+    try testing.expectEqualStrings("af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc", &root);
     try testing.expect(isZero(&s.head.txset_hash));
     try testing.expectEqualStrings(
-        "0ac47307b63113dc84b47d582540229b11198aa5a6175340942f3809479e9474",
+        "1383b906aefd323ffd80933dc645fdd2d5a57867b299ba6e16e10f192d3d1cb5",
         &std.fmt.bytesToHex(s.head.hash, .lower),
     );
 
-    apply(&s, &.{ .close_time = TestNet.genesis_close_time + 1, .txs = .empty });
+    try apply(&s, &.{ .close_time = TestNet.genesis_close_time + 1, .txs = .empty }, testing.allocator);
     const txset = std.fmt.bytesToHex(s.head.txset_hash, .lower);
     const head = std.fmt.bytesToHex(s.head.hash, .lower);
     // txset hash of the single byte `00`
     try testing.expectEqualStrings("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d", &txset);
-    try testing.expectEqualStrings("15dbc342c6c0942315b5c55422aea3ab62539b699d3cd7f214b97bf0311131c7", &head);
+    try testing.expectEqualStrings("b74b4ef8c7730b0a6676bee0b7a427f58fa558627212a8b231ed9a1ea9c5c2de", &head);
 }
 
 test "hex helpers" {
@@ -1584,13 +1714,14 @@ test "E2c golden: network descriptor and ledger value use disjoint canonical dom
     var descriptor_buf: [128]u8 = undefined;
     const descriptor = networkDescriptor(genesis_close_time, "testnet", &descriptor_buf);
     try testing.expectEqual(@as(usize, 30), descriptor.len);
+    // "REGISTRY-NET-V3" — the heap-state capacity epoch.
     try testing.expectEqualStrings(
-        "52454749535452592d4e45542d5632000000006553f100746573746e6574",
+        "52454749535452592d4e45542d5633000000006553f100746573746e6574",
         &std.fmt.bytesToHex(descriptor[0..30].*, .lower),
     );
     const nid = networkId("testnet", genesis_close_time);
     try testing.expectEqualStrings(
-        "f43d2c05072db41167a6b75274d123e37df41109114d7ef8793d99b3c96b0bd9",
+        "163c6025f0c03961008d038221bee18e6056f5e5f50e5bec8f1a09173cb05d15",
         &std.fmt.bytesToHex(nid, .lower),
     );
 
@@ -1613,7 +1744,8 @@ test "E2c golden: network descriptor and ledger value use disjoint canonical dom
 
 test "E2c contextual validation enforces the exact slot-derived close-time interval" {
     const t = TestNet.init();
-    var state = t.genesis();
+    var state = try t.genesis(testing.allocator);
+    defer state.deinit(testing.allocator);
     state.head.slot = 10;
     state.head.close_time = 1000;
 
@@ -1635,6 +1767,8 @@ test "E2c contextual validation enforces the exact slot-derived close-time inter
     forged.txs[0].name[0] = 'x';
     try testing.expectEqual(Verdict.invalid, validate(&state, &.{ .close_time = 1003, .txs = forged }, 13));
 
+    // Aliases on purpose: only `head` mutates and exactly one deinit runs
+    // (the original's) — any storage mutation here would dangle the alias.
     var near_end = state;
     near_end.head.close_time = std.math.maxInt(u64) - 5;
     try testing.expectEqual(Verdict.invalid, validate(&near_end, &.{ .close_time = std.math.maxInt(u64) - 5, .txs = clean }, 11));
@@ -1662,7 +1796,8 @@ test "E2c restored heads remain inside the representable genesis-anchored interv
 
 test "E2c proposal clamps wall time and combination chooses the minimum candidate time" {
     const t = TestNet.init();
-    const state = t.genesis();
+    var state = try t.genesis(testing.allocator);
+    defer state.deinit(testing.allocator);
     const pending = [_]Tx{
         t.tx(0, 2, .set, "alice", "v", zero_key),
         t.tx(0, 1, .claim, "alice", "", zero_key),
@@ -1693,6 +1828,8 @@ test "E2c proposal clamps wall time and combination chooses the minimum candidat
     at_end.head.close_time = std.math.maxInt(u64);
     try testing.expect(proposal(&at_end, &.{}, 0) == null);
 
+    // Aliases on purpose: only `head` mutates and exactly one deinit runs
+    // (the original's) — any storage mutation here would dangle the alias.
     var near_end = state;
     near_end.head.close_time = std.math.maxInt(u64) - 5;
     try testing.expectEqual(std.math.maxInt(u64), proposal(&near_end, &.{}, std.math.maxInt(u64)).?.close_time);
@@ -1700,34 +1837,35 @@ test "E2c proposal clamps wall time and combination chooses the minimum candidat
 
 test "E2c apply is a no-op unless value is an exact clean close-time successor" {
     const t = TestNet.init();
-    const genesis = t.genesis();
+    var genesis = try t.genesis(testing.allocator);
+    defer genesis.deinit(testing.allocator);
     const clean = TxSet.empty;
 
     var stale_time = genesis;
-    apply(&stale_time, &.{ .close_time = genesis.head.close_time, .txs = clean });
+    try apply(&stale_time, &.{ .close_time = genesis.head.close_time, .txs = clean }, testing.allocator);
     try testing.expect(std.meta.eql(genesis, stale_time));
 
     var far_time = genesis;
-    apply(&far_time, &.{ .close_time = genesis.head.close_time + max_close_time_step + 1, .txs = clean });
+    try apply(&far_time, &.{ .close_time = genesis.head.close_time + max_close_time_step + 1, .txs = clean }, testing.allocator);
     try testing.expect(std.meta.eql(genesis, far_time));
 
     var seq_gap = genesis;
-    apply(&seq_gap, &.{
+    try apply(&seq_gap, &.{
         .close_time = genesis.head.close_time + 1,
         .txs = TestNet.set(&.{t.tx(0, 2, .claim, "ahead", "", zero_key)}),
-    });
+    }, testing.allocator);
     try testing.expect(std.meta.eql(genesis, seq_gap));
 
     var exhausted_slot = genesis;
     exhausted_slot.head.slot = std.math.maxInt(u64);
     const before_hash = exhausted_slot.head.hash;
-    apply(&exhausted_slot, &.{ .close_time = genesis.head.close_time + 1, .txs = clean });
+    try apply(&exhausted_slot, &.{ .close_time = genesis.head.close_time + 1, .txs = clean }, testing.allocator);
     try testing.expectEqual(std.math.maxInt(u64), exhausted_slot.head.slot);
     try testing.expectEqualSlices(u8, &before_hash, &exhausted_slot.head.hash);
     try testing.expect(exhausted_slot.last_value == null);
 
     var applied = genesis;
-    apply(&applied, &.{ .close_time = genesis.head.close_time + max_close_time_step, .txs = clean });
+    try apply(&applied, &.{ .close_time = genesis.head.close_time + max_close_time_step, .txs = clean }, testing.allocator);
     try testing.expectEqual(@as(u64, 1), applied.head.slot);
     try testing.expectEqual(genesis.head.close_time + max_close_time_step, applied.head.close_time);
     try testing.expectEqual(applied.head.close_time, applied.last_value.?.close_time);

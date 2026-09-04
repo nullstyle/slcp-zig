@@ -15,12 +15,12 @@
 //! the dedup floor, the exact-predecessor nomination seed, and the
 //! contiguous-journal rules all describe the same state the adapter owns.
 //!
-//! The state is still plain by-value data (E1's bounded shape), so the
-//! observation is simply a copy and nothing needs `deinitObs`. When the state
-//! grows heap-backed storage, `observe` becomes an owned clone with
-//! `deinitObs`, `apply` allocates through its `gpa`, and the cadence loop
-//! returns each applied state through `release` — the contract already
-//! spells both shapes (ADR 0003).
+//! The state is heap-backed (the capacity epoch): `initState` clones the
+//! context's state, `apply` allocates through its `gpa` (an OutOfMemory halts
+//! the node, never the agreed value), and the observation is an OWNED clone
+//! of the whole state — `deinitObs` frees it and every `Applied` returns
+//! through `release` (ADR 0003). The cadence loop moves each observation into
+//! the RPC shared state and the history outbox borrows it first.
 
 const std = @import("std");
 const slcp = @import("slcp");
@@ -33,9 +33,9 @@ pub const Registry = struct {
     pub const State = registry.State;
     pub const Command = registry.LedgerValue;
 
-    /// The whole state is the observation: the cadence loop persists the
-    /// snapshot from it, offers history publication, and swaps it into the
-    /// RPC shared state. Plain data, so `release` is a no-op.
+    /// The whole state, as an OWNED clone: the cadence loop persists the
+    /// snapshot from it, offers history publication, then moves it into the
+    /// RPC shared state. Every Applied returns through `release`.
     pub const Obs = registry.State;
 
     /// The boot state `main.zig` selected (genesis, local snapshot, or
@@ -45,13 +45,11 @@ pub const Registry = struct {
     pub const InitError = error{OutOfMemory};
 
     pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State {
-        _ = gpa;
-        return context;
+        return context.clone(gpa);
     }
 
     pub fn deinitState(state: *State, gpa: std.mem.Allocator) void {
-        _ = state;
-        _ = gpa;
+        state.deinit(gpa);
     }
 
     pub fn initialSlot(state: *const State) u64 {
@@ -70,15 +68,16 @@ pub const Registry = struct {
         };
     }
 
-    /// The state is updated in place; nothing allocates yet.
     pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
-        _ = gpa;
-        registry.apply(state, &cmd);
+        try registry.apply(state, &cmd, gpa);
     }
 
     pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs {
-        _ = gpa;
-        return state.*;
+        return state.clone(gpa);
+    }
+
+    pub fn deinitObs(obs: *Obs, gpa: std.mem.Allocator) void {
+        obs.deinit(gpa);
     }
 
     pub fn combine(state: *const State, cmds: []const Command) Command {
@@ -101,10 +100,9 @@ comptime {
     // program passes (roadmap §3.1); the contract check happens at create.
     std.debug.assert(registry.max_ledger_value_bytes <= registry.max_value_bytes);
     std.debug.assert(Node.codec.is_custom);
-    // The state is plain data today: observations carry it by value and
-    // `release` is a no-op. Flipping to heap-backed state means giving the
-    // observation ownership (`deinitObs`) in the same change.
-    std.debug.assert(!Node.obs_owns_memory);
+    // The observation owns a heap clone of the state; every Applied must be
+    // released.
+    std.debug.assert(Node.obs_owns_memory);
 }
 
 // ---------------------------------------------------------------------------
@@ -126,11 +124,17 @@ const Track = struct {
     /// deterministic per-ledger bound across a restart.
     close_times: [max_slots + 1]?u64 = @splat(null),
     last_slot: u64 = 0,
-    /// The state copy of the last applied item.
+    /// An owned clone of the last applied observation (the applied item
+    /// itself is released by the pump after `note`).
     last_state: ?registry.State = null,
     const max_slots = 8;
 
-    fn note(self: *Track, item: Node.Applied) !void {
+    fn deinit(self: *Track, gpa: std.mem.Allocator) void {
+        if (self.last_state) |*s| s.deinit(gpa);
+        self.last_state = null;
+    }
+
+    fn note(self: *Track, gpa: std.mem.Allocator, item: Node.Applied) !void {
         // Roadmap §3.8: the header's slot must be the delivered slot.
         try testing.expectEqual(item.slot, item.obs.head.slot);
         try testing.expectEqual(item.obs.head.close_time, item.obs.last_value.?.close_time);
@@ -139,7 +143,8 @@ const Track = struct {
             self.close_times[item.slot] = item.obs.head.close_time;
         }
         self.last_slot = item.slot;
-        self.last_state = item.obs;
+        if (self.last_state) |*s| s.deinit(gpa);
+        self.last_state = try item.obs.clone(gpa);
     }
 };
 
@@ -163,16 +168,19 @@ fn proposeEmpty(state: *const registry.State) registry.LedgerValue {
 /// slot below `target` a node proposes again (2-of-2 needs both proposers).
 /// `ta` / `tb` record the head hashes and the last state.
 fn pump(a: *Node, b: *Node, pa: Proposer, pb: Proposer, ta: *Track, tb: *Track, target: u64, deadline_ms: u64) !void {
+    const gpa = testing.allocator;
     var waited: u64 = 0;
     while (ta.last_slot < target or tb.last_slot < target) {
         if (waited > deadline_ms) return error.PumpTimeout;
         if (try a.waitApplied(.{ .timeout_ms = 20 })) |x| {
-            try ta.note(x);
+            try ta.note(gpa, x);
             if (x.slot < target) try a.propose(pa(&x.obs));
+            a.release(x);
         }
         if (try b.waitApplied(.{ .timeout_ms = 20 })) |x| {
-            try tb.note(x);
+            try tb.note(gpa, x);
             if (x.slot < target) try b.propose(pb(&x.obs));
+            b.release(x);
         }
         waited += 40;
     }
@@ -215,9 +223,12 @@ test "registry over OwnedAppNode (2-of-2 loopback): skewed clocks converge and t
     test_claim_set = .{ .count = 1 };
     test_claim_set.txs[0] = claim;
 
-    const genesis = registry.State.genesis(nid, genesis_close_time);
+    var genesis = try registry.State.genesis(nid, genesis_close_time, gpa);
+    defer genesis.deinit(gpa);
     var ta: Track = .{};
     var tb: Track = .{};
+    defer ta.deinit(gpa);
+    defer tb.deinit(gpa);
 
     const b = blk: {
         const a = try Node.create(gpa, io, .{
@@ -279,9 +290,10 @@ test "registry over OwnedAppNode (2-of-2 loopback): skewed clocks converge and t
 
     // Snapshot round-trip through the file format, then restart a from it —
     // the snapshot travels in the create CONTEXT, not a global.
-    var snap_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snap = registry.writeSnapshot(&s3, &snap_buf);
-    const restored = registry.readSnapshot(snap).?;
+    const snap = try registry.writeSnapshot(&s3, gpa);
+    defer gpa.free(snap);
+    var restored = (try registry.readSnapshot(gpa, snap)).?;
+    defer restored.deinit(gpa);
     const a2 = try Node.create(gpa, io, .{
         .network = network_descriptor,
         .secret_seed = seed_a,
@@ -294,6 +306,7 @@ test "registry over OwnedAppNode (2-of-2 loopback): skewed clocks converge and t
     }, restored);
     defer a2.deinit();
     var ta2: Track = .{};
+    defer ta2.deinit(gpa);
     try a2.propose(proposeClaimUntilApplied(&restored));
     try b.propose(proposeEmpty(&s3));
     try pump(a2, b, proposeClaimUntilApplied, proposeEmpty, &ta2, &tb, 4, 90_000);

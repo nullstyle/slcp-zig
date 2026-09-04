@@ -83,8 +83,8 @@ transaction's,
 **even when the operation fails** (stellar-core's rule; it is what keeps
 `validate` and `apply` in agreement), then the operation runs — `claim` a
 free name, `set` its value or `transfer` it or `release` it as its owner —
-and its result (`ok`, `name_taken`, `not_owner`, `no_such_name`,
-`registry_full`) is recorded. Then the header advances:
+and its result (`ok`, `name_taken`, `not_owner`, `no_such_name`) is
+recorded. Then the header advances:
 `slot += 1`, `prev_hash = hash`, `txset_hash = SHA-256(set)`,
 `state_root = SHA-256(the sorted accounts and names)`,
 `hash = SHA-256("REGISTRY-HDR-V2" ‖ network_id ‖ slot ‖ close_time ‖
@@ -336,7 +336,7 @@ mesh — see *Security*). On every box:
 
    ```
    registry: node d4f7315f…985e58 listening on port 7411; 2 peer(s); data in data; starting from genesis at slot 0 close_time=1788480000
-   registry: limits: 32 txs per set, 64 accounts, 128 names, 256 pending; busy slots every >= 1000 ms, idle heartbeat every 3000 ms
+   registry: limits: 32 txs per set, 256 pending, unbounded accounts and names; busy slots every >= 1000 ms, idle heartbeat every 3000 ms
    registry: rpc listening on 127.0.0.1:7412
    slot 1: close_time=1788480060 txs=0 ok=0 head=<hash16>
    slot 2: close_time=1788480120 txs=0 ok=0 head=<hash16>
@@ -471,11 +471,15 @@ These remaining limits are deliberate:
   the registry stops rather than discard a history record or let a successor
   overtake it. Boot-time journal replay may publish one oldest entry
   synchronously when it needs that capacity for the exact next successor.
-- **Bounded state.** 64 accounts, 128 names, 32 transactions per slot. The
-  typed layer copies the state after every applied slot and `initialState()`
-  cannot read a file, which is why the state is plain data and the snapshot
-  is loaded through a global before the node starts.
-- **No heap state, generic archive protocol, upgrades, quotas, watcher nodes,
+- **Heap state, unbounded accounts and names** (the capacity epoch: Snapshot
+  V4, the `REGISTRY-NET-V3` network tag, and the old 64/128 inline caps
+  removed). 32 transactions per slot still bound the consensus VALUE. The
+  state travels by pointer or explicit clone through `slcp.OwnedAppNode`:
+  `initState` clones the boot snapshot handed to `create` as its context
+  (no global), `apply` allocates through the adapter, and each applied slot
+  hands the user thread an owned observation which the cadence loop moves
+  into the RPC shared state after the snapshot and history outbox borrow it.
+- **No generic archive protocol, upgrades, quotas, watcher nodes,
   or HTTP.** The remainder of E2 and E3. The application-owned archive does
   not make history a generic SLCP protocol. The native Node now offers a
   configurable bounded answering window and Experimental catch-up telemetry;
