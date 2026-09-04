@@ -1,7 +1,7 @@
 //! Value handling (design §4.4, §5.4 values.zig bullet): gpa-owned opaque
 //! byte values, byte-lexicographic ordering, sorted-unique value sets, and
-//! the per-slot driver-validation cache keyed by SHA-256(value) so each
-//! distinct value crosses the driver boundary at most once per slot.
+//! the per-slot driver-validation cache keyed by SHA-256(phase || value), so
+//! nomination and ballot policy remain independent.
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -69,11 +69,12 @@ pub const ValueSet = struct {
     }
 };
 
-/// Per-slot driver-verdict cache: SHA-256(value) → Validity.
+/// Per-slot driver-verdict cache: SHA-256(protocol phase || value) → Validity.
 /// BOUNDED (adversary-fillable: ballot counter-churn with fresh values would
 /// otherwise grow it without limit — M2 safety review F1; the §16 wasm
-/// budget counts it at max_entries × ~40 B). FIFO eviction, deterministic;
-/// a re-validated evictee gets the same verdict (drivers are deterministic).
+/// budget counts it at max_entries entries). FIFO eviction, deterministic;
+/// a re-validated evictee gets the same phase-specific verdict (drivers are
+/// deterministic for the same slot, value, and phase).
 pub const ValidationCache = struct {
     pub const max_entries: usize = 4096;
 
@@ -92,12 +93,19 @@ pub const ValidationCache = struct {
         return h.finalResult();
     }
 
-    pub fn get(self: *const ValidationCache, bytes: []const u8) ?driver_mod.Validity {
-        return self.map.get(key(bytes));
+    fn phaseKey(bytes: []const u8, is_nomination: bool) [32]u8 {
+        var h = Sha256.init(.{});
+        h.update(&.{@intFromBool(is_nomination)});
+        h.update(bytes);
+        return h.finalResult();
     }
 
-    pub fn put(self: *ValidationCache, gpa: std.mem.Allocator, bytes: []const u8, v: driver_mod.Validity) !void {
-        const k = key(bytes);
+    pub fn get(self: *const ValidationCache, bytes: []const u8, is_nomination: bool) ?driver_mod.Validity {
+        return self.map.get(phaseKey(bytes, is_nomination));
+    }
+
+    pub fn put(self: *ValidationCache, gpa: std.mem.Allocator, bytes: []const u8, is_nomination: bool, v: driver_mod.Validity) !void {
+        const k = phaseKey(bytes, is_nomination);
         const gop = try self.map.getOrPut(gpa, k);
         if (gop.found_existing) {
             gop.value_ptr.* = v;
@@ -137,13 +145,15 @@ test "ValueSet keeps sorted-unique order and superset semantics" {
     try std.testing.expect(!sub.isSupersetOf(&s));
 }
 
-test "ValidationCache round-trips verdicts" {
+test "ValidationCache round-trips phase-specific verdicts" {
     const gpa = std.testing.allocator;
     var c: ValidationCache = .{};
     defer c.deinit(gpa);
-    try std.testing.expectEqual(@as(?driver_mod.Validity, null), c.get("v1"));
-    try c.put(gpa, "v1", .valid);
-    try c.put(gpa, "v2", .maybe_valid);
-    try std.testing.expectEqual(driver_mod.Validity.valid, c.get("v1").?);
-    try std.testing.expectEqual(driver_mod.Validity.maybe_valid, c.get("v2").?);
+    try std.testing.expectEqual(@as(?driver_mod.Validity, null), c.get("v1", true));
+    try c.put(gpa, "v1", true, .valid);
+    try c.put(gpa, "v1", false, .invalid);
+    try c.put(gpa, "v2", false, .maybe_valid);
+    try std.testing.expectEqual(driver_mod.Validity.valid, c.get("v1", true).?);
+    try std.testing.expectEqual(driver_mod.Validity.invalid, c.get("v1", false).?);
+    try std.testing.expectEqual(driver_mod.Validity.maybe_valid, c.get("v2", false).?);
 }

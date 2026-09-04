@@ -5665,12 +5665,13 @@ test "hold gate: an EXTERNALIZE(next_deliver + 1) from one peer is held while th
 // the engine externalizes 20 from {a, b} + me → the delivery gap-jump
 // (20 >= 1 + 16) lands on 20 → slot 21 is released at the frontier, and
 // from there every slot is validated AFTER the one before it was applied:
-// the Counter-shaped probe answers .maybe_valid exactly once (slot 20,
-// judged against count 0 — harmless, a v-blocking set had externalized it)
-// and .valid for 21 and 22, so the node's own EXTERNALIZE(21) and (22)
-// reach the wire. Non-vacuity: dropping the v-blocking release (`.ready`)
+// the Counter-shaped probe answers .maybe_valid twice for slot 20 — once
+// for its nomination value and once for its ballot value, both judged against
+// count 0. That is harmless because a v-blocking set had externalized it.
+// Validation is .valid for 21 and 22, so the node's own EXTERNALIZE(21) and
+// (22) reach the wire. Non-vacuity: dropping the v-blocking release (`.ready`)
 // leaves next_deliver at 1 with 4 entries held after b's EXT(20); feeding
-// EXTERNALIZE straight through makes maybe_verdicts 3 and own_latest(21)
+// EXTERNALIZE straight through makes maybe_verdicts 4 and own_latest(21)
 // null (mute on every caught-up slot); dropping the `open` mark makes b's
 // EXT(21) wait in the buffer instead of completing slot 21.
 test "hold gate: catch-up far behind — a v-blocking set of EXTERNALIZEs releases its slot early, the gap-jump follows, later slots validate after apply and the node votes on them" {
@@ -5715,7 +5716,7 @@ test "hold gate: catch-up far behind — a v-blocking set of EXTERNALIZEs releas
     try std.testing.expectEqual(@as(u64, 3), n.hold.released_early.load(.acquire)); // NOM(20), EXT(20) a, EXT(20) b
     try std.testing.expectEqual(@as(u64, 1), n.hold.released.load(.acquire)); // a's EXT(21), at the frontier
     try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire)); // a's EXT(22)
-    try std.testing.expectEqual(@as(u32, 1), probe.maybe_verdicts); // slot 20 only, judged against count 0
+    try std.testing.expectEqual(@as(u32, 2), probe.maybe_verdicts); // slot 20 nomination + ballot, judged against count 0
     try std.testing.expect(n.own_latest.get(20) == null); // mute on 20: harmless, the network finished it
 
     // b's EXT(21) / EXT(22): frontier slots, fed straight in → each
@@ -5728,7 +5729,7 @@ test "hold gate: catch-up far behind — a v-blocking set of EXTERNALIZEs releas
     try std.testing.expectEqualSlices(u64, &[_]u64{ 20, 21, 22 }, probe.delivered.items);
     try std.testing.expectEqual(@as(u64, 23), n.next_deliver);
     try std.testing.expectEqual(@as(u64, 22), probe.count);
-    try std.testing.expectEqual(@as(u32, 1), probe.maybe_verdicts); // still only slot 20
+    try std.testing.expectEqual(@as(u32, 2), probe.maybe_verdicts); // still only slot 20's two protocol phases
     try std.testing.expect(n.eng.slots.get(21).?.fully_validated);
     try std.testing.expect(n.eng.slots.get(22).?.fully_validated);
     try std.testing.expect(n.own_latest.get(21) != null);

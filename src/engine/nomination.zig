@@ -523,13 +523,14 @@ fn leaderRound(ctx: *const engine_mod.Ctx, s: *const slot_mod2.Slot) LeaderRound
 }
 
 /// Per-slot cached driver validation for nomination values (§5.4: each
-/// distinct value crosses the driver boundary at most once per slot; oracle:
+/// distinct nomination value crosses the driver boundary once while cached;
+/// ballot verdicts occupy a separate cache entry; oracle:
 /// NominationProtocol::validateValue → SCPDriver::validateValue,
 /// NominationProtocol.cpp:73-78).
 fn validateCached(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot, value: []const u8) anyerror!driver_mod.Validity {
-    if (s.validation_cache.get(value)) |vl| return vl;
+    if (s.validation_cache.get(value, true)) |vl| return vl;
     const vl = ctx.driverValidate(s.index, value, true);
-    try s.validation_cache.put(ctx.gpa, value, vl);
+    try s.validation_cache.put(ctx.gpa, value, true, vl);
     return vl;
 }
 

@@ -368,12 +368,12 @@ fn fedRatify(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, voted_pred: anytype) !bool
 // ---------------------------------------------------------------------------
 
 /// Per-slot cached driver verdict for a ballot value (§5.4 values.zig
-/// bullet: each distinct value crosses the driver boundary at most once per
-/// slot).
+/// bullet: each distinct ballot value crosses the driver boundary once while
+/// cached; nomination verdicts occupy a separate cache entry).
 fn cachedValidate(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, value: []const u8) !driver_mod.Validity {
-    if (s.validation_cache.get(value)) |v| return v;
+    if (s.validation_cache.get(value, false)) |v| return v;
     const v = ctx.driverValidate(s.index, value, false);
-    try s.validation_cache.put(ctx.gpa, value, v);
+    try s.validation_cache.put(ctx.gpa, value, false, v);
     return v;
 }
 

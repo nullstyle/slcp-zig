@@ -788,6 +788,10 @@ const EngineOpts = struct {
 /// Engine whose local qset is {1, [self, peer, peer2, peer3]} — all test
 /// peers are in the published transitive quorum graph.
 fn makeEngine(gpa: std.mem.Allocator, opts: EngineOpts) !engine.Engine {
+    return makeEngineWithDriver(gpa, opts, driver_mod.Driver.default());
+}
+
+fn makeEngineWithDriver(gpa: std.mem.Allocator, opts: EngineOpts, drv: driver_mod.Driver) !engine.Engine {
     const node_id = try crypto.publicKeyFromSeed(engine_seed);
     const members = [_][32]u8{
         node_id,
@@ -803,7 +807,7 @@ fn makeEngine(gpa: std.mem.Allocator, opts: EngineOpts) !engine.Engine {
         .quorum_set = qs,
         .strict_canonical = opts.strict,
         .limits = opts.limits,
-    }, driver_mod.Driver.default());
+    }, drv);
 }
 
 /// Build a signed Envelope frame from `seed`'s keypair via emit (a stand-in
@@ -920,6 +924,98 @@ fn expectStatus(gpa: std.mem.Allocator, eng: *engine.Engine, input: engine.Input
     var d = try pushAndDrain(gpa, eng, input);
     defer d.deinit(gpa);
     try testing.expectEqual(expected, d.status);
+}
+
+const PhaseValidationTrace = struct {
+    nomination_calls: u32 = 0,
+    ballot_calls: u32 = 0,
+
+    fn validate(raw: *anyopaque, slot: u64, value: []const u8, is_nomination: bool) driver_mod.Validity {
+        _ = slot;
+        _ = value;
+        const self: *PhaseValidationTrace = @ptrCast(@alignCast(raw));
+        if (is_nomination) {
+            self.nomination_calls += 1;
+            return .invalid; // nomination may apply a stricter admission policy
+        }
+        self.ballot_calls += 1;
+        return .valid;
+    }
+
+    fn combine(raw: *anyopaque, slot: u64, candidates: []const []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) driver_mod.DriverError!void {
+        _ = raw;
+        _ = slot;
+        _ = candidates;
+        _ = gpa;
+        _ = out;
+        return error.DriverFault;
+    }
+
+    fn driver(self: *PhaseValidationTrace) driver_mod.Driver {
+        return .{ .ctx = @ptrCast(self), .validate_value = validate, .combine_candidates = combine };
+    }
+};
+
+const PhaseOrderOutcome = struct {
+    first_status: engine.InputStatus,
+    second_status: engine.InputStatus,
+    nomination_calls: u32,
+    ballot_calls: u32,
+};
+
+fn runPhaseOrder(gpa: std.mem.Allocator, nomination_first: bool) !PhaseOrderOutcome {
+    var trace: PhaseValidationTrace = .{};
+    var eng = try makeEngineWithDriver(gpa, .{}, trace.driver());
+    defer eng.deinit();
+
+    const peer_pk = try crypto.publicKeyFromSeed(peer_seed);
+    const qh = try qsetHashOf(gpa, 1, &.{peer_pk});
+    const qbytes = try framedQset(gpa, 1, &.{peer_pk});
+    defer gpa.free(qbytes);
+    try expectStatus(gpa, &eng, .{ .qset_received = .{ .bytes = qbytes } }, .applied);
+
+    const value = "phase-sensitive";
+    const nomination = try peerEnvelope(gpa, peer_seed, 1, .{ .nominate = .{
+        .qset_hash = qh,
+        .votes = &.{value},
+        .accepted = &.{},
+    } });
+    defer gpa.free(nomination);
+    const ballot = try peerEnvelope(gpa, peer_seed, 1, .{ .prepare = .{
+        .qset_hash = qh,
+        .ballot = .{ .counter = 1, .value = value },
+        .prepared = null,
+        .prepared_prime = null,
+        .n_c = 0,
+        .n_h = 0,
+    } });
+    defer gpa.free(ballot);
+
+    const first = if (nomination_first) nomination else ballot;
+    const second = if (nomination_first) ballot else nomination;
+    var first_drained = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = first } });
+    defer first_drained.deinit(gpa);
+    var second_drained = try pushAndDrain(gpa, &eng, .{ .envelope_received = .{ .bytes = second } });
+    defer second_drained.deinit(gpa);
+    return .{
+        .first_status = first_drained.status,
+        .second_status = second_drained.status,
+        .nomination_calls = trace.nomination_calls,
+        .ballot_calls = trace.ballot_calls,
+    };
+}
+
+test "phase-dependent validation is cached independently in either protocol arrival order" {
+    const gpa = testing.allocator;
+    const actual = [_]PhaseOrderOutcome{
+        try runPhaseOrder(gpa, true),
+        try runPhaseOrder(gpa, false),
+    };
+    const expected = [_]PhaseOrderOutcome{
+        .{ .first_status = .applied, .second_status = .applied, .nomination_calls = 1, .ballot_calls = 1 },
+        .{ .first_status = .applied, .second_status = .applied, .nomination_calls = 1, .ballot_calls = 1 },
+    };
+    try testing.expectEqualDeep(expected, actual);
 }
 
 // (protocol_stubs marker test removed at integration: protocols are real.)

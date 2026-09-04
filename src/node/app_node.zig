@@ -3,8 +3,9 @@
 //!
 //! slcp-core stays bytes-only. `AppNode(App)` is a comptime adapter that
 //! compiles a typed, pure state machine (`State`, `Command`, `validate`,
-//! `apply`, optional `combine` / `initialState` / `encode` + `decode`) down to
-//! the frozen §8.2 `Driver` vtable; the engine never learns it exists.
+//! `apply`, optional `combine` / `initialState` / `initialSlot` /
+//! `initialCommand` / `encode` + `decode`) down to the frozen §8.2 `Driver`
+//! vtable; the engine never learns it exists.
 //! `validate` may optionally accept `ValueContext` to observe the current slot
 //! and whether this is a nomination or ballot check.
 //!
@@ -397,7 +398,7 @@ fn validateAppContract(comptime App: type) void {
             contractError(App, "combine has the wrong signature." ++
                 "\n  want: fn (State, []const Command) Command" ++
                 "\n  got:  " ++ @typeName(@TypeOf(App.combine)) ++
-                "\n  combine must be deterministic and total; its result must self-validate .valid.");
+                "\n  combine must be deterministic and total; its result must not self-validate .invalid.");
     }
     if (@hasDecl(App, "initialState")) {
         if (@TypeOf(App.initialState) != fn () State)

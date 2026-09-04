@@ -1,10 +1,10 @@
 //! Application driver interface (design §8.1–§8.2, §8.4).
 //!
 //! The contract, identical in every host language: synchronous, pure,
-//! deterministic. validateValue is called at most once per distinct value per
-//! slot (the engine caches verdicts in values.zig); combineCandidates must be
-//! total over arbitrary candidate sets and its result must self-validate
-//! `.valid` and respect max_value_bytes.
+//! deterministic. validateValue verdicts are cached independently for
+//! nomination and ballot checks of a value in a slot; combineCandidates must
+//! be total over arbitrary candidate sets and its result must self-validate
+//! as anything except `.invalid` and respect max_value_bytes.
 
 const std = @import("std");
 
