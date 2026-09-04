@@ -385,6 +385,43 @@ test "wire: scalar frames round-trip" {
     }
 }
 
+test "wire: current decoder accepts a pre-feature two-data-word Hello" {
+    const gpa = testing.allocator;
+    const network_prefix = [_]u8{ 1, 3, 3, 7, 2, 4, 6, 8 };
+    const node_id: [32]u8 = @splat(0x5A);
+
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var fb = try gen_overlay.Frame.Builder.init(&mb);
+
+    // overlay.capnp before 50456f7 allocated Hello as exactly two data
+    // words plus two pointers. Build that layout directly instead of using
+    // the current generated initHello(), which allocates a third data word
+    // even when featureFlags is zero.
+    fb._builder.writeU16(0, 1); // Frame.hello union discriminant
+    const legacy = try fb._builder.initStruct(0, 2, 2);
+    try testing.expectEqual(@as(u16, 2), legacy.data_size);
+    try testing.expectEqual(@as(u16, 2), legacy.pointer_count);
+    try testing.expectError(error.OutOfBounds, legacy.writeU64Strict(16, feature_app_messages));
+    legacy.writeU32(0, protocol_version);
+    legacy.writeU16(4, 7311);
+    legacy.writeU64(8, 77);
+    try legacy.writeData(0, &network_prefix);
+    try legacy.writeData(1, &node_id);
+
+    const encoded = @constCast(try mb.toBytes());
+    defer gpa.free(encoded);
+    var got = try decode(gpa, encoded);
+    defer got.deinit(gpa);
+
+    try testing.expectEqual(protocol_version, got.hello.protocol_version);
+    try testing.expectEqual(@as(u64, 0), got.hello.feature_flags);
+    try testing.expectEqualSlices(u8, &network_prefix, &got.hello.network_id_prefix);
+    try testing.expectEqualSlices(u8, &node_id, &got.hello.node_id);
+    try testing.expectEqual(@as(u64, 77), got.hello.current_slot);
+    try testing.expectEqual(@as(u16, 7311), got.hello.listen_port);
+}
+
 test "wire: dont_have round-trips its id" {
     const gpa = testing.allocator;
     const id: [32]u8 = @splat(0xAB);
