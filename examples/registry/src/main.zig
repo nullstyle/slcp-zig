@@ -783,10 +783,13 @@ const HistoryPublisher = struct {
                 self.wakeup.latchFatal(0, err);
                 return;
             };
-            const ledger = staged orelse {
+            var ledger = staged orelse {
                 if (!self.wakeup.waitForChange(&observed_generation)) return;
                 continue;
             };
+            // nextStaged hands the worker an owned state; publish one entry
+            // per iteration and free it before waiting for the next.
+            defer ledger.deinit(self.gpa);
             const status = self.archive.recordApplied(&ledger) catch |err| {
                 if (historyFailureIsFatal(err)) {
                     self.wakeup.latchFatal(ledger.head.slot, err);
