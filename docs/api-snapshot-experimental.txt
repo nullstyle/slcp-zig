@@ -32,6 +32,7 @@ slcp.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []cons
 slcp.Driver.ctx: field *anyopaque
 slcp.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
 slcp.Driver.validate_value: field *const fn (*anyopaque, u64, []const u8, bool) driver.Validity
+slcp.Node.app_gossip: field node.app_gossip.State
 slcp.Node.cur_source: field ?usize = null
 slcp.Node.current_slot: field u64
 slcp.Node.delivery: field ?node.node.DeliveryHook
@@ -589,6 +590,7 @@ slcp.core.gen.overlay.DontHave.Reader.wrap: fn (serialization.message.StructRead
 slcp.core.gen.overlay.DontHave.Reader: struct
 slcp.core.gen.overlay.DontHave: struct
 slcp.core.gen.overlay.Frame.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
+slcp.core.gen.overlay.Frame.Builder.hasAppMessage: fn (gen.overlay.Frame.Builder) bool
 slcp.core.gen.overlay.Frame.Builder.hasDontHave: fn (gen.overlay.Frame.Builder) bool
 slcp.core.gen.overlay.Frame.Builder.hasEnvelope: fn (gen.overlay.Frame.Builder) bool
 slcp.core.gen.overlay.Frame.Builder.hasGetQset: fn (gen.overlay.Frame.Builder) bool
@@ -601,6 +603,7 @@ slcp.core.gen.overlay.Frame.Builder.initEnvelope: fn (*gen.overlay.Frame.Builder
 slcp.core.gen.overlay.Frame.Builder.initHello: fn (*gen.overlay.Frame.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.overlay.Hello.Builder
 slcp.core.gen.overlay.Frame.Builder.initQset: fn (*gen.overlay.Frame.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.slcp.QuorumSet.Builder
 slcp.core.gen.overlay.Frame.Builder.initSlotState: fn (*gen.overlay.Frame.Builder) error{FarPointerOffsetTooLarge,InvalidSegmentId,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!gen.overlay.SlotState.Builder
+slcp.core.gen.overlay.Frame.Builder.setAppMessage: fn (*gen.overlay.Frame.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.overlay.Frame.Builder.setGetQset: fn (*gen.overlay.Frame.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.overlay.Frame.Builder.setGetSlotState: fn (*gen.overlay.Frame.Builder, u64) error{}!void
 slcp.core.gen.overlay.Frame.Builder.setPing: fn (*gen.overlay.Frame.Builder, u64) error{}!void
@@ -609,6 +612,7 @@ slcp.core.gen.overlay.Frame.Builder.setUnset: fn (*gen.overlay.Frame.Builder, vo
 slcp.core.gen.overlay.Frame.Builder.wrap: fn (serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder) gen.overlay.Frame.Builder
 slcp.core.gen.overlay.Frame.Builder: struct
 slcp.core.gen.overlay.Frame.Reader._reader: field serialization.message.StructReader
+slcp.core.gen.overlay.Frame.Reader.getAppMessage: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,WrongUnionMember}![]const u8
 slcp.core.gen.overlay.Frame.Reader.getDontHave: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.overlay.DontHave.Reader
 slcp.core.gen.overlay.Frame.Reader.getEnvelope: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.slcp.Envelope.Reader
 slcp.core.gen.overlay.Frame.Reader.getGetQset: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,WrongUnionMember}![]const u8
@@ -619,6 +623,7 @@ slcp.core.gen.overlay.Frame.Reader.getPong: fn (gen.overlay.Frame.Reader) error{
 slcp.core.gen.overlay.Frame.Reader.getQset: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.slcp.QuorumSet.Reader
 slcp.core.gen.overlay.Frame.Reader.getSlotState: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,InvalidFarPointer,InvalidPointer,InvalidRootPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit,TruncatedMessage,WrongUnionMember}!gen.overlay.SlotState.Reader
 slcp.core.gen.overlay.Frame.Reader.getUnset: fn (gen.overlay.Frame.Reader) error{InvalidEnumValue,WrongUnionMember}!void
+slcp.core.gen.overlay.Frame.Reader.hasAppMessage: fn (gen.overlay.Frame.Reader) bool
 slcp.core.gen.overlay.Frame.Reader.hasDontHave: fn (gen.overlay.Frame.Reader) bool
 slcp.core.gen.overlay.Frame.Reader.hasEnvelope: fn (gen.overlay.Frame.Reader) bool
 slcp.core.gen.overlay.Frame.Reader.hasGetQset: fn (gen.overlay.Frame.Reader) bool
@@ -630,6 +635,7 @@ slcp.core.gen.overlay.Frame.Reader.which: fn (gen.overlay.Frame.Reader) error{In
 slcp.core.gen.overlay.Frame.Reader.whichOrdinal: fn (gen.overlay.Frame.Reader) u16
 slcp.core.gen.overlay.Frame.Reader.wrap: fn (serialization.message.StructReader) gen.overlay.Frame.Reader
 slcp.core.gen.overlay.Frame.Reader: struct
+slcp.core.gen.overlay.Frame.WhichTag.appMessage: enumerant = 10
 slcp.core.gen.overlay.Frame.WhichTag.dontHave: enumerant = 5
 slcp.core.gen.overlay.Frame.WhichTag.envelope: enumerant = 2
 slcp.core.gen.overlay.Frame.WhichTag.getQset: enumerant = 3
@@ -647,6 +653,7 @@ slcp.core.gen.overlay.Hello.Builder.hasNetworkIdPrefix: fn (gen.overlay.Hello.Bu
 slcp.core.gen.overlay.Hello.Builder.hasNodeId: fn (gen.overlay.Hello.Builder) bool
 slcp.core.gen.overlay.Hello.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.overlay.Hello.Builder
 slcp.core.gen.overlay.Hello.Builder.setCurrentSlot: fn (*gen.overlay.Hello.Builder, u64) error{}!void
+slcp.core.gen.overlay.Hello.Builder.setFeatureFlags: fn (*gen.overlay.Hello.Builder, u64) error{}!void
 slcp.core.gen.overlay.Hello.Builder.setListenPort: fn (*gen.overlay.Hello.Builder, u16) error{}!void
 slcp.core.gen.overlay.Hello.Builder.setNetworkIdPrefix: fn (*gen.overlay.Hello.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
 slcp.core.gen.overlay.Hello.Builder.setNodeId: fn (*gen.overlay.Hello.Builder, []const u8) error{ElementCountTooLarge,FarPointerOffsetTooLarge,InvalidPointer,InvalidSegmentId,ListTooLarge,OffsetOutOfRange,OutOfBounds,OutOfMemory,PointerIndexOutOfBounds,TooManySegments}!void
@@ -655,6 +662,7 @@ slcp.core.gen.overlay.Hello.Builder.wrap: fn (serialization.message.struct_build
 slcp.core.gen.overlay.Hello.Builder: struct
 slcp.core.gen.overlay.Hello.Reader._reader: field serialization.message.StructReader
 slcp.core.gen.overlay.Hello.Reader.getCurrentSlot: fn (gen.overlay.Hello.Reader) error{}!u64
+slcp.core.gen.overlay.Hello.Reader.getFeatureFlags: fn (gen.overlay.Hello.Reader) error{}!u64
 slcp.core.gen.overlay.Hello.Reader.getListenPort: fn (gen.overlay.Hello.Reader) error{}!u16
 slcp.core.gen.overlay.Hello.Reader.getNetworkIdPrefix: fn (gen.overlay.Hello.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
 slcp.core.gen.overlay.Hello.Reader.getNodeId: fn (gen.overlay.Hello.Reader) error{InvalidFarPointer,InvalidPointer,InvalidSegmentId,OutOfBounds,PointerDepthLimit}![]const u8
@@ -1162,6 +1170,12 @@ slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFail
 slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding, *const engine.qset.QuorumSetOwned) error{WriteFailed}!void
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
+slcp.node.AppMessageStats.dropped_messages: field u64
+slcp.node.AppMessageStats.duplicate_messages: field u64
+slcp.node.AppMessageStats.queued_bytes: field usize
+slcp.node.AppMessageStats.queued_items: field usize
+slcp.node.AppMessageStats.receiving: field bool
+slcp.node.AppMessageStats: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
 slcp.node.HoldBuffer.Admit.dropped_badsig: enumerant = 5
 slcp.node.HoldBuffer.Admit.dropped_far: enumerant = 3
@@ -1222,6 +1236,8 @@ slcp.node.Meta: struct
 slcp.node.Node.JournalTail.first: field u64
 slcp.node.Node.JournalTail.last: field u64
 slcp.node.Node.JournalTail: struct
+slcp.node.Node.appMessageStats: fn (*node.node.Node) node.app_gossip.Stats
+slcp.node.Node.app_gossip: field node.app_gossip.State
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
 slcp.node.Node.delivery: field ?node.node.DeliveryHook
@@ -1257,6 +1273,7 @@ slcp.node.Node.peers_live: field atomic.Value(usize) = <default>
 slcp.node.Node.pending_ext: field hash_map.Custom(u64,[]u8,hash_map.AutoContext(u64),80) = <default>
 slcp.node.Node.prop_mu: field Io.Mutex = <default>
 slcp.node.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
+slcp.node.Node.publishAppMessage: fn (*node.node.Node, []const u8) error{AppMessageTooLarge}!void
 slcp.node.Node.purge_floor: field atomic.Value(u64) = <default>
 slcp.node.Node.q: field node.node.InputQueue
 slcp.node.Node.qset_cache: field node.qset_disk_cache.QsetDiskCache
@@ -1267,8 +1284,10 @@ slcp.node.Node.stats_mu: field Io.Mutex = <default>
 slcp.node.Node.stats_snapshot: field engine.engine.Stats = <default>
 slcp.node.Node.storageStats: fn (*node.node.Node) node.node.StorageStats
 slcp.node.Node.store: field node.store.Store
+slcp.node.Node.waitAppMessage: fn (*node.node.Node, node.node.Node.WaitOptions) ?[]u8
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel
+slcp.node.PublishAppMessageError: type = error{AppMessageTooLarge}
 slcp.node.StorageStats.qset_cache_bytes: field usize
 slcp.node.StorageStats.qset_cache_degraded: field bool
 slcp.node.StorageStats.qset_cache_entries: field usize
@@ -1327,12 +1346,16 @@ slcp.overlay.TestLinkFilter: type = *const fn ([32]u8, [32]u8) bool
 slcp.overlay.default_read_buffer_size: const usize = 262144
 slcp.overlay.framer_options: const rpc.wire.framing.Framer.Options
 slcp.overlay.inbound_rate_soft_cap_bytes_per_s: const usize = 262144
+slcp.overlay.max_app_write_queue_bytes: const usize = 1048576
+slcp.overlay.max_app_write_queue_items: const usize = 256
 slcp.overlay.max_frame_bytes: const usize = 1048576
 slcp.overlay.max_inbound_conns: const usize = 128
 slcp.overlay.max_outstanding_requests: const usize = 64
 slcp.overlay.max_write_queue_bytes: const usize = 16777216
 slcp.overlay.max_write_queue_items: const usize = 1024
 slcp.overlay.parseHostPort: fn ([]const u8) error{BadPeerSpec}!node.overlay.HostPort
+slcp.overlay.reserved_write_queue_bytes: const usize = 4194304
+slcp.overlay.reserved_write_queue_items: const usize = 256
 slcp.overlay.setTestLinkFilter: fn (?*const fn ([32]u8, [32]u8) bool) void
 slcp.overlay.validatePeerSpec: fn ([]const u8) error{BadHost,BadPort,EmptyHost,MissingPort}!void
 slcp.overlay: struct
@@ -1387,13 +1410,15 @@ slcp.timers: struct
 slcp.wire.DontHave.id: field []const u8
 slcp.wire.DontHave.kind: field u8
 slcp.wire.DontHave: struct
-slcp.wire.Error: type = error{BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}
+slcp.wire.Error: type = error{AppMessageTooLarge,BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}
 slcp.wire.Hello.current_slot: field u64
+slcp.wire.Hello.feature_flags: field u64 = 0
 slcp.wire.Hello.listen_port: field u16
 slcp.wire.Hello.network_id_prefix: field [8]u8
 slcp.wire.Hello.node_id: field [32]u8
 slcp.wire.Hello.protocol_version: field u32
 slcp.wire.Hello: struct
+slcp.wire.OverlayFrame.app_message: variant []const u8
 slcp.wire.OverlayFrame.deinit: fn (*node.wire.OverlayFrame, mem.Allocator) void
 slcp.wire.OverlayFrame.dont_have: variant node.wire.DontHave
 slcp.wire.OverlayFrame.envelope: variant []const u8
@@ -1408,8 +1433,10 @@ slcp.wire.OverlayFrame: union
 slcp.wire.SlotState.envelopes: field []const []const u8
 slcp.wire.SlotState.slot: field u64
 slcp.wire.SlotState: struct
-slcp.wire.decode: fn (mem.Allocator, []const u8) error{BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}!node.wire.OverlayFrame
-slcp.wire.encode: fn (mem.Allocator, node.wire.OverlayFrame) error{BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}![]u8
+slcp.wire.decode: fn (mem.Allocator, []const u8) error{AppMessageTooLarge,BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}!node.wire.OverlayFrame
+slcp.wire.encode: fn (mem.Allocator, node.wire.OverlayFrame) error{AppMessageTooLarge,BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,TooManyEnvelopes,UnsetUnion}![]u8
+slcp.wire.feature_app_messages: const u64 = 1
+slcp.wire.max_app_message_bytes: const usize = 65536
 slcp.wire.max_slot_state_envelopes: const comptime_int = 64
 slcp.wire.protocol_version: const u32 = 1
 slcp.wire: struct
