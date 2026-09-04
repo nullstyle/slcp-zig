@@ -27,7 +27,43 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: heap-sized application state seam
+## Current feature work: registry heap-state migration (capacity epoch)
+
+The registry example now runs on the heap-sized state seam end to end. On top
+of the Experimental `slcp.OwnedAppNode` adapter (ADR 0003, below), the
+example's state became unbounded heap storage: sorted `ArrayListUnmanaged`
+accounts and names with explicit `deinit`/`clone`, an allocating `apply`
+(only `OutOfMemory` can fail it, which halts the node), and Snapshot V4
+state encodings with u32 counts and dynamic lengths. The 64-account/128-name
+caps and the `registry_full` result no longer exist; 32 transactions per
+slot still bound the consensus VALUE. The REGISTRY-NET-V3 network tag makes
+the snapshot format change a loud application epoch (V3 snapshots fail the
+magic check; old data directories fail as `DataDirOtherNetwork), following
+the E2c mixed-version rule. The boot snapshot reaches `initState` as the
+create context — the process-global `boot` is gone — and applied
+observations are owned clones: the cadence loop borrows them for the
+snapshot write and history staging, then moves each into the RPC shared
+state, freeing its predecessor. The history archive clones into its
+frontier/ready/inflight/proof fields and frees on every rejection path.
+Ledger records, tip assertions, and the LedgerValue encoding are
+byte-identical; the genesis state root moved with the empty-state encoding
+(the format goldens moved with it). See
+[`ADR 0004`](docs/adr/0004-registry-capacity-epoch.md).
+
+### Current registry-capacity verification
+
+- Registry suite: **PASS** — 100/100 (99 migrated plus the cap-removal
+  proofs: 500 accounts and 300 names validate/apply/sort correctly, and a
+  V4 snapshot round-trips byte-identically far beyond both old caps), with
+  **zero leaks** under the testing allocator.
+- Docs-smoke: **PASS** — 436 checks, 0 failures.
+- Full three-process registry smoke: **PASS** — the ReleaseSafe consumer
+  build plus the live quorum line, transaction flooding across hops, the
+  deterministic close-time chain, ordinary restart, the ≥201-slot outage
+  with peerless anchor-to-certified-tip replay, the necessary recovered
+  vote, and the hard-epoch data-dir probe, all on the heap-backed state.
+
+## Historical feature record: heap-sized application state seam
 
 Experimental `slcp.OwnedAppNode(App)` (ADR 0003) is the opt-in sibling of the
 typed `AppNode` for state that does not fit by-value copies: one adapter owns

@@ -961,7 +961,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         if (pending_install == null) {
             // Finish older admitted work before a newer shared certificate
             // can move the outbox frontier.
-            drainStartupHistory(&history_archive.?) catch |err| {
+            drainStartupHistory(&history_archive.?, gpa) catch |err| {
                 std.debug.print("registry node: cannot finish the durable history backlog before boot: {t}; keep this node stopped and restore shared archive availability\n", .{err});
                 return 1;
             };
@@ -1139,7 +1139,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     // initial history/local snapshot. This closes the crash window where the
     // consensus journal is durably ahead of the application snapshot.
     const boot_history: ?*history.Archive = if (history_archive) |*archive| archive else null;
-    const ready_state = drainBootReplay(node, selected.state, boot_history) catch |err| {
+    const ready_state = drainBootReplay(node, gpa, &selected.state, boot_history) catch |err| {
         if (err == error.NodeHalted) {
             std.debug.print("registry node: halted while recovering the local journal; see the log above\n", .{});
         } else {

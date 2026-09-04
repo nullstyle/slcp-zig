@@ -6,11 +6,12 @@ that a future Stable interface already exists.
 
 **Status as of 2026-09-04:** E1, E2a transaction flooding, E2b authenticated
 checkpoint catch-up, E2c deterministic ledger close time, and E2d replayable
-registry history are implemented. Configurable native answering and an initial
-local catch-up snapshot are also implemented. The library seam for heap-sized
-application state — Experimental `slcp.OwnedAppNode` (ADR 0003) — is
-implemented and proved in its own test suite; migrating the registry example
-onto it, archive retention, richer per-peer operations, and E3 remain
+registry history are implemented. Configurable native answering, an initial
+local catch-up snapshot, and the heap-state track are implemented: the
+Experimental `slcp.OwnedAppNode` seam (ADR 0003) and the registry's migration
+onto it (ADR 0004 — unbounded heap-backed accounts and names, Snapshot V4,
+the REGISTRY-NET-V3 epoch tag, owned observations end to end, no process
+global). Archive retention, richer per-peer operations, and E3 remain
 designs only.
 
 ## Direction
@@ -275,31 +276,30 @@ the first later transaction-bearing ledger, after which node0 returns and all
 three converge. The exact E2d verification counts and process evidence are
 recorded in [`STATUS.md`](../STATUS.md).
 
-## E2 remainder — State and retention (planned)
+## E2 remainder — State and retention (partially delivered)
 
-The heap-state library seam is delivered: Experimental `slcp.OwnedAppNode(App)`
-owns allocation, initialization, mutation, observation, and cleanup behind one
-lifecycle (see [`ADR 0003`](adr/0003-owned-application-state.md)), with the
-same restart continuity rules as `AppNode`. Its tests are the working recipe
-for a snapshot loaded through the startup context with no process global, an
-observation that owns a deep copy, and a 2-of-2 loopback restart.
+The heap-state track is delivered end to end. The library seam — Experimental
+`slcp.OwnedAppNode(App)` owning allocation, initialization, mutation,
+observation, and cleanup behind one lifecycle
+([ADR 0003](adr/0003-owned-application-state.md)) — landed first with the
+same restart continuity rules as `AppNode`. The registry then migrated onto
+it ([ADR 0004](adr/0004-registry-capacity-epoch.md)): accounts and names are
+unbounded sorted heap storage (the 64/128 caps and the `registry_full`
+result are gone), `apply` allocates through the adapter, the boot state
+travels as the create context (no process global), applied observations are
+owned clones released after the snapshot and history borrow them, and
+Snapshot V4 plus the REGISTRY-NET-V3 tag make the format change a loud
+application epoch — V3 snapshots fail the magic check and old data
+directories fail as `DataDirOtherNetwork`. Consensus values (LedgerValue,
+transaction sets, ledger records) are byte-identical; only state encodings
+and the genesis root moved.
 
-Remaining work includes:
+Remaining work:
 
-- the registry migration onto `OwnedAppNode`: heap-backed sorted account and
-  name storage with the artificial 64/128 caps removed. This is its own
-  application storage epoch, not a library change: Snapshot V3 and the
-  replayable-history formats encode fixed-width counts (u8 account/name
-  counts) and fixed per-entry widths, so growing past them needs a V4
-  snapshot plus anchor/history format decision with the same migration care
-  as E2d's `history-v1` boundary (trusted signing fences bind anchor snapshot
-  digests). The migration then threads ownership through `main.zig`'s boot
-  selection (the `selected.state` copies become explicit clones with release
-  points), `rpc.zig`'s shared state (an owned clone swapped under the lock,
-  freeing the previous one), and `history.zig`'s outbox (owned clones or
-  pre-serialized snapshot bytes per staged entry);
 - explicit archive retention, pruning, and operational sizing policy;
-- richer per-peer visibility beyond the local `catchupStats` snapshot.
+- richer per-peer visibility beyond the local `catchupStats` snapshot;
+- quota-style admission control, since state growth is now bounded by memory
+  and disk rather than fixed caps (an E3 concern).
 
 ## E3 — Upgrades and operations (planned)
 

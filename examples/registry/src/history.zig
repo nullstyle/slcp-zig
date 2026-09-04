@@ -112,6 +112,10 @@ pub const Recovery = struct {
     anchor_slot: u64,
     /// Number of ledger records applied after the authenticated anchor.
     replayed_ledgers: u64,
+
+    pub fn deinit(self: *Recovery, gpa: std.mem.Allocator) void {
+        self.state.deinit(gpa);
+    }
 };
 
 const Watermark = struct {
