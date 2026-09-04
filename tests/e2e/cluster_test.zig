@@ -8,11 +8,14 @@
 //!      agreement preserved (no stale-vs-self) — and then REJOINS VOTING: a
 //!      survivor is killed so 3-of-4 needs the restarted node (S8b: a
 //!      restarted node that stayed mute would halt the cluster here);
-//!   3. partition/heal — the cluster is split 2/2 (no half has quorum → it
+//!   3. configured answering window — a node misses 20 contiguous slots,
+//!      beyond the default 16 but within its configured 32, recovers every
+//!      slot without a gap-jump, then proves it has rejoined voting;
+//!   4. partition/heal — the cluster is split 2/2 (no half has quorum → it
 //!      halts, which is CORRECT FBA behavior), then healed → progress resumes;
-//!   4. equivocator — a quorum member floods two contradictory PREPAREs;
+//!   5. equivocator — a quorum member floods two contradictory PREPAREs;
 //!      the honest nodes still agree;
-//!   5. double restart — two of four restart together, three times; the
+//!   6. double restart — two of four restart together, three times; the
 //!      network resumes every time (the S8 D1 shape over real sockets).
 //!
 //! Partition uses `slcp.overlay.setTestLinkFilter` — a test-only seam that
@@ -39,11 +42,12 @@ const RESTART_SLOTS: u64 = 60;
 const PARTITION_SLOTS: u64 = 50;
 const EQUIV_SLOTS: u64 = 40;
 const DOUBLE_RESTART_SLOTS: u64 = 45;
-/// node.zig `purge_window`: peers answer at most this many slots back.
-const ANSWERING_WINDOW: u64 = 16;
+const DEFAULT_ANSWERING_WINDOW_SLOTS: u8 = 16;
+const CONFIGURED_ANSWERING_WINDOW_SLOTS: u8 = 32;
+const RECOVERABLE_OUTAGE_SLOTS: u64 = 20;
 
 // Deterministic identities (seed i = all-byte i+1). Index N is the
-// equivocator's key (only used by scenario 4's 5-node config).
+// equivocator's key (only used by scenario 5's 5-node config).
 fn seedFor(i: usize) [32]u8 {
     return @splat(@intCast(i + 1));
 }
@@ -80,6 +84,8 @@ const Consumer = struct {
     mu: std.Io.Mutex = .init,
     records: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     highest: u64 = 0,
+    last_delivered: ?u64 = null,
+    non_contiguous_deliveries: u64 = 0,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
@@ -91,6 +97,10 @@ const Consumer = struct {
         while (!self.stop.load(.acquire)) {
             if (self.node.waitExternalized(.{ .timeout_ms = 100 })) |ext| {
                 self.mu.lockUncancelable(self.io);
+                if (self.last_delivered) |last| {
+                    if (ext.slot != last +| 1) self.non_contiguous_deliveries +|= 1;
+                }
+                self.last_delivered = ext.slot;
                 if (self.records.fetchRemove(ext.slot)) |old| self.gpa.free(old.value);
                 self.records.put(self.gpa, ext.slot, ext.value) catch self.gpa.free(ext.value);
                 if (ext.slot > self.highest) self.highest = ext.slot;
@@ -123,6 +133,12 @@ const Consumer = struct {
         return std.mem.eql(u8, found, value);
     }
 
+    fn nonContiguousDeliveryCount(self: *Consumer) u64 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.non_contiguous_deliveries;
+    }
+
     fn stopJoin(self: *Consumer) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
@@ -149,6 +165,7 @@ const Cluster = struct {
     /// (e.g. the equivocator).
     n_validators: usize = N,
     threshold: u32 = 3,
+    answering_window_slots: u8 = DEFAULT_ANSWERING_WINDOW_SLOTS,
     nodes: [N]?*Node = @splat(null),
     consumers: [N]Consumer = undefined,
     /// consumers[i] is initialized (spawnNode can fail partway; deinit must
@@ -177,6 +194,7 @@ const Cluster = struct {
             .listen_port = self.base_port + @as(u16, @intCast(i)),
             .peers = peers,
             .data_dir = dir,
+            .answering_window_slots = self.answering_window_slots,
         });
         self.nodes[i] = node;
         self.consumers[i] = .{ .node = node, .gpa = gpa, .io = self.io };
@@ -298,6 +316,19 @@ const Cluster = struct {
                 try n.propose(v);
             }
         }
+    }
+
+    /// Give each live validator exactly one proposal and wait for that slot.
+    /// Unlike `proposeAll`, this leaves no queued proposal fuel, so an outage
+    /// can be held to an exact number of committed slots.
+    fn externalizeOne(self: *Cluster, prefix: []const u8, slot: u64) !void {
+        var vbuf: [64]u8 = undefined;
+        for (0..N) |i| {
+            const n = self.nodes[i] orelse continue;
+            const v = try std.fmt.bufPrint(&vbuf, "{s}-{d}-n{d}", .{ prefix, slot, i });
+            try n.propose(v);
+        }
+        try self.waitLiveReached(slot, 30_000);
     }
 
     fn deinit(self: *Cluster) void {
@@ -438,7 +469,7 @@ test "e2e: kill and restart a node mid-run; it gap-jumps, catches up, rejoins vo
     // Cluster keeps going with 3 of 4 (still a quorum) — until it is more
     // than an answering window past where node 3 died, so the restart below
     // cannot be answered slot by slot (a guaranteed gap of >= 8 slots).
-    const restart_when = @max(40, hwm_at_kill + ANSWERING_WINDOW + 8);
+    const restart_when = @max(40, hwm_at_kill + DEFAULT_ANSWERING_WINDOW_SLOTS + 8);
     {
         var waited: u64 = 0;
         while (cl.consumers[0].highestSlot() < restart_when) : (waited += 100) {
@@ -533,6 +564,122 @@ test "e2e: kill and restart a node mid-run; it gap-jumps, catches up, rejoins vo
     try std.testing.expect(wd.seen.load(.acquire) > 0);
     try std.testing.expect(wd.checked_after_mark.load(.acquire) > 0);
     try std.testing.expectEqual(@as(u32, 0), wd.violations.load(.acquire));
+}
+
+// A configured answering window is bounded recent-slot assistance, not an
+// application history archive. This scenario holds the outage to exactly 20
+// committed slots: too old for the default 16-slot policy, but still inside
+// the configured 32-slot policy. The restarted validator must therefore
+// receive every missing decision rather than abandoning a gap.
+test "e2e: configured answering window recovers every recent slot without a gap-jump and rejoins voting" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cl = Cluster{
+        .gpa = gpa,
+        .io = io,
+        .base_port = 39600,
+        .data_root = scratch_root ++ "/configured-answering-window",
+        .answering_window_slots = CONFIGURED_ANSWERING_WINDOW_SLOTS,
+    };
+    removeTree(io, cl.data_root);
+    defer cl.deinit();
+
+    for (0..N) |i| try cl.spawnNode(i);
+    try cl.waitMesh(20_000);
+
+    // One proposal per live validator per slot keeps the queue empty at each
+    // checkpoint. That turns the outage length into a controlled input rather
+    // than a race against a pre-fuelled cluster.
+    const warm_frontier: u64 = 4;
+    for (1..warm_frontier + 1) |slot| {
+        try cl.externalizeOne("window-warm", slot);
+    }
+    try std.testing.expectEqual(warm_frontier, cl.consumers[3].highestSlot());
+    cl.killNode(3);
+
+    const survivor_frontier = warm_frontier + RECOVERABLE_OUTAGE_SLOTS;
+    for (warm_frontier + 1..survivor_frontier + 1) |slot| {
+        try cl.externalizeOne("window-away", slot);
+    }
+    try std.testing.expect(RECOVERABLE_OUTAGE_SLOTS > DEFAULT_ANSWERING_WINDOW_SLOTS);
+    try std.testing.expect(RECOVERABLE_OUTAGE_SLOTS < CONFIGURED_ANSWERING_WINDOW_SLOTS);
+    try std.testing.expectEqual(survivor_frontier, cl.minHighestLive());
+
+    // Restart from only node 3's local journal and the live peers. No
+    // application proposal is queued until after exact catch-up is proven.
+    try cl.spawnNode(3);
+    try cl.waitMesh(20_000);
+    try waitFor(io, 120_000, &cl, struct {
+        fn ok(c: *Cluster) bool {
+            return c.consumers[3].highestSlot() >= survivor_frontier;
+        }
+    }.ok);
+
+    const local_tail = cl.nodes[3].?.journal_tail orelse return error.MissingRestartJournalTail;
+    try std.testing.expectEqual(warm_frontier, local_tail.last);
+    try std.testing.expectEqual(RECOVERABLE_OUTAGE_SLOTS, survivor_frontier - local_tail.last);
+
+    // Presence is asserted explicitly for node 3 at every slot; the generic
+    // agreement helper alone would be vacuous when one consumer lacks a slot.
+    var recovered_value: std.ArrayList(u8) = .empty;
+    defer recovered_value.deinit(gpa);
+    var incumbent_value: std.ArrayList(u8) = .empty;
+    defer incumbent_value.deinit(gpa);
+    var slot = local_tail.last + 1;
+    while (slot <= survivor_frontier) : (slot += 1) {
+        try std.testing.expect(try cl.consumers[3].valueAt(slot, &recovered_value));
+        try std.testing.expect(try cl.consumers[1].valueAt(slot, &incumbent_value));
+        try std.testing.expectEqualSlices(u8, incumbent_value.items, recovered_value.items);
+    }
+    try std.testing.expectEqual(@as(u64, 0), cl.consumers[3].nonContiguousDeliveryCount());
+
+    // Wait for the coherent engine-thread snapshot corresponding to the
+    // observed delivery, then rule out silent gap abandonment directly.
+    {
+        var waited: u64 = 0;
+        while (cl.nodes[3].?.catchupStats().delivery_frontier < survivor_frontier) : (waited += 50) {
+            if (waited >= 10_000) return error.CatchupStatsTimeout;
+            sleepMs(io, 50);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 0), cl.nodes[3].?.catchupStats().gap_jumps);
+
+    // Make the recovered validator necessary for quorum, then inject a value
+    // that only it knows. Externalization by {1,2,3} proves node 3 resumed
+    // active voting; replaying old decisions cannot manufacture this value.
+    cl.killNode(0);
+    const challenge = "\xffconfigured-window-node-3";
+    for (0..32) |_| try cl.nodes[3].?.propose(challenge);
+    for (0..32) |i| {
+        var low_buf: [48]u8 = undefined;
+        const low = try std.fmt.bufPrint(&low_buf, "window-post-low-{d}", .{i});
+        try cl.nodes[1].?.propose(low);
+        try cl.nodes[2].?.propose(low);
+    }
+
+    var challenge_slot: ?u64 = null;
+    {
+        var waited: u64 = 0;
+        while (waited < 90_000) : (waited += 100) {
+            const shared_highest = @min(cl.consumers[1].highestSlot(), @min(cl.consumers[2].highestSlot(), cl.consumers[3].highestSlot()));
+            var candidate = survivor_frontier + 1;
+            while (candidate <= shared_highest) : (candidate += 1) {
+                if (cl.consumers[1].hasValueAt(candidate, challenge) and
+                    cl.consumers[2].hasValueAt(candidate, challenge) and
+                    cl.consumers[3].hasValueAt(candidate, challenge))
+                {
+                    challenge_slot = candidate;
+                    break;
+                }
+            }
+            if (challenge_slot != null) break;
+            sleepMs(io, 100);
+        }
+    }
+    const proved_slot = challenge_slot orelse return error.ConfiguredWindowVoteTimeout;
+    try assertAgreement(&cl, proved_slot);
+    try std.testing.expectEqual(@as(u64, 0), cl.nodes[3].?.catchupStats().gap_jumps);
 }
 
 // The S8 D1 shape over real sockets: two of four go down together mid-run
@@ -942,7 +1089,7 @@ const Watchdog = struct {
 };
 
 // -----------------------------------------------------------------------
-// Scenario 4: an equivocating quorum member
+// Scenario 5: an equivocating quorum member
 // -----------------------------------------------------------------------
 
 const MessageBuilder = core.capnpc.message.MessageBuilder;
