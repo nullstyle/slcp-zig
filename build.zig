@@ -783,7 +783,9 @@ pub fn build(b: *std.Build) void {
     // dependency), then three `registry node`s over loopback (listen
     // 47411-47413, RPC 47421-47423) driven through the real CLI: a
     // conflicting claim, set / transfer / release, head agreement, SIGKILL +
-    // restart of node2 and a transaction through the restarted node. Prints
+    // ordinary restart, then authenticated recovery after at least 201 missed slots
+    // and a transaction whose next-slot quorum requires the recovered node.
+    // Prints
     // `[registry-smoke] nodes=3 txs=N slots=M head=<hex16>`. Minutes-scale
     // and port-bound (it runs ALONE, like e2e and example-smoke): its own
     // step, not part of `test` — `test` only compiles the tool and runs its
@@ -804,7 +806,7 @@ pub fn build(b: *std.Build) void {
     run_registry_smoke.addPassthruArgs();
     run_registry_smoke.setCwd(b.path("."));
     run_registry_smoke.has_side_effects = true;
-    const registry_smoke_step = b.step("registry-smoke", "Build examples/registry as a consumer, run 3 loopback registry nodes through the CLI (conflicting claim, set/transfer/release, kill -9 + restart node2) (`-- --keep --deadline-s S`)");
+    const registry_smoke_step = b.step("registry-smoke", "Build examples/registry as a consumer; run 3 loopback nodes through flooding, ordinary restart, and authenticated recovery after at least 201 missed slots (`-- --keep --deadline-s S`)");
     registry_smoke_step.dependOn(&run_registry_smoke.step);
 
     const run_registry_build = b.addRunArtifact(registry_smoke);

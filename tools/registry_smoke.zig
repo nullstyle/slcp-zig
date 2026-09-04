@@ -10,14 +10,19 @@
 //! set / transfer / release apply everywhere, `head` hashes agree across
 //! nodes at the same slot, node2 is SIGKILLed and restarted from its
 //! snapshot + journal and catches up to the same hash, and a transaction
-//! submitted to the restarted node lands everywhere. Before the crash the
+//! submitted to the restarted node lands everywhere. It is then killed for
+//! at least 201 slots, restored from a quorum-certified history checkpoint inside
+//! the 16-slot answering window, and shown to be a necessary voter for the
+//! exact next transaction-bearing slot. Before the first crash the
 //! nodes form the deliberate line node2→node1→node0. One transaction is
 //! submitted only to nomination-disabled node2; `head pending=1` proves it
 //! crossed one and two overlay hops while both survivors remain at slot S,
 //! then their `slot S+1: txs=1` lines prove it survived node2's SIGKILL and
-//! landed in exactly the next slot. The restarted node gets a second recovery
-//! peer because consensus envelopes are not relayed across that line. Every
-//! wait is a bounded state poll rather than a fixed sleep.
+//! landed in exactly the next slot. The first restart gets a second recovery
+//! peer because consensus envelopes are not relayed across that line. For the
+//! history restart that peer is dead: node2 has only node1, which was proved
+//! unable to advance alone. Every wait is a bounded state poll rather than a
+//! fixed sleep.
 //!
 //! The scratch copy is the published example with ONE line rewritten — the
 //! `.path = "../.."` dependency in build.zig.zon, re-pointed at the repo from
@@ -25,7 +30,7 @@
 //! once (a drifted example is a red smoke, not a silently vacuous one).
 //!
 //! Evidence line on success (stdout):
-//! `[registry-smoke] nodes=3 txs=7 slots=N head=<hex16>`.
+//! `[registry-smoke] nodes=3 txs=8 slots=N head=<hex16>`.
 //!
 //! argv: `--zig <path>` (required; the build step passes its own zig)
 //! `[--deadline-s S=300] [--build-only] [--keep]
@@ -51,7 +56,7 @@ pub const rpc_base: u16 = 47421;
 /// The registry network passphrase every node and client is given.
 pub const network = "registry-smoke";
 /// Transactions the script submits (the `txs=` field of the evidence line).
-pub const n_txs: u64 = 7;
+pub const n_txs: u64 = 8;
 const default_deadline_s: u64 = 300;
 const default_registry_src = "examples/registry";
 const scratch_root = ".zig-cache/registry-smoke";
@@ -61,6 +66,7 @@ const line_buf_bytes: usize = 64 * 1024;
 /// run (from the first spawn) is bounded by `--deadline-s`.
 const poll_ms: u64 = 200;
 const poll_bound_ms: u64 = 90_000;
+const history_bound_ms: u64 = 180_000;
 const ready_bound_ms: u64 = 60_000;
 /// One CLI invocation (a TCP round trip on loopback) may not hang the smoke.
 const cli_timeout_ms: u64 = 10_000;
@@ -68,11 +74,25 @@ const cli_timeout_ms: u64 = 10_000;
 const agreement_min_ms: u64 = 3_000;
 const report_every_ms: u64 = 10_000;
 const all_mask: u8 = (1 << n_nodes) - 1;
-/// The survivors close slowly enough for the smoke to observe propagated
-/// pending state before nomination. The source's cadence is disabled: its
-/// transaction can only land if it crosses the line to a survivor.
-const survivor_cadence_ms = "5000";
+/// Busy slots stay open long enough for the smoke to observe propagated
+/// pending state before nomination. Idle heartbeats are deliberately fast so
+/// a 201-slot history outage does not turn this into an excessive sleep.
+/// The combination also pins the production cadence rule: an idle heartbeat
+/// must NOT bypass `min-slot-ms` once a transaction is pending.
+const survivor_min_slot_ms = "5000";
+const survivor_heartbeat_ms = "500";
+/// Pending must remain at S past an entire idle-heartbeat deadline. The old
+/// `(pending && busy_min) || heartbeat` bug advances during this interval.
+const pending_cadence_guard_ms: u64 = 1000;
+/// The history-rejoining node must co-vote with the sole survivor through the
+/// short retained tail, but a one-second heartbeat leaves a deterministic
+/// window in which the harness can observe H and submit tx8 for exactly H+1.
+const rejoin_heartbeat_ms = "1000";
 const disabled_cadence_ms = "18446744073709551615";
+const checkpoint_every = "8";
+const absent_slots: u64 = 201;
+const answering_window: u64 = 16;
+const stable_head_ms: u64 = 1000;
 
 pub fn listenPort(i: usize) u16 {
     return listen_base + @as(u16, @intCast(i));
@@ -262,6 +282,46 @@ pub fn parseSlotLine(raw: []const u8) ?SlotLine {
     return .{ .slot = slot, .txs = txs orelse return null, .head16 = head16 };
 }
 
+pub const CheckpointKind = enum { signed, certified };
+pub const CheckpointLine = struct { slot: u64, kind: CheckpointKind };
+
+/// The machine-readable prefix of the registry's checkpoint progress log:
+/// `history checkpoint slot N signed|certified ...`. The suffix is diagnostic
+/// and may grow; the first five tokens are the smoke contract.
+pub fn parseCheckpointLine(raw: []const u8) ?CheckpointLine {
+    var it = std.mem.tokenizeScalar(u8, trimLine(raw), ' ');
+    if (!std.mem.eql(u8, it.next() orelse return null, "history")) return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "checkpoint")) return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "slot")) return null;
+    const slot = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const status = it.next() orelse return null;
+    const kind: CheckpointKind = if (std.mem.eql(u8, status, "signed"))
+        .signed
+    else if (std.mem.eql(u8, status, "certified"))
+        .certified
+    else
+        return null;
+    return .{ .slot = slot, .kind = kind };
+}
+
+/// Extract the exact checkpoint slot from the normal node startup line. A
+/// local `snapshot` boot must not satisfy this witness.
+pub fn parseHistoryBootSlot(raw: []const u8) ?u64 {
+    const marker = "starting from history checkpoint at slot ";
+    const line = trimLine(raw);
+    const at = std.mem.indexOf(u8, line, marker) orelse return null;
+    const number = line[at + marker.len ..];
+    if (number.len == 0) return null;
+    return std.fmt.parseInt(u64, number, 10) catch null;
+}
+
+/// The two arithmetic acceptance boundaries of the E2b witness. Written as a
+/// pure predicate so off-by-one weakening goes red in unit tests.
+pub fn historyWitnessOk(absent_at: u64, stable_head: u64, checkpoint: u64) bool {
+    if (stable_head < absent_at or checkpoint > stable_head) return false;
+    return stable_head - absent_at >= absent_slots and stable_head - checkpoint < answering_window;
+}
+
 // ---------------------------------------------------------------------------
 // The consumer copy
 // ---------------------------------------------------------------------------
@@ -295,6 +355,9 @@ pub fn evidenceLine(buf: []u8, nodes: usize, txs: u64, slots: u64, head16: []con
 // Node processes
 // ---------------------------------------------------------------------------
 
+const checkpoint_signed_bit: u8 = 1 << 0;
+const checkpoint_certified_bit: u8 = 1 << 1;
+
 /// One `registry node` process: its scratch dir (cwd: `--data-dir data` is
 /// relative), its argv (identical across restarts), the child, and a reader
 /// thread over the child's stderr (the `slot N:` lines and the library's
@@ -305,7 +368,7 @@ const NodeProc = struct {
     io: std.Io,
     index: usize,
     dir: []const u8,
-    argv: []const []const u8,
+    argv: [][]const u8,
     child: ?std.process.Child = null,
     thread: ?std.Thread = null,
     rdr_buf: []u8,
@@ -322,6 +385,11 @@ const NodeProc = struct {
     /// Kept across restarts so the crash-survival proof can name the exact
     /// successor slot and show that it carried precisely the flooded tx.
     slot_txs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// checkpoint slot → observed progress bits. `certified` also implies
+    /// this validator has emitted its own signed attestation.
+    history_checkpoints: std.AutoHashMapUnmanaged(u64, u8) = .empty,
+    /// Set only by the explicit `starting from history checkpoint` boot log.
+    history_boot_slot: ?u64 = null,
     eof: bool = false,
     expect_eof: bool = false,
     /// The first line that contradicted an earlier print of the same slot by
@@ -358,6 +426,7 @@ const NodeProc = struct {
         if (self.bad) |b| gpa.free(b);
         self.slot_heads.deinit(gpa);
         self.slot_txs.deinit(gpa);
+        self.history_checkpoints.deinit(gpa);
         for (self.argv) |s| gpa.free(s);
         gpa.free(self.argv);
         gpa.free(self.dir);
@@ -373,6 +442,7 @@ const NodeProc = struct {
         self.eof = false;
         self.expect_eof = false;
         self.max_slot = 0;
+        self.history_boot_slot = null;
         self.mu.unlock(self.io);
         self.child = try std.process.spawn(self.io, .{
             .argv = self.argv,
@@ -407,6 +477,32 @@ const NodeProc = struct {
         self.argv = grown;
     }
 
+    /// Replace one `--flag value` pair in the owned argv, or append it when
+    /// absent. Restarts deliberately change cadence and select a minimum
+    /// checkpoint without rebuilding the rest of the process command.
+    fn setFlagValue(self: *NodeProc, flag: []const u8, value: []const u8) !void {
+        std.debug.assert(self.child == null and self.thread == null);
+        for (self.argv, 0..) |arg, i| {
+            if (!std.mem.eql(u8, arg, flag)) continue;
+            if (i + 1 >= self.argv.len) return error.MalformedArgv;
+            const replacement = try self.gpa.dupe(u8, value);
+            self.gpa.free(self.argv[i + 1]);
+            self.argv[i + 1] = replacement;
+            return;
+        }
+        const grown = try self.gpa.alloc([]const u8, self.argv.len + 2);
+        errdefer self.gpa.free(grown);
+        const owned_flag = try self.gpa.dupe(u8, flag);
+        errdefer self.gpa.free(owned_flag);
+        const owned_value = try self.gpa.dupe(u8, value);
+        errdefer self.gpa.free(owned_value);
+        @memcpy(grown[0..self.argv.len], self.argv);
+        grown[self.argv.len] = owned_flag;
+        grown[self.argv.len + 1] = owned_value;
+        self.gpa.free(self.argv);
+        self.argv = grown;
+    }
+
     /// SIGKILL (not the SIGTERM of `Child.kill`), join the reader (its EOF
     /// arrives when the child dies), then reap. Idempotent.
     fn stop(self: *NodeProc) void {
@@ -433,12 +529,29 @@ const NodeProc = struct {
 
     fn noteLine(self: *NodeProc, line: []const u8) void {
         const parsed = parseSlotLine(line);
+        const checkpoint = parseCheckpointLine(line);
+        const history_boot = parseHistoryBootSlot(line);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const copy = self.gpa.dupe(u8, line) catch return;
         if (self.tail[self.tail_next]) |old| self.gpa.free(old);
         self.tail[self.tail_next] = copy;
         self.tail_next = (self.tail_next + 1) % tail_lines;
+        if (checkpoint) |event| {
+            const gop = self.history_checkpoints.getOrPut(self.gpa, event.slot) catch return;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* |= switch (event.kind) {
+                .signed => checkpoint_signed_bit,
+                .certified => checkpoint_signed_bit | checkpoint_certified_bit,
+            };
+        }
+        if (history_boot) |slot| {
+            if (self.history_boot_slot) |old| {
+                if (old != slot and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+            } else {
+                self.history_boot_slot = slot;
+            }
+        }
         const p = parsed orelse return;
         if (p.slot > self.max_slot) self.max_slot = p.slot;
         if (self.slot_txs.get(p.slot)) |prev| {
@@ -544,6 +657,10 @@ const Poll = struct {
     }
 
     fn tick(self: *Poll, c: *Cluster) !void {
+        return self.tickEvery(c, poll_ms);
+    }
+
+    fn tickEvery(self: *Poll, c: *Cluster, interval_ms: u64) !void {
         try c.checkProcs();
         try c.checkDeadline();
         if (self.elapsed(c.io) >= self.bound_ms) {
@@ -552,7 +669,7 @@ const Poll = struct {
             return error.PollBound;
         }
         c.maybeReport();
-        try std.Io.sleep(c.io, std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake);
+        try std.Io.sleep(c.io, std.Io.Duration.fromMilliseconds(@intCast(interval_ms)), .awake);
     }
 };
 
@@ -951,8 +1068,10 @@ const Cluster = struct {
 
     /// Prove application-message propagation before consensus can hide it:
     /// every node must expose the expected pending count while still exactly
-    /// at `slot`. Advancing past the observation slot is a hard failure, not a
-    /// reason to weaken the assertion and accept eventual application.
+    /// at `slot`, continuously past the idle-heartbeat deadline. Advancing
+    /// past the observation slot is a hard failure, not a reason to weaken the
+    /// assertion and accept eventual application. This is the red witness for
+    /// an idle heartbeat incorrectly bypassing the busy minimum.
     fn waitPendingAtExactSlot(
         self: *Cluster,
         nodes: []const usize,
@@ -961,6 +1080,7 @@ const Cluster = struct {
         what: []const u8,
     ) !void {
         var poll = Poll.init(self.io, poll_bound_ms, what);
+        var all_since: ?std.Io.Timestamp = null;
         while (true) {
             var all_met = true;
             for (nodes) |i| {
@@ -978,8 +1098,15 @@ const Cluster = struct {
                 if (h.slot != slot or h.pending != want_pending) all_met = false;
             }
             if (all_met) {
-                std.debug.print("[registry-smoke] ok after {d} ms: {s}\n", .{ poll.elapsed(self.io), what });
-                return;
+                if (all_since == null) all_since = std.Io.Timestamp.now(self.io, .awake);
+                if (elapsedMs(self.io, all_since.?) >= pending_cadence_guard_ms) {
+                    std.debug.print("[registry-smoke] ok after {d} ms: {s}; remained pending at S for >= {d} ms (> idle heartbeat)\n", .{
+                        poll.elapsed(self.io), what, pending_cadence_guard_ms,
+                    });
+                    return;
+                }
+            } else {
+                all_since = null;
             }
             try poll.tick(self);
         }
@@ -1025,6 +1152,212 @@ const Cluster = struct {
             if (all_met) {
                 std.debug.print("[registry-smoke] ok after {d} ms: {s}\n", .{ poll.elapsed(self.io), what });
                 return;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    fn nodesMask(nodes: []const usize) u8 {
+        var mask: u8 = 0;
+        for (nodes) |i| mask |= bit(i);
+        return mask;
+    }
+
+    /// Highest durable slot whose application log was printed by every named
+    /// node, optionally with one exact transaction count. The registry writes
+    /// its snapshot before this line, so this is stronger than a fleeting RPC
+    /// sample and remains usable with sub-second idle slots.
+    fn commonLoggedSlotNow(self: *Cluster, nodes: []const usize, min_slot: u64, want_txs: ?u64) ?u64 {
+        const want_mask = nodesMask(nodes);
+        var best: ?u64 = null;
+        var it = self.log_heads.iterator();
+        while (it.next()) |e| {
+            const slot = e.key_ptr.*;
+            if (slot < min_slot or e.value_ptr.mask & want_mask != want_mask) continue;
+            if (want_txs) |want| {
+                var counts_match = true;
+                for (nodes) |i| {
+                    const p = self.procs[i];
+                    p.mu.lockUncancelable(self.io);
+                    const got = p.slot_txs.get(slot);
+                    p.mu.unlock(self.io);
+                    if (got == null or got.? != want) counts_match = false;
+                }
+                if (!counts_match) continue;
+            }
+            if (best == null or slot > best.?) best = slot;
+        }
+        return best;
+    }
+
+    fn waitCommonLoggedSlot(
+        self: *Cluster,
+        nodes: []const usize,
+        min_slot: u64,
+        want_txs: ?u64,
+        what: []const u8,
+    ) !u64 {
+        var poll = Poll.init(self.io, poll_bound_ms, what);
+        while (true) {
+            try self.checkProcs();
+            if (self.commonLoggedSlotNow(nodes, min_slot, want_txs)) |slot| {
+                const seen = self.log_heads.get(slot).?;
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (durable slot {d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, slot, &seen.head16,
+                });
+                return slot;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// Catch the first fresh common application line before the node loops'
+    /// 100 ms `waitApplied` tick returns and lets them nominate an idle value.
+    /// Once the transaction is admitted, the 5 s busy minimum takes over.
+    fn waitFreshCommonLoggedSlot(
+        self: *Cluster,
+        nodes: []const usize,
+        min_slot: u64,
+        what: []const u8,
+    ) !u64 {
+        var poll = Poll.init(self.io, poll_bound_ms, what);
+        while (true) {
+            try self.checkProcs();
+            if (self.commonLoggedSlotNow(nodes, min_slot, 0)) |slot| {
+                const seen = self.log_heads.get(slot).?;
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (fresh durable slot {d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, slot, &seen.head16,
+                });
+                return slot;
+            }
+            try poll.tickEvery(self, 1);
+        }
+    }
+
+    const CertifiedWitness = struct { checkpoint: u64, live_head: u64 };
+
+    fn certifiedCheckpointNow(self: *Cluster, nodes: *const [2]usize, max_slot: u64) ?u64 {
+        const mask = nodesMask(nodes);
+        const a = self.procs[nodes[0]];
+        const b = self.procs[nodes[1]];
+        var best: ?u64 = null;
+        a.mu.lockUncancelable(self.io);
+        b.mu.lockUncancelable(self.io);
+        defer b.mu.unlock(self.io);
+        defer a.mu.unlock(self.io);
+        var it = a.history_checkpoints.iterator();
+        while (it.next()) |e| {
+            const slot = e.key_ptr.*;
+            const a_status = e.value_ptr.*;
+            const b_status = b.history_checkpoints.get(slot) orelse continue;
+            if (a_status & checkpoint_signed_bit == 0 or b_status & checkpoint_signed_bit == 0) continue;
+            if ((a_status | b_status) & checkpoint_certified_bit == 0) continue;
+            if (slot > max_slot) continue;
+            const logged = self.log_heads.get(slot) orelse continue;
+            if (logged.mask & mask != mask) continue;
+            if (best == null or slot > best.?) best = slot;
+        }
+        return best;
+    }
+
+    /// Wait for two distinct survivor processes to report their attestation
+    /// for C, at least one to report C certified, and both to have durably
+    /// applied C with the same head. The returned live head is within the
+    /// protocol's 16-slot answering window of C.
+    fn waitCertifiedCheckpoint(self: *Cluster, nodes: *const [2]usize, min_live_slot: u64) !CertifiedWitness {
+        var poll = Poll.init(self.io, history_bound_ms, "a recent two-signer certified history checkpoint after at least 201 missed slots");
+        while (true) {
+            try self.checkProcs();
+            const live_head = self.commonLoggedSlotNow(nodes, min_live_slot, 0);
+            if (live_head) |h| {
+                if (self.certifiedCheckpointNow(nodes, h)) |c| {
+                    if (h - c >= answering_window) {
+                        try poll.tick(self);
+                        continue;
+                    }
+                    std.debug.print("[registry-smoke] ok after {d} ms: checkpoint C={d} signed by node{d}+node{d}, certified, live H={d}, lag={d}\n", .{
+                        poll.elapsed(self.io), c, nodes[0], nodes[1], h, h - c,
+                    });
+                    return .{ .checkpoint = c, .live_head = h };
+                }
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// After the second validator dies, allow already-buffered work to drain,
+    /// then require one exact slot/hash to remain unchanged for `stable_ms`.
+    fn waitHeadStable(self: *Cluster, i: usize, min_slot: u64, stable_ms: u64) !Head {
+        var poll = Poll.init(self.io, poll_bound_ms, "the sole survivor's head to remain unchanged for one second");
+        var candidate: ?Head = null;
+        var since = std.Io.Timestamp.now(self.io, .awake);
+        while (true) {
+            const h = (try self.queryHead(i)) orelse {
+                candidate = null;
+                try poll.tick(self);
+                continue;
+            };
+            if (h.slot < min_slot) {
+                try poll.tick(self);
+                continue;
+            }
+            if (candidate == null or candidate.?.slot != h.slot or !std.mem.eql(u8, &candidate.?.hash, &h.hash)) {
+                candidate = h;
+                since = std.Io.Timestamp.now(self.io, .awake);
+            } else if (elapsedMs(self.io, since) >= stable_ms) {
+                std.debug.print("[registry-smoke] ok after {d} ms: node{d} stalled without quorum at H={d} head={s}… for >= {d} ms\n", .{
+                    poll.elapsed(self.io), i, h.slot, h.hash[0..16], stable_ms,
+                });
+                return h;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    fn waitHistoryBoot(self: *Cluster, i: usize, min_slot: u64, stable_head: u64) !u64 {
+        var poll = Poll.init(self.io, ready_bound_ms, "node2's explicit history-checkpoint boot log");
+        while (true) {
+            const p = self.procs[i];
+            p.mu.lockUncancelable(self.io);
+            const got = p.history_boot_slot;
+            p.mu.unlock(self.io);
+            if (got) |slot| {
+                // A second certificate can become complete after the harness
+                // sampled C but before node0's kill reaches it. loadLatest
+                // correctly chooses that newer artifact, so accept B >= C
+                // while retaining the same stable-H/window proof.
+                if (slot < min_slot or slot > stable_head or stable_head - slot >= answering_window) {
+                    std.debug.print("[registry-smoke] node{d} booted from history checkpoint B={d}; expected C={d} <= B <= H={d} and H-B < {d}\n", .{
+                        i, slot, min_slot, stable_head, answering_window,
+                    });
+                    return error.WrongHistoryCheckpoint;
+                }
+                std.debug.print("[registry-smoke] ok after {d} ms: node{d} booted from history checkpoint B={d} (requested minimum C={d}, stable H={d})\n", .{
+                    poll.elapsed(self.io), i, slot, min_slot, stable_head,
+                });
+                return slot;
+            }
+            try poll.tick(self);
+        }
+    }
+
+    /// The checkpoint-restored process must visibly pass through the exact
+    /// stable frontier, not merely appear at some later matching state.
+    fn waitHeadExact(self: *Cluster, i: usize, want: Head) !Head {
+        var poll = Poll.init(self.io, poll_bound_ms, "node2 to catch the sole survivor's exact stable H/hash");
+        while (true) {
+            if (try self.queryHead(i)) |h| {
+                if (h.slot > want.slot) {
+                    std.debug.print("[registry-smoke] node{d} skipped the observable catch-up frontier H={d} and reached {d}\n", .{ i, want.slot, h.slot });
+                    return error.CatchUpOvershot;
+                }
+                if (h.slot == want.slot) {
+                    if (!std.mem.eql(u8, &h.hash, &want.hash)) return error.HeadDisagreement;
+                    std.debug.print("[registry-smoke] ok after {d} ms: node{d} caught exact H={d} head={s}…\n", .{
+                        poll.elapsed(self.io), i, h.slot, h.hash[0..16],
+                    });
+                    return h;
+                }
             }
             try poll.tick(self);
         }
@@ -1100,16 +1433,18 @@ const Cluster = struct {
         _ = try self.submit(.alice, 0, &.{ "transfer", "alice", bob_hex });
         try self.waitGet("alice", .{ .owner = self.pk(.bob) }, &all, "get alice → owner=bob on every node");
 
-        // (6) First retain the broad head-agreement sweep, then wait for one
-        // newer common idle close. That fresh pending=0 head is slot S for
-        // the deterministic flooding proof and leaves almost the whole 5 s
-        // survivor cadence as an observation window.
-        const agreed_slot = try self.headAgreement();
-        const settled = try self.waitCommonHead(
+        // (6) Retain the broad head-agreement sweep, then catch the next
+        // common durable idle close through the process logs at 1 ms cadence.
+        // CLI sampling is intentionally not used for this edge: with a fast
+        // idle heartbeat, sequential `head` processes can consume the whole
+        // pre-nomination interval before tx6 is even submitted.
+        _ = try self.headAgreement();
+        var before_barrier: u64 = 0;
+        for (self.procs) |p| before_barrier = @max(before_barrier, p.maxSlot());
+        const settled = try self.waitFreshCommonLoggedSlot(
             &all,
-            agreed_slot + 1,
-            0,
-            "a fresh common pending=0 head after the initial work",
+            before_barrier + 1,
+            "the first fresh common pending-free slot for the flooding barrier",
         );
 
         // tx6 enters ONLY nomination-disabled node2. In the line topology,
@@ -1120,7 +1455,7 @@ const Cluster = struct {
         _ = try self.submit(.bob, 2, &.{ "set", "bob", "x" });
         try self.waitPendingAtExactSlot(
             &.{ 1, 0 },
-            settled.slot,
+            settled,
             1,
             "tx6 pending on node1 (one hop) and node0 (two hops), both still at S",
         );
@@ -1128,7 +1463,7 @@ const Cluster = struct {
         // (7) Kill the sole submission node before any nomination. The two
         // survivors are the quorum; their own per-slot lines must show the
         // flooded transaction in exactly S+1, not merely some later slot.
-        std.debug.print("[registry-smoke] SIGKILL source node2 at proof slot S={d}\n", .{settled.slot});
+        std.debug.print("[registry-smoke] SIGKILL source node2 at proof slot S={d}\n", .{settled});
         {
             const p2 = self.procs[2];
             p2.mu.lockUncancelable(self.io);
@@ -1138,7 +1473,7 @@ const Cluster = struct {
         }
         try self.waitSlotTxs(
             &.{ 0, 1 },
-            settled.slot + 1,
+            settled + 1,
             1,
             "node0 and node1 externalized exactly S+1 with txs=1 after the source died",
         );
@@ -1160,11 +1495,107 @@ const Cluster = struct {
 
         // (8) A second single-source transaction through the restarted,
         // nomination-disabled end of the line. It can land only by flooding
-        // to a survivor that can nominate it.
+        // to a survivor that can nominate it (tx7, the end of the E2a slice).
         _ = try self.submit(.bob, 2, &.{ "release", "bob" });
         try self.waitGet("bob", .none, &all, "get bob → none on every node (released via the restarted node2)");
 
+        // (9) Move one durable, empty slot beyond tx7, then kill node2 again.
+        // Record the stopped process's actual final slot (rather than a
+        // pre-kill sample) and require both survivors' persisted/logged chain
+        // to contain that exact slot. This is absence origin S.
+        var after_tx7: u64 = 0;
+        for (self.procs) |p| after_tx7 = @max(after_tx7, p.maxSlot());
+        _ = try self.waitCommonLoggedSlot(&all, after_tx7 + 1, 0, "a common durable empty head after tx7");
+        {
+            const p2 = self.procs[2];
+            p2.mu.lockUncancelable(self.io);
+            p2.expect_eof = true;
+            p2.mu.unlock(self.io);
+            p2.stop();
+        }
+        const absent_at = self.procs[2].maxSlot();
+        try self.waitSlotTxs(&all, absent_at, 0, "all three durably recorded absence origin S before node2 misses at least 201 slots");
+        std.debug.print("[registry-smoke] history outage begins at durable S={d}; node2 stopped\n", .{absent_at});
+
+        // node0+node1 are still a 2-of-3 quorum. Their 500 ms idle heartbeat
+        // drives at least 201 transaction-free slots while the shared history
+        // archive receives an attestation every 8 slots. A usable C must be
+        // signed by both, certified by the local qset, and no more than 15
+        // slots behind the live common head.
+        const survivors = [_]usize{ 0, 1 };
+        const certified = try self.waitCertifiedCheckpoint(&survivors, absent_at + absent_slots);
+
+        // Remove node0 as well. node1 may finish already-buffered work, so the
+        // stable H is measured after the kill; five or more independent head
+        // samples over one second prove it cannot advance by itself.
+        {
+            const p0 = self.procs[0];
+            p0.mu.lockUncancelable(self.io);
+            p0.expect_eof = true;
+            p0.mu.unlock(self.io);
+            p0.stop();
+        }
+        const stable = try self.waitHeadStable(1, certified.live_head, stable_head_ms);
+        // node0's reader is joined, so freeze the newest certificate both
+        // survivors actually logged before selecting the import floor. This
+        // closes the C→C+8 race between the earlier sample and SIGKILL.
+        try self.checkProcs();
+        const checkpoint_floor = self.certifiedCheckpointNow(&survivors, stable.slot) orelse return error.MissingCertifiedCheckpoint;
+        if (!historyWitnessOk(absent_at, stable.slot, checkpoint_floor)) {
+            std.debug.print("[registry-smoke] invalid E2b witness: S={d} C={d} stable H={d}; need H-S >= {d} and H-C < {d}\n", .{
+                absent_at, checkpoint_floor, stable.slot, absent_slots, answering_window,
+            });
+            return error.HistoryWitnessOutOfRange;
+        }
+        {
+            const p1 = self.procs[1];
+            p1.mu.lockUncancelable(self.io);
+            const advanced = p1.slot_txs.contains(stable.slot + 1);
+            p1.mu.unlock(self.io);
+            if (advanced) return error.SoleSurvivorAdvanced;
+        }
+
+        // (10) Restart node2 from the certified archive, not its 201-slot-old
+        // local snapshot. The extra node0 dial from its first restart remains
+        // configured but node0 is dead, leaving node1 as its only live peer.
+        // A finite heartbeat lets node2 co-vote through C+1..H; the one-second
+        // interval then leaves time to observe exact H before tx8 is queued.
+        var checkpoint_buf: [20]u8 = undefined;
+        const checkpoint_s = try std.fmt.bufPrint(&checkpoint_buf, "{d}", .{checkpoint_floor});
+        try self.procs[2].setFlagValue("--min-slot-ms", survivor_min_slot_ms);
+        try self.procs[2].setFlagValue("--heartbeat-ms", rejoin_heartbeat_ms);
+        try self.procs[2].setFlagValue("--history-min-slot", checkpoint_s);
+        std.debug.print("[registry-smoke] restarting node2 with --history-min-slot C={d}; node0 peer is configured but dead, node1 is the sole live peer\n", .{checkpoint_floor});
+        self.procs[2].spawn() catch |err| {
+            std.debug.print("[registry-smoke] cannot respawn node2 from history: {t}\n", .{err});
+            return err;
+        };
+        const boot_checkpoint = try self.waitHistoryBoot(2, checkpoint_floor, stable.slot);
+        if (!historyWitnessOk(absent_at, stable.slot, boot_checkpoint)) return error.HistoryWitnessOutOfRange;
+        _ = try self.waitHeadExact(2, stable);
+
+        // tx8 changes state and must land in exactly H+1 on both live nodes.
+        // node1 was proved stalled at H, so this externalization proves the
+        // checkpoint-restored node has rejoined as a necessary voter.
+        _ = try self.submit(.bob, 2, &.{ "set", "alice", "history" });
+        const rejoined_slot = stable.slot + 1;
+        try self.waitSlotTxs(&.{ 1, 2 }, rejoined_slot, 1, "node1+node2 externalized tx8 in exactly H+1 after checkpoint catch-up");
+        try self.waitGet("alice", .{ .value = "686973746f7279" }, &.{ 1, 2 }, "tx8 state agrees on node1+node2 at the rejoined frontier");
+
+        // (11) Finally restart node0. Depending on whether H+1 was itself an
+        // 8-slot boundary it may select local persistence or the newer shared
+        // certificate; either path must converge with the two-node chain.
+        // (The exact tx8 line is already pinned on its necessary voters.)
+        std.debug.print("[registry-smoke] restarting node0 after node1+node2 rejoined at slot {d}\n", .{rejoined_slot});
+        self.procs[0].spawn() catch |err| {
+            std.debug.print("[registry-smoke] cannot respawn node0: {t}\n", .{err});
+            return err;
+        };
+        try self.waitCatchUp(0, rejoined_slot);
+        try self.waitGet("alice", .{ .value = "686973746f7279" }, &all, "tx8 state agrees on all three nodes after node0 restarts");
+
         // A last sweep so the evidence names the newest slot every node agrees on.
+        _ = try self.headAgreement();
         for (all) |i| _ = try self.headRetry(i, "a final `head` from every node");
         try self.checkProcs();
         if (self.txs != n_txs) {
@@ -1389,6 +1820,9 @@ fn run(init: std.process.Init, args: Args) !void {
     var rpc: [n_nodes][]u8 = undefined;
     var rpc_made: usize = 0;
     defer for (rpc[0..rpc_made]) |r| gpa.free(r);
+    const history_dir = try std.fmt.allocPrint(gpa, "{s}/history", .{scratch});
+    defer gpa.free(history_dir);
+    try cwd.createDirPath(io, history_dir);
     for (0..n_nodes) |i| {
         const dir = try std.fmt.allocPrint(gpa, "{s}/node{d}", .{ scratch, i });
         defer gpa.free(dir);
@@ -1399,19 +1833,22 @@ fn run(init: std.process.Init, args: Args) !void {
         var rpc_buf: [8]u8 = undefined;
         const listen_s = try std.fmt.bufPrint(&listen_buf, "{d}", .{listenPort(i)});
         const rpc_s = try std.fmt.bufPrint(&rpc_buf, "{d}", .{rpcPort(i)});
-        const cadence = if (i == 2) disabled_cadence_ms else survivor_cadence_ms;
+        const min_slot = if (i == 2) disabled_cadence_ms else survivor_min_slot_ms;
+        const heartbeat = if (i == 2) disabled_cadence_ms else survivor_heartbeat_ms;
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.appendSlice(gpa, &.{
-            exe,              "node",
-            "--network",      network,
-            "--key",          node_key_paths[i],
-            "--data-dir",     "data",
-            "--quorum",       quorum_path,
-            "--listen",       listen_s,
-            "--rpc",          rpc_s,
-            "--min-slot-ms",  cadence,
-            "--heartbeat-ms", cadence,
+            exe,                  "node",
+            "--network",          network,
+            "--key",              node_key_paths[i],
+            "--data-dir",         "data",
+            "--quorum",           quorum_path,
+            "--listen",           listen_s,
+            "--rpc",              rpc_s,
+            "--min-slot-ms",      min_slot,
+            "--heartbeat-ms",     heartbeat,
+            "--history-dir",      history_dir,
+            "--checkpoint-every", checkpoint_every,
         });
         // A deliberate line, with arrows denoting the only configured dial:
         // node2 --peer node1; node1 --peer node0; node0 has no peer argument.
@@ -1429,8 +1866,8 @@ fn run(init: std.process.Init, args: Args) !void {
         std.debug.print("[registry-smoke] cannot spawn node{d} ({s}): {t}\n", .{ p.index, p.argv[0], err });
         return err;
     };
-    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; survivor cadence {s} ms; node2 nomination disabled\n", .{
-        listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), survivor_cadence_ms,
+    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; busy min {s} ms, idle heartbeat {s} ms, checkpoint every {s}; node2 nomination disabled\n", .{
+        listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), survivor_min_slot_ms, survivor_heartbeat_ms, checkpoint_every,
     });
 
     // ---- (5)–(9) the acceptance script ----
@@ -1570,6 +2007,38 @@ test "parseSlotLine: the node's `slot N: txs=K ok=J head=<hex16>` line" {
     try testing.expect(parseSlotLine("") == null);
 }
 
+// Non-vacuity: a locally published signature is not itself a certificate.
+// The at-least-201-slot witness waits specifically for `.certified`, while retaining
+// the per-process `.signed` observations that prove two distinct signers.
+test "parseCheckpointLine: signed and certified are distinct exact statuses" {
+    const signed = parseCheckpointLine("history checkpoint slot 208 signed signer=abc").?;
+    try testing.expectEqual(@as(u64, 208), signed.slot);
+    try testing.expectEqual(CheckpointKind.signed, signed.kind);
+    const certified = parseCheckpointLine("history checkpoint slot 216 certified signers=2").?;
+    try testing.expectEqual(@as(u64, 216), certified.slot);
+    try testing.expectEqual(CheckpointKind.certified, certified.kind);
+    try testing.expect(parseCheckpointLine("history checkpoint slot 216 published") == null);
+    try testing.expect(parseCheckpointLine("history checkpoint slot x certified") == null);
+    try testing.expect(parseCheckpointLine("checkpoint slot 216 certified") == null);
+    try testing.expect(parseCheckpointLine("slot 216: txs=0 ok=0") == null);
+}
+
+test "parseHistoryBootSlot: only an explicit history-checkpoint boot satisfies it" {
+    const line = "registry: node abc listening on port 1; 1 peer(s); data in data; starting from history checkpoint at slot 208";
+    try testing.expectEqual(@as(?u64, 208), parseHistoryBootSlot(line));
+    try testing.expect(parseHistoryBootSlot("registry: node abc; starting from the snapshot at slot 208") == null);
+    try testing.expect(parseHistoryBootSlot("registry: node abc; starting from history checkpoint at slot nope") == null);
+    try testing.expect(parseHistoryBootSlot("history checkpoint slot 208 certified") == null);
+}
+
+test "history witness boundaries: more than 200 absent slots and checkpoint inside 16-slot window" {
+    try testing.expect(historyWitnessOk(10, 211, 196)); // exact 201; exact lag 15
+    try testing.expect(!historyWitnessOk(10, 210, 195)); // exact 200 is insufficient
+    try testing.expect(!historyWitnessOk(10, 211, 195)); // lag 16 is outside
+    try testing.expect(!historyWitnessOk(10, 211, 212)); // checkpoint from the future
+    try testing.expect(!historyWitnessOk(10, 9, 9));
+}
+
 test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
     const gpa = testing.allocator;
     var empty_buf: [0]u8 = .{};
@@ -1586,6 +2055,7 @@ test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
         if (p.bad) |s| gpa.free(s);
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
+        p.history_checkpoints.deinit(gpa);
     }
 
     p.noteLine("slot 7: txs=1 ok=1 head=0123456789abcdef");
@@ -1597,11 +2067,49 @@ test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
     try testing.expect(p.bad != null);
 }
 
+test "NodeProc retains history attestations, certification, and boot source" {
+    const gpa = testing.allocator;
+    var empty_buf: [0]u8 = .{};
+    var p: NodeProc = .{
+        .gpa = gpa,
+        .io = testing.io,
+        .index = 2,
+        .dir = "",
+        .argv = &.{},
+        .rdr_buf = &empty_buf,
+    };
+    defer {
+        for (&p.tail) |*line| if (line.*) |s| gpa.free(s);
+        if (p.bad) |s| gpa.free(s);
+        p.slot_heads.deinit(gpa);
+        p.slot_txs.deinit(gpa);
+        p.history_checkpoints.deinit(gpa);
+    }
+
+    p.noteLine("history checkpoint slot 208 signed signer=aaa");
+    try testing.expectEqual(checkpoint_signed_bit, p.history_checkpoints.get(208).?);
+    p.noteLine("history checkpoint slot 208 certified signers=2");
+    try testing.expectEqual(checkpoint_signed_bit | checkpoint_certified_bit, p.history_checkpoints.get(208).?);
+    p.noteLine("registry: node abc; starting from history checkpoint at slot 208");
+    try testing.expectEqual(@as(?u64, 208), p.history_boot_slot);
+}
+
+test "NodeProc restart argv replaces cadence and appends history minimum" {
+    const gpa = testing.allocator;
+    const p = try NodeProc.create(gpa, testing.io, 2, "", &.{ "registry", "node", "--heartbeat-ms", disabled_cadence_ms });
+    defer p.destroy();
+    try p.setFlagValue("--heartbeat-ms", rejoin_heartbeat_ms);
+    try testing.expectEqualStrings(rejoin_heartbeat_ms, p.argv[3]);
+    try p.setFlagValue("--history-min-slot", "208");
+    try testing.expectEqualStrings("--history-min-slot", p.argv[4]);
+    try testing.expectEqualStrings("208", p.argv[5]);
+}
+
 // Non-vacuity: the evidence literal is what `just preflight` greps; a typo
 // in the formatter goes red here before it goes red in preflight.
 test "evidence line" {
     var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings("[registry-smoke] nodes=3 txs=7 slots=17 head=0123456789abcdef", try evidenceLine(&buf, 3, 7, 17, "0123456789abcdef"));
+    try testing.expectEqualStrings("[registry-smoke] nodes=3 txs=8 slots=217 head=0123456789abcdef", try evidenceLine(&buf, 3, 8, 217, "0123456789abcdef"));
 }
 
 // Non-vacuity: the zon rewrite must re-point the path dep (exactly once) to
