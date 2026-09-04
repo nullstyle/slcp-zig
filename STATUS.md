@@ -2,9 +2,9 @@
 
 **Snapshot date:** 2026-09-03
 
-This file distinguishes released code, the pre-sprint baseline, and the local
-v0.2.0 candidate. It is a snapshot, not a guarantee of fitness: this remains
-an experimental project, no production use is recommended, and no license is
+This file distinguishes released code, the prior v0.2.0 candidate, and current
+feature work. It is a snapshot, not a guarantee of fitness: this remains an
+experimental project, no production use is recommended, and no license is
 granted.
 
 ## Repository baseline
@@ -16,13 +16,58 @@ granted.
 | Hardening baseline | local `main` at `87d7083` (2026-09-03) | Exact qset lifecycle, bounded native ingress, restart/purge hardening, stronger fuzz/E2E evidence, canonical project state, and its recorded proof. |
 | Package payload freeze | `1b68041` (not pushed or tagged) | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
 | Local repository candidate | code tip `0f39869` plus hash-neutral release records (not pushed or tagged) | Retains the frozen package payload and fixes the example registry's detached RPC-handler teardown race found during release ablation. |
+| E2a implementation and proof | `50456f7` through `0932a83` (including smoke `6899855`, legacy-Hello test `2051f5b`, and waiter/FIFO hardening `0932a83`) | Adds negotiated, bounded Experimental application-message transport, registry-controlled flooding, deterministic source-death proof, outbound isolation, and race-safe inbox teardown. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current v0.2.0 candidate
+## Current feature work: E2a transaction flooding
+
+E2a is the first delivered slice of the examples roadmap's second stage. It
+adds append-only overlay negotiation (`Hello.featureFlags` bit 0 and
+`Frame.appMessage` arm 10) plus Experimental native Node
+`publishAppMessage`, `waitAppMessage`, and `appMessageStats` entry points. The
+inbox is lazy opt-in, capped at 64 KiB per payload and 1,024 items / 16 MiB in
+total, and deduplicates by SHA-256 only while a copy remains queued. Delivery
+is best-effort and non-durable. The generic Node does not auto-relay; the
+application validates and explicitly republishes accepted messages. App frames
+from a peer that did not negotiate feature bit 0 are dropped. Per connection,
+outbound app traffic is capped at 256 writer items / 1 MiB inside the unchanged
+1,024-item / 16 MiB aggregate, with 256 items / 4 MiB kept unavailable to app
+traffic. App pressure drops only that frame and does not disconnect the peer
+or consume the ordinary/consensus reserve.
+
+Inbox shutdown atomically closes new waiter admission and drains all waiters
+that crossed that gate before teardown. FIFO delivery uses a head index rather
+than shifting attacker-controlled queue contents on every receive; live
+retention remains capped at 1,024 messages and physical item storage at twice
+that bound during churn.
+
+The registry now gives RPC and gossip bytes one admission path: exact
+canonical transaction encoding, registry-network signature, next sequence,
+duplicate, and pending-cap checks. An accepted transaction is flooded
+immediately after the shared-state lock is released, every accepting node
+relays it under the same policy, and pending bytes are reflooded every second.
+The main loop drains at most 64 gossip messages per tick.
+
+The strengthened smoke is green as a deterministic application-transport
+witness. In a three-node line, a nomination-disabled end node submitted one
+transaction; both survivors reported it pending at S=6 after 224 ms; the
+source was killed; and both survivors printed `slot 7: txs=1` for S+1=7. The
+source then restarted and caught up in 219 ms. The complete run finished in
+59 s with `[registry-smoke] nodes=3 txs=7 slots=8 head=6420b17d5a264ddd`.
+The result proves next-eligible-slot inclusion and survival of the submission
+node once propagation has occurred. It is fresh post-candidate evidence; the
+ledger in the prior-candidate section below remains historical and is not
+being reused as proof of E2a.
+
+No Stable API declaration changes in E2a. The new Node methods, result types,
+statistics, wire module details, and schema-generated accessors are
+Experimental; the signed consensus schema and sans-I/O Engine are unchanged.
+
+## Prior v0.2.0 candidate record
 
 The candidate combines the completed correctness and boundedness sprint with
 a second storage-boundary sprint. This is still not a release or deployment
@@ -87,7 +132,7 @@ and reviewed. The removal of Experimental `Store.putQset` / `Store.getQset`
 and the addition of `Node.storageStats()` make this a pre-1.0 minor release;
 the migration is recorded in `CHANGELOG.md`.
 
-## Current verification ledger
+## Prior v0.2.0 verification ledger
 
 These fields intentionally describe the integrated candidate tree, not the
 v0.1.0 release run. Before the package freeze, the ordinary full graph was
@@ -99,7 +144,7 @@ passed under another unprescribed shell Zig and remains supplemental evidence.
 The final cold preflight passed at clean `0f52660` under the Zig prescribed by
 `mise.toml`.
 
-| Gate | Current sprint result |
+| Gate | Pinned candidate result |
 |---|---|
 | Package payload freeze | PASS — `1b68041`; tree clean before hashing |
 | Repository code candidate | PASS — `0f39869`; focused lifecycle fix committed separately from the cache sprint |
@@ -148,7 +193,7 @@ test-only scheduler gate makes both old conditions deterministically red; the
 focused registry suite passed 20 consecutive repetitions before the
 post-fix cold runs, and the integrated suite passes under the prescribed Zig.
 
-## Known boundaries after this sprint
+## Known boundaries after E2a
 
 - Transport remains unauthenticated and unencrypted; deploy behind a private
   network or authenticated tunnel.
@@ -171,7 +216,9 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   run without competing copies, especially on macOS.
 - One identity must never run on two machines; local locking cannot detect a
   copied key or data directory.
-- The E2 and E3 example stages remain plans, not implemented features.
+- E2a transaction flooding is delivered, but E2 history archives,
+  checkpoint/state transfer, heap-sized state, and close time remain future
+  work; E3 remains planned.
 - Licensing remains an explicit owner decision; this repository grants none.
 
 ## Reading order

@@ -196,6 +196,13 @@ expect in the Stable list and that are deliberately **not**:
   the `qset_cache_evictions` removal count (policy evictions plus
   invalidations), failures, and the sticky degraded flag may evolve with that
   cache while the Stable consensus statistics stay separate.
+- `slcp.node.Node.publishAppMessage`, `waitAppMessage`, and
+  `appMessageStats`, together with `PublishAppMessageError` and
+  `AppMessageStats`: the best-effort, non-durable native application-message
+  seam added after v0.2.0. Its 64 KiB frame cap, lazy opt-in queue behavior,
+  outbound writer sub-caps/reserve, counters, and application-owned
+  relay/retry policy may evolve without changing the Stable consensus or
+  typed-application interface.
 - `slcp.lint_report`: the CLI's rendering of lint findings. The lint
   **codes** are frozen by `schema/host.capnp` and `vectors/lint.json`, not
   by these Zig names.

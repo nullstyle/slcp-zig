@@ -13,6 +13,48 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ## [Unreleased]
 
+### Added
+
+- Experimental native-node application messaging:
+  `Node.publishAppMessage`, `Node.waitAppMessage`, and
+  `Node.appMessageStats`, backed by a lazy opt-in FIFO capped at 1,024
+  messages / 16 MiB and a 64 KiB payload limit. SHA-256 payload deduplication
+  lasts only while a copy is queue-resident; delivery is best-effort and
+  non-durable.
+- Append-only overlay negotiation for application messages:
+  `Hello.featureFlags` bit 0 and `Frame.appMessage` arm 10. Messages are sent
+  only to capable peers, an unnegotiated inbound arm is dropped, and unknown
+  feature bits remain ignorable. A pre-feature Hello decodes the appended
+  field as zero and continues carrying consensus traffic without app frames.
+- Registry transaction flooding through one RPC/gossip admission boundary.
+  Canonical, network-signed, correctly sequenced transactions are flooded on
+  acceptance and reflooded every second while pending; the main loop drains at
+  most 64 received messages per tick.
+
+### Changed
+
+- Outbound application traffic now has a 256-item / 1 MiB per-peer subset of
+  the unchanged 1,024-item / 16 MiB aggregate writer queue. A 256-item /
+  4 MiB reserve remains unavailable to app frames, and app pressure drops
+  only that opportunistic frame instead of disconnecting the peer, preserving
+  explicit headroom for ordinary and consensus traffic.
+- Application-message shutdown now closes waiter admission atomically and
+  drains every admitted waiter before inbox teardown. FIFO removal is
+  amortized O(1), with physical queue storage bounded to twice the 1,024-item
+  live-message cap during churn.
+- The registry smoke now uses a three-node line and a nomination-disabled
+  submission node. It proves one-hop and two-hop propagation at ledger slot S,
+  kills the source, and requires the two survivors to include exactly that
+  transaction in the next slot, S+1.
+
+### Security
+
+- Opaque application frames are not authenticated by SLCP. The generic Node
+  never auto-relays received bytes; applications must authenticate, validate,
+  deduplicate, and explicitly republish. The registry verifies canonical
+  encoding, network-bound Ed25519 signatures, sequence, duplicates, and queue
+  capacity before any relay, so invalid peer traffic is not amplified.
+
 ## [0.2.0] - 2026-09-03
 
 **Candidate package hash** (computed from the frozen package tree with

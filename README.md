@@ -42,9 +42,10 @@ halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
 
 ## Status
 
-- **This tree is the local v0.2.0 release candidate**; v0.1.0 remains the
-  latest tag until the exact candidate completes the release gates, is pushed,
-  and passes CI. Nothing here is supported.
+- **This tree has moved beyond the local v0.2.0 candidate into post-candidate
+  E2a feature work:** bounded Experimental application messaging and registry
+  transaction flooding with a source-death proof. v0.1.0 remains the latest
+  tag. Nothing here is supported.
 - The engine (`slcp-core`) has run a deterministic 1000-seed simulation
   matrix with Byzantine actors, a fuzz suite, a native-vs-wasm differential
   replay, and a real-socket 4-node end-to-end cluster with kill/restart and
@@ -325,7 +326,7 @@ mise exec -- zig build test
 | `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
 | `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
-| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three registry nodes over loopback through its CLI — conflicting claims, `set` / `transfer` / `release`, identical heads, a `SIGKILL` + restart of one node. Not part of `test` (which runs `registry-tests`, the example's own tests). |
+| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three registry nodes in a loopback line through its CLI — bounded transaction flooding across two hops, next-slot inclusion after the sole submission node is `SIGKILL`ed, restart/catch-up, plus the registry operations and identical-head checks. Not part of `test` (which runs `registry-tests`, the example's own tests). |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
 | `zig build sim-matrix` / `zig build byz-matrix` | The full 1000-seed simulation and Byzantine matrices (long). |
@@ -406,9 +407,9 @@ in [`docs/stability.md`](docs/stability.md).
   system invariants, and code map.
 - [`STATUS.md`](STATUS.md) — the dated split between released, committed
   unreleased, and current worktree state, including the verification ledger.
-- [`docs/examples-roadmap.md`](docs/examples-roadmap.md) — E1's shipped
-  registry shape and the planned E2/E3 progression toward history, upgrades,
-  and operations.
+- [`docs/examples-roadmap.md`](docs/examples-roadmap.md) — E1's registry,
+  E2a's delivered bounded transaction flooding, and the remaining E2/E3 path
+  toward history, upgrades, and operations.
 - `docs/protocol.md` — the normative byte-level definition of SLCP v1 as a
   citation index: domain tags, canonical form, quorum sets, leader election,
   frozen limits, statement sanity, the engine boundary, overlay and
@@ -426,11 +427,10 @@ in [`docs/stability.md`](docs/stability.md).
 - `docs/stability.md` — the Stable / Experimental tiers and how the API
   snapshot enforces them.
 - `examples/counter/README.md` — the three-VPS deployment walkthrough.
-- `examples/registry/README.md` — the second example: signed transactions
-  with sequence numbers, transaction sets as the value (custom codec +
-  `combine`), a ledger header hash chain, snapshots, a localhost RPC and a
-  CLI — the first step of an examples track that grows toward a
-  stellar-core-shaped application without money.
+- `examples/registry/README.md` — the second example: signed sequenced
+  transactions, bounded pre-nomination flooding that survives source death
+  once propagated, transaction sets as the value, a ledger header hash chain,
+  snapshots, localhost RPC, and CLI.
 - `vectors/` — the cross-implementation conformance vectors; when prose and
   vectors disagree, the vectors win.
 

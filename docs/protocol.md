@@ -726,7 +726,8 @@ marks the engine failed (sticky); `pushInput` then always returns
 
 Source: `schema/overlay.capnp` (copied), `src/node/wire.zig` (frame codec),
 `src/node/overlay.zig` (sockets, budgets, backoff), `src/node/node.zig`
-(relay policy, catch-up, anti-entropy). Vector:
+(relay policy, catch-up, anti-entropy), and `src/node/app_gossip.zig`
+(bounded application inbox). Vector:
 `vectors/framing/framing_fixtures.json` (the capnp segment framing, vendored
 verbatim from capnp-zig — see `vectors/framing/PROVENANCE.md`).
 
@@ -755,6 +756,7 @@ struct Frame { union {
   slotState    @7 :SlotState;
   ping         @8 :UInt64;
   pong         @9 :UInt64;
+  appMessage   @10 :Data;             # opaque application payload; <= 64 KiB
 }}
 
 struct Hello {
@@ -764,6 +766,7 @@ struct Hello {
   nodeId          @2 :Data;           # advisory, UNAUTHENTICATED
   currentSlot     @3 :UInt64;         # advisory
   listenPort      @4 :UInt16;         # for reciprocal dialing
+  featureFlags    @5 :UInt64;         # advisory capability bits; unknown bits ignored
 }
 
 struct DontHave  { kind @0 :UInt8; id @1 :Data; }
@@ -773,8 +776,13 @@ struct SlotState { slot @0 :UInt64; envelopes @1 :List(Slcp.Envelope); }  # <= 6
 **Hello semantics** (`overlay.zig` `runConnection`): each side sends its own
 Hello first, then reads the peer's first frame, which must be a Hello with
 `protocolVersion == 1` and a matching `networkIdPrefix` — otherwise
-disconnect. `nodeId`, `currentSlot` and `listenPort` are unauthenticated
-hints. There is **no transport authentication in v1** — see
+disconnect. `nodeId`, `currentSlot`, `listenPort`, and `featureFlags` are
+unauthenticated hints. `featureFlags` bit 0 (`feature_app_messages`) advertises
+support for `appMessage`; a sender does not enqueue that arm to a peer without
+the bit, and a receiver drops the arm when the peer did not advertise it.
+An older two-data-word Hello has no field 5 and decodes `featureFlags` as zero,
+so consensus transport stays compatible with app messaging disabled. Unknown
+bits are ignored. There is **no transport authentication in v1** — see
 `docs/threat-model.md`.
 
 **Frame codec rules** (`wire.zig` header — the one place these conversions
@@ -785,9 +793,12 @@ re-serializes them back into a standalone message. The envelope frame is
 never signed over its own framing — only `statementBytes` are — so the
 re-serialization is safe by construction. `qset` frames get the same
 treatment (bounded by depth ≤ 4, ≤ 255 validators). `slotState` carries at
-most `max_slot_state_envelopes = 64` envelopes.
+most `max_slot_state_envelopes = 64` envelopes. `appMessage` is opaque Data;
+encode and decode both reject payloads larger than
+`max_app_message_bytes = 64 * 1024`.
 
-**Budgets** (copied from `src/node/overlay.zig` constants):
+**Budgets** (copied from `src/node/overlay.zig` and `src/node/wire.zig`
+constants):
 
 | Constant | Value |
 |---|---|
@@ -795,7 +806,10 @@ most `max_slot_state_envelopes = 64` envelopes.
 | `inbound_rate_soft_cap_bytes_per_s` | `256 * 1024` (256 KiB/s per peer, soft) |
 | `max_outstanding_requests` | `64` |
 | `max_frame_bytes` | `1 << 20` (1 MiB) |
-| `max_write_queue_items` / `max_write_queue_bytes` | `1024` / `16 * 1024 * 1024` (overflow ⇒ disconnect) |
+| `max_app_message_bytes` | `64 * 1024` (64 KiB) |
+| `max_write_queue_items` / `max_write_queue_bytes` | `1024` / `16 * 1024 * 1024` aggregate per peer (ordinary overflow ⇒ disconnect) |
+| `max_app_write_queue_items` / `max_app_write_queue_bytes` | `256` / `1 * 1024 * 1024` per-peer app subset (pressure ⇒ drop only that app frame) |
+| `reserved_write_queue_items` / `reserved_write_queue_bytes` | `256` / `4 * 1024 * 1024` of the aggregate remain unavailable to app traffic |
 | `max_inbound_conns` | `128` (over-cap accepts closed before any allocation) |
 | `handshake_timeout_s` | 10 s, as an `std.Io.Timeout` on the read operation (absolute across the whole handshake) |
 | `max_budget_strikes` | `32` breaches over the connection's lifetime (strikes never reset) ⇒ disconnect |
@@ -811,6 +825,41 @@ losses increment the Experimental
 non-allocating control lane: repeated watermarks coalesce to the maximum and
 run before the ordinary backlog, so a queued qset response cannot revive
 pending state below a newly published purge floor.
+
+**Application-message transport** (`node.zig` `publishAppMessage`,
+`waitAppMessage`, `appMessageStats`; `app_gossip.zig`): this Experimental
+native-host seam is deliberately outside consensus. `publishAppMessage`
+broadcasts one opaque payload of 0..64 KiB to currently connected peers whose
+Hello advertised feature bit 0; it neither persists nor locally enqueues the
+payload. Each peer's writer applies a 256-item / 1 MiB app subset inside its
+unchanged 1,024-item / 16 MiB aggregate queue and keeps 256 items / 4 MiB
+unavailable to app traffic. Reaching an app or reserve boundary drops only the
+app frame and leaves the connection open; ordinary queue overflow retains the
+existing disconnect behavior. The first call to `waitAppMessage` lazily opts
+the node into inbound retention. Before that opt-in, received application
+payloads are dropped without retaining either bytes or digests. After opt-in,
+a FIFO owns at most
+1,024 payloads and 16 MiB. SHA-256 deduplication covers only payloads currently
+in that queue: once an application takes a message, identical bytes may be
+delivered again so a rejected or lost attempt remains retryable. Cap overflow,
+allocation failure, pre-opt-in traffic, and shutdown drop the newcomer;
+`AppMessageStats` reports receiving state, queued items/bytes, drops, and
+queue-resident duplicates.
+
+FIFO removal uses a head index and amortized compaction rather than shifting
+the live queue on every delivery. At most 1,024 live items are retained, and
+physical item storage is capped at 2,048 entries during churn. Shutdown first
+closes an atomic waiter-admission gate, broadcasts to parked waiters, and does
+not tear down the inbox until every wait call that crossed the gate has
+finished its State access. Node ownership must still prevent other new inbox
+method calls before deinitialization.
+
+Delivery is best-effort and non-durable. `Node` never automatically relays a
+received application message. The application must authenticate, validate,
+deduplicate as its domain requires, explicitly republish an accepted payload,
+and retry while it remains useful. Consequently an invalid peer payload has
+no generic Node-level amplification path, and an application that needs replay
+or history must own it above this seam.
 
 **Relay policy — as built** (`src/node/node.zig` `dispatch`, `onRecv`,
 `onPeerUp`, `resyncLoop`; this is normative for v1 and supersedes design
@@ -888,6 +937,10 @@ pending state below a newly published purge floor.
 - Zero-frame placeholder envelopes the engine emits as self-records are
   dropped at the single `Node.emitEnvelope` chokepoint. This is a protocol
   contract, not an optimization.
+- Inbound `appMessage` from a peer that negotiated feature bit 0 is offered
+  once to the bounded opt-in inbox; an unnegotiated arm is dropped. Neither is
+  fed to the Engine or automatically relayed. An explicit application publish
+  is a fresh opportunistic broadcast to every capable connected peer.
 - `ping` is answered with `pong` of the same payload; `pong` is ignored.
 
 ## 13. Persistence

@@ -32,17 +32,21 @@ driver's determinism (`docs/determinism.md`).
 ## 2. **No transport authentication in v1.**
 
 TCP in the clear. The `Hello` frame is unauthenticated: its `nodeId`,
-`currentSlot` and `listenPort` fields are advisory hints, and
+`currentSlot`, `listenPort`, and `featureFlags` fields are advisory hints, and
 `networkIdPrefix` (the first 8 bytes of the networkId) is a fast
 wrong-network disconnect, **not a secret and not authentication**
 (`schema/overlay.capnp`, protocol §12). Consequences:
 
 - Anyone who can reach the listen port can connect, claim any `nodeId` in
-  `Hello`, and send any frame.
+  `Hello`, advertise any feature bits, and send any negotiated frame.
+  An `appMessage` from a peer that omitted feature bit 0 is dropped, but an
+  attacker can simply advertise the bit; it is capability negotiation, not
+  authorization.
 - They cannot forge a statement (signatures, §1), but they can burn every
   per-peer budget in §3 and use the two unauthenticated answer paths
   (`getQset`, `getSlotState`) as amplification.
-- Traffic is readable on the wire: statement contents are not confidential.
+- Traffic is readable on the wire: statement and application-message contents
+  are not confidential.
 
 **Deployment guidance — treat the listen port as an internal service:**
 
@@ -62,7 +66,8 @@ heading so the warning cannot be edited away.
 
 ## 3. What a malicious peer can do
 
-Per-peer budgets, copied from `src/node/overlay.zig` (protocol §12):
+Per-peer budgets, copied from `src/node/overlay.zig` and `src/node/wire.zig`
+(protocol §12):
 
 | What the peer can burn | Bound |
 |---|---|
@@ -70,9 +75,12 @@ Per-peer budgets, copied from `src/node/overlay.zig` (protocol §12):
 | unanswered requests | `max_outstanding_requests = 64` |
 | strikes before disconnect | `max_budget_strikes = 32` |
 | concurrent inbound connections (all peers together) | `max_inbound_conns = 128`; over-cap accepts are closed before any allocation |
-| our write queue toward a peer that stops reading | `max_write_queue_items = 1024` / `max_write_queue_bytes = 16 MiB`; overflow ⇒ disconnect |
+| our aggregate write queue toward a peer that stops reading | `max_write_queue_items = 1024` / `max_write_queue_bytes = 16 MiB`; ordinary overflow ⇒ disconnect |
+| application subset of that write queue | `max_app_write_queue_items = 256` / `max_app_write_queue_bytes = 1 MiB`; app pressure drops only that frame |
+| aggregate capacity unavailable to application frames | `reserved_write_queue_items = 256` / `reserved_write_queue_bytes = 4 MiB` for ordinary/consensus traffic |
 | a connection that never sends `Hello` | `handshake_timeout_s` = 10 s absolute deadline on the read operation |
 | frame size | `max_frame_bytes = 1 MiB`; larger ⇒ framing error ⇒ disconnect |
+| one decoded application message | `max_app_message_bytes = 64 KiB`; larger ⇒ codec rejection |
 
 After transport decoding, the native Engine-input queue is independently
 bounded to 1,024 items / 16 MiB. Network work is capped at 960 items / 15 MiB,
@@ -90,11 +98,38 @@ before any own statement is restored or network input is accepted. Own-log
 records below it are skipped, so an uncompacted disk tail cannot consume the
 Engine slot budget with retired history.
 
+The separate application-message inbox is lazy and global, not one allocation
+per connection. Until the application first calls `waitAppMessage`, received
+payloads are dropped without retaining bytes or hashes. Afterwards it owns at
+most 1,024 messages / 16 MiB, drops newcomers on cap or allocation pressure,
+and deduplicates payload digests by SHA-256 only while one copy remains queued.
+`Node.appMessageStats()` exposes receiving state, queue use, drops, and
+queue-resident duplicates. Taking a message removes that digest, deliberately
+allowing the same bytes to arrive again for application-controlled retry.
+FIFO churn does not shift the live queue on every delivery: a head index and
+amortized compaction cap physical item storage at 2,048 entries. Shutdown
+closes waiter admission and drains admitted waiters before freeing the inbox.
+
+Outbound application traffic is opportunistic on every connection. Its
+256-item / 1 MiB subset and the 256-item / 4 MiB ordinary reserve sit inside,
+not in addition to, the unchanged 1,024-item / 16 MiB aggregate writer cap.
+Application pressure drops the app frame without closing the socket; it
+cannot consume the reserve, and app enqueue itself never takes the ordinary
+overflow-disconnect path. The shared FIFO still gives already-queued app bytes
+a bounded position ahead of later consensus output.
+
 **Amplification surfaces.** `getQset` (answered with one cached qset frame,
 bounded by depth ≤ 4 / ≤ 255 validators) and `getSlotState` (answered with at
 most 64 of *our own* envelopes). Both are **per-request fan-out only**:
 requests are never relayed, so one request yields at most one reply from the
 node it was sent to. `dontHave` is ignored by the receiver (as built).
+
+Opaque `appMessage` frames have no SLCP signature or built-in authorization.
+The generic Node only queues them and **never auto-relays receipt**, so hostile
+bytes do not gain a library-level flood path. An application that explicitly
+republishes becomes responsible for first checking its canonical form,
+network binding, signature or other authentication, replay rules, and local
+capacity. Invalid or rejected input must stop at that boundary.
 
 **Parking caps** (`src/engine/limits.zig`, `src/engine/pending.zig`): an
 envelope citing an unknown qset hash parks until the qset arrives —

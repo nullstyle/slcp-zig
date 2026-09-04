@@ -103,7 +103,7 @@ checklist.
 interface hides the engine pump, TCP overlay, timer wheel, consensus-log
 persistence, the bounded best-effort quorum-set answering cache, restart
 recovery, input serialization, slot-ordered delivery, and the bounded
-Engine-ingress and future-slot hold queues.
+Engine-ingress, future-slot hold, and application-message queues.
 
 One engine thread owns all engine state. Overlay readers, timers, and
 application callers enqueue inputs; they do not call the engine directly.
@@ -130,6 +130,26 @@ establishes that a later slot is already decided. Statements beyond the
 window or its item/byte caps are dropped for later resynchronization. This
 ordering protects state-dependent validation from caching an out-of-date
 verdict for a slot that still needs the node's vote.
+
+Opaque application messages stay outside the Engine and its signed consensus
+schema. The Experimental `Node.publishAppMessage`, `waitAppMessage`, and
+`appMessageStats` seam is a best-effort native-host facility: an appended
+Hello capability bit prevents sending its appended frame arm to older peers,
+while an inbound app frame without that negotiated bit is dropped. The first
+wait lazily opts the process into payload retention. The inbox accepts payloads
+through 64 KiB and is bounded to 1,024 items / 16 MiB, with SHA-256 payload
+deduplication only while a copy remains queued. On each connection, app frames
+may occupy at most 256 writer items / 1 MiB inside the unchanged 1,024-item /
+16 MiB aggregate, while 256 items / 4 MiB remain reserved for ordinary and
+consensus traffic. App pressure drops only the opportunistic frame instead of
+disconnecting the peer. The writer reserve preserves explicit consensus
+headroom; it does not reorder already-queued application frames ahead of
+consensus output. Inbox removal is amortized O(1), and shutdown closes waiter
+admission before draining every admitted waiter. This is not a durable message
+log. Receipt never implies relay; an application must authenticate and validate
+a payload, then explicitly publish accepted bytes and retry them according to
+its own policy. This keeps untrusted overlay input from acquiring a generic
+amplification path inside `Node` or consuming the writer's consensus reserve.
 
 ### Typed application module
 
@@ -195,9 +215,9 @@ Changes should preserve these system-level invariants:
 5. **Apply before next-slot validation.** Normal host delivery keeps
    state-dependent validation from judging a live slot against stale state.
 6. **Bound adversary-controlled retention.** Frames, input and effect queues,
-   held statements, pending envelopes, stored statements, quorum sets, slots,
-   value caches, and managed quorum-set files all have explicit memory or disk
-   limits and defined overflow behavior.
+   application messages, held statements, pending envelopes, stored
+   statements, quorum sets, slots, value caches, and managed quorum-set files
+   all have explicit memory or disk limits and defined overflow behavior.
 7. **Consensus-critical failure becomes silence.** Consensus-log write
    failure, driver fault, or a sticky engine failure makes the node inert
    instead of continuing with ambiguous state. An answering-cache failure is
@@ -258,6 +278,9 @@ Envelope signatures authenticate statements, not connections. `Hello` fields
 are hints, and transport is plaintext. A deployment must place the listener on
 a private or authenticated network such as WireGuard and restrict peer access.
 See [`docs/threat-model.md`](docs/threat-model.md) before exposing a node.
+Opaque application messages have no library-level signature or authorization;
+the receiving application owns that trust boundary and must not republish a
+message merely because it arrived from an overlay peer.
 
 One signing identity must correspond to one live validator. The data-directory
 lock prevents duplicate use of one directory, but no local mechanism can stop

@@ -1,13 +1,14 @@
 # registry — signed transactions, transaction sets and a header chain on slcp
 
-The second example, and the first step of the examples roadmap (E1): a
-**replicated name registry** with the shape of stellar-core and none of the
-money. Principals hold Ed25519 keys and sign transactions that carry a
-per-account sequence number; each slot's value is a **transaction set**; a
-node applies the agreed set to a bounded, sorted state and advances a ledger
-**header hash chain**; the state is snapshotted after every slot; a
-localhost **RPC** takes transactions from a small CLI. Three nodes, three
-processes, one binary.
+The second example, now covering E1 plus the E2a transaction-flooding slice of
+the examples roadmap: a **replicated name registry** with the shape of
+stellar-core and none of the money. Principals hold Ed25519 keys and sign
+transactions that carry a per-account sequence number; accepted transactions
+flood between validators before nomination; each slot's value is a
+**transaction set**; a node applies the agreed set to a bounded, sorted state
+and advances a ledger **header hash chain**; the state is snapshotted after
+every slot; a localhost **RPC** takes transactions from a small CLI. Three
+nodes, three processes, one binary.
 
 Where `examples/counter` is the 40-line program, this one is four files:
 
@@ -15,11 +16,11 @@ Where `examples/counter` is the 40-line program, this one is four files:
 |---|---|
 | `src/registry.zig` | the pure state machine — transactions, sets, `validate` / `combine` / `apply`, the header chain, the snapshot format; standard library only, no I/O |
 | `src/app.zig` | the `slcp.AppNode` adapter (custom codec, in-place `apply`, `initialState` + `initialSlot` from a snapshot) and a live 2-of-2 test |
-| `src/rpc.zig` | the RPC: a line protocol on 127.0.0.1 (`head`, `get`, `account`, `submit`) and its client |
-| `src/main.zig` | the process: `registry node …` and the client verbs `submit`, `get`, `account`, `head` |
+| `src/rpc.zig` | the shared RPC/gossip transaction-admission boundary, a line protocol on 127.0.0.1 (`head`, `get`, `account`, `submit`), and its client |
+| `src/main.zig` | the process, bounded gossip drain/reflood loop, and the client verbs `submit`, `get`, `account`, `head` |
 
-Everything the node agrees on is deterministic and bounded; the limits are
-printed at startup:
+Everything the node agrees on is deterministic and bounded. Domain and cadence
+limits are printed at startup; the transport/gossip bounds are fixed in code:
 
 | Limit | Value |
 |---|---|
@@ -27,6 +28,9 @@ printed at startup:
 | accounts / names | 64 / 128 (bounded plain-data state, about 20 KB) |
 | name / value | `[a-z0-9-]`, 1..32 bytes / any bytes, 0..64 |
 | pending queue | 256 |
+| application-message payload / inbox | 64 KiB / 1024 messages or 16 MiB (lazy opt-in, best effort) |
+| outbound application writer per peer | 256 messages or 1 MiB; 256 items / 4 MiB of the unchanged aggregate stay reserved for ordinary traffic |
+| gossip work | immediate flood on acceptance, 1 s reflood while pending, at most 64 receives per main-loop tick |
 | cadence | busy slots ≥ 1 s apart (`--min-slot-ms`); idle heartbeat every 3 s (`--heartbeat-ms`) |
 
 ## How it works
@@ -87,14 +91,16 @@ archives) closes. A node stopped before its first applied slot restarts
 from genesis and is fine; a data dir whose journal was compacted but whose
 snapshot is missing is refused (the missing slots cannot be rebuilt).
 
-**Cadence.** After each applied slot a node proposes exactly once for the
-next: right away when it has pending transactions (after `--min-slot-ms`),
-otherwise at the idle heartbeat. There is no transaction flooding in E1, so
-a transaction submitted to one node lands in the first slot whose round-1
-leader is that node — about three heartbeats on average, sometimes ten.
-E2's flooding removes the wait; until then, lower `--heartbeat-ms` if you
-want latency and raise it if you want a longer answering window (it is 16
-heartbeats of idle time).
+**Cadence and flooding.** After each applied slot a node proposes exactly once
+for the next: right away when it has pending transactions (after
+`--min-slot-ms`), otherwise at the idle heartbeat. A transaction accepted from
+RPC or gossip is immediately published to every capable connected peer. Each
+peer runs the same canonical/signature/sequence/cap admission before adding it
+to its pending queue and explicitly publishing it onward; rejected bytes are
+never amplified. Pending transactions are reflooded every second until pruned
+after application or supersession. The transport is best-effort and
+non-durable, but once the transaction has reached a live validator it can be
+proposed in the next eligible slot even if the submission node then dies.
 
 **RPC.** One request line, one response line, on 127.0.0.1 only:
 
@@ -105,9 +111,12 @@ account <hex64>     → account key=<hex64> seq=<n> next=<n>
 submit <hex470>     → ok txid=<hex64>   |   err <code> <text>
 ```
 
-`submit` decodes, verifies the signature, requires `seq == next`, refuses
-duplicates and a full queue (`bad_request`, `bad_tx`, `bad_sig`, `bad_seq`,
-`queue_full`, `duplicate`). The CLI's `submit` verb does the whole dance:
+`submit` decodes the exact canonical 235-byte transaction, verifies its
+network-bound signature, requires `seq == next`, and refuses duplicates or a
+full queue (`bad_request`, `bad_tx`, `bad_sig`, `bad_seq`, `queue_full`,
+`duplicate`). Gossip input uses that same admission function. Acceptance adds
+the transaction locally and immediately floods the canonical bytes after the
+shared-state lock is released. The CLI's `submit` verb does the whole dance:
 it asks the node for `head` (the network id) and `account` (the next seq),
 builds and signs the transaction with your key file, and sends it.
 
@@ -202,8 +211,9 @@ mesh — see *Security*). On every box:
    entry name=alice owner=ec18c4a9102f6f4c6b4ede60df68bc8193f3410752cbbf5cc8980e5a02b373ba value=
    ```
 
-   `ok` means *queued*; the entry appears a few slots later, on every node.
-   Then `set alice hello` (values are shown as hex: `value=68656c6c6f`),
+   `ok` means *queued and flooded*; under a connected healthy quorum the
+   entry appears in the next eligible slot on every node. Then `set alice
+   hello` (values are shown as hex: `value=68656c6c6f`),
    `transfer alice <bob's public key>`, `release alice`. A second `claim
    alice` from another key is accepted at submit, applied with the result
    `name_taken`, and consumes that account's sequence number — exactly like
@@ -224,19 +234,21 @@ mesh — see *Security*). On every box:
 
    It came back from its snapshot, was handed the slots it missed by its
    peers, and prints the same heads as the others. It also votes again: a
-   transaction submitted to the restarted node lands like any other. Stay
+   transaction submitted to the restarted node floods to the other validators
+   and lands in the next eligible slot like any other. Stay
    away longer than 16 slots (48 s of idle heartbeats, or 16 busy slots)
    and it exits with code 3 instead — see *Limits*.
 
-## Limits — what E1 does not do
+## Limits — what E2a still does not do
 
-These are the gaps this step records for E2
-(`docs/examples-roadmap.md`, "Gaps recorded by E1");
-each one is deliberate:
+Transaction flooding closes one gap recorded by E1. These remaining limits
+are deliberate:
 
-- **No transaction flooding.** A transaction is known only to the node it
-  was submitted to until that node leads a nomination round. Latency is a
-  few heartbeats; a node that is down takes its queue with it (resubmit).
+- **Flooding is best-effort, not history.** Pending queues and the generic
+  Node inbox are memory-only. Immediate publication plus a 1 s reflood heals
+  ordinary loss and reconnects; once another validator admits a transaction,
+  loss of the submission node does not lose it. If the source dies before any
+  peer admits the bytes, or every holder restarts before application, resubmit.
 - **No history.** A node that misses more than the answering window (16
   slots) cannot rebuild its state: it exits with code 3 when the library
   hands it a slot past the gap, or, more than ~80 slots behind, it waits
@@ -249,7 +261,7 @@ each one is deliberate:
   cannot read a file, which is why the state is plain data and the snapshot
   is loaded through a global before the node starts.
 - **No close time, no upgrades, no quotas, no watcher nodes, no HTTP.**
-  E2 and E3.
+  The remainder of E2 and E3.
 
 ## Security
 
@@ -265,17 +277,35 @@ stalled node. A second node on a busy RPC port is refused at start. Keep
 client key files 0600; the registry never reads them — only
 `registry submit` does, on the client's machine.
 
+Application-message frames are also unauthenticated opaque bytes. The generic
+Node drops an app frame when its sender did not negotiate feature bit 0, caps
+each payload at 64 KiB, retains none until the registry opts in, bounds the
+active inbox to 1,024 items / 16 MiB, and never auto-relays receipt. Outbound
+app frames may use at most 256 writer items / 1 MiB per peer and cannot consume
+the 256-item / 4 MiB ordinary reserve; app pressure drops that frame without
+disconnecting the peer. The registry drains at most 64 messages per main-loop
+tick and routes each through the same exact canonical decoding,
+network-signature verification, next-seq, duplicate, and 256-pending checks as
+RPC. Only accepted canonical bytes are explicitly flooded and reflooded. A
+reachable attacker can still consume the transport budgets and force bounded
+parse/signature work, which is another reason the listen port remains an
+internal service.
+
 ## The loopback smoke (what CI runs)
 
-`zig build registry-smoke` from the repository root does the whole
-procedure on one machine: one nested consumer build of this directory
-(ReleaseSafe), three node keys and two client keys, a 2-of-3 `quorum.json`,
-three nodes on ports 47411–47413 (RPC 47421–47423), then the acceptance
-script — alice claims `alice`, bob's conflicting claim is applied as
-`name_taken`, `set`, a second name, `transfer`, identical heads on all three
-nodes, node2 `SIGKILL`ed and restarted from its snapshot and journal,
-catching up to the same head, and a `release` submitted to the restarted
-node applied everywhere. Evidence line on stdout:
+`zig build registry-smoke` from the repository root does the whole procedure
+on one machine: one nested consumer build of this directory (ReleaseSafe),
+three node keys and two client keys, a 2-of-3 `quorum.json`, and three nodes on
+ports 47411–47413 (RPC 47421–47423). The overlay is a deliberate line,
+node2→node1→node0, and node2's nomination cadence is disabled. After the
+ordinary claim/conflict/set/transfer and same-head checks, one transaction is
+submitted only to node2. The harness first requires `pending=1` at node1 and
+node0 while both remain at the same slot S, proving one-hop and two-hop
+application flooding before consensus can hide it. It then `SIGKILL`s node2
+and requires both survivors' own slot lines to report `slot S+1: txs=1`.
+Node2 restarts from its snapshot and journal, catches up, and a final release
+submitted only through that nomination-disabled node lands everywhere by
+flooding. Evidence line on stdout:
 
 ```
 [registry-smoke] nodes=3 txs=7 slots=N head=<hex16>

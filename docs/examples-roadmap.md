@@ -4,8 +4,9 @@ This track grows one non-financial application toward the architectural
 complexity of Stellar Core. It is a direction-setting document, not a promise
 that a future Stable interface already exists.
 
-**Status as of 2026-09-03:** E1 is implemented and included in the v0.2.0
-release candidate; E2 and E3 are designs only.
+**Status as of 2026-09-03:** E1 and the E2a transaction-flooding slice are
+implemented. History/checkpoint catch-up, heap state, close time, and E3
+remain designs only.
 
 ## Direction
 
@@ -17,7 +18,8 @@ assets, fees, or smart contracts.
 | Step | Application capability | Library pressure it exposes |
 |---|---|---|
 | E1: registry | Signed transactions, sequence numbers, transaction-set consensus values, header hash chain, snapshots, local RPC and CLI | Records limitations without changing the library interface. |
-| E2: history and flooding | Transaction gossip, heap state, checkpoints, catch-up, close time | App-message transport, configurable history, external snapshot start, and a heap-state application path. |
+| E2a: transaction flooding | Authenticated registry transactions propagate before nomination and survive loss of their submission node once another validator has admitted them | Experimental app-message transport with bounded opt-in retention and application-owned trust, relay, and retry policy. |
+| E2 remainder: history and state | Heap state, checkpoints, catch-up, close time | Configurable history, external snapshot start, and a heap-state application path. |
 | E3: upgrades and operations | Voted upgrades, quotas, atomic operation sets, invariants, close metadata, watchers, HTTP | Richer typed-driver hooks, watcher delivery, and operational statistics. |
 
 ## E1 — Registry (implemented)
@@ -50,9 +52,10 @@ semantics while keeping transport and operational complexity understandable.
    parameter. A large ledger needs heap-owned state and durable loading.
 2. Recent-slot answering is bounded and not configurable. A node outside the
    retained window needs verified history catch-up rather than a gap jump.
-3. The overlay carries consensus traffic but no application messages. A
-   transaction submitted to one node waits for that node to influence a
-   nomination.
+3. The original overlay carried consensus traffic but no application
+   messages, so a transaction waited for its submission node to influence a
+   nomination. E2a resolves this gap for the registry with bounded,
+   best-effort transaction flooding.
 4. Typed validation does not receive the slot number. Close-time policy would
    need it, or would need to use the raw driver.
 5. Catch-up and missing-quorum stalls need richer operator visibility.
@@ -62,22 +65,58 @@ Historical acceptance evidence for E1 is recorded in
 [`README.md`](../examples/registry/README.md). Current-worktree verification
 is recorded separately in [`STATUS.md`](../STATUS.md).
 
-## E2 — History and flooding (planned)
+## E2a — Transaction flooding (implemented)
 
-E2 extends the same application with:
+E2a adds an append-only overlay capability without changing the signed
+consensus schema: Hello `featureFlags` bit 0 advertises support and Frame arm
+10 carries an opaque application message. The Experimental native Node seam
+is `publishAppMessage`, `waitAppMessage`, and `appMessageStats`. Reception is
+lazy opt-in; an app frame from a peer that did not advertise bit 0 is dropped;
+each payload is capped at 64 KiB; and the FIFO is bounded to 1,024 items /
+16 MiB. SHA-256 deduplication lasts only while a copy remains queued. Per
+connection, outbound app traffic has a 256-item / 1 MiB subset of the unchanged
+1,024-item / 16 MiB writer queue and cannot consume its 256-item / 4 MiB
+ordinary reserve; app pressure drops the app frame without disconnecting the
+peer. The transport is best-effort and non-durable; generic Node receipt never
+implies relay. Applications authenticate and validate input before explicitly
+republishing it and own any retry or history policy.
 
-- transaction flooding so every validator can propose the transactions it
-  knows;
+The registry routes RPC and gossip bytes through one admission boundary:
+exact 235-byte canonical encoding, signature for this registry network,
+next sequence number, duplicate rejection, and the 256-item pending cap.
+Acceptance triggers an immediate flood outside the shared-state lock. Every
+node that admits the transaction does the same, forming application-controlled
+multi-hop flooding, and pending transactions are reflooded every second until
+application removes them. The main loop drains at most 64 owned gossip
+messages per tick so peer traffic cannot monopolize application progress.
+
+The E2a smoke witness uses a three-node line and a nomination-disabled source.
+It observes the one submitted transaction in both survivors' pending queues
+while all heads are still at slot S, kills the only submission node, and then
+requires both survivors to externalize exactly one transaction in S+1. Thus a
+transaction reaches the next eligible slot and survives submitting-node death
+once it has propagated. It does not promise delivery when the source dies
+before any peer admits the message, nor does it provide durable replay.
+
+## E2 — History and flooding (partially implemented)
+
+E2a delivers transaction flooding. The remaining E2 work extends the same
+application with:
+
 - heap-sized account and name state;
 - checkpointed history containing headers, transaction sets, and snapshots;
 - verified catch-up from an archive after a node falls outside recent history;
 - close time in the consensus value, with deterministic combination and a
   carefully defined local-clock policy.
 
-Likely library work, each requiring separate interface and compatibility
+Delivered library work:
+
+- the budgeted Experimental application-message frame and
+  broadcast/receive/statistics seam described above.
+
+Remaining library work, each requiring separate interface and compatibility
 review:
 
-- a budgeted application-message overlay frame and broadcast/receive seam;
 - configurable answering history;
 - a verified external-snapshot starting point;
 - either a heap-aware typed application interface or a first-class raw-driver
@@ -85,9 +124,9 @@ review:
 - opt-in slot context for typed validation;
 - explicit visibility into dropped far-ahead statements and peer state.
 
-Acceptance target: a node absent for 200 slots rebuilds from a checkpoint and
-rejoins voting; all nodes reach the same head; a transaction submitted to any
-node lands in the next slot; the E1 smoke remains green.
+Remaining acceptance target: a node absent for 200 slots rebuilds from a
+checkpoint and rejoins voting; all nodes reach the same head; the E1 and E2a
+smoke behavior remains green.
 
 ## E3 — Upgrades and operations (planned)
 
