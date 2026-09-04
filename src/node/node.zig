@@ -47,10 +47,13 @@ test {
 const log = std.log.scoped(.slcp_node);
 
 const default_answering_window_slots: u8 = 16;
-const max_answering_window_slots: u8 = @intCast(@min(
-    (core.limits.Limits{}).max_live_slots,
-    wire.max_slot_state_envelopes,
-) - 1);
+const max_answering_window_slots: u8 = 62;
+comptime {
+    if (@as(u32, max_answering_window_slots) + 2 > (core.limits.Limits{}).max_live_slots)
+        @compileError("answering-window maximum must leave Engine slots for current work and catch-up progress");
+    if (@as(usize, max_answering_window_slots) + 2 > wire.max_slot_state_envelopes)
+        @compileError("answering-window maximum plus current and catch-up work must fit one slotState response");
+}
 
 /// One validated startup policy owns every past-window calculation. Keeping
 /// this separate from `HoldBuffer.window` is intentional: that fixed bound
@@ -88,9 +91,9 @@ test "answering policy: floor and gap boundary follow the configured window with
 
     const max = AnsweringPolicy{ .slots = max_answering_window_slots };
     try std.testing.expectEqual(@as(u64, 1), max.floor(max_answering_window_slots));
-    try std.testing.expect(!max.gapExhausted(100, 162));
-    try std.testing.expect(max.gapExhausted(100, 163));
-    try std.testing.expect(max.gapExhausted(std.math.maxInt(u64) - 63, std.math.maxInt(u64)));
+    try std.testing.expect(!max.gapExhausted(100, 161));
+    try std.testing.expect(max.gapExhausted(100, 162));
+    try std.testing.expect(max.gapExhausted(std.math.maxInt(u64) - 62, std.math.maxInt(u64)));
 }
 
 /// Anti-entropy period (§9.2 host policy; see the resync_thread field).
@@ -175,7 +178,7 @@ fn explainCreateError(err: CreateError) []const u8 {
         error.KeyFileIoFailed => ".key_file could not be read or created (I/O error); check the path and the filesystem.",
         error.KeyFileTooPermissive => ".key_file is readable by group or other (mode 0644, say) but the seed must be owner-only like ssh keys; run `chmod 600 <file>` and start again.",
         error.MaxValueBytesOutOfRange => ".max_value_bytes is outside [1, 65536]; pick the largest value your app will ever propose.",
-        error.AnsweringWindowSlotsOutOfRange => ".answering_window_slots is outside [1, 63]; use the default 16 or choose a bounded recent-slot catch-up horizon.",
+        error.AnsweringWindowSlotsOutOfRange => ".answering_window_slots is outside [1, 62]; use the default 16 or choose a bounded recent-slot catch-up horizon.",
         error.StartSlotZero => ".start_slot is 0 but slots start at 1; drop it (default 1).",
         error.StartSlotBehindJournal => ".start_slot is at or below the journal high-water mark in .data_dir; drop it (the node resumes after the journal) or use a fresh data_dir.",
         error.BadPeerSpec => "a .peers entry is not host:port (IPv4/IPv6 literal or hostname, port 1..65535).",
@@ -352,7 +355,7 @@ pub const Options = struct {
     /// Largest value `propose` accepts; [1, 65536].
     max_value_bytes: u32 = 4096,
     /// Recently delivered slots retained for native peer answering and
-    /// bounded catch-up. Valid range: 1..63. This is not archival history.
+    /// bounded catch-up. Valid range: 1..62. This is not archival history.
     answering_window_slots: u8 = default_answering_window_slots,
     /// First slot to nominate proposals for (default 1). Must be above the
     /// journal high-water mark of an existing data_dir.
@@ -417,8 +420,9 @@ pub const StorageStats = struct {
 /// Local facts about bounded native peer catch-up. Experimental: this is an
 /// operational snapshot, not a network-freshness oracle or history archive.
 /// Gauges are coherent at one completed Engine input/effect boundary;
-/// counters are monotonic and saturating for the Node lifetime.
+/// counters accumulate for the Node lifetime, and gap totals saturate.
 pub const CatchupStats = struct {
+    /// Configured local horizon, fixed for this Node lifetime.
     answering_window_slots: u8,
     /// Slot immediately before the next ordered application delivery. Before
     /// the first delivery this is `start_slot - 1`.
@@ -428,16 +432,21 @@ pub const CatchupStats = struct {
     answerable_slots: usize,
     oldest_answerable_slot: ?u64,
     newest_answerable_slot: ?u64,
+    /// First slot still admitted by the native host and Engine. This can be
+    /// newer than `oldest_answerable_slot` after journal recovery.
     purge_floor: u64,
+    /// Current bounded work awaiting a safe Engine/delivery turn.
     held_statements: usize,
     pending_externalizations: usize,
     pending_lowest_slot: ?u64,
     pending_highest_slot: ?u64,
+    /// Cumulative hold-gate outcomes for this Node lifetime.
     released_at_frontier_statements: u64,
     released_early_statements: u64,
     dropped_far_statements: u64,
     dropped_full_statements: u64,
     dropped_behind_statements: u64,
+    /// Cumulative local answering-horizon abandonments. Both totals saturate.
     gap_jumps: u64,
     gap_slots_skipped: u64,
 };
@@ -1317,7 +1326,7 @@ pub const Node = struct {
         // Validate the answering policy before identity loading or any
         // filesystem, listener, or thread side effect.
         if (opts.answering_window_slots < 1 or opts.answering_window_slots > max_answering_window_slots) {
-            return fail(diag, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots {d} is outside [1, 63]; use the default 16 or choose at most 63 so the bounded Engine retains room for current consensus work.", .{opts.answering_window_slots});
+            return fail(diag, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots {d} is outside [1, 62]; use the default 16 or choose at most 62 so the bounded Engine retains room for current consensus and catch-up progress.", .{opts.answering_window_slots});
         }
 
         // ---- identity ----
@@ -2575,10 +2584,11 @@ pub const Node = struct {
         }
         gop.value_ptr.* = copy;
 
-        // Gap-jump on UNANSWERABILITY: once any buffered slot sits a full
-        // answering window past the frontier, the gap slot is older than the
-        // configured local horizon. Peers may retain different horizons, so
-        // this is bounded local policy rather than a claim about the network.
+        // Gap-jump on LOCAL HORIZON EXHAUSTION: once any buffered slot sits
+        // a full answering window past the frontier, the gap slot is older
+        // than the configured local horizon. Peers may retain different
+        // horizons, so this is bounded local policy rather than a claim about
+        // the network.
         // (A count threshold is unreachable: peers can supply at most one
         // answering window of old slots — review finding.)
         var highest: u64 = 0;
@@ -3993,7 +4003,7 @@ test "recovery predecessor merges an external checkpoint with the durable journa
 // A normal compaction at frontier 64 leaves slots 49..64, after which a
 // crash just before frontier 128 can leave slots 49..127 in both logs. The
 // restart must derive both floors from the durable high-water mark before
-// restoring own.log. This maximum-window case keeps the newest 63 historical
+// restoring own.log. This maximum-window case keeps the newest 62 historical
 // slots while inbound traffic through the journal HWM is already closed.
 // Without the bounded answer floor, the oldest 64 slots fill the Engine and
 // slot 128 cannot be nominated; without the stronger admission floor, stale
@@ -4009,19 +4019,20 @@ test "restart recovery separates the closed admission floor from the retained ow
     const passphrase = "restart purge-floor recovery v1";
     const seed: [32]u8 = @splat(0x43);
     const peer_seed: [32]u8 = @splat(0x77);
+    const peer_b_seed: [32]u8 = @splat(0x78);
     const me = try crypto.publicKeyFromSeed(seed);
     const peer_a = try crypto.publicKeyFromSeed(peer_seed);
-    const peer_b: [32]u8 = @splat(0x78);
+    const peer_b = try crypto.publicKeyFromSeed(peer_b_seed);
     const network_id = crypto.networkIdFromPassphrase(passphrase);
-    const answering_window_slots: u8 = 63;
+    const answering_window_slots: u8 = max_answering_window_slots;
 
     // This is exactly the record range left by the 64-slot compaction cadence
-    // immediately before its next boundary: 63 retained slots plus 63 newer
+    // immediately before its next boundary: 62 retained slots plus 63 newer
     // ones. Keep one latest own EXTERNALIZE per slot.
     {
         var st = try store_mod.Store.open(gpa, io, data_dir);
         defer st.deinit();
-        var slot: u64 = 2;
+        var slot: u64 = 3;
         while (slot <= 127) : (slot += 1) {
             var value_buf: [16]u8 = undefined;
             const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{slot});
@@ -4050,8 +4061,8 @@ test "restart recovery separates the closed admission floor from the retained ow
     try std.testing.expectEqual(@as(u64, 128), n.purge_floor.load(.acquire));
     try std.testing.expectEqual(@as(usize, answering_window_slots), n.stats().live_slots);
     const recovered_catchup = n.catchupStats();
-    try std.testing.expectEqual(@as(usize, 63), recovered_catchup.answerable_slots);
-    try std.testing.expectEqual(@as(?u64, 65), recovered_catchup.oldest_answerable_slot);
+    try std.testing.expectEqual(@as(usize, 62), recovered_catchup.answerable_slots);
+    try std.testing.expectEqual(@as(?u64, 66), recovered_catchup.oldest_answerable_slot);
     try std.testing.expectEqual(@as(?u64, 127), recovered_catchup.newest_answerable_slot);
     {
         n.own_mu.lockUncancelable(io);
@@ -4078,9 +4089,25 @@ test "restart recovery separates the closed admission floor from the retained ow
     try n.propose("fresh-after-restart");
     try pollUntil(io, 2_000, n, struct {
         fn admitted(node: *Node) bool {
-            return node.stats().live_slots == 64; // 63 restored + current
+            return node.stats().live_slots == 63; // 62 restored + current
         }
     }.admitted);
+
+    // Catch-up needs one more transient Engine slot beyond the retained
+    // answers and ordinary current work. A v-blocking far-ahead decision must
+    // be able to open, externalize, and trigger the gap jump that purges old
+    // state; filling all 64 slots before it arrives deadlocks that recovery.
+    GateFixture.ownEngineThread(n);
+    const catchup_slot = n.next_deliver + answering_window_slots;
+    const ext_a = try buildSignedStatement(gpa, peer_seed, n.network_id, n.local_qset_hash, catchup_slot, .{ .externalize = "catchup" });
+    defer gpa.free(ext_a);
+    const ext_b = try buildSignedStatement(gpa, peer_b_seed, n.network_id, n.local_qset_hash, catchup_slot, .{ .externalize = "catchup" });
+    defer gpa.free(ext_b);
+    n.applyInput(try envelopeItem(gpa, ext_a));
+    n.applyInput(try envelopeItem(gpa, ext_b));
+    const progressed = n.catchupStats();
+    try std.testing.expectEqual(@as(u64, 1), progressed.gap_jumps);
+    try std.testing.expectEqual(catchup_slot, progressed.delivery_frontier);
 }
 
 // Enlarging the policy cannot recreate records compacted under a smaller

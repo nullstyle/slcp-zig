@@ -46,6 +46,19 @@ const InputItem = slcp.node.InputItem;
 
 const max_n = 7;
 const max_slot = 16;
+const default_answering_window_slots: u8 = 16;
+
+/// Mirrors node.zig's validated past-retention policy. This is deliberately
+/// separate from HoldBuffer's fixed 64-slot bound on future inbound work.
+const AnsweringPolicy = struct {
+    slots: u8 = default_answering_window_slots,
+
+    /// Subtract only after establishing the ordering so a frontier near
+    /// `maxInt(u64)` cannot overflow while checking the configured distance.
+    fn gapExhausted(self: AnsweringPolicy, next: u64, highest: u64) bool {
+        return highest >= next and highest - next >= self.slots;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Apps under test
@@ -178,6 +191,9 @@ fn Harness(comptime App: type) type {
         /// exactly as `Node.applyInput` does; false: fed straight to the
         /// engine (the pre-S8b node — the control).
         gate: bool = false,
+        /// Startup policy used by the Node-faithful delivery model. Tests may
+        /// select any production-valid value in 1..62 before driving traffic.
+        answering: AnsweringPolicy = .{},
 
         pub fn init(gpa: std.mem.Allocator, n: u8, threshold: u32) !*Self {
             const self = try gpa.create(Self);
@@ -367,7 +383,7 @@ fn Harness(comptime App: type) type {
 
         /// node.zig `onExternalized` + `drainDeliverable`: journal, buffer
         /// out-of-order externalizations, gap-jump once a buffered slot sits
-        /// a full answering window (16) past the frontier, then apply the
+        /// a full configured answering window past the frontier, then apply the
         /// contiguous frontier in slot order (exactly what AppNode's hook
         /// does at delivery: decode → App.apply → state).
         fn onExternalized(self: *Self, idx: u8, slot: u64, bytes: []const u8) !void {
@@ -384,8 +400,8 @@ fn Harness(comptime App: type) type {
                 highest = @max(highest, k.*);
                 lowest = @min(lowest, k.*);
             }
-            if (highest >= nd.next_deliver + 16 and lowest > nd.next_deliver) {
-                if (self.trace) std.debug.print("    node {d} externalized gap: slots {d}..{d} unrecoverable; resuming delivery at {d}\n", .{ idx, nd.next_deliver, lowest - 1, lowest });
+            if (nd.pending.count() > 0 and self.answering.gapExhausted(nd.next_deliver, highest) and lowest > nd.next_deliver) {
+                if (self.trace) std.debug.print("    node {d} externalized gap: slots {d}..{d} fell outside this model node's answering window; resuming delivery at {d}\n", .{ idx, nd.next_deliver, lowest - 1, lowest });
                 nd.next_deliver = lowest;
             }
             while (nd.pending.remove(nd.next_deliver)) {
@@ -687,6 +703,31 @@ fn Harness(comptime App: type) type {
             }
         }
     };
+}
+
+test "liveness model: configured answering window controls the gap-jump boundary without overflow" {
+    const H = Harness(Counter);
+    const gpa = std.testing.allocator;
+    const h = try H.init(gpa, 1, 1);
+    defer h.deinit();
+    try std.testing.expectEqual(@as(u8, 16), h.answering.slots);
+    h.answering.slots = 32;
+
+    var value_32_buf: [H.AN.codec.size]u8 = undefined;
+    const value_32 = H.AN.codec.encode(.{ .next = 32 }, &value_32_buf);
+    try h.onExternalized(0, 32, value_32);
+    try std.testing.expectEqual(@as(u64, 1), h.nodes[0].next_deliver);
+    try std.testing.expectEqual(@as(u64, 0), h.nodes[0].app.state.count);
+
+    var value_33_buf: [H.AN.codec.size]u8 = undefined;
+    const value_33 = H.AN.codec.encode(.{ .next = 33 }, &value_33_buf);
+    try h.onExternalized(0, 33, value_33);
+    try std.testing.expectEqual(@as(u64, 34), h.nodes[0].next_deliver);
+    try std.testing.expectEqual(@as(u64, 33), h.nodes[0].app.state.count);
+
+    const highest = std.math.maxInt(u64);
+    try std.testing.expect(!h.answering.gapExhausted(highest - 31, highest));
+    try std.testing.expect(h.answering.gapExhausted(highest - 32, highest));
 }
 
 // ---------------------------------------------------------------------------

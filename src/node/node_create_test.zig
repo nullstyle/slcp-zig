@@ -273,7 +273,7 @@ test "answering window: zero is rejected before the data directory is created" {
     try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window", .{}));
 }
 
-test "answering window: 64 is rejected before identity, data, or listener side effects" {
+test "answering window: 63 is rejected before identity, data, or listener side effects" {
     const io = testing.io;
     const net = std.Io.net;
     var g = try Golden.init();
@@ -292,16 +292,16 @@ test "answering window: 64 is rejected before identity, data, or listener side e
     var opts = g.options();
     opts.secret_seed = null;
     opts.key_file = try g.sub(&key_buf, "bad-answering-window.key");
-    opts.data_dir = try g.sub(&data_buf, "bad-answering-window-64");
+    opts.data_dir = try g.sub(&data_buf, "bad-answering-window-63");
     opts.listen_port = occupied_port;
-    opts.answering_window_slots = 64;
+    opts.answering_window_slots = 63;
 
-    try g.expectFail(opts, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots 64");
+    try g.expectFail(opts, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots 63");
     try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window.key", .{}));
-    try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window-64", .{}));
+    try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window-63", .{}));
 }
 
-test "answering window: boundary values 1 and 63 create and report exactly" {
+test "answering window: boundary values 1 and 62 create and report exactly" {
     const io = testing.io;
     var g = try Golden.init();
     defer g.deinit();
@@ -316,11 +316,11 @@ test "answering window: boundary values 1 and 63 create and report exactly" {
 
     var max_buf: [std.fs.max_path_bytes]u8 = undefined;
     var max_opts = g.options();
-    max_opts.data_dir = try g.sub(&max_buf, "answering-window-63");
-    max_opts.answering_window_slots = 63;
+    max_opts.data_dir = try g.sub(&max_buf, "answering-window-62");
+    max_opts.answering_window_slots = 62;
     const max = try Node.create(testing.allocator, io, max_opts);
     defer max.deinit();
-    try testing.expectEqual(@as(u8, 63), max.catchupStats().answering_window_slots);
+    try testing.expectEqual(@as(u8, 62), max.catchupStats().answering_window_slots);
 }
 
 // Non-vacuity: each bad spec exercises one `validatePeerSpec` arm — wiring

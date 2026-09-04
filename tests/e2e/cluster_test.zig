@@ -650,6 +650,8 @@ test "e2e: configured answering window recovers every recent slot without a gap-
     // active voting; replaying old decisions cannot manufacture this value.
     cl.killNode(0);
     const challenge = "\xffconfigured-window-node-3";
+    // The pre-challenge run reached slot 24; 32 copies outlast callbacks for
+    // that whole prior range and still leave the restarted node fresh fuel.
     for (0..32) |_| try cl.nodes[3].?.propose(challenge);
     for (0..32) |i| {
         var low_buf: [48]u8 = undefined;
@@ -679,7 +681,15 @@ test "e2e: configured answering window recovers every recent slot without a gap-
     }
     const proved_slot = challenge_slot orelse return error.ConfiguredWindowVoteTimeout;
     try assertAgreement(&cl, proved_slot);
+    {
+        var waited: u64 = 0;
+        while (cl.nodes[3].?.catchupStats().delivery_frontier < proved_slot) : (waited += 50) {
+            if (waited >= 10_000) return error.CatchupStatsTimeout;
+            sleepMs(io, 50);
+        }
+    }
     try std.testing.expectEqual(@as(u64, 0), cl.nodes[3].?.catchupStats().gap_jumps);
+    try std.testing.expectEqual(@as(u64, 0), cl.consumers[3].nonContiguousDeliveryCount());
 }
 
 // The S8 D1 shape over real sockets: two of four go down together mid-run
