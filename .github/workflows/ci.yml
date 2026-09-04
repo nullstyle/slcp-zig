@@ -155,8 +155,9 @@ jobs:
 
       # The recipe lists the hand-written trees explicitly (build.zig,
       # src/*.zig, src/cli, src/node, src/engine, src/wasm, sim, tests, tools,
-      # examples); src/gen is NOT covered because capnpc-zig's output is not
-      # fmt-clean (R10; see docs/upstream/06-check-api-cache-and-fmt-clean-gen.md).
+      # and the hand-written example roots); src/gen and ignored consumer
+      # dependency caches are NOT covered because generated dependency output
+      # is not fmt-clean (R10; see docs/upstream/06-check-api-cache-and-fmt-clean-gen.md).
       # docs-smoke (inside `test`) pins that every other src/<dir> is listed,
       # so a new hand-written directory cannot slip past this job unformatted.
       - name: Check formatting

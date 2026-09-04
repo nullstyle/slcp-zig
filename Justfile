@@ -91,19 +91,19 @@ docs-smoke:
 # M6 stage anchor (apisnap_ci): fmt / fmt-check / ci-lint / api-snapshot / check-api go here.
 
 # src/gen is deliberately NOT listed: capnpc-zig output is not fmt-clean (R10;
-# docs/upstream/06). `examples` covers examples/counter (build.zig + src) and
-# examples/bytes_node.zig — both are quoted verbatim by the README, so a
-# formatting drift there is a docs-smoke red too. `src/*.zig` is a glob over
-# top-level FILES, so every hand-written src/<dir> must be named here
-# explicitly — docs-smoke checks that each one is (only src/gen is exempt),
-# after src/cli shipped unformatted-checkable through S2–S7 (S8 finding 20).
+# docs/upstream/06). Examples are listed below by their hand-written roots so
+# a consumer build's ignored zig-pkg dependency cache is not traversed.
+# `src/*.zig` is a glob over top-level FILES, so every hand-written src/<dir>
+# must be named here explicitly — docs-smoke checks that each one is (only
+# src/gen is exempt), after src/cli shipped unformatted-checkable through
+# S2–S7 (S8 finding 20).
 # Format the hand-written trees.
 fmt:
-    zig fmt build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples
+    zig fmt build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
 
 # CI twin of `fmt`: same paths, --check.
 fmt-check:
-    zig fmt --check build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples
+    zig fmt --check build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
 
 # Lint the GitHub Actions workflows (brew install actionlint).
 ci-lint:
