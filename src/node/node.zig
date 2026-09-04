@@ -3993,11 +3993,11 @@ test "recovery predecessor merges an external checkpoint with the durable journa
 // A normal compaction at frontier 64 leaves slots 49..64, after which a
 // crash just before frontier 128 can leave slots 49..127 in both logs. The
 // restart must derive both floors from the durable high-water mark before
-// restoring own.log. The answer cache keeps the newest 16 historical slots,
-// while inbound traffic through the journal HWM is already closed. Without
-// the bounded answer floor, the oldest 64 slots fill the Engine and slot 128
-// cannot be nominated; without the stronger admission floor, stale peer
-// traffic can reactivate a slot the application has already applied.
+// restoring own.log. This maximum-window case keeps the newest 63 historical
+// slots while inbound traffic through the journal HWM is already closed.
+// Without the bounded answer floor, the oldest 64 slots fill the Engine and
+// slot 128 cannot be nominated; without the stronger admission floor, stale
+// peer traffic can reactivate a slot the application has already applied.
 test "restart recovery separates the closed admission floor from the retained own-log window" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4013,15 +4013,15 @@ test "restart recovery separates the closed admission floor from the retained ow
     const peer_a = try crypto.publicKeyFromSeed(peer_seed);
     const peer_b: [32]u8 = @splat(0x78);
     const network_id = crypto.networkIdFromPassphrase(passphrase);
-    const answering_window_slots: u8 = 32;
+    const answering_window_slots: u8 = 63;
 
     // This is exactly the record range left by the 64-slot compaction cadence
-    // immediately before its next boundary: 32 retained slots plus 63 newer
+    // immediately before its next boundary: 63 retained slots plus 63 newer
     // ones. Keep one latest own EXTERNALIZE per slot.
     {
         var st = try store_mod.Store.open(gpa, io, data_dir);
         defer st.deinit();
-        var slot: u64 = 33;
+        var slot: u64 = 2;
         while (slot <= 127) : (slot += 1) {
             var value_buf: [16]u8 = undefined;
             const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{slot});
@@ -4049,6 +4049,10 @@ test "restart recovery separates the closed admission floor from the retained ow
     try std.testing.expectEqual(expected_answer_floor, n.answer_floor);
     try std.testing.expectEqual(@as(u64, 128), n.purge_floor.load(.acquire));
     try std.testing.expectEqual(@as(usize, answering_window_slots), n.stats().live_slots);
+    const recovered_catchup = n.catchupStats();
+    try std.testing.expectEqual(@as(usize, 63), recovered_catchup.answerable_slots);
+    try std.testing.expectEqual(@as(?u64, 65), recovered_catchup.oldest_answerable_slot);
+    try std.testing.expectEqual(@as(?u64, 127), recovered_catchup.newest_answerable_slot);
     {
         n.own_mu.lockUncancelable(io);
         defer n.own_mu.unlock(io);
@@ -4074,9 +4078,56 @@ test "restart recovery separates the closed admission floor from the retained ow
     try n.propose("fresh-after-restart");
     try pollUntil(io, 2_000, n, struct {
         fn admitted(node: *Node) bool {
-            return node.stats().live_slots == 33; // 32 restored + current
+            return node.stats().live_slots == 64; // 63 restored + current
         }
     }.admitted);
+}
+
+// Enlarging the policy cannot recreate records compacted under a smaller
+// window. The public snapshot reports the real local coverage while the
+// configured horizon warms up, rather than presenting the target floor as
+// data the node can actually serve.
+test "catchup stats report actual retained coverage after widening a compacted data dir" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const passphrase = "answering-window warmup v1";
+    const seed: [32]u8 = @splat(0x49);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const network_id = crypto.networkIdFromPassphrase(passphrase);
+    {
+        var st = try store_mod.Store.open(gpa, io, data_dir);
+        defer st.deinit();
+        var slot: u64 = 17;
+        while (slot <= 32) : (slot += 1) {
+            var value_buf: [16]u8 = undefined;
+            const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{slot});
+            try st.appendExternalized(slot, value);
+            const env = try buildSignedExternalize(gpa, seed, network_id, slot, value);
+            try st.appendOwn(slot, env);
+            gpa.free(env);
+        }
+    }
+
+    const n = try Node.create(gpa, io, .{
+        .network = passphrase,
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .answering_window_slots = 32,
+    });
+    defer n.deinit();
+
+    const catchup = n.catchupStats();
+    try std.testing.expectEqual(@as(u8, 32), catchup.answering_window_slots);
+    try std.testing.expectEqual(@as(usize, 16), catchup.answerable_slots);
+    try std.testing.expectEqual(@as(?u64, 17), catchup.oldest_answerable_slot);
+    try std.testing.expectEqual(@as(?u64, 32), catchup.newest_answerable_slot);
 }
 
 // `start_slot` is another durable-frontier declaration: even without a
@@ -4303,7 +4354,7 @@ test "app messages: repeated publishes cross a real loopback connection as owned
 /// replay delivers 1..62 and sets next_deliver = 63), seed `pending_ext` with
 /// `seed_slots` (an out-of-order catch-up batch), drain ONCE, and report what
 /// externalized.log holds afterward.
-fn probeDrainCompaction(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, seed_slots: []const u64) !struct { records: usize, min_slot: u64, delivered: usize } {
+fn probeDrainCompaction(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, answering_window_slots: u8, seed_slots: []const u64) !struct { records: usize, min_slot: u64, delivered: usize } {
     const passphrase = "s8 compaction cadence probe";
     const seed: [32]u8 = @splat(0x51);
     const me = try crypto.publicKeyFromSeed(seed);
@@ -4327,6 +4378,7 @@ fn probeDrainCompaction(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8
         .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
         .listen_port = 0,
         .data_dir = data_dir,
+        .answering_window_slots = answering_window_slots,
         .diagnostic = &diag,
         .delivery = hook.hook(),
     });
@@ -4366,20 +4418,34 @@ test "compaction cadence: a drain that ends on 64 compacts, and so does a drain 
     const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
     var a_buf: [std.fs.max_path_bytes]u8 = undefined;
     var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var c_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var d_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_a = try std.fmt.bufPrint(&a_buf, "{s}/a", .{root});
     const dir_b = try std.fmt.bufPrint(&b_buf, "{s}/b", .{root});
+    const dir_c = try std.fmt.bufPrint(&c_buf, "{s}/c", .{root});
+    const dir_d = try std.fmt.bufPrint(&d_buf, "{s}/d", .{root});
 
     // Arm A: frontier 64 → compact(64 - 15 = 49): records 49..62 survive.
-    const a = try probeDrainCompaction(gpa, io, dir_a, &.{ 63, 64 });
+    const a = try probeDrainCompaction(gpa, io, dir_a, 16, &.{ 63, 64 });
     try std.testing.expectEqual(@as(usize, 64), a.delivered);
     try std.testing.expectEqual(@as(usize, 14), a.records);
     try std.testing.expectEqual(@as(u64, 49), a.min_slot);
     // Arm B: frontier 65 crossed the 64 boundary inside one drain →
     // compact(65 - 15 = 50): records 50..62 survive.
-    const b = try probeDrainCompaction(gpa, io, dir_b, &.{ 63, 64, 65 });
+    const b = try probeDrainCompaction(gpa, io, dir_b, 16, &.{ 63, 64, 65 });
     try std.testing.expectEqual(@as(usize, 65), b.delivered);
     try std.testing.expectEqual(@as(usize, 13), b.records);
     try std.testing.expectEqual(@as(u64, 50), b.min_slot);
+
+    // The cadence stays 64 under a wider policy; only the keep floor moves.
+    const c = try probeDrainCompaction(gpa, io, dir_c, 32, &.{ 63, 64 });
+    try std.testing.expectEqual(@as(usize, 64), c.delivered);
+    try std.testing.expectEqual(@as(usize, 30), c.records);
+    try std.testing.expectEqual(@as(u64, 33), c.min_slot);
+    const d = try probeDrainCompaction(gpa, io, dir_d, 32, &.{ 63, 64, 65 });
+    try std.testing.expectEqual(@as(usize, 65), d.delivered);
+    try std.testing.expectEqual(@as(usize, 29), d.records);
+    try std.testing.expectEqual(@as(u64, 34), d.min_slot);
 }
 
 // -- S8 D2: stats().failed reflects the node-level inert latch ------------------
