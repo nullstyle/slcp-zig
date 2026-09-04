@@ -92,7 +92,7 @@ fn hasCustomCodec(comptime App: type) bool {
 fn containsPointer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .pointer => true,
-        .optional => |o| if (o.child) |C| containsPointer(C) else false,
+        .optional => |o| containsPointer(o.child),
         .array => |a| containsPointer(a.child),
         .vector => |v| containsPointer(v.child),
         .@"struct" => |s| blk: {

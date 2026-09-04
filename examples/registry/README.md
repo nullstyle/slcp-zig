@@ -17,7 +17,7 @@ Where `examples/counter` is the 40-line program, this one is five files:
 | File | What |
 |---|---|
 | `src/registry.zig` | the pure state machine — transactions, sets, `validate` / `combine` / `apply`, the header chain, the snapshot format; standard library only, no I/O |
-| `src/app.zig` | the `slcp.AppNode` adapter (custom codec, in-place `apply`, and `initialState` / `initialSlot` / `initialCommand` from boot state) and a live 2-of-2 test |
+| `src/app.zig` | the `slcp.OwnedAppNode` adapter (custom codec, in-place `apply`, `initialSlot` / `initialCommand` from the loaded state, and the boot state passed to `create` as its context — no process global) and a live 2-of-2 test |
 | `src/rpc.zig` | the shared RPC/gossip transaction-admission boundary, a line protocol on 127.0.0.1 (`head`, `get`, `account`, `submit`), and its client |
 | `src/history.zig` | the quorum-authenticated replayable-history archive, ledger/tip-vote formats, trusted signing fence, and hostile-storage tests |
 | `src/main.zig` | the process, history replay/publication, bounded gossip drain/reflood loop, and the client verbs `submit`, `get`, `account`, `head` |

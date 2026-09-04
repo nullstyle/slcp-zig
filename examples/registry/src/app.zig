@@ -1,78 +1,110 @@
-//! app.zig — the `slcp.AppNode` adapter for the registry
-//! (docs/examples-roadmap.md E1–E2c).
+//! app.zig — the `slcp.OwnedAppNode` adapter for the registry
+//! (docs/examples-roadmap.md E1–E2d).
 //!
 //! The pure state machine lives in `registry.zig`; this file is the glue the
-//! typed layer needs: the `App` contract (`State`, `Command`, contextual `validate`,
-//! `apply`, `combine`, the custom codec, `initialState` / `initialSlot` /
-//! `initialCommand`) and the process-wide `boot` snapshot those recovery
-//! functions read.
+//! owned typed layer needs: the App contract (`State`, `Command`, contextual
+//! `validate`, allocating `apply`, `combine`, the custom codec, and the
+//! observation) plus the startup `Context` that carries the selected boot
+//! state into `initState`. What used to be the process-wide `boot` global is
+//! now an argument: `main.zig` hands the exact snapshot (or genesis) it
+//! selected to `OwnedAppNode.create`, and `initState` receives it before any
+//! engine, thread, or listener exists.
 //!
-//! `boot` is a global because `initialState()` is `fn () State` — it can
-//! take no `io` and no argument (the roadmap's first "Gaps recorded by E1"
-//! item). `main.zig` sets it from the snapshot file (or genesis) BEFORE
-//! `AppNode.create`, which performs the bytes-level recovery internally.
+//! Restart continuity binds to what `initState` loaded: `initialSlot` is the
+//! state's own head slot and `initialCommand` its last consensus value, so
+//! the dedup floor, the exact-predecessor nomination seed, and the
+//! contiguous-journal rules all describe the same state the adapter owns.
+//!
+//! The state is still plain by-value data (E1's bounded shape), so the
+//! observation is simply a copy and nothing needs `deinitObs`. When the state
+//! grows heap-backed storage, `observe` becomes an owned clone with
+//! `deinitObs`, `apply` allocates through its `gpa`, and the cadence loop
+//! returns each applied state through `release` — the contract already
+//! spells both shapes (ADR 0003).
 
 const std = @import("std");
 const slcp = @import("slcp");
 pub const registry = @import("registry.zig");
 
-/// What the three recovery declarations return. Set once before `create`.
-pub var boot: struct { state: registry.State, slot: u64 } = .{ .state = .{}, .slot = 0 };
-
-/// The §8.5 App. `validate` and `apply` run on the engine thread; both are
-/// pure over `State`, the candidate value, and the driver's slot context.
+/// The owned-contract App. `validate`, `apply`, `combine`, and `observe` run
+/// on the engine thread, pure over `State`, the candidate value, and the
+/// driver's slot context.
 pub const Registry = struct {
     pub const State = registry.State;
     pub const Command = registry.LedgerValue;
 
-    pub fn validate(state: State, cmd: Command, context: slcp.ValueContext) slcp.Validity {
-        return switch (registry.validate(&state, &cmd, context.slot)) {
+    /// The whole state is the observation: the cadence loop persists the
+    /// snapshot from it, offers history publication, and swaps it into the
+    /// RPC shared state. Plain data, so `release` is a no-op.
+    pub const Obs = registry.State;
+
+    /// The boot state `main.zig` selected (genesis, local snapshot, or
+    /// recovered history frontier). Borrowed for the `initState` call only.
+    pub const Context = registry.State;
+
+    pub const InitError = error{OutOfMemory};
+
+    pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State {
+        _ = gpa;
+        return context;
+    }
+
+    pub fn deinitState(state: *State, gpa: std.mem.Allocator) void {
+        _ = state;
+        _ = gpa;
+    }
+
+    pub fn initialSlot(state: *const State) u64 {
+        return state.head.slot;
+    }
+
+    pub fn initialCommand(state: *const State) ?Command {
+        return state.last_value;
+    }
+
+    pub fn validate(state: *const State, cmd: Command, context: slcp.ValueContext) slcp.Validity {
+        return switch (registry.validate(state, &cmd, context.slot)) {
             .invalid => .invalid,
             .maybe_valid => .maybe_valid,
             .valid => .valid,
         };
     }
 
-    /// The large-state shape: the ~27 KB State (including its last
-    /// LedgerValue) is updated in place.
-    pub fn apply(state: *State, cmd: Command) void {
+    /// The state is updated in place; nothing allocates yet.
+    pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        _ = gpa;
         registry.apply(state, &cmd);
     }
 
-    pub fn combine(state: State, cmds: []const Command) Command {
-        return registry.combine(&state, cmds);
+    pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs {
+        _ = gpa;
+        return state.*;
     }
 
-    pub fn initialState() State {
-        return boot.state;
-    }
-
-    pub fn initialSlot() u64 {
-        return boot.slot;
-    }
-
-    pub fn initialCommand() ?Command {
-        return boot.state.last_value;
+    pub fn combine(state: *const State, cmds: []const Command) Command {
+        return registry.combine(state, cmds);
     }
 
     // The custom codec (variable-length sets; the auto-codec cannot).
     pub fn encode(cmd: Command, buf: []u8) []u8 {
         return cmd.encode(buf);
     }
-
     pub fn decode(bytes: []const u8) ?Command {
         return registry.LedgerValue.decode(bytes);
     }
 };
 
-pub const Node = slcp.AppNode(Registry);
+pub const Node = slcp.OwnedAppNode(Registry);
 
 comptime {
     // The custom codec's largest encoding must fit the node option the
     // program passes (roadmap §3.1); the contract check happens at create.
     std.debug.assert(registry.max_ledger_value_bytes <= registry.max_value_bytes);
     std.debug.assert(Node.codec.is_custom);
-    std.debug.assert(Node.apply_in_place);
+    // The state is plain data today: observations carry it by value and
+    // `release` is a no-op. Flipping to heap-backed state means giving the
+    // observation ownership (`deinitObs`) in the same change.
+    std.debug.assert(!Node.obs_owns_memory);
 }
 
 // ---------------------------------------------------------------------------
@@ -100,14 +132,14 @@ const Track = struct {
 
     fn note(self: *Track, item: Node.Applied) !void {
         // Roadmap §3.8: the header's slot must be the delivered slot.
-        try testing.expectEqual(item.slot, item.state.head.slot);
-        try testing.expectEqual(item.state.head.close_time, item.state.last_value.?.close_time);
+        try testing.expectEqual(item.slot, item.obs.head.slot);
+        try testing.expectEqual(item.obs.head.close_time, item.obs.last_value.?.close_time);
         if (item.slot <= max_slots) {
-            self.hashes[item.slot] = item.state.head.hash;
-            self.close_times[item.slot] = item.state.head.close_time;
+            self.hashes[item.slot] = item.obs.head.hash;
+            self.close_times[item.slot] = item.obs.head.close_time;
         }
         self.last_slot = item.slot;
-        self.last_state = item.state;
+        self.last_state = item.obs;
     }
 };
 
@@ -136,23 +168,23 @@ fn pump(a: *Node, b: *Node, pa: Proposer, pb: Proposer, ta: *Track, tb: *Track, 
         if (waited > deadline_ms) return error.PumpTimeout;
         if (try a.waitApplied(.{ .timeout_ms = 20 })) |x| {
             try ta.note(x);
-            if (x.slot < target) try a.propose(pa(&x.state));
+            if (x.slot < target) try a.propose(pa(&x.obs));
         }
         if (try b.waitApplied(.{ .timeout_ms = 20 })) |x| {
             try tb.note(x);
-            if (x.slot < target) try b.propose(pb(&x.state));
+            if (x.slot < target) try b.propose(pb(&x.obs));
         }
         waited += 40;
     }
 }
 
-// Non-vacuity: without `initialSlot()` reading `boot.slot` the restarted
-// node re-applies slots 1..3 on top of the slot-3 snapshot and its first
-// applied item is slot 1 with a header at slot 4 (the §3.8 check fails);
-// without the custom codec the set does not round-trip and the claim is
-// never applied; a different `network_id` in `boot` makes validate reject
-// the claim (bad signature) and the pump times out.
-test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapshot restart preserves the exact predecessor" {
+// Non-vacuity: without `initialSlot` reading the loaded state's head slot the
+// restarted node re-applies slots 1..3 on top of the slot-3 snapshot and its
+// first applied item is slot 1 with a header at slot 4 (the §3.8 check
+// fails); without the custom codec the set does not round-trip and the claim
+// is never applied; a different `network_id` in the context makes validate
+// reject the claim (bad signature) and the pump times out.
+test "registry over OwnedAppNode (2-of-2 loopback): skewed clocks converge and the snapshot context preserves the exact predecessor" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -164,7 +196,7 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
     const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
     const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
 
-    const network = "registry app test v2";
+    const network = "registry app test v3";
     const genesis_close_time: u64 = 1_700_000_000;
     var network_buf: [128]u8 = undefined;
     const network_descriptor = registry.networkDescriptor(genesis_close_time, network, &network_buf);
@@ -183,7 +215,7 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
     test_claim_set = .{ .count = 1 };
     test_claim_set.txs[0] = claim;
 
-    boot = .{ .state = registry.State.genesis(nid, genesis_close_time), .slot = 0 };
+    const genesis = registry.State.genesis(nid, genesis_close_time);
     var ta: Track = .{};
     var tb: Track = .{};
 
@@ -196,7 +228,7 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
             .data_dir = dir_a,
             .max_value_bytes = registry.max_value_bytes,
             .diagnostic = &diag,
-        });
+        }, genesis);
         defer a.deinit();
         const b = try Node.create(gpa, io, .{
             .network = network_descriptor,
@@ -207,14 +239,14 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
             .data_dir = dir_b,
             .max_value_bytes = registry.max_value_bytes,
             .diagnostic = &diag,
-        });
+        }, genesis);
         errdefer b.deinit();
 
         // The proposers disagree by the full permitted clock window. Close
         // time remains a deterministic consensus value: both nodes must
         // externalize the same value and resulting header.
-        try a.propose(registry.proposal(&boot.state, test_claim_set.slice(), genesis_close_time + registry.max_close_time_step).?);
-        try b.propose(registry.proposal(&boot.state, &.{}, genesis_close_time + 1).?);
+        try a.propose(registry.proposal(&genesis, test_claim_set.slice(), genesis_close_time + registry.max_close_time_step).?);
+        try b.propose(registry.proposal(&genesis, &.{}, genesis_close_time + 1).?);
         try pump(a, b, proposeClaimUntilApplied, proposeEmpty, &ta, &tb, 3, 60_000);
 
         // The claim landed (a re-proposes it until it does — the node
@@ -236,7 +268,7 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
     };
     defer b.deinit();
 
-    // Phase 2 needs a's slot-3 STATE (the value copy `waitApplied` handed
+    // Phase 2 needs a's slot-3 STATE (the observation `waitApplied` handed
     // out), not just its hash. Which slot carried the claim depends on
     // who led the first round; the entry is there either way.
     const s3 = ta.last_state.?;
@@ -245,10 +277,11 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
     try testing.expectEqualSlices(u8, &client_pk, &s3.findName("alice").?.owner);
     try testing.expectEqual(@as(u64, 1), s3.accountSeq(client_pk));
 
-    // Snapshot round-trip through the file format, then restart a from it.
+    // Snapshot round-trip through the file format, then restart a from it —
+    // the snapshot travels in the create CONTEXT, not a global.
     var snap_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snap = registry.writeSnapshot(&s3, &snap_buf);
-    boot = .{ .state = registry.readSnapshot(snap).?, .slot = 3 };
+    const restored = registry.readSnapshot(snap).?;
     const a2 = try Node.create(gpa, io, .{
         .network = network_descriptor,
         .secret_seed = seed_a,
@@ -258,10 +291,10 @@ test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapsh
         .data_dir = dir_a,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    });
+    }, restored);
     defer a2.deinit();
     var ta2: Track = .{};
-    try a2.propose(proposeClaimUntilApplied(&boot.state));
+    try a2.propose(proposeClaimUntilApplied(&restored));
     try b.propose(proposeEmpty(&s3));
     try pump(a2, b, proposeClaimUntilApplied, proposeEmpty, &ta2, &tb, 4, 90_000);
     // First applied item after the restart is slot 4 (1..3 skipped), and it

@@ -444,7 +444,7 @@ fn createBootNode(
 ) !*app.Node {
     var options = base_options;
     options.start_slot = selected.start_slot;
-    return app.Node.create(gpa, io, options) catch |err| {
+    return app.Node.create(gpa, io, options, selected.state) catch |err| {
         if ((selected.source == .history or
             selected.source == .history_outbox or
             selected.source == .trusted_local) and
@@ -452,7 +452,7 @@ fn createBootNode(
         {
             std.debug.print("registry node: authenticated history tip slot {d} overlaps a newer local journal; verifying that journal as its continuation\n", .{selected.state.head.slot});
             options.start_slot = 1;
-            return app.Node.create(gpa, io, options);
+            return app.Node.create(gpa, io, options, selected.state);
         }
         return err;
     };
@@ -472,13 +472,13 @@ fn drainBootReplay(
     while (try node.waitApplied(.{ .timeout_ms = 0 })) |applied| {
         const successor = std.math.add(u64, ready.head.slot, 1) catch
             return error.BootReplayDiscontinuity;
-        if (applied.slot != successor or applied.state.head.slot != applied.slot)
+        if (applied.slot != successor or applied.obs.head.slot != applied.slot)
             return error.BootReplayDiscontinuity;
         // AppNode's journal is already durable. Admit every replayed state to
         // the trusted history outbox before allowing the ordinary snapshot to
         // catch up, exactly as the live cadence path does.
-        if (history_archive) |archive| try stageBootHistory(archive, &applied.state);
-        ready = applied.state;
+        if (history_archive) |archive| try stageBootHistory(archive, &applied.obs);
+        ready = applied.obs;
     }
     return ready;
 }
@@ -946,7 +946,6 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             return 1;
         };
     }
-    app.boot = .{ .state = selected.state, .slot = selected.state.head.slot };
 
     const slcp_dir = try std.fmt.allocPrint(gpa, "{s}/slcp", .{data_dir});
     defer gpa.free(slcp_dir);
@@ -1039,8 +1038,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         selected = latest.selected;
         authenticated_recovery = latest.recovery;
         pending_install = null;
-        app.boot = .{ .state = selected.state, .slot = selected.state.head.slot };
-    }
+        }
 
     const node = createBootNode(gpa, io, node_options, selected) catch |err| {
         std.debug.print("registry node: cannot start ({t}): {s}\n", .{ err, diag.message() });
@@ -1196,16 +1194,16 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             }
         }
         if (item) |a| {
-            if (a.slot != a.state.head.slot) {
+            if (a.slot != a.obs.head.slot) {
                 // The native node abandoned a delivery gap under its local
                 // slot horizon (roadmap §2.1 gap 2): `apply` skipped the set
                 // (it does not fit this state) and the header stayed put.
                 // Stop at once — `exit`, not a return through `deinit`, so
                 // the engine thread applies nothing more meanwhile.
                 if (f.history_dir != null) {
-                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; restart from a certified history tip at or beyond the gap.\n", .{ a.slot, a.state.head.slot });
+                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; restart from a certified history tip at or beyond the gap.\n", .{ a.slot, a.obs.head.slot });
                 } else {
-                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; configure authenticated history or rejoin only when the whole network starts over.\n", .{ a.slot, a.state.head.slot });
+                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; configure authenticated history or rejoin only when the whole network starts over.\n", .{ a.slot, a.obs.head.slot });
                 }
                 std.process.exit(3);
             }
@@ -1215,17 +1213,17 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             // replay, while a crash afterward can never erase this ledger
             // from the publication backlog.
             if (history_publisher) |history_worker| {
-                history_worker.offer(a.state) catch |err| {
+                history_worker.offer(a.obs) catch |err| {
                     std.debug.print("registry node: cannot durably stage history ledger slot {d}: {t}; stopping before history can skip a ledger\n", .{ a.slot, err });
                     stopNodeAndExit(server, node, &node_needs_deinit, 1);
                 };
             }
-            writeSnapshotFile(io, dir, &a.state) catch |err| {
+            writeSnapshotFile(io, dir, &a.obs) catch |err| {
                 std.debug.print("registry node: cannot write {s}/snapshot: {t}; stopping (a node that cannot persist must stop)\n", .{ data_dir, err });
                 stopNodeAndExit(server, node, &node_needs_deinit, 1);
             };
             if (history_publisher) |history_worker| {
-                history_worker.confirmSnapshot(&a.state) catch |err| {
+                history_worker.confirmSnapshot(&a.obs) catch |err| {
                     std.debug.print("registry node: cannot preserve trusted boot provenance at slot {d}: {t}; stopping\n", .{ a.slot, err });
                     stopNodeAndExit(server, node, &node_needs_deinit, 1);
                 };
@@ -1233,15 +1231,15 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             // RPC only observes the new head once both application durability
             // barriers above have completed.
             shared.lock();
-            shared.state = a.state;
+            shared.state = a.obs;
             shared.prune();
             shared.unlock();
             var ok: usize = 0;
-            for (a.state.lastResults()) |r| {
+            for (a.obs.lastResults()) |r| {
                 if (r == .ok) ok += 1;
             }
-            const head_hex = registry.hex32(a.state.head.hash);
-            std.debug.print("slot {d}: close_time={d} txs={d} ok={d} head={s}\n", .{ a.slot, a.state.head.close_time, a.state.last_count, ok, head_hex[0..16] });
+            const head_hex = registry.hex32(a.obs.head.hash);
+            std.debug.print("slot {d}: close_time={d} txs={d} ok={d} head={s}\n", .{ a.slot, a.obs.head.close_time, a.obs.last_count, ok, head_hex[0..16] });
             last_close = nowMs(io);
             next_stall_warn = last_close + stall_warn_ms;
             proposed = false;
@@ -1550,9 +1548,6 @@ test "registry main: fresh history activation does not grant external boot prove
         &descriptor_buf,
     );
     var diag: slcp.node.Diagnostic = .{};
-    const saved_boot = app.boot;
-    defer app.boot = saved_boot;
-    app.boot = .{ .state = local, .slot = local.head.slot };
     try testing.expectError(error.InitialSlotOutsideJournal, createBootNode(gpa, io, .{
         .network = descriptor,
         .secret_seed = seed,
@@ -1745,9 +1740,6 @@ test "registry main: confirmed pending install is followed by fresh recovery bef
         var empty_journal_buf: [std.fs.max_path_bytes]u8 = undefined;
         const empty_journal_path = try std.fmt.bufPrint(&empty_journal_buf, "{s}/empty-journal", .{root});
         var diag: slcp.node.Diagnostic = .{};
-        const saved_boot = app.boot;
-        defer app.boot = saved_boot;
-        app.boot = .{ .state = withheld.selected.state, .slot = withheld.selected.state.head.slot };
         const validation_node = try createBootNode(gpa, io, .{
             .network = descriptor,
             .secret_seed = seeds[0],
@@ -1859,7 +1851,6 @@ test "registry main: a missing snapshot cannot replay a compacted journal" {
     const seed: [32]u8 = @splat(0xb1);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
-    defer app.boot = .{ .state = .{}, .slot = 0 };
 
     var encoded_buf: [registry.max_ledger_value_bytes]u8 = undefined;
     const encoded = (registry.LedgerValue{
@@ -1872,7 +1863,7 @@ test "registry main: a missing snapshot cannot replay a compacted journal" {
         try store.appendExternalized(49, encoded);
     }
 
-    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+    const boot_state = registry.State.genesis(network_id, test_genesis_close_time);
     if (app.Node.create(gpa, io, .{
         .network = descriptor,
         .secret_seed = seed,
@@ -1882,7 +1873,7 @@ test "registry main: a missing snapshot cannot replay a compacted journal" {
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    })) |node| {
+    }, boot_state)) |node| {
         node.deinit();
         return error.ExpectedCompactedJournalRejection;
     } else |err| {
@@ -1906,8 +1897,7 @@ test "registry main: the E2c descriptor rejects a pre-E2c data directory" {
     const seed: [32]u8 = @splat(0xb2);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
-    defer app.boot = .{ .state = .{}, .slot = 0 };
-    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+    const boot_state = registry.State.genesis(network_id, test_genesis_close_time);
 
     // The legacy registry passed the human passphrase directly to Node.
     const legacy = try app.Node.create(gpa, io, .{
@@ -1919,7 +1909,7 @@ test "registry main: the E2c descriptor rejects a pre-E2c data directory" {
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    });
+    }, boot_state);
     legacy.deinit();
 
     if (app.Node.create(gpa, io, .{
@@ -1931,7 +1921,7 @@ test "registry main: the E2c descriptor rejects a pre-E2c data directory" {
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    })) |unexpected| {
+    }, boot_state)) |unexpected| {
         unexpected.deinit();
         return error.ExpectedHardNetworkEpoch;
     } else |err| try testing.expectEqual(error.DataDirOtherNetwork, err);
@@ -1951,8 +1941,7 @@ test "registry main: a legacy transaction-set journal fails closed if the networ
     const seed: [32]u8 = @splat(0xb3);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
-    defer app.boot = .{ .state = .{}, .slot = 0 };
-    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+    const boot_state = registry.State.genesis(network_id, test_genesis_close_time);
 
     // Establish current network identity, then inject bytes written by the
     // pre-E2c TxSet codec to isolate the value-format migration check.
@@ -1965,7 +1954,7 @@ test "registry main: a legacy transaction-set journal fails closed if the networ
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    });
+    }, boot_state);
     current.deinit();
     var old_buf: [registry.max_set_bytes]u8 = undefined;
     {
@@ -1983,7 +1972,7 @@ test "registry main: a legacy transaction-set journal fails closed if the networ
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    }));
+    }, boot_state));
 }
 
 test "registry main: snapshot replacement does not follow a planted temp or final symlink" {
@@ -2249,11 +2238,10 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     const seed: [32]u8 = @splat(0xc1);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
-    defer app.boot = .{ .state = .{}, .slot = 0 };
 
     var checkpoint: registry.State = undefined;
     var after: registry.State = undefined;
-    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+    const boot_state = registry.State.genesis(network_id, test_genesis_close_time);
     {
         const original = try app.Node.create(gpa, io, .{
             .network = descriptor,
@@ -2264,17 +2252,17 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
             .data_dir = data_dir,
             .max_value_bytes = registry.max_value_bytes,
             .diagnostic = &diag,
-        });
+        }, boot_state);
         defer original.deinit();
-        try original.propose(registry.proposal(&app.boot.state, &.{}, test_genesis_close_time + 1).?);
-        checkpoint = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.state;
+        try original.propose(registry.proposal(&boot_state, &.{}, test_genesis_close_time + 1).?);
+        checkpoint = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.obs;
         try original.propose(registry.proposal(&checkpoint, &.{}, checkpoint.head.close_time + 1).?);
-        after = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.state;
+        after = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.obs;
     }
 
     // Model a crash after the Node journal durably recorded slot 2 but before
     // main replaced its slot-1 application snapshot.
-    app.boot = .{ .state = checkpoint, .slot = checkpoint.head.slot };
+    const checkpoint_state = checkpoint;
     try testing.expectError(error.StartSlotBehindJournal, app.Node.create(gpa, io, .{
         .network = descriptor,
         .secret_seed = seed,
@@ -2285,7 +2273,7 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
         .max_value_bytes = registry.max_value_bytes,
         .start_slot = checkpoint.head.slot + 1,
         .diagnostic = &diag,
-    }));
+    }, checkpoint_state));
 
     const resumed = try app.Node.create(gpa, io, .{
         .network = descriptor,
@@ -2296,7 +2284,7 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
         .data_dir = data_dir,
         .max_value_bytes = registry.max_value_bytes,
         .diagnostic = &diag,
-    });
+    }, checkpoint_state);
     defer resumed.deinit();
     const ready = try drainBootReplay(resumed, checkpoint, null);
     try testing.expectEqual(@as(u64, 2), ready.head.slot);
