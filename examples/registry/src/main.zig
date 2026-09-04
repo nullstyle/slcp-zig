@@ -966,6 +966,9 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         .include_self = f.history_dir == null,
         .data_dir = slcp_dir,
         .max_value_bytes = registry.max_value_bytes,
+        // Intentionally omit `answering_window_slots`: this example uses the
+        // Node default of 16 for bounded live-peer catch-up and its
+        // authenticated archive for longer outages.
         .start_slot = selected.start_slot,
         .diagnostic = &diag,
     };
@@ -976,7 +979,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         // that transaction on an isolated listener first. Only then may this
         // boot consult shared storage for a newer U; otherwise replacing T's
         // marker is unsafe, while joining live consensus from T+1 can strand
-        // a node that is already beyond the peers' answering window.
+        // a node already beyond reachable peers' retained coverage.
         if (selected.source != .history_outbox) {
             std.debug.print("registry node: trusted pending history did not select its exact install frontier; keep this node stopped\n", .{});
             return 1;
@@ -1171,9 +1174,8 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     // right away when transactions are pending, else at the heartbeat.
     var last_close = nowMs(io);
     var proposed = false;
-    // A node that fell more than ~80 slots behind (the library's 64-slot
-    // hold window plus its 16-slot answering window) is not told so: the
-    // statements it needs are dropped silently. Say something every minute.
+    // No per-peer retained-coverage signal explains whether a quiet node lacks
+    // quorum or cannot obtain a missing slot. Say something every minute.
     var next_stall_warn = nowMs(io) + stall_warn_ms;
     var next_gossip_reflood = nowMs(io) + gossip_reflood_ms;
     while (true) {
@@ -1195,15 +1197,15 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
         if (item) |a| {
             if (a.slot != a.state.head.slot) {
-                // Delivered a slot past a gap the library could not answer
-                // (roadmap §2.1 gap 2): `apply` skipped the set (it does
-                // not fit this state) and the header stayed put. Stop at
-                // once — `exit`, not a return through `deinit`, so the
-                // engine thread applies nothing more meanwhile.
+                // The native node abandoned a delivery gap under its local
+                // slot horizon (roadmap §2.1 gap 2): `apply` skipped the set
+                // (it does not fit this state) and the header stayed put.
+                // Stop at once — `exit`, not a return through `deinit`, so
+                // the engine thread applies nothing more meanwhile.
                 if (f.history_dir != null) {
-                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: this process crossed a gap outside live history. Exiting with code 3; restart from a certified history tip at or beyond the gap.\n", .{ a.slot, a.state.head.slot });
+                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; restart from a certified history tip at or beyond the gap.\n", .{ a.slot, a.state.head.slot });
                 } else {
-                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: this node missed slots the peers have already compacted. Exiting with code 3; configure authenticated history or rejoin only when the whole network starts over.\n", .{ a.slot, a.state.head.slot });
+                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: its local answering horizon expired before it obtained the missing slots from reachable peers. Exiting with code 3; configure authenticated history or rejoin only when the whole network starts over.\n", .{ a.slot, a.state.head.slot });
                 }
                 std.process.exit(3);
             }
@@ -1261,9 +1263,9 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
         if (now >= next_stall_warn) {
             if (f.history_dir != null) {
-                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or this process fell beyond live history; in the latter case restart it after a certified history tip covering the gap is available\n", .{(nowMs(io) -| last_close) / 1000});
+                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or needed retained statements are not arriving from reachable peers; in the latter case restart this process after a certified history tip covering the gap is available\n", .{(nowMs(io) -| last_close) / 1000});
             } else {
-                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or this node fell beyond live history; configure authenticated history for catch-up, or use a fresh --data-dir only when the whole network starts over\n", .{(nowMs(io) -| last_close) / 1000});
+                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or needed retained statements are not arriving from reachable peers; configure authenticated history for long-outage recovery, or use a fresh --data-dir only when the whole network starts over\n", .{(nowMs(io) -| last_close) / 1000});
             }
             next_stall_warn = now + stall_warn_ms;
         }
@@ -1649,7 +1651,8 @@ test "registry main: confirmed pending install is followed by fresh recovery bef
     }
 
     // While A is stopped, shared history advances more than two full cadence
-    // intervals beyond T. This models a tip beyond the live answering window.
+    // intervals beyond T. This models a tip beyond this binary's default live
+    // answering window.
     for (7..40) |_| {
         advanceEmpty(&remote);
         try Publisher.publish(&b, &remote);

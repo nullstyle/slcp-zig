@@ -15,6 +15,18 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Added
 
+- Stable `Node.Options.answering_window_slots`, mirrored by `AppNode`, makes
+  bounded native live-peer catch-up configurable from 1 through 62 slots
+  (default 16). One validated policy now governs restart restoration,
+  statement retention, log compaction, and the node's local gap-abandonment
+  horizon; invalid values fail before identity, filesystem, listener, or
+  thread side effects.
+- Experimental `Node.catchupStats()` reports the configured horizon, ordered
+  delivery frontier, the count and bounds of cached own statements for
+  slots at or below that frontier, buffered/held work, drop and release
+  counters, and cumulative gap jumps/skipped slots. Cached coverage may include
+  locally abandoned slots or holes and is not a quorum-availability,
+  network-freshness, or history-archive claim.
 - Experimental native-node application messaging:
   `Node.publishAppMessage`, `Node.waitAppMessage`, and
   `Node.appMessageStats`, backed by a lazy opt-in FIFO capped at 1,024
@@ -88,10 +100,10 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   transaction-bearing ledger before the third node rejoins.
 - Registry busy cadence now remains governed by `--min-slot-ms` whenever a
   transaction is pending; `--heartbeat-ms` applies only to idle slots.
-- Restart recovery now separates the 16-slot own-statement answer floor from
-  the stronger admission/Engine purge floor at the journal successor. Lagging
-  peers can still receive retained EXTERNALIZE answers, while traffic for a
-  journal-confirmed slot cannot recreate local consensus state.
+- Restart recovery now separates the configured own-statement answer floor
+  from the stronger admission/Engine purge floor at the journal successor.
+  Lagging peers can still receive retained EXTERNALIZE answers, while traffic
+  for a journal-confirmed slot cannot recreate local consensus state.
 - The registry smoke runs -30/0/+30-second proposal clocks, verifies every
   observed close-time step and the complete long-outage time chain, restores
   the exact timed non-anchor history tip by bounded replay, and proves that
@@ -166,8 +178,8 @@ sans-I/O Engine directly. No Stable declaration changed.
   `initialSlot`), a localhost line-protocol RPC (`head`, `get`, `account`,
   `submit`) and a CLI (`registry node | submit | get | account | head`).
   Library-neutral: it uses only the v0.1.0 Stable API and records the gaps
-  it hits (no transaction flooding, the fixed 16-slot answering window, the
-  typed layer's per-slot state copy) for the next step.
+  it hits (no transaction flooding, the then-fixed 16-slot answering window,
+  the typed layer's per-slot state copy) for the next step.
 - `zig build registry-tests` (in `test`): the example's pure state machine,
   its RPC, and a live 2-of-2 pair with a restart from a snapshot;
   `registry-intree` compiles the program against the in-tree module.

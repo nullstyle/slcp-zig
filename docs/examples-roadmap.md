@@ -6,8 +6,9 @@ that a future Stable interface already exists.
 
 **Status as of 2026-09-04:** E1, E2a transaction flooding, E2b authenticated
 checkpoint catch-up, E2c deterministic ledger close time, and E2d replayable
-registry history are implemented. Heap state, configurable core answering
-history, archive retention, and E3 remain designs only.
+registry history are implemented. Configurable native answering and an initial
+local catch-up snapshot are also implemented. Heap state, archive retention,
+richer per-peer operations, and E3 remain designs only.
 
 ## Direction
 
@@ -24,7 +25,8 @@ assets, fees, or smart contracts.
 | E2b: checkpoint catch-up | A validator absent for hundreds of slots authenticates recent state and rejoins voting | Application-owned quorum attestations plus the typed node's checked state/previous-value recovery seam. |
 | E2c: deterministic close time | Every agreed ledger carries a bounded logical timestamp and recovery preserves its exact temporal context | Optional typed `ValueContext`, a coordinated application network/storage epoch, and an explicit proposal-clock boundary. |
 | E2d: replayable registry history | Every applied slot is archived, and a validator can strictly replay from a periodic anchor to an exact certified tip without peers | An application-owned history layer, ordered bounded publication, and explicit retention/freshness limits without changing core consensus. |
-| E2 remainder: state and retention | Heap state, archive retention, and configurable core answering history | A heap-state application path, pruning policy, and configurable native retention. |
+| Native catch-up controls | Operators can tune recent live-peer assistance and inspect local catch-up state | Stable `answering_window_slots` plus Experimental `catchupStats`, without turning the Node into an archive. |
+| E2 remainder: state and retention | Heap state and archive retention | A heap-state application path and an explicit history-pruning policy. |
 | E3: upgrades and operations | Voted upgrades, quotas, atomic operation sets, invariants, close metadata, watchers, HTTP | Richer typed-driver hooks, watcher delivery, and operational statistics. |
 
 ## E1 — Registry (implemented)
@@ -55,17 +57,21 @@ semantics while keeping transport and operational complexity understandable.
 
 1. Typed applied state is copied per slot, and initialization has no I/O
    parameter. A large ledger needs heap-owned state and durable loading.
-2. Recent-slot answering in the generic Node is bounded and not configurable.
-   E2d now lets the registry cross a long outage through its application-owned
-   replayable archive without a live peer; configurable core history remains
-   absent.
+2. Recent-slot answering in the generic Node is bounded. The post-E2d control
+   makes that local 1..62-slot window configurable, while E2d lets the registry
+   cross a genuinely long outage through its separate application-owned
+   replayable archive without a live peer.
 3. The original overlay carried consensus traffic but no application
    messages, so a transaction waited for its submission node to influence a
    nomination. E2a resolves this gap for the registry with bounded,
    best-effort transaction flooding.
 4. E2c resolves the typed-context gap: validation may opt into
    `slcp.ValueContext` for the slot and nomination/ballot phase.
-5. Catch-up and missing-quorum stalls need richer operator visibility.
+5. The node-local `catchupStats` snapshot now exposes cached own-statement
+   count and bounds at or below the ordered-delivery frontier, buffered work,
+   drops, and gap jumps. That set may include locally abandoned slots or holes;
+   per-peer retained coverage and quorum-level stall diagnosis still need
+   richer operator visibility.
 
 Historical acceptance evidence for E1 is recorded in
 [`CHANGELOG.md`](../CHANGELOG.md) and the example's
@@ -197,8 +203,8 @@ entire resulting header and exact last value to match before accepting the next
 link. Replay ends only at the signed tip hash. The anchor interval bounds this
 to `N-1` applications—at most 63—so a node can reconstruct the exact certified
 tip and serve it before any peer returns. This is application-owned history;
-the native Node still has its fixed 16-slot answering window and no generic
-state-transfer protocol.
+the native Node has a configurable bounded answering window and still has no
+generic state-transfer protocol.
 
 Anchors accelerate startup but do not reset continuity. Before signing an
 anchor-slot tip assertion, the publisher reconstructs and validates that
@@ -271,11 +277,10 @@ recorded in [`STATUS.md`](../STATUS.md).
 Remaining work includes:
 
 - heap-sized account and name state;
-- configurable Node answering history;
 - explicit archive retention, pruning, and operational sizing policy;
 - either a heap-aware typed application interface or a first-class raw-driver
   recipe;
-- explicit visibility into dropped far-ahead statements and peer state.
+- richer per-peer visibility beyond the local `catchupStats` snapshot.
 
 ## E3 — Upgrades and operations (planned)
 

@@ -20,13 +20,38 @@ granted.
 | E2b implementation and proof | `c66b450` through `35ad39b` (registry feature `f77e01c`, exact-current smoke `35ad39b`) | Adds application-owned quorum-authenticated registry checkpoints, durable local signing fences, hostile-archive handling, exact-successor `AppNode` recovery, CLI integration, and a proved long-outage rejoin. |
 | E2c implementation and proof | `77ac9b1` through `83d66f7` | Adds typed `ValueContext`, phase-separated validation caching, deterministic registry close time, G-anchored restored-state checks, a hard network/storage epoch, exact timed checkpoint recovery, closed-slot restart rejection, and a strengthened long-outage temporal-chain smoke. |
 | E2d implementation and proof | `422b479` (registry feature), `d2324e6` (peerless-recovery smoke) | Replaces registry checkpoint-only recovery with per-slot immutable ledger records, quorum-certified history tips, bounded strict replay, crash-durable ordered publication, and peerless recovery proof. |
+| Native answering-window control and proof | `327e614` (feature), `cb052c0` (real-socket proof), `636af81` (boundary hardening), `7bc2cb6` (Stable API acceptance), `d9880d7` and `4bf729e` (capacity and telemetry corrections) | Adds Stable per-node `answering_window_slots`, Experimental local catch-up telemetry, a configured-window exact-recovery/voting witness, and maximum-capacity recovery hardening. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: E2d replayable registry history
+## Current feature work: configurable native answering window
+
+Each native Node now accepts an `answering_window_slots` value from 1 through
+62, defaulting to 16. That window bounds retained own statements used to help
+a recently lagging live peer and the slot-distance at which the local node may
+abandon an unavailable gap. Experimental `catchupStats()` reports coherent
+node-local cached-own-statement count and bounds for slots at or below the
+ordered-delivery frontier, buffered work, drop counters, and gap jumps. Cached
+slots may include locally abandoned slots or holes, and the snapshot is not a
+peer or quorum view. The registry intentionally keeps the default 16-slot live
+window and uses its application-owned replayable archive for long outages.
+
+### Current answering-window verification
+
+- Repository gate: **PASS** — 87/87 build steps; the latest cached invocation
+  executed 627 passing tests plus 1 expected platform skip.
+- Native node suite: **PASS** — 193 passed plus 1 expected platform skip out
+  of 194.
+- Full real-socket E2E suite: **PASS** — 8/8, including configured-window
+  exact contiguous catch-up beyond 16 slots and subsequent voting.
+- API gate: **PASS** — 292 Stable declarations frozen and 1,497 Experimental
+  declarations verified.
+- Docs-smoke: **PASS** — 436 checks plus 17/17 tests.
+
+## Historical feature record: E2d replayable registry history
 
 E2d is implemented and verified in the registry example. Every applied
 non-genesis slot produces an immutable, cadence-independent ledger record
@@ -326,10 +351,12 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   network or authenticated tunnel.
 - Quorum linting cannot prove intersection across independently configured
   nodes.
-- The native node still retains only a bounded 16-slot answering window and
-  has no generic state-transfer or archival protocol. The registry now crosses
-  a long outage through its application-owned anchor-to-certified-tip replay,
-  including without a live peer; that does not enlarge the core window.
+- The native node retains a bounded answering window configurable from 1
+  through 62 slots (default 16) and has no generic state-transfer or archival
+  protocol. Different local windows affect availability, not consensus
+  safety. The registry crosses a long outage through its application-owned
+  anchor-to-certified-tip replay, including without a live peer; that remains
+  a separate mechanism rather than an enlarged native window.
 - The qset cache bounds owned logical payloads, not filesystem allocation:
   directory metadata, block rounding, operator-owned unrelated/mixed-case
   names, and at most one newly stranded atomic-write temp per Node lifetime
@@ -360,9 +387,9 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   copied key or data directory.
 - E2a transaction flooding, E2b application checkpoint recovery, E2c
   deterministic close time, and E2d application-owned replayable history are
-  delivered. Heap-sized state, configurable core answering history, explicit
-  archive retention, and richer peer/catch-up visibility remain future work;
-  E3 remains planned.
+  delivered. The post-E2d native answering-window control and local catch-up
+  snapshot are also delivered. Heap-sized state, explicit archive retention,
+  and richer per-peer visibility remain future work; E3 remains planned.
 - Licensing remains an explicit owner decision; this repository grants none.
 
 ## Reading order

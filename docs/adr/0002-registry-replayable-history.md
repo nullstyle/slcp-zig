@@ -58,9 +58,11 @@ and SLCP Stable interface remain unchanged.
 
 ## Considered options
 
-- Enlarging or making SLCP's answering window configurable was rejected
-  because application state replay, snapshot policy, and history transport do
-  not belong in the consensus library.
+- Using a larger or configurable SLCP answering window *as the registry's
+  recovery design* was rejected because application state replay, snapshot
+  policy, and history transport do not belong in the consensus library. The
+  later native 1..62-slot control tunes bounded live-peer assistance only; it
+  does not replace this archive or change the decision above.
 - Continuing to certify only periodic snapshots was rejected because it leaves
   an unauthenticated suffix and still requires a live peer to supply it.
 - Coalescing publication work to the newest state was rejected because a

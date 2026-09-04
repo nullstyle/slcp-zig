@@ -11,18 +11,19 @@
 //! nodes at the same slot, node2 is SIGKILLed and restarted from its
 //! snapshot + journal and catches up to the same hash, and a transaction
 //! submitted to the restarted node lands everywhere. It is then killed for
-//! at least 201 slots, then restored alone by replaying more than the entire
-//! 16-slot answering window from a quorum-certified archive tip while both
-//! surviving peers are dead. It is then shown to be a necessary voter for the
-//! first later transaction-bearing slot (with any intervening ledgers proved
-//! empty and identical). The validators deliberately propose
-//! from wall clocks skewed by -30/0/+30 seconds; every RPC and durable slot log
-//! must agree on close time, and every observed adjacent ledger must advance it
-//! by 1..60 seconds. Archive replay, exact-H boot, and the complete post-H
-//! continuation are all pinned to that same temporal chain. Before the first
-//! crash the nodes form the deliberate line node2→node1→node0. One transaction is
-//! submitted only to nomination-disabled node2; `head pending=1` proves it
-//! crossed one and two overlay hops while both survivors remain at slot S,
+//! at least 201 slots, then restored alone by replaying more than the registry
+//! binary's default 16-slot native answering window from a quorum-certified
+//! archive tip while both surviving peers are dead. It is then shown to be a
+//! necessary voter for the first later transaction-bearing slot (with any
+//! intervening ledgers proved empty and identical). The validators
+//! deliberately propose from wall clocks skewed by -30/0/+30 seconds; every
+//! RPC and durable slot log must agree on close time, and every observed
+//! adjacent ledger must advance it by 1..60 seconds. Archive replay, exact-H
+//! boot, and the complete post-H continuation are all pinned to that same
+//! temporal chain. Before the first crash the nodes form the deliberate line
+//! node2→node1→node0. One transaction is submitted only to nomination-disabled
+//! node2; `head pending=1` proves it crossed one and two overlay hops while
+//! both survivors remain at slot S,
 //! then their `slot S+1: txs=1` lines prove it survived node2's SIGKILL and
 //! landed in exactly the next slot. The first restart gets a second recovery
 //! peer because consensus envelopes are not relayed across that line. For the
@@ -98,14 +99,14 @@ const rejoin_heartbeat_ms = "1000";
 const disabled_cadence_ms = "18446744073709551615";
 const checkpoint_every = "64";
 const history_anchor_every: u64 = 64;
-/// A replay at least this deep cannot be satisfied by the native node's
-/// retained 16-slot answering window.
-const min_archive_replay_ledgers: u64 = answering_window + 1;
+const default_answering_window_slots: u64 = 16;
+/// A replay at least this deep cannot be satisfied by this registry binary's
+/// retained default native answering window.
+const min_archive_replay_ledgers: u64 = default_answering_window_slots + 1;
 /// Deliberately disagreeing proposal clocks. Consensus must still derive one
 /// deterministic close time, and every restart retains its original skew.
 const proposal_clock_offsets = [_][]const u8{ "-30", "0", "30" };
 const absent_slots: u64 = 201;
-const answering_window: u64 = 16;
 /// Consensus close time must advance on every sequential ledger, but by no
 /// more than this protocol constant. Keep the smoke independent of the
 /// example package while pinning the same wire-level rule.
@@ -1633,8 +1634,8 @@ const Cluster = struct {
 
     /// Wait until the exact RPC head shared by the two survivors is itself a
     /// two-signer certified archive tip. Its anchor-to-tip span must exceed
-    /// the native answering window, so the later peerless boot cannot be a
-    /// disguised live catch-up.
+    /// this registry binary's default native answering window, so the later
+    /// peerless boot cannot be a disguised live catch-up.
     fn waitCertifiedArchiveTip(self: *Cluster, nodes: *const [2]usize, first_slot: u64, min_tip: u64) !HistoryFrontier {
         const budget_ms = historyWaitBudgetMs(self.deadline_ms, elapsedMs(self.io, self.started));
         var poll = Poll.init(self.io, budget_ms, "a non-anchor certified archive tip at least 17 ledgers beyond its anchor and 201 beyond node2");
@@ -1947,7 +1948,7 @@ const Cluster = struct {
         // takes snapshot anchors only every 64 slots, and attests replayable
         // tips between anchors. Wait until the exact common RPC head is itself
         // certified and at least 17 ledgers beyond its anchor: that replay is
-        // strictly larger than the native answering window.
+        // strictly larger than the registry's default native answering window.
         const survivors = [_]usize{ 0, 1 };
         const sampled_tip = try self.waitCertifiedArchiveTip(&survivors, absent_at, absent_at + absent_slots);
 
@@ -2591,7 +2592,7 @@ test "rejoin transaction span permits agreed empty ledgers before the first tran
 test "archive replay witness boundaries: long outage and a non-anchor tip at least 17 ledgers deep" {
     try testing.expect(archiveReplayWitnessOk(72, 256, 273, 17)); // exact 201-slot outage and 17-ledger replay
     try testing.expect(!archiveReplayWitnessOk(73, 256, 273, 17)); // exact 200 is insufficient
-    try testing.expect(!archiveReplayWitnessOk(72, 256, 272, 16)); // sixteen ledgers does not escape the answering window
+    try testing.expect(!archiveReplayWitnessOk(72, 256, 272, 16)); // sixteen ledgers does not escape the default answering window
     try testing.expect(!archiveReplayWitnessOk(72, 255, 273, 18)); // anchor is not a 64-slot boundary
     try testing.expect(!archiveReplayWitnessOk(72, 192, 273, 81)); // an older boundary is not this tip's anchor
     try testing.expect(!archiveReplayWitnessOk(72, 256, 320, 64)); // tip itself is an anchor boundary

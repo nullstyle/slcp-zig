@@ -222,6 +222,22 @@ every box.
     info(slcp_node): 0 live connection(s) to 2 configured peer(s) — consensus needs a quorum; waiting
     ```
 
+    Native catch-up uses each process's local `answering_window_slots` policy:
+    16 by default, configurable from 1 through 62 in the `AppNode.create`
+    options. Configure the same W on all three machines if you want a
+    predictable recent-outage target. A node can answer only from statements
+    it actually retained, and widening an already compacted data directory
+    does not bring deleted slots back; an emitting node refills cached
+    past-side own statements toward the new W only as it emits new statements.
+    `node.raw().catchupStats()` exposes their local count and bounds at or below
+    the ordered-delivery frontier, but that set can include locally abandoned
+    slots or holes and does not prove quorum availability.
+
+    This is recent signed-consensus-statement exchange, not counter-state
+    transfer. The counter tolerates a skipped old gap because each command is
+    a complete value (`count becomes N`). An application that must reconstruct
+    every old transition needs its own snapshots and authenticated history.
+
 ## Common stalls
 
 | Symptom | Cause | Fix |
@@ -235,7 +251,8 @@ every box.
 | Startup error `DataDirBusy` | Another live process holds `slcp-data/` (this node was started twice, or a copy of the program runs from the same directory). | Stop the duplicate; one identity runs once. The lock dies with the process, so a restart after a crash needs no cleanup. |
 | Startup error `KeyFileBad` / `KeyFileAccessDenied` / `KeyFileDirMissing` | `slcp.key` is not a raw 32-byte seed, is unreadable, or its directory does not exist. | `slcp key new slcp.key` in the directory you run from; check permissions (0600). |
 | Startup error `KeyFileTooPermissive` | `slcp.key` is readable by group or other (mode 0644, say): it was copied or restored with a loose mode (`slcp key new` mints it 0600), and like ssh the node refuses a seed other accounts can read. | `chmod 600 slcp.key` and start again (the message spells out the exact command). |
-| `externalized gap: slots A..B unrecoverable; resuming delivery at C` | A node was down for more than 16 slots; the others have already compacted those slots and cannot answer for them. | Expected: the node skips the gap (votes it was holding for the skipped range are dropped) and continues from the live frontier. The log is loud on purpose. |
+| Startup error `AnsweringWindowSlotsOutOfRange` | `.answering_window_slots` is 0 or above 62. | Use the default 16 or choose a value in `[1, 62]`; 62 reserves Engine capacity for current consensus and far-ahead catch-up. |
+| `externalized gap: slots A..B fell outside this node's answering window; resuming delivery at C` | The node received a decided slot at least W slots beyond its missing delivery, where W is its own configured answering window. This is a local slot-horizon policy; it does not prove every peer discarded the gap. | The node drops held statements for the skipped range and continues from C. For fewer jumps, configure a larger common W before the outage and inspect each peer's cached coverage with `catchupStats()`; applications requiring old state still need their own history transfer. |
 | After a restart one node prints `slot N` lines again but does not propose for a few seconds while the others continue | Normal: it replays its journal, then holds the next slot's votes until it has applied the slot it missed, and rejoins from there. | Nothing; if it stays silent for more than ~10 s check connectivity (`peer … unreachable`). |
 | `warning(slcp_overlay): overlay: rejecting peer, network_id_prefix mismatch` | `.network` differs between machines. | Make `.network` byte-identical everywhere. |
 | Two nodes stop agreeing with each other, or one keeps rejecting the other's statements | The same `slcp.key` runs in two processes (a copied directory, or a node started twice). One identity must never run twice: a second process from the same directory reads the same `slcp-data/` too, and on macOS it even binds the same port. | Stop the duplicate. Every machine mints its own key with `slcp key new`. |

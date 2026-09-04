@@ -101,13 +101,17 @@ but does have a real header: it commits to the network id, `G`, and empty state
 root with zero previous/transaction hashes. On an ordinary restart the node
 reads that snapshot into `initialState()`, names its slot in `initialSlot()`,
 exposes the exact ledger value through `initialCommand()`, and the library
-replays only newer journal slots. A node that returns within the library's
-16-slot answering window catches up from peers in the usual way. Snapshot V3
-is the sole accepted format; pre-E2c V1/V2 snapshots lack the timed predecessor
-value and are rejected. Before selecting either a local or authenticated boot
-state, the process also requires slot zero to equal configured G exactly and a
-later head to remain inside the cumulative `[G+slot,G+60·slot]` interval.
-Slot 0 is never a history anchor or tip.
+replays only newer journal slots. The native Node answering window is
+configurable from 1 through 62 slots; this example deliberately leaves it at
+the default 16. A node that returns within those 16 slots can catch up when
+enough reachable validators provide every missing slot before the local
+horizon is crossed; authenticated archive replay is the mechanism for longer
+outages. Snapshot V3 is the sole accepted format; pre-E2c V1/V2 snapshots lack
+the timed predecessor value and are
+rejected. Before selecting either a local or authenticated boot state, the
+process also requires slot zero to equal configured G exactly and a later head
+to remain inside the cumulative `[G+slot,G+60·slot]` interval. Slot 0 is never
+a history anchor or tip.
 
 `--history-dir <dir>` adds long-outage recovery without trusting that shared
 directory. Every applied non-genesis slot gets an immutable ledger record that
@@ -215,12 +219,13 @@ snapshot's slot, their heads must agree. Those checks are not an arbitrary or
 continuous runtime fork detector: a withheld object or a validator's newer
 latest pointer can hide an older alternative.
 
-A process that encounters an unrecoverable gap while running still exits with
-code 3 rather than apply a discontinuous ledger value. Restart it after a
-certified history tip covering the gap is available. A node stopped before its
-first slot still restarts from genesis; a compacted journal without either a
-usable local snapshot or configured certified history is refused. The shared
-history archive grows until an explicit retention design exists.
+A process whose native node abandons a live-delivery gap still exits with code
+3 rather than apply a discontinuous ledger value. This does not claim the
+history is globally unavailable: restart it after a certified history tip
+covering the gap is available. A node stopped before its first slot still
+restarts from genesis; a compacted journal without either a usable local
+snapshot or configured certified history is refused. The shared history
+archive grows until an explicit retention design exists.
 
 **Cadence, time, and flooding.** After each applied slot a node proposes
 exactly once for the next: right away when it has pending transactions (after
@@ -456,8 +461,9 @@ These remaining limits are deliberate:
   data appear. Per-validator latest pointers may hide an older certificate
   after validators advance at different rates, and more than 16 distinct valid
   startup candidates is a fail-closed availability error. Without history,
-  the native Node's original 16-slot answering limit remains. A compacted
-  journal without a usable local snapshot or certified history is refused.
+  this binary's default 16-slot native answering window is its bounded
+  live-peer catch-up horizon. A compacted journal without a usable local
+  snapshot or certified history is refused.
 - **History has no retention policy yet.** Immutable shared ledgers and votes,
   periodic anchors, and trusted per-slot signing/frontier evidence grow with
   publication. A blocked publication head retries in order from the durable
@@ -469,11 +475,12 @@ These remaining limits are deliberate:
   typed layer copies the state after every applied slot and `initialState()`
   cannot read a file, which is why the state is plain data and the snapshot
   is loaded through a global before the node starts.
-- **No heap state, configurable core answering history, upgrades, quotas,
-  watcher nodes, or HTTP.** The remainder of E2 and E3. The application-owned
-  archive does not make history a generic SLCP protocol; Node's own answering
-  window is still fixed at 16 slots, and far-ahead drops/peer catch-up state
-  have limited operator visibility.
+- **No heap state, generic archive protocol, upgrades, quotas, watcher nodes,
+  or HTTP.** The remainder of E2 and E3. The application-owned archive does
+  not make history a generic SLCP protocol. The native Node now offers a
+  configurable bounded answering window and Experimental catch-up telemetry;
+  this example keeps the 16-slot default and relies on its authenticated
+  archive for long-outage recovery.
 
 ## Security
 
@@ -574,10 +581,11 @@ requires node0 and node1 to externalize at least 201 new transaction-free
 slots. The survivors must then agree on an exact non-anchor tip assertion H
 that both signed, that one observed as quorum-certified, and that lies at least
 17 ledger records beyond anchor A.
-That span is deliberately larger than the native Node's 16-slot answering
-window. The harness then stops **both** survivors. With both peers dead, node2
-restarts with floor H, must report strict archive replay from A through H, and
-must expose H's exact hash and close time over RPC before any peer returns.
+That span is deliberately larger than this registry binary's default 16-slot
+native answering window. The harness then stops **both** survivors. With both
+peers dead, node2 restarts with floor H, must report strict archive replay from
+A through H, and must expose H's exact hash and close time over RPC before any
+peer returns.
 Only then does node1 restart. Node2 is a necessary voter with node1 for
 transaction 8 in the first later transaction-bearing ledger; every optional
 intervening ledger must appear on both logs, be empty, and extend one complete

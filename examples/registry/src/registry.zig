@@ -44,7 +44,9 @@ pub const max_pending: usize = 256;
 /// than `min_slot_ms` when transactions are pending; when idle, close every
 /// `heartbeat_ms`. E2a floods admitted transactions before nomination, so a
 /// transaction can land in the first eligible slot after network admission;
-/// the library's 16-slot answering window is 16 heartbeats of idle time.
+/// this binary leaves the configurable native answering window at its 16-slot
+/// default, equivalent to 16 heartbeats of idle time. Authenticated archive
+/// replay covers longer outages.
 pub const min_slot_ms: u64 = 1000;
 pub const heartbeat_ms: u64 = 3000;
 
