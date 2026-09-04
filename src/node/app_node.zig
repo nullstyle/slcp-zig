@@ -513,12 +513,16 @@ fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: a
     return err;
 }
 
-/// §8.5 delta-app recipe: can a `State` persisted at slot `s0` be caught up
-/// from the retained journal tail? A snapshot at 0 claims nothing.
-fn initialSlotWithinTail(s0: u64, tail: ?node.Node.JournalTail) bool {
+/// §8.5 delta-app recipe: can a `State` persisted at slot `s0` hand off to
+/// this Node? A snapshot at 0 claims nothing. Otherwise either the retained
+/// local journal must continue it, or an explicit start at its exact
+/// successor declares that the application verified an external checkpoint.
+fn initialSlotCanStart(s0: u64, tail: ?node.Node.JournalTail, start_slot: u64) bool {
     if (s0 == 0) return true;
+    const successor = std.math.add(u64, s0, 1) catch return false;
+    if (start_slot == successor) return true;
     const t = tail orelse return false;
-    return t.first <= s0 + 1 and s0 <= t.last;
+    return t.first <= successor and s0 <= t.last;
 }
 
 /// The teaching text for a journaled value the current `Command` cannot
@@ -539,7 +543,7 @@ const bad_composite_fmt = "{s}.combine returned a Command that its own validate 
 /// thread and read/write the one `state` — no lock, no tearing. The user
 /// thread only ever sees value copies via `waitApplied`.
 ///
-/// Restart (v1 limitation, plan R17): `State` is NOT persisted. After
+/// Restart (plan R17): `State` is NOT persisted by this module. After
 /// `create`, `state` = `initialState()` + `apply` over the replayed journal
 /// tail (compaction-bounded: the last ≥16 slots), so commands must be full
 /// VALUES ("count becomes 3"), never deltas. An app with delta semantics
@@ -547,12 +551,16 @@ const bad_composite_fmt = "{s}.combine returned a Command that its own validate 
 /// `waitApplied` item carries one), and declares BOTH `initialState()` (the
 /// snapshot) and `pub fn initialSlot() u64` (that slot): `create` seeds its
 /// dedup floor from `initialSlot()` before the tail replays, so journaled
-/// slots at or below it are skipped, not re-applied (S8 D2). A snapshot the
-/// retained tail cannot catch up (older than its first slot, ahead of its
-/// last, or without a journal) is `InitialSlotOutsideJournal`, so persist at
-/// least every 16 applied slots. Either way the first proposal after a
-/// restart is usually STALE (computed from `initialState()`): the network
-/// rejects it and the §0 loop catches up from the applied stream.
+/// slots at or below it are skipped, not re-applied (S8 D2). Ordinarily the
+/// retained tail must continue that slot, so persist at least every 16 applied
+/// slots. An application that independently verifies an external checkpoint
+/// through slot H instead sets `initialSlot()` to H and `.start_slot` to the
+/// exact successor H + 1; that explicit handoff starts consensus and delivery
+/// after the checkpoint even when the local journal is absent or stale.
+/// Every other snapshot/journal mismatch is `InitialSlotOutsideJournal`.
+/// Without an external cutover, the first proposal after a restart is usually
+/// STALE (computed from `initialState()`): the network rejects it and the §0
+/// loop catches up from the applied stream.
 pub fn AppNode(comptime App: type) type {
     comptime validateAppContract(App);
     return struct {
@@ -620,7 +628,9 @@ pub fn AppNode(comptime App: type) type {
         }
 
         /// The slot `initialState()` already includes (§8.5 delta-app
-        /// recipe); 0 when the app declares no `initialSlot()`.
+        /// recipe); 0 when the app declares no `initialSlot()`. State loaded
+        /// from an independently verified external checkpoint through H must
+        /// be paired with `.start_slot = H + 1`.
         fn initialSlot() u64 {
             if (@hasDecl(App, "initialSlot")) return App.initialSlot();
             return 0;
@@ -642,8 +652,9 @@ pub fn AppNode(comptime App: type) type {
         /// hook ctx (stable address). Adds two members to the bytes-level
         /// `CreateError`: an auto-encoded Command larger than
         /// `max_value_bytes`, and a journaled value the Command cannot decode;
-        /// a third for a persisted `State` whose `initialSlot()` the retained
-        /// journal tail cannot catch up.
+        /// a third for a persisted `State` whose `initialSlot()` is neither
+        /// continued by the retained journal nor paired with an explicit
+        /// exact-successor checkpoint start.
         pub fn create(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
             // Same contract as Node.create: a reused Diagnostic never keeps
             // a previous failure's text, and OutOfMemory gets a message too
@@ -694,21 +705,24 @@ pub fn AppNode(comptime App: type) type {
                 return e;
             };
             self.n = n;
-            // §8.5 delta-app recipe: a persisted State is only as good as the
-            // journal that continues it. Refuse a snapshot the retained tail
-            // cannot catch up — ahead of the journal (or with no journal at
-            // all: a snapshot from somewhere else), or older than the tail's
-            // first slot (the slots in between are gone) — rather than start
-            // on a silently wrong State.
+            // §8.5 delta-app recipe: a persisted State is usable when the
+            // local journal continues it, or when the application explicitly
+            // starts at its exact successor after independently verifying an
+            // external checkpoint. Anything else would re-apply or skip a
+            // slot and silently produce the wrong State.
             const s0 = initialSlot();
-            if (s0 != 0 and !initialSlotWithinTail(s0, n.journal_tail)) {
+            if (s0 != 0 and !initialSlotCanStart(s0, n.journal_tail, opts.start_slot)) {
                 const tail = n.journal_tail;
                 n.deinit();
                 self.n = null;
-                if (tail) |t| {
-                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} retains slots {d}..{d}; a persisted State must come from this data_dir and be no older than the retained tail (persist it at least every 16 applied slots, from the waitApplied stream) — or return 0 and use full-value commands.", .{ s0, opts.data_dir, t.first, t.last });
+                const successor: ?u64 = std.math.add(u64, s0, 1) catch null;
+                if (successor == null) {
+                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} has no successor slot, so the node cannot start after that State; use a checkpoint below the maximum u64 slot.", .{s0});
                 }
-                return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} is empty; a persisted State cannot be caught up without the journal it was taken from — start this data_dir from initialSlot() = 0 (a snapshot from elsewhere cannot be used), or restore its journal alongside it.", .{ s0, opts.data_dir });
+                if (tail) |t| {
+                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} retains slots {d}..{d} and .start_slot is {d}; use a local State the retained tail can continue (persist it at least every 16 applied slots), or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly.", .{ s0, opts.data_dir, t.first, t.last, opts.start_slot, s0, successor.? });
+                }
+                return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} is empty and .start_slot is {d}; start from initialSlot() = 0, restore the local journal, or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly.", .{ s0, opts.data_dir, opts.start_slot, s0, successor.? });
             }
             self.created.store(true, .release);
             return self;
@@ -1896,18 +1910,166 @@ test "restart of a DELTA app from a persisted snapshot (2-of-2 loopback): initia
     try testing.expect(std.mem.indexOf(u8, d2.message(), "empty") != null);
 }
 
-// Non-vacuity: the predicate is the whole outside-journal rule; flipping
-// either comparison (or the empty-journal arm) fails one of the arms below.
-test "initialSlot vs the retained journal tail: within, at either edge, ahead, behind, no journal" {
+// An application can verify a checkpoint independently of the Node's local
+// journal, reconstruct State through slot H, and declare H + 1 as the first
+// slot this process should participate in. The exact-successor relationship
+// is the handoff: the checkpoint accounts for every earlier slot, while the
+// Node owns every later one.
+test "AppNode starts from a verified external checkpoint at its exact successor" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+
+    delta_snapshot = .{ .state = .{ .sum = 200 }, .slot = 200 };
+    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+    const seed = seedOf(0x74);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: node.Diagnostic = .{};
+
+    const n = try DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint exact successor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .start_slot = 201,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    try testing.expect(n.raw().journal_tail == null);
+    try n.propose(.{ .add = 1 });
+    const applied = (try n.waitApplied(.{ .timeout_ms = 5_000 })) orelse return error.Timeout;
+    try testing.expectEqual(@as(u64, 201), applied.slot);
+    try testing.expectEqual(@as(i64, 201), applied.state.sum);
+}
+
+// A checkpoint may replace state from an older incarnation of the same node.
+// Node.create rejects a cutover at/below the journal high-water mark; when the
+// checkpoint is ahead, AppNode's pre-seeded applied_hwm makes the stale tail a
+// no-op and the explicit start establishes the new delivery frontier.
+test "external checkpoint ahead of a stale local journal starts without replaying stale slots" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+
+    const seed = seedOf(0x76);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const network = "external checkpoint over stale journal v1";
+    var diag: node.Diagnostic = .{};
+
+    // Leave one locally journaled slot behind.
+    {
+        const old = try DeltaNode.create(gpa, io, .{
+            .network = network,
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}),
+            .listen_port = 0,
+            .data_dir = td.path(),
+            .diagnostic = &diag,
+        });
+        defer old.deinit();
+        try old.propose(.{ .add = 1 });
+        const applied = (try old.waitApplied(.{ .timeout_ms = 5_000 })) orelse return error.Timeout;
+        try testing.expectEqual(@as(u64, 1), applied.slot);
+    }
+
+    delta_snapshot = .{ .state = .{ .sum = 200 }, .slot = 200 };
+    const n = try DeltaSnapNode.create(gpa, io, .{
+        .network = network,
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .start_slot = 201,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    try n.propose(.{ .add = 1 });
+    const applied = (try n.waitApplied(.{ .timeout_ms = 5_000 })) orelse return error.Timeout;
+    try testing.expectEqual(@as(u64, 201), applied.slot);
+    try testing.expectEqual(@as(i64, 201), applied.state.sum);
+    try testing.expect((try n.waitApplied(.{ .timeout_ms = 25 })) == null);
+}
+
+// The explicit start is an assertion that the application verified every
+// slot through H. It must name H + 1 exactly: H would reopen an accounted-for
+// slot, while H + 2 would silently skip one. Omitting the assertion retains
+// the conservative local-journal rule. maxInt has no successor.
+test "external checkpoint start must be the checked exact successor" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+
+    const seed = seedOf(0x75);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: node.Diagnostic = .{};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    delta_snapshot = .{ .state = .{ .sum = 200 }, .slot = 200 };
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint predecessor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&path_buf, "at-h"),
+        .start_slot = 200,
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "start_slot = 201") != null);
+
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint skipped successor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&path_buf, "after-successor"),
+        .start_slot = 202,
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "start_slot = 201") != null);
+
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint no assertion v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&path_buf, "default-start"),
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "start_slot = 201") != null);
+
+    delta_snapshot = .{ .state = .{}, .slot = std.math.maxInt(u64) };
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint no successor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&path_buf, "max-slot"),
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "has no successor") != null);
+}
+
+// Non-vacuity for the local-journal arm: flipping either comparison (or the
+// empty-journal arm) fails one of the cases below. The live checkpoint tests
+// above pin the predicate's separate exact-successor arm.
+test "initialSlot handoff through the retained journal: within, at either edge, ahead, behind, no journal" {
     // tail 49..70: a snapshot at 48 (tail starts right after it) through 70.
-    try testing.expect(initialSlotWithinTail(48, .{ .first = 49, .last = 70 }));
-    try testing.expect(initialSlotWithinTail(60, .{ .first = 49, .last = 70 }));
-    try testing.expect(initialSlotWithinTail(70, .{ .first = 49, .last = 70 }));
-    try testing.expect(!initialSlotWithinTail(71, .{ .first = 49, .last = 70 })); // ahead
-    try testing.expect(!initialSlotWithinTail(47, .{ .first = 49, .last = 70 })); // behind: 48 lost
-    try testing.expect(!initialSlotWithinTail(1, null)); // no journal
-    try testing.expect(initialSlotWithinTail(0, null)); // the default: nothing claimed
-    try testing.expect(initialSlotWithinTail(0, .{ .first = 49, .last = 70 }));
+    try testing.expect(initialSlotCanStart(48, .{ .first = 49, .last = 70 }, 1));
+    try testing.expect(initialSlotCanStart(60, .{ .first = 49, .last = 70 }, 1));
+    try testing.expect(initialSlotCanStart(70, .{ .first = 49, .last = 70 }, 1));
+    try testing.expect(!initialSlotCanStart(71, .{ .first = 49, .last = 70 }, 1)); // ahead
+    try testing.expect(!initialSlotCanStart(47, .{ .first = 49, .last = 70 }, 1)); // behind: 48 lost
+    try testing.expect(!initialSlotCanStart(1, null, 1)); // no journal
+    try testing.expect(initialSlotCanStart(0, null, 1)); // the default: nothing claimed
+    try testing.expect(initialSlotCanStart(0, .{ .first = 49, .last = 70 }, 1));
 }
 
 // Non-vacuity: without the reset at the top of AppNode.create and the OOM
