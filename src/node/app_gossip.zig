@@ -6,6 +6,7 @@
 //! to every capable peer. In particular, receipt never implies relay.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const wire = @import("wire.zig");
 
 pub const max_items: usize = 1024;
@@ -21,7 +22,20 @@ pub const Stats = struct {
     duplicate_messages: u64,
 };
 
+const WaitTestHook = struct {
+    reached: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn park(self: *WaitTestHook) void {
+        self.reached.store(true, .release);
+        while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+    }
+};
+
 pub const State = struct {
+    const wait_closing_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const wait_count_mask: usize = wait_closing_bit - 1;
+    const max_physical_items = 2 * max_items;
     const Digest = [32]u8;
     const Queued = struct {
         payload: []u8,
@@ -34,13 +48,21 @@ pub const State = struct {
     cond: std.Io.Condition = .init,
     drained: std.Io.Condition = .init,
     queue: std.ArrayList(Queued) = .empty,
+    head: usize = 0,
     pending: std.AutoHashMapUnmanaged(Digest, void) = .empty,
     queued_bytes: usize = 0,
     receiving: bool = false,
     closed: bool = false,
-    waiters: usize = 0,
+    // The high bit closes admission; the remaining bits count wait calls that
+    // have crossed the lifetime gate but have not finished State cleanup.
+    wait_gate: std.atomic.Value(usize) = .init(0),
+    waiters: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     dropped_messages: u64 = 0,
     duplicate_messages: u64 = 0,
+    wait_entry_test_hook: if (builtin.is_test) ?*WaitTestHook else void =
+        if (builtin.is_test) null else {},
+    wait_exit_test_hook: if (builtin.is_test) ?*WaitTestHook else void =
+        if (builtin.is_test) null else {},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) State {
         return .{ .gpa = gpa, .io = io };
@@ -71,11 +93,12 @@ pub const State = struct {
             self.dropped_messages +|= 1;
             return;
         };
-        if (self.queue.items.len >= max_items or next_bytes > max_bytes) {
+        if (self.queueCount() >= max_items or next_bytes > max_bytes) {
             self.dropped_messages +|= 1;
             return;
         }
-        self.queue.ensureUnusedCapacity(self.gpa, 1) catch {
+        self.compactQueueIfNeeded();
+        self.ensureQueueAppendCapacity() catch {
             self.dropped_messages +|= 1;
             return;
         };
@@ -94,15 +117,19 @@ pub const State = struct {
     }
 
     pub fn wait(self: *State, timeout_ms: ?u64) ?[]u8 {
+        if (!self.enterWait()) return null;
+        if (comptime builtin.is_test) {
+            if (self.wait_entry_test_hook) |hook| hook.park();
+        }
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        defer self.leaveWaitLocked();
         self.receiving = true;
-        self.waiters += 1;
+        if (comptime builtin.is_test) self.waiters += 1;
         defer {
-            self.waiters -= 1;
-            if (self.waiters == 0) self.drained.signal(self.io);
+            if (comptime builtin.is_test) self.waiters -= 1;
         }
-        while (self.queue.items.len == 0 and !self.closed) {
+        while (self.queueCount() == 0 and !self.closed) {
             if (timeout_ms) |ms| {
                 self.cond.waitTimeout(self.io, &self.mu, .{ .duration = .{
                     .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)),
@@ -113,7 +140,12 @@ pub const State = struct {
             }
         }
         if (self.closed) return null;
-        const item = self.queue.orderedRemove(0);
+        const item = self.queue.items[self.head];
+        self.head += 1;
+        if (self.head == self.queue.items.len) {
+            self.queue.clearRetainingCapacity();
+            self.head = 0;
+        }
         const removed = self.pending.remove(item.digest);
         std.debug.assert(removed);
         self.queued_bytes -= item.payload.len;
@@ -121,16 +153,23 @@ pub const State = struct {
     }
 
     pub fn closeAndDrain(self: *State) void {
+        _ = self.wait_gate.fetchOr(wait_closing_bit, .acq_rel);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.closed = true;
         self.cond.broadcast(self.io);
-        while (self.waiters > 0) self.drained.waitUncancelable(self.io, &self.mu);
+        while (self.activeWaitCount() > 0) {
+            self.drained.waitUncancelable(self.io, &self.mu);
+        }
     }
 
+    /// Before `deinit`, the caller must prevent every new State method call and
+    /// externally drain non-wait calls. Only `wait` frames which successfully
+    /// crossed the atomic gate may overlap teardown; `closeAndDrain` wakes and
+    /// drains those frames. A call preempted before gate entry is not covered.
     pub fn deinit(self: *State) void {
         self.closeAndDrain();
-        for (self.queue.items) |item| self.gpa.free(item.payload);
+        for (self.queue.items[self.head..]) |item| self.gpa.free(item.payload);
         self.queue.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.* = undefined;
@@ -141,11 +180,71 @@ pub const State = struct {
         defer self.mu.unlock(self.io);
         return .{
             .receiving = self.receiving,
-            .queued_items = self.queue.items.len,
+            .queued_items = self.queueCount(),
             .queued_bytes = self.queued_bytes,
             .dropped_messages = self.dropped_messages,
             .duplicate_messages = self.duplicate_messages,
         };
+    }
+
+    fn enterWait(self: *State) bool {
+        var gate = self.wait_gate.load(.acquire);
+        while (gate & wait_closing_bit == 0) {
+            std.debug.assert(gate < wait_count_mask);
+            if (self.wait_gate.cmpxchgWeak(
+                gate,
+                gate + 1,
+                .acq_rel,
+                .acquire,
+            )) |actual| {
+                gate = actual;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Called by `wait` while holding `mu`. The active count reaches zero only
+    /// under the same mutex `closeAndDrain` holds while checking it, so the
+    /// closer cannot return while this frame still has State cleanup to do.
+    fn leaveWaitLocked(self: *State) void {
+        const previous = self.wait_gate.fetchSub(1, .acq_rel);
+        const previous_count = previous & wait_count_mask;
+        std.debug.assert(previous_count > 0);
+        if (previous & wait_closing_bit != 0 and previous_count == 1) {
+            self.drained.broadcast(self.io);
+        }
+        if (comptime builtin.is_test) {
+            if (self.wait_exit_test_hook) |hook| hook.park();
+        }
+    }
+
+    fn activeWaitCount(self: *const State) usize {
+        return self.wait_gate.load(.acquire) & wait_count_mask;
+    }
+
+    fn queueCount(self: *const State) usize {
+        std.debug.assert(self.head <= self.queue.items.len);
+        return self.queue.items.len - self.head;
+    }
+
+    fn compactQueueIfNeeded(self: *State) void {
+        if (self.head < max_items) return;
+        const live = self.queue.items[self.head..];
+        std.mem.copyForwards(Queued, self.queue.items[0..live.len], live);
+        self.queue.shrinkRetainingCapacity(live.len);
+        self.head = 0;
+    }
+
+    fn ensureQueueAppendCapacity(self: *State) std.mem.Allocator.Error!void {
+        const needed = self.queue.items.len + 1;
+        if (needed <= self.queue.capacity) return;
+        std.debug.assert(needed <= max_physical_items);
+
+        const doubled = if (self.queue.capacity == 0) 8 else 2 * self.queue.capacity;
+        const target = @min(max_physical_items, @max(needed, doubled));
+        try self.queue.ensureTotalCapacityPrecise(self.gpa, target);
     }
 };
 
@@ -173,8 +272,8 @@ test "app gossip: an unused inbox retains no inbound payload or digest" {
     var state = State.init(gpa, io);
     defer state.deinit();
 
-    state.receive("first");
-    state.receive("second");
+    state.receive("same");
+    state.receive("same");
 
     const stats = state.snapshot();
     try std.testing.expect(!stats.receiving);
@@ -182,6 +281,14 @@ test "app gossip: an unused inbox retains no inbound payload or digest" {
     try std.testing.expectEqual(@as(usize, 0), stats.queued_bytes);
     try std.testing.expectEqual(@as(u64, 2), stats.dropped_messages);
     try std.testing.expectEqual(@as(u64, 0), stats.duplicate_messages);
+
+    // Pre-opt-in traffic must leave no digest behind: once this consumer opts
+    // in, the same bytes are admissible immediately.
+    try std.testing.expect(state.wait(0) == null);
+    state.receive("same");
+    const got = state.wait(0) orelse return error.MessageMissing;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("same", got);
 }
 
 test "app gossip: duplicates collapse only while queue-resident and FIFO order survives retry" {
@@ -238,6 +345,16 @@ test "app gossip: empty and 64 KiB payloads are valid while an oversized inbound
     try std.testing.expectError(error.AppMessageTooLarge, state.validatePublish(over_cap));
 
     try std.testing.expect(state.wait(0) == null);
+    state.receive("");
+    const empty = state.wait(0) orelse return error.MessageMissing;
+    defer gpa.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    state.receive(at_cap);
+    const exact = state.wait(0) orelse return error.MessageMissing;
+    defer gpa.free(exact);
+    try std.testing.expectEqualSlices(u8, at_cap, exact);
+
     state.receive(over_cap);
     const stats = state.snapshot();
     try std.testing.expectEqual(@as(usize, 0), stats.queued_items);
@@ -268,6 +385,49 @@ test "app gossip: the FIFO admits at most 1024 distinct payloads" {
     gpa.free(freed);
     state.receive("one-too-many");
     try std.testing.expectEqual(max_items, state.snapshot().queued_items);
+}
+
+test "app gossip: a saturated FIFO churns in order with bounded physical storage" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var state = State.init(gpa, io);
+    defer state.deinit();
+    try std.testing.expect(state.wait(0) == null);
+
+    var encoded: [8]u8 = undefined;
+    for (0..max_items) |i| {
+        std.mem.writeInt(u64, &encoded, @intCast(i), .little);
+        state.receive(&encoded);
+    }
+
+    const churn_count = 3 * max_items;
+    for (0..churn_count) |i| {
+        const got = state.wait(0) orelse return error.MessageMissing;
+        const actual = std.mem.readInt(u64, got[0..8], .little);
+        gpa.free(got);
+        try std.testing.expectEqual(@as(u64, @intCast(i)), actual);
+
+        std.mem.writeInt(u64, &encoded, @intCast(max_items + i), .little);
+        state.receive(&encoded);
+
+        const stats = state.snapshot();
+        try std.testing.expectEqual(max_items, stats.queued_items);
+        try std.testing.expect(state.queue.items.len <= 2 * max_items);
+        try std.testing.expect(state.queue.capacity <= 2 * max_items);
+        if (i == 0) {
+            // A head-index FIFO retains the popped slot until amortized
+            // compaction; orderedRemove(0) keeps these lengths equal.
+            try std.testing.expect(state.queue.items.len > stats.queued_items);
+        }
+    }
+
+    for (churn_count..churn_count + max_items) |expected| {
+        const got = state.wait(0) orelse return error.MessageMissing;
+        const actual = std.mem.readInt(u64, got[0..8], .little);
+        gpa.free(got);
+        try std.testing.expectEqual(@as(u64, @intCast(expected)), actual);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.snapshot().queued_items);
 }
 
 test "app gossip: queued payload bytes stop exactly at 16 MiB" {
@@ -430,5 +590,222 @@ test "app gossip: allocation failure retains no digest and the same payload can 
         stats = state.snapshot();
         try std.testing.expectEqual(@as(usize, 0), stats.queued_items);
         try std.testing.expectEqual(@as(u64, 0), stats.duplicate_messages);
+    }
+}
+
+test "app gossip: close drains a wait call that entered before acquiring the mutex" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var state = State.init(gpa, io);
+    defer state.deinit();
+
+    const Waiter = struct {
+        state: *State,
+        done: std.atomic.Value(bool) = .init(false),
+        saw_null: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            const result = self.state.wait(null);
+            self.saw_null.store(result == null, .release);
+            self.done.store(true, .release);
+        }
+    };
+    const Closer = struct {
+        state: *State,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.state.closeAndDrain();
+            self.done.store(true, .release);
+        }
+    };
+    const Inspect = struct {
+        fn closed(state_: *State, io_: std.Io) bool {
+            state_.mu.lockUncancelable(io_);
+            defer state_.mu.unlock(io_);
+            return state_.closed;
+        }
+    };
+
+    var hook = WaitTestHook{};
+    state.wait_entry_test_hook = &hook;
+    var waiter = Waiter{ .state = &state };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+
+    var waited_ms: u64 = 0;
+    while (!hook.reached.load(.acquire) and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const waiter_reached_entry = hook.reached.load(.acquire);
+
+    var closer = Closer{ .state = &state };
+    const closer_thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+
+    waited_ms = 0;
+    while (!Inspect.closed(&state, io) and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const closer_reached_notification = Inspect.closed(&state, io);
+
+    waited_ms = 0;
+    while (!closer.done.load(.acquire) and waited_ms < 250) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const close_returned_before_wait_entry_finished = closer.done.load(.acquire);
+
+    hook.release.store(true, .release);
+    waiter_thread.join();
+    closer_thread.join();
+
+    try std.testing.expect(waiter_reached_entry);
+    try std.testing.expect(closer_reached_notification);
+    try std.testing.expect(!close_returned_before_wait_entry_finished);
+    try std.testing.expect(waiter.done.load(.acquire));
+    try std.testing.expect(waiter.saw_null.load(.acquire));
+}
+
+test "app gossip: close does not return before the last waiter finishes its exit handshake" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var state = State.init(gpa, io);
+    defer state.deinit();
+
+    const Waiter = struct {
+        state: *State,
+
+        fn run(self: *@This()) void {
+            std.debug.assert(self.state.wait(0) == null);
+        }
+    };
+    const Closer = struct {
+        state: *State,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.state.closeAndDrain();
+            self.done.store(true, .release);
+        }
+    };
+
+    var hook = WaitTestHook{};
+    state.wait_exit_test_hook = &hook;
+    var waiter = Waiter{ .state = &state };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+
+    var waited_ms: u64 = 0;
+    while (!hook.reached.load(.acquire) and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const waiter_reached_exit = hook.reached.load(.acquire);
+
+    var closer = Closer{ .state = &state };
+    const closer_thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    waited_ms = 0;
+    while (state.wait_gate.load(.acquire) & State.wait_closing_bit == 0 and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const closer_closed_gate = state.wait_gate.load(.acquire) & State.wait_closing_bit != 0;
+
+    waited_ms = 0;
+    while (!closer.done.load(.acquire) and waited_ms < 250) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const close_returned_before_wait_exit_finished = closer.done.load(.acquire);
+
+    hook.release.store(true, .release);
+    waiter_thread.join();
+    closer_thread.join();
+
+    try std.testing.expect(waiter_reached_exit);
+    try std.testing.expect(closer_closed_gate);
+    try std.testing.expect(!close_returned_before_wait_exit_finished);
+}
+
+test "app gossip: close broadcasts to every parked waiter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var state = State.init(gpa, io);
+    defer state.deinit();
+
+    const waiter_count = 4;
+    const Waiter = struct {
+        state: *State,
+        done: std.atomic.Value(bool) = .init(false),
+        saw_null: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            const result = self.state.wait(null);
+            self.saw_null.store(result == null, .release);
+            self.done.store(true, .release);
+        }
+    };
+    const Closer = struct {
+        state: *State,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.state.closeAndDrain();
+            self.done.store(true, .release);
+        }
+    };
+    const Inspect = struct {
+        fn parkedWaiters(state_: *State, io_: std.Io) usize {
+            state_.mu.lockUncancelable(io_);
+            defer state_.mu.unlock(io_);
+            return state_.waiters;
+        }
+
+        fn closed(state_: *State, io_: std.Io) bool {
+            state_.mu.lockUncancelable(io_);
+            defer state_.mu.unlock(io_);
+            return state_.closed;
+        }
+    };
+
+    var waiters: [waiter_count]Waiter = undefined;
+    var waiter_threads: [waiter_count]std.Thread = undefined;
+    for (&waiters, &waiter_threads) |*waiter, *thread| {
+        waiter.* = .{ .state = &state };
+        thread.* = try std.Thread.spawn(.{}, Waiter.run, .{waiter});
+    }
+
+    var waited_ms: u64 = 0;
+    while (Inspect.parkedWaiters(&state, io) != waiter_count and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const all_waiters_parked = Inspect.parkedWaiters(&state, io) == waiter_count;
+
+    var closer = Closer{ .state = &state };
+    const closer_thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+
+    waited_ms = 0;
+    while (!Inspect.closed(&state, io) and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const closer_reached_notification = Inspect.closed(&state, io);
+
+    waited_ms = 0;
+    while (!closer.done.load(.acquire) and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const needed_rescue_broadcast = !closer.done.load(.acquire);
+    if (needed_rescue_broadcast) {
+        // Keep a broken signal-only implementation from hanging the test.
+        state.mu.lockUncancelable(io);
+        state.closed = true;
+        state.cond.broadcast(io);
+        state.drained.broadcast(io);
+        state.mu.unlock(io);
+    }
+
+    closer_thread.join();
+    for (&waiter_threads) |*thread| thread.join();
+
+    try std.testing.expect(all_waiters_parked);
+    try std.testing.expect(closer_reached_notification);
+    try std.testing.expect(!needed_rescue_broadcast);
+    for (&waiters) |*waiter| {
+        try std.testing.expect(waiter.done.load(.acquire));
+        try std.testing.expect(waiter.saw_null.load(.acquire));
     }
 }

@@ -3677,7 +3677,7 @@ test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount dro
     try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
 }
 
-test "app messages: a published payload crosses a real loopback connection as owned bytes" {
+test "app messages: repeated publishes cross a real loopback connection as owned bytes" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3733,6 +3733,13 @@ test "app messages: a published payload crosses a real loopback connection as ow
     const got = b.waitAppMessage(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
     defer gpa.free(got);
     try std.testing.expectEqualSlices(u8, want, got);
+
+    // Delivery removes the queue-resident digest, so an explicit periodic
+    // reflood of the same application payload is observable again.
+    try a.publishAppMessage(want);
+    const retried = b.waitAppMessage(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
+    defer gpa.free(retried);
+    try std.testing.expectEqualSlices(u8, want, retried);
 }
 
 // -- S8 D2: compaction cadence vs. multi-slot drains ---------------------------
