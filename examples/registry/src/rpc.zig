@@ -189,8 +189,8 @@ pub fn handle(shared: *Shared, line: []const u8, out: []u8) []const u8 {
         shared.lock();
         defer shared.unlock();
         const s = &shared.state;
-        return fmt(out, "head slot={d} hash={s} accounts={d} names={d} pending={d} network={s}", .{
-            s.head.slot, &registry.hex32(s.head.hash), s.n_accounts, s.n_names, shared.n_pending, &registry.hex32(s.network_id),
+        return fmt(out, "head slot={d} close_time={d} hash={s} accounts={d} names={d} pending={d} network={s}", .{
+            s.head.slot, s.head.close_time, &registry.hex32(s.head.hash), s.n_accounts, s.n_names, shared.n_pending, &registry.hex32(s.network_id),
         });
     }
     if (std.mem.eql(u8, verb, "get")) {
@@ -211,6 +211,7 @@ pub fn handle(shared: *Shared, line: []const u8, out: []u8) []const u8 {
     }
     if (std.mem.eql(u8, verb, "submit")) {
         const hex = it.next() orelse return fmt(out, "err bad_request submit <hex of {d} bytes>", .{registry.tx_bytes});
+        if (it.next() != null) return fmt(out, "err bad_request submit takes exactly one transaction; close time is chosen by the validator", .{});
         if (hex.len != 2 * registry.tx_bytes) return fmt(out, "err bad_tx expected {d} hex chars, got {d}", .{ 2 * registry.tx_bytes, hex.len });
         var raw: [registry.tx_bytes]u8 = undefined;
         _ = std.fmt.hexToBytes(&raw, hex) catch return fmt(out, "err bad_tx not hex", .{});
@@ -516,7 +517,8 @@ pub fn field(line: []const u8, key: []const u8) ?[]const u8 {
 const testing = std.testing;
 
 fn testShared() Shared {
-    return .{ .io = testing.io, .state = .{ .network_id = registry.networkId("rpc test") } };
+    const network_id = registry.networkId("rpc test", 0);
+    return .{ .io = testing.io, .state = registry.State.genesis(network_id, 0) };
 }
 
 fn signedTx(seed_byte: u8, seq: u64, name: []const u8, nid: [32]u8) Tx {
@@ -608,7 +610,7 @@ test "admission rejects malformed, wrong-network, out-of-sequence, duplicate, an
     malformed[73] = 1; // non-zero name padding is not canonical
     try testing.expectEqual(Admission.bad_tx, sh.admit(&malformed));
 
-    const wrong_network = signedTx(0x24, 1, "alice", registry.networkId("not rpc test"));
+    const wrong_network = signedTx(0x24, 1, "alice", registry.networkId("not rpc test", 0));
     var wrong_raw: [registry.tx_bytes]u8 = undefined;
     wrong_network.encode(&wrong_raw);
     try testing.expectEqual(Admission.bad_sig, sh.admit(&wrong_raw));
@@ -682,7 +684,8 @@ test "shared: prune drops applied pending transactions and retains later ones" {
     // Slot 1 applied t1 only (say another node's set): t1 pruned, t2 stays.
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = t1;
-    registry.apply(&sh.state, &set);
+    const value: registry.LedgerValue = .{ .close_time = 1, .txs = set };
+    registry.apply(&sh.state, &value);
     sh.prune();
     try testing.expectEqual(@as(usize, 1), sh.n_pending);
     try testing.expectEqual(@as(u64, 2), sh.pending[0].seq);
@@ -692,11 +695,23 @@ test "shared: prune drops applied pending transactions and retains later ones" {
 // Non-vacuity: every verb and every `err` code in `handle` has a line here;
 // the `field` helper must find the first `key=` token only.
 test "handle: head/get/account/submit lines and every error code" {
-    var sh = testShared();
+    const genesis_close_time: u64 = 1_234_567_890;
+    const network_id = registry.networkId("rpc handle test", genesis_close_time);
+    var sh: Shared = .{
+        .io = testing.io,
+        .state = registry.State.genesis(network_id, genesis_close_time),
+    };
     const nid = sh.state.network_id;
     var out: [max_line]u8 = undefined;
     var r = handle(&sh, "head", &out);
+    var expected_head_buf: [max_line]u8 = undefined;
+    const expected_head = try std.fmt.bufPrint(&expected_head_buf, "head slot=0 close_time=1234567890 hash={s} accounts=0 names=0 pending=0 network={s}", .{
+        &registry.hex32(sh.state.head.hash),
+        &registry.hex32(nid),
+    });
+    try testing.expectEqualStrings(expected_head, r);
     try testing.expectEqualStrings("0", field(r, "slot").?);
+    try testing.expectEqualStrings("1234567890", field(r, "close_time").?);
     try testing.expectEqualStrings(&registry.hex32(nid), field(r, "network").?);
     try testing.expectEqualStrings("0", field(r, "pending").?);
 
@@ -712,6 +727,11 @@ test "handle: head/get/account/submit lines and every error code" {
     const hex = hexOf(&enc, &hex_buf);
     var line_buf: [max_line]u8 = undefined;
     const submit_line = try std.fmt.bufPrint(&line_buf, "submit {s}", .{hex});
+    var timed_submit_buf: [max_line]u8 = undefined;
+    const timed_submit = try std.fmt.bufPrint(&timed_submit_buf, "submit {s} close_time=1234567891", .{hex});
+    r = handle(&sh, timed_submit, &out);
+    try testing.expectEqualStrings("err bad_request submit takes exactly one transaction; close time is chosen by the validator", r);
+    try testing.expectEqual(@as(usize, 0), sh.n_pending);
     r = handle(&sh, submit_line, &out);
     try testing.expectEqualStrings(&registry.hex32(t1.digest(nid)), field(r, "txid").?);
     try testing.expect(std.mem.startsWith(u8, r, "ok "));
@@ -729,7 +749,7 @@ test "handle: head/get/account/submit lines and every error code" {
     const l5 = try std.fmt.bufPrint(&line_buf, "submit {s}", .{hexOf(&enc, &hex_buf)});
     r = handle(&sh, l5, &out);
     try testing.expect(std.mem.startsWith(u8, r, "err bad_seq expected=2"));
-    var wrong = signedTx(0x31, 2, "bob", registry.networkId("other"));
+    var wrong = signedTx(0x31, 2, "bob", registry.networkId("other", 0));
     wrong.encode(&enc);
     const lw = try std.fmt.bufPrint(&line_buf, "submit {s}", .{hexOf(&enc, &hex_buf)});
     r = handle(&sh, lw, &out);
@@ -750,13 +770,15 @@ test "handle: head/get/account/submit lines and every error code" {
     // After the claim applies, `get` shows the entry with a hex value.
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = t1;
-    registry.apply(&sh.state, &set);
+    const value1: registry.LedgerValue = .{ .close_time = 1_234_567_891, .txs = set };
+    registry.apply(&sh.state, &value1);
     var v = signedTx(0x31, 2, "alice", nid);
     v = Tx.init(v.source, 2, .set, "alice", "hi", registry.zero_key).?;
     v.sign(@splat(0x31), nid) catch unreachable;
     var set2: registry.TxSet = .{ .count = 1 };
     set2.txs[0] = v;
-    registry.apply(&sh.state, &set2);
+    const value2: registry.LedgerValue = .{ .close_time = 1_234_567_892, .txs = set2 };
+    registry.apply(&sh.state, &value2);
     r = handle(&sh, "get alice", &out);
     try testing.expectEqualStrings("alice", field(r, "name").?);
     try testing.expectEqualStrings("6869", field(r, "value").?);

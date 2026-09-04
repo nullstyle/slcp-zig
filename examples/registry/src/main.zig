@@ -36,9 +36,11 @@ const GossipPublisher = struct {
 const usage =
     \\registry — a replicated name registry on slcp (examples/registry)
     \\
-    \\  registry node --network <passphrase> --key <file> --data-dir <dir> --quorum <json>
+    \\  registry node --network <passphrase> --genesis-close-time <unix-seconds>
+    \\                --key <file> --data-dir <dir> --quorum <json>
     \\                --listen <port> --rpc <port> [--peer host:port]...
     \\                [--min-slot-ms 1000] [--heartbeat-ms 3000]
+    \\                [--proposal-clock-offset-s 0]
     \\                [--history-dir <dir> [--checkpoint-every 8] [--history-min-slot 0]]
     \\  registry submit --key <file> [--rpc ip:port] claim <name>
     \\  registry submit --key <file> [--rpc ip:port] set <name> <value>
@@ -99,6 +101,8 @@ fn usageError(msg: []const u8) u8 {
 
 const Flags = struct {
     network: ?[]const u8 = null,
+    /// Required network anchor: POSIX/Unix seconds, leap seconds ignored.
+    genesis_close_time: ?u64 = null,
     key: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
     quorum: ?[]const u8 = null,
@@ -108,6 +112,9 @@ const Flags = struct {
     rpc: []const u8 = default_rpc,
     min_slot_ms: u64 = registry.min_slot_ms,
     heartbeat_ms: u64 = registry.heartbeat_ms,
+    /// Test/operations clock injection. It affects only this node's proposal;
+    /// deterministic validation never reads it or the local wall clock.
+    proposal_clock_offset_s: i64 = 0,
     /// A shared, untrusted archive. Validator attestations authenticate its
     /// contents; the local signing fence lives under `data_dir` instead.
     history_dir: ?[]const u8 = null,
@@ -123,7 +130,7 @@ const Flags = struct {
     }
 };
 
-const FlagError = error{ UnknownFlag, MissingValue, BadPort, BadMillis, BadCheckpointInterval, BadSlot } || std.mem.Allocator.Error;
+const FlagError = error{ UnknownFlag, MissingValue, BadPort, BadMillis, BadGenesisCloseTime, BadClockOffset, BadCheckpointInterval, BadSlot } || std.mem.Allocator.Error;
 
 fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool) FlagError!Flags {
     var f: Flags = .{};
@@ -141,6 +148,9 @@ fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool)
         const value = args[i];
         if (eql(name, "network")) {
             f.network = value;
+        } else if (eql(name, "genesis-close-time")) {
+            f.genesis_close_time = std.fmt.parseInt(u64, value, 10) catch return error.BadGenesisCloseTime;
+            if (f.genesis_close_time.? == std.math.maxInt(u64)) return error.BadGenesisCloseTime;
         } else if (eql(name, "key")) {
             f.key = value;
         } else if (eql(name, "data-dir")) {
@@ -164,6 +174,8 @@ fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool)
         } else if (eql(name, "heartbeat-ms")) {
             f.heartbeat_ms = std.fmt.parseInt(u64, value, 10) catch return error.BadMillis;
             if (f.heartbeat_ms == 0) return error.BadMillis;
+        } else if (eql(name, "proposal-clock-offset-s")) {
+            f.proposal_clock_offset_s = std.fmt.parseInt(i64, value, 10) catch return error.BadClockOffset;
         } else if (eql(name, "history-dir")) {
             if (value.len == 0) return error.MissingValue;
             f.history_dir = value;
@@ -188,6 +200,8 @@ fn flagsOrUsage(gpa: std.mem.Allocator, args: []const []const u8, node_mode: boo
             error.MissingValue => "a flag is missing its value",
             error.BadPort => "a port must be a number in 1..65535",
             error.BadMillis => "--min-slot-ms / --heartbeat-ms take milliseconds (heartbeat > 0)",
+            error.BadGenesisCloseTime => "--genesis-close-time must be a Unix-seconds integer below 18446744073709551615",
+            error.BadClockOffset => "--proposal-clock-offset-s must be a signed seconds integer",
             error.BadCheckpointInterval => "--checkpoint-every must be a number in 1..16",
             error.BadSlot => "--history-min-slot must be a non-negative slot number",
             error.OutOfMemory => "out of memory",
@@ -221,6 +235,23 @@ fn historyFailureIsFatal(err: anyerror) bool {
 fn nowMs(io: std.Io) u64 {
     const ns = std.Io.Clock.now(.awake, io).nanoseconds;
     return @intCast(@divTrunc(ns, std.time.ns_per_ms));
+}
+
+/// Unix/POSIX whole seconds, ignoring leap seconds. This is called only when
+/// constructing this validator's own proposal; received values and replay
+/// are checked exclusively against deterministic ledger state.
+fn wallSeconds(io: std.Io) u64 {
+    const ns = std.Io.Clock.now(.real, io).nanoseconds;
+    if (ns <= 0) return 0;
+    const seconds = @divFloor(ns, std.time.ns_per_s);
+    return std.math.cast(u64, seconds) orelse std.math.maxInt(u64);
+}
+
+fn shiftedWallSeconds(seconds: u64, offset: i64) u64 {
+    const shifted = @as(i128, seconds) + @as(i128, offset);
+    if (shifted <= 0) return 0;
+    if (shifted >= std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @intCast(shifted);
 }
 
 fn readSnapshotFile(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !?registry.State {
@@ -310,6 +341,7 @@ const BootSelectionError = error{
 /// from older state.
 fn selectBootState(
     network_id: [32]u8,
+    genesis_close_time: u64,
     local: ?registry.State,
     authenticated: ?registry.State,
     min_slot: u64,
@@ -344,7 +376,7 @@ fn selectBootState(
     if (eligible_local) |snapshot|
         return .{ .state = snapshot, .source = .local_snapshot, .start_slot = 1 };
     if (min_slot != 0) return error.HistoryFloorUnavailable;
-    return .{ .state = .{ .network_id = network_id }, .source = .genesis, .start_slot = 1 };
+    return .{ .state = registry.State.genesis(network_id, genesis_close_time), .source = .genesis, .start_slot = 1 };
 }
 
 /// Drain the synchronous journal replay that `AppNode.create` queued before
@@ -580,6 +612,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     var f = flagsOrUsage(gpa, args, true) orelse return 2;
     defer f.deinit(gpa);
     const network = f.network orelse return usageError("--network is required");
+    const genesis_close_time = f.genesis_close_time orelse return usageError("--genesis-close-time is required");
     const key_path = f.key orelse return usageError("--key is required");
     const data_dir = f.data_dir orelse return usageError("--data-dir is required");
     const quorum_path = f.quorum orelse return usageError("--quorum is required");
@@ -627,7 +660,10 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
 
     // Boot state: prefer a newer quorum-authenticated history checkpoint,
     // otherwise resume the local snapshot (or genesis for a fresh node).
-    const nid = registry.networkId(network);
+    const nid = registry.networkId(network, genesis_close_time);
+    const descriptor_buf = try gpa.alloc(u8, registry.tag_net.len + 8 + network.len);
+    defer gpa.free(descriptor_buf);
+    const network_descriptor = registry.networkDescriptor(genesis_close_time, network, descriptor_buf);
     const dir = if (f.history_dir != null)
         openDurableDataDir(io, data_dir, syncDirectory) catch |err| {
             std.debug.print("registry node: cannot durably create --data-dir {s}: {t}; in history mode its immediate parent must already exist on durable storage\n", .{ data_dir, err });
@@ -681,7 +717,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         };
     }
 
-    const selected = selectBootState(nid, local_snapshot, authenticated, f.history_min_slot) catch |err| {
+    const selected = selectBootState(nid, genesis_close_time, local_snapshot, authenticated, f.history_min_slot) catch |err| {
         switch (err) {
             error.HistoryCheckpointConflict => std.debug.print("registry node: the authenticated history checkpoint and local snapshot claim different heads at the same slot; keep this node stopped\n", .{}),
             error.HistoryFloorUnavailable => std.debug.print("registry node: no local snapshot or authenticated history checkpoint reaches --history-min-slot {d}; refusing an anti-rollback downgrade\n", .{f.history_min_slot}),
@@ -696,7 +732,9 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
 
     var diag: slcp.node.Diagnostic = .{};
     var node_options: app.Node.Options = .{
-        .network = network,
+        // Registry schema and genesis time are part of the raw SLCP signing
+        // domain too, so old nodes cannot enter this network and merely stall.
+        .network = network_descriptor,
         .key_file = key_path,
         // `kp` also signs history assertions. Bind Node's later key-file read
         // to that exact identity so a path swap cannot split the two roles.
@@ -802,8 +840,8 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         .local_snapshot => "the snapshot",
         .history => "history checkpoint",
     };
-    std.debug.print("registry: node {s} listening on port {d}; {d} peer(s); data in {s}; starting from {s} at slot {d}\n", .{
-        &registry.hex32(kp.public_key), node.raw().boundPort(), f.peers.items.len, data_dir, boot_source, selected.state.head.slot,
+    std.debug.print("registry: node {s} listening on port {d}; {d} peer(s); data in {s}; starting from {s} at slot {d} close_time={d}\n", .{
+        &registry.hex32(kp.public_key), node.raw().boundPort(), f.peers.items.len, data_dir, boot_source, selected.state.head.slot, selected.state.head.close_time,
     });
     std.debug.print("registry: limits: {d} txs per set, {d} accounts, {d} names, {d} pending; busy slots every >= {d} ms, idle heartbeat every {d} ms\n", .{
         registry.max_txs, registry.max_accounts, registry.max_names, registry.max_pending, f.min_slot_ms, f.heartbeat_ms,
@@ -877,7 +915,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
                 if (r == .ok) ok += 1;
             }
             const head_hex = registry.hex32(a.state.head.hash);
-            std.debug.print("slot {d}: txs={d} ok={d} head={s}\n", .{ a.slot, a.state.last_count, ok, head_hex[0..16] });
+            std.debug.print("slot {d}: close_time={d} txs={d} ok={d} head={s}\n", .{ a.slot, a.state.head.close_time, a.state.last_count, ok, head_hex[0..16] });
             last_close = nowMs(io);
             next_stall_warn = last_close + stall_warn_ms;
             proposed = false;
@@ -907,14 +945,15 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
         if (!proposed) {
             const since = now -| last_close;
-            var set: ?registry.TxSet = null;
+            var value: ?registry.LedgerValue = null;
             shared.lock();
             if (registry.nominationDue(shared.n_pending > 0, since, f.min_slot_ms, f.heartbeat_ms)) {
-                set = registry.proposal(&shared.state, shared.pendingSlice());
+                const proposal_time = shiftedWallSeconds(wallSeconds(io), f.proposal_clock_offset_s);
+                value = registry.proposal(&shared.state, shared.pendingSlice(), proposal_time);
             }
             shared.unlock();
-            if (set) |s| {
-                node.propose(s) catch |err| {
+            if (value) |v| {
+                node.propose(v) catch |err| {
                     std.debug.print("registry node: propose failed: {t}\n", .{err});
                 };
                 proposed = true;
@@ -1026,25 +1065,51 @@ test {
 }
 
 const testing = std.testing;
+const test_genesis_close_time: u64 = 1_700_000_000;
+
+fn testNetworkId(passphrase: []const u8) [32]u8 {
+    return registry.networkId(passphrase, test_genesis_close_time);
+}
+
+fn testGenesis(passphrase: []const u8) registry.State {
+    return registry.State.genesis(testNetworkId(passphrase), test_genesis_close_time);
+}
+
+fn advanceEmpty(state: *registry.State) void {
+    const value = registry.proposal(state, &.{}, state.head.close_time + 1).?;
+    registry.apply(state, &value);
+}
 
 test "registry main: history flags parse and checkpoint cadence is bounded by the answering window" {
     var parsed = try parseFlags(testing.allocator, &.{
-        "--history-dir",      "/shared/history",
-        "--checkpoint-every", "16",
-        "--history-min-slot", "240",
+        "--genesis-close-time",      "1700000000",
+        "--proposal-clock-offset-s", "-30",
+        "--history-dir",             "/shared/history",
+        "--checkpoint-every",        "16",
+        "--history-min-slot",        "240",
     }, true);
     defer parsed.deinit(testing.allocator);
     try testing.expectEqualStrings("/shared/history", parsed.history_dir.?);
+    try testing.expectEqual(test_genesis_close_time, parsed.genesis_close_time.?);
+    try testing.expectEqual(@as(i64, -30), parsed.proposal_clock_offset_s);
     try testing.expectEqual(@as(u64, 16), parsed.checkpoint_every);
     try testing.expectEqual(@as(u64, 240), parsed.history_min_slot);
 
     try testing.expectError(error.BadCheckpointInterval, parseFlags(testing.allocator, &.{ "--checkpoint-every", "0" }, true));
     try testing.expectError(error.BadCheckpointInterval, parseFlags(testing.allocator, &.{ "--checkpoint-every", "17" }, true));
     try testing.expectError(error.BadSlot, parseFlags(testing.allocator, &.{ "--history-min-slot", "not-a-slot" }, true));
+    try testing.expectError(error.BadGenesisCloseTime, parseFlags(testing.allocator, &.{ "--genesis-close-time", "18446744073709551615" }, true));
+    try testing.expectError(error.BadClockOffset, parseFlags(testing.allocator, &.{ "--proposal-clock-offset-s", "fast" }, true));
+}
+
+test "registry main: proposal clock offsets saturate without affecting cadence time" {
+    try testing.expectEqual(@as(u64, 70), shiftedWallSeconds(100, -30));
+    try testing.expectEqual(@as(u64, 0), shiftedWallSeconds(10, -30));
+    try testing.expectEqual(std.math.maxInt(u64), shiftedWallSeconds(std.math.maxInt(u64) - 5, 30));
 }
 
 test "registry main: boot selection prefers authenticated history and treats its floor as absolute" {
-    const nid = registry.networkId("registry main history selection");
+    const nid = testNetworkId("registry main history selection");
     var local: registry.State = .{ .network_id = nid };
     local.head.slot = 10;
     local.head.hash = @splat(0x10);
@@ -1052,31 +1117,33 @@ test "registry main: boot selection prefers authenticated history and treats its
     checkpoint.head.slot = 11;
     checkpoint.head.hash = @splat(0x11);
 
-    const newer = try selectBootState(nid, local, checkpoint, 0);
+    const newer = try selectBootState(nid, test_genesis_close_time, local, checkpoint, 0);
     try testing.expectEqual(BootSource.history, newer.source);
     try testing.expectEqual(@as(u64, 12), newer.start_slot);
 
-    const local_newer = try selectBootState(nid, checkpoint, local, 0);
+    const local_newer = try selectBootState(nid, test_genesis_close_time, checkpoint, local, 0);
     try testing.expectEqual(BootSource.local_snapshot, local_newer.source);
     try testing.expectEqual(@as(u64, 1), local_newer.start_slot);
 
-    const equal = try selectBootState(nid, checkpoint, checkpoint, checkpoint.head.slot);
+    const equal = try selectBootState(nid, test_genesis_close_time, checkpoint, checkpoint, checkpoint.head.slot);
     try testing.expectEqual(BootSource.history, equal.source);
     try testing.expectEqual(@as(u64, 12), equal.start_slot);
 
     var fork = checkpoint;
     fork.head.hash = @splat(0xff);
-    try testing.expectError(error.HistoryCheckpointConflict, selectBootState(nid, checkpoint, fork, 0));
-    try testing.expectError(error.HistoryFloorUnavailable, selectBootState(nid, local, null, 11));
+    try testing.expectError(error.HistoryCheckpointConflict, selectBootState(nid, test_genesis_close_time, checkpoint, fork, 0));
+    try testing.expectError(error.HistoryFloorUnavailable, selectBootState(nid, test_genesis_close_time, local, null, 11));
 }
 
 test "registry main: a history-free empty boot preserves genesis behavior" {
-    const nid = registry.networkId("registry main genesis selection");
-    const selected = try selectBootState(nid, null, null, 0);
+    const nid = testNetworkId("registry main genesis selection");
+    const selected = try selectBootState(nid, test_genesis_close_time, null, null, 0);
     try testing.expectEqual(BootSource.genesis, selected.source);
     try testing.expectEqual(@as(u64, 0), selected.state.head.slot);
     try testing.expectEqual(@as(u64, 1), selected.start_slot);
     try testing.expectEqualSlices(u8, &nid, &selected.state.network_id);
+    try testing.expectEqual(test_genesis_close_time, selected.state.head.close_time);
+    try testing.expectEqualSlices(u8, &registry.headerHash(nid, &selected.state.head), &selected.state.head.hash);
 }
 
 test "registry main: a missing snapshot cannot replay a compacted journal" {
@@ -1087,23 +1154,28 @@ test "registry main: a missing snapshot cannot replay a compacted journal" {
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
     const network = "registry main compacted journal without snapshot";
-    const network_id = registry.networkId(network);
+    const network_id = testNetworkId(network);
+    var descriptor_buf: [128]u8 = undefined;
+    const descriptor = registry.networkDescriptor(test_genesis_close_time, network, &descriptor_buf);
     const seed: [32]u8 = @splat(0xb1);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
     defer app.boot = .{ .state = .{}, .slot = 0 };
 
-    var encoded_buf: [registry.max_set_bytes]u8 = undefined;
-    const encoded = registry.TxSet.empty.encode(&encoded_buf);
+    var encoded_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+    const encoded = (registry.LedgerValue{
+        .close_time = test_genesis_close_time + 49,
+        .txs = .empty,
+    }).encode(&encoded_buf);
     {
         var store = try slcp.store.Store.open(gpa, io, data_dir);
         defer store.deinit();
         try store.appendExternalized(49, encoded);
     }
 
-    app.boot = .{ .state = .{ .network_id = network_id }, .slot = 0 };
+    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
     if (app.Node.create(gpa, io, .{
-        .network = network,
+        .network = descriptor,
         .secret_seed = seed,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .include_self = false,
@@ -1121,6 +1193,100 @@ test "registry main: a missing snapshot cannot replay a compacted journal" {
     }
 }
 
+test "registry main: the E2c descriptor rejects a pre-E2c data directory" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = data_dir_buf[0..try tmp.dir.realPath(io, &data_dir_buf)];
+    const network = "registry main hard epoch";
+    const network_id = testNetworkId(network);
+    var descriptor_buf: [128]u8 = undefined;
+    const descriptor = registry.networkDescriptor(test_genesis_close_time, network, &descriptor_buf);
+    const seed: [32]u8 = @splat(0xb2);
+    const id = try registry.publicKeyOf(seed);
+    var diag: slcp.node.Diagnostic = .{};
+    defer app.boot = .{ .state = .{}, .slot = 0 };
+    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+
+    // The legacy registry passed the human passphrase directly to Node.
+    const legacy = try app.Node.create(gpa, io, .{
+        .network = network,
+        .secret_seed = seed,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .include_self = false,
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .max_value_bytes = registry.max_value_bytes,
+        .diagnostic = &diag,
+    });
+    legacy.deinit();
+
+    if (app.Node.create(gpa, io, .{
+        .network = descriptor,
+        .secret_seed = seed,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .include_self = false,
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .max_value_bytes = registry.max_value_bytes,
+        .diagnostic = &diag,
+    })) |unexpected| {
+        unexpected.deinit();
+        return error.ExpectedHardNetworkEpoch;
+    } else |err| try testing.expectEqual(error.DataDirOtherNetwork, err);
+}
+
+test "registry main: a legacy transaction-set journal fails closed if the network guard is bypassed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = data_dir_buf[0..try tmp.dir.realPath(io, &data_dir_buf)];
+    const network = "registry main legacy journal";
+    const network_id = testNetworkId(network);
+    var descriptor_buf: [128]u8 = undefined;
+    const descriptor = registry.networkDescriptor(test_genesis_close_time, network, &descriptor_buf);
+    const seed: [32]u8 = @splat(0xb3);
+    const id = try registry.publicKeyOf(seed);
+    var diag: slcp.node.Diagnostic = .{};
+    defer app.boot = .{ .state = .{}, .slot = 0 };
+    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
+
+    // Establish current network identity, then inject bytes written by the
+    // pre-E2c TxSet codec to isolate the value-format migration check.
+    const current = try app.Node.create(gpa, io, .{
+        .network = descriptor,
+        .secret_seed = seed,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .include_self = false,
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .max_value_bytes = registry.max_value_bytes,
+        .diagnostic = &diag,
+    });
+    current.deinit();
+    var old_buf: [registry.max_set_bytes]u8 = undefined;
+    {
+        var store = try slcp.store.Store.open(gpa, io, data_dir);
+        defer store.deinit();
+        try store.appendExternalized(1, registry.TxSet.empty.encode(&old_buf));
+    }
+
+    try testing.expectError(error.UndecodableExternalizedValue, app.Node.create(gpa, io, .{
+        .network = descriptor,
+        .secret_seed = seed,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .include_self = false,
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .max_value_bytes = registry.max_value_bytes,
+        .diagnostic = &diag,
+    }));
+}
+
 test "registry main: snapshot replacement does not follow a planted temp or final symlink" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const io = testing.io;
@@ -1135,8 +1301,8 @@ test "registry main: snapshot replacement does not follow a planted temp or fina
     // its target before the rename.
     try tmp.dir.symLink(io, "outside", "snapshot.tmp", .{});
 
-    var state: registry.State = .{ .network_id = registry.networkId("registry main snapshot atomic") };
-    registry.apply(&state, &registry.TxSet.empty);
+    var state = testGenesis("registry main snapshot atomic");
+    advanceEmpty(&state);
     try writeSnapshotFile(io, tmp.dir, &state);
 
     const sentinel = try tmp.dir.readFileAlloc(io, "outside", testing.allocator, .limited(32));
@@ -1219,7 +1385,7 @@ test "registry main: the publisher latches trusted fence I/O as fatal" {
     const signing_path = try std.fmt.bufPrint(&signing_buf, "{s}/signing", .{root});
     const seed: [32]u8 = @splat(0xd1);
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
-    const network_id = registry.networkId("registry publisher trusted fence failure");
+    const network_id = testNetworkId("registry publisher trusted fence failure");
     var archive = try history.Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
@@ -1235,8 +1401,8 @@ test "registry main: the publisher latches trusted fence I/O as fatal" {
     const publisher = try HistoryPublisher.start(gpa, io, archive);
     archive_live = false;
     defer publisher.deinit();
-    var state: registry.State = .{ .network_id = network_id };
-    registry.apply(&state, &registry.TxSet.empty);
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    advanceEmpty(&state);
     publisher.offer(state);
 
     const deadline = nowMs(io) + 5_000;
@@ -1251,11 +1417,11 @@ test "registry main: the publisher latches trusted fence I/O as fatal" {
 }
 
 test "registry main: an availability-blocked checkpoint is coalesced to the newest due state" {
-    const nid = registry.networkId("registry main checkpoint coalescing");
-    var eight: registry.State = .{ .network_id = nid };
-    for (0..8) |_| registry.apply(&eight, &registry.TxSet.empty);
+    const nid = testNetworkId("registry main checkpoint coalescing");
+    var eight = registry.State.genesis(nid, test_genesis_close_time);
+    for (0..8) |_| advanceEmpty(&eight);
     var sixteen = eight;
-    for (8..16) |_| registry.apply(&sixteen, &registry.TxSet.empty);
+    for (8..16) |_| advanceEmpty(&sixteen);
 
     var mailbox = HistoryMailbox.init(testing.io);
     defer mailbox.stop();
@@ -1267,11 +1433,11 @@ test "registry main: an availability-blocked checkpoint is coalesced to the newe
 }
 
 test "registry main: a newer checkpoint supersedes an active publication after availability failure" {
-    const nid = registry.networkId("registry main active history supersession");
-    var eight: registry.State = .{ .network_id = nid };
-    for (0..8) |_| registry.apply(&eight, &registry.TxSet.empty);
+    const nid = testNetworkId("registry main active history supersession");
+    var eight = registry.State.genesis(nid, test_genesis_close_time);
+    for (0..8) |_| advanceEmpty(&eight);
     var sixteen = eight;
-    for (8..16) |_| registry.apply(&sixteen, &registry.TxSet.empty);
+    for (8..16) |_| advanceEmpty(&sixteen);
 
     var mailbox = HistoryMailbox.init(testing.io);
     defer mailbox.stop();
@@ -1303,13 +1469,13 @@ const SlowHistoryMailboxConsumer = struct {
 
 test "registry main: a slow history consumer does not block offers and sees only the newest queued checkpoint" {
     const io = testing.io;
-    const nid = registry.networkId("registry main slow history consumer");
-    var eight: registry.State = .{ .network_id = nid };
-    for (0..8) |_| registry.apply(&eight, &registry.TxSet.empty);
+    const nid = testNetworkId("registry main slow history consumer");
+    var eight = registry.State.genesis(nid, test_genesis_close_time);
+    for (0..8) |_| advanceEmpty(&eight);
     var sixteen = eight;
-    for (8..16) |_| registry.apply(&sixteen, &registry.TxSet.empty);
+    for (8..16) |_| advanceEmpty(&sixteen);
     var twenty_four = sixteen;
-    for (16..24) |_| registry.apply(&twenty_four, &registry.TxSet.empty);
+    for (16..24) |_| advanceEmpty(&twenty_four);
 
     var mailbox = HistoryMailbox.init(io);
     var consumer = SlowHistoryMailboxConsumer{ .mailbox = &mailbox };
@@ -1345,7 +1511,9 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const data_dir = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
     const network = "registry main checkpoint journal overlap";
-    const network_id = registry.networkId(network);
+    const network_id = testNetworkId(network);
+    var descriptor_buf: [128]u8 = undefined;
+    const descriptor = registry.networkDescriptor(test_genesis_close_time, network, &descriptor_buf);
     const seed: [32]u8 = @splat(0xc1);
     const id = try registry.publicKeyOf(seed);
     var diag: slcp.node.Diagnostic = .{};
@@ -1353,10 +1521,10 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
 
     var checkpoint: registry.State = undefined;
     var after: registry.State = undefined;
-    app.boot = .{ .state = .{ .network_id = network_id }, .slot = 0 };
+    app.boot = .{ .state = registry.State.genesis(network_id, test_genesis_close_time), .slot = 0 };
     {
         const original = try app.Node.create(gpa, io, .{
-            .network = network,
+            .network = descriptor,
             .secret_seed = seed,
             .quorum = slcp.Quorum.of(1, &.{id}),
             .include_self = false,
@@ -1366,9 +1534,9 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
             .diagnostic = &diag,
         });
         defer original.deinit();
-        try original.propose(registry.TxSet.empty);
+        try original.propose(registry.proposal(&app.boot.state, &.{}, test_genesis_close_time + 1).?);
         checkpoint = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.state;
-        try original.propose(registry.TxSet.empty);
+        try original.propose(registry.proposal(&checkpoint, &.{}, checkpoint.head.close_time + 1).?);
         after = (try original.waitApplied(.{ .timeout_ms = 5_000 })).?.state;
     }
 
@@ -1376,7 +1544,7 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     // main replaced its slot-1 application snapshot.
     app.boot = .{ .state = checkpoint, .slot = checkpoint.head.slot };
     try testing.expectError(error.StartSlotBehindJournal, app.Node.create(gpa, io, .{
-        .network = network,
+        .network = descriptor,
         .secret_seed = seed,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .include_self = false,
@@ -1388,7 +1556,7 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     }));
 
     const resumed = try app.Node.create(gpa, io, .{
-        .network = network,
+        .network = descriptor,
         .secret_seed = seed,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .include_self = false,
@@ -1401,6 +1569,10 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     const ready = try drainBootReplay(resumed, checkpoint);
     try testing.expectEqual(@as(u64, 2), ready.head.slot);
     try testing.expectEqualSlices(u8, &after.head.hash, &ready.head.hash);
+    try testing.expectEqual(after.head.close_time, ready.head.close_time);
+    var after_value_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+    var ready_value_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, after.last_value.?.encode(&after_value_buf), ready.last_value.?.encode(&ready_value_buf));
 
     // The process installs the replay-complete state before it exposes RPC.
     // Persisting the stale checkpoint here would resurrect slot 1 on the next
@@ -1409,4 +1581,5 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
     const installed = (try readSnapshotFile(io, tmp.dir, gpa)) orelse return error.SnapshotMissing;
     try testing.expectEqual(@as(u64, 2), installed.head.slot);
     try testing.expectEqualSlices(u8, &after.head.hash, &installed.head.hash);
+    try testing.expectEqual(after.head.close_time, installed.head.close_time);
 }

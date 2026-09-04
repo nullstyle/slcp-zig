@@ -2,7 +2,7 @@
 //! (docs/examples-roadmap.md E1–E2b).
 //!
 //! The pure state machine lives in `registry.zig`; this file is the glue the
-//! typed layer needs: the `App` contract (`State`, `Command`, `validate`,
+//! typed layer needs: the `App` contract (`State`, `Command`, contextual `validate`,
 //! `apply`, `combine`, the custom codec, `initialState` / `initialSlot` /
 //! `initialCommand`) and the process-wide `boot` snapshot those recovery
 //! functions read.
@@ -20,13 +20,13 @@ pub const registry = @import("registry.zig");
 pub var boot: struct { state: registry.State, slot: u64 } = .{ .state = .{}, .slot = 0 };
 
 /// The §8.5 App. `validate` and `apply` run on the engine thread; both are
-/// pure over `State` and the set.
+/// pure over `State`, the candidate value, and the driver's slot context.
 pub const Registry = struct {
     pub const State = registry.State;
-    pub const Command = registry.TxSet;
+    pub const Command = registry.LedgerValue;
 
-    pub fn validate(state: State, cmd: Command) slcp.Validity {
-        return switch (registry.validate(&state, &cmd)) {
+    pub fn validate(state: State, cmd: Command, context: slcp.ValueContext) slcp.Validity {
+        return switch (registry.validate(&state, &cmd, context.slot)) {
             .invalid => .invalid,
             .maybe_valid => .maybe_valid,
             .valid => .valid,
@@ -51,7 +51,7 @@ pub const Registry = struct {
     }
 
     pub fn initialCommand() ?Command {
-        return boot.state.last_set;
+        return boot.state.last_value;
     }
 
     // The custom codec (variable-length sets; the auto-codec cannot).
@@ -60,7 +60,7 @@ pub const Registry = struct {
     }
 
     pub fn decode(bytes: []const u8) ?Command {
-        return registry.TxSet.decode(bytes);
+        return registry.LedgerValue.decode(bytes);
     }
 };
 
@@ -69,7 +69,7 @@ pub const Node = slcp.AppNode(Registry);
 comptime {
     // The custom codec's largest encoding must fit the node option the
     // program passes (roadmap §3.1); the contract check happens at create.
-    std.debug.assert(registry.max_set_bytes <= registry.max_value_bytes);
+    std.debug.assert(registry.max_ledger_value_bytes <= registry.max_value_bytes);
     std.debug.assert(Node.codec.is_custom);
     std.debug.assert(Node.apply_in_place);
 }
@@ -89,6 +89,9 @@ const testing = std.testing;
 const Track = struct {
     /// head hash by slot (slots 1..max_slots), null until applied.
     hashes: [max_slots + 1]?[32]u8 = @splat(null),
+    /// Consensus close time by slot, used to prove skew convergence and the
+    /// deterministic per-ledger bound across a restart.
+    close_times: [max_slots + 1]?u64 = @splat(null),
     last_slot: u64 = 0,
     /// The state copy of the last applied item.
     last_state: ?registry.State = null,
@@ -97,7 +100,11 @@ const Track = struct {
     fn note(self: *Track, item: Node.Applied) !void {
         // Roadmap §3.8: the header's slot must be the delivered slot.
         try testing.expectEqual(item.slot, item.state.head.slot);
-        if (item.slot <= max_slots) self.hashes[item.slot] = item.state.head.hash;
+        try testing.expectEqual(item.state.head.close_time, item.state.last_value.?.close_time);
+        if (item.slot <= max_slots) {
+            self.hashes[item.slot] = item.state.head.hash;
+            self.close_times[item.slot] = item.state.head.close_time;
+        }
         self.last_slot = item.slot;
         self.last_state = item.state;
     }
@@ -106,17 +113,17 @@ const Track = struct {
 /// What a node proposes after an applied slot, given its new state — the
 /// node loop's rule in miniature: pending transactions until they apply,
 /// then the empty set.
-const Proposer = *const fn (*const registry.State) registry.TxSet;
+const Proposer = *const fn (*const registry.State) registry.LedgerValue;
 
 var test_claim_set: registry.TxSet = .{ .count = 0 };
 
-fn proposeClaimUntilApplied(state: *const registry.State) registry.TxSet {
-    return if (state.findName("alice") == null) test_claim_set else registry.TxSet.empty;
+fn proposeClaimUntilApplied(state: *const registry.State) registry.LedgerValue {
+    const pending = if (state.findName("alice") == null) test_claim_set.slice() else &.{};
+    return registry.proposal(state, pending, state.head.close_time +| registry.max_close_time_step).?;
 }
 
-fn proposeEmpty(state: *const registry.State) registry.TxSet {
-    _ = state;
-    return registry.TxSet.empty;
+fn proposeEmpty(state: *const registry.State) registry.LedgerValue {
+    return registry.proposal(state, &.{}, state.head.close_time +| 1).?;
 }
 
 /// Drive both nodes until each has applied `target`: after every applied
@@ -144,7 +151,7 @@ fn pump(a: *Node, b: *Node, pa: Proposer, pb: Proposer, ta: *Track, tb: *Track, 
 // without the custom codec the set does not round-trip and the claim is
 // never applied; a different `network_id` in `boot` makes validate reject
 // the claim (bad signature) and the pump times out.
-test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes with equal heads; a restart from the snapshot skips the replayed tail" {
+test "registry over AppNode (2-of-2 loopback): skewed clocks converge and snapshot restart preserves the exact predecessor" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -156,11 +163,14 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
     const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
     const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
 
-    const network = "registry app test v1";
+    const network = "registry app test v2";
+    const genesis_close_time: u64 = 1_700_000_000;
+    var network_buf: [128]u8 = undefined;
+    const network_descriptor = registry.networkDescriptor(genesis_close_time, network, &network_buf);
     const seed_a: [32]u8 = @splat(0x81);
     const seed_b: [32]u8 = @splat(0x82);
     const ids = [2][32]u8{ try registry.publicKeyOf(seed_a), try registry.publicKeyOf(seed_b) };
-    const nid = registry.networkId(network);
+    const nid = registry.networkId(network, genesis_close_time);
     var diag: slcp.node.Diagnostic = .{};
     var spec_buf: [32]u8 = undefined;
 
@@ -172,13 +182,13 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
     test_claim_set = .{ .count = 1 };
     test_claim_set.txs[0] = claim;
 
-    boot = .{ .state = .{ .network_id = nid }, .slot = 0 };
+    boot = .{ .state = registry.State.genesis(nid, genesis_close_time), .slot = 0 };
     var ta: Track = .{};
     var tb: Track = .{};
 
     const b = blk: {
         const a = try Node.create(gpa, io, .{
-            .network = network,
+            .network = network_descriptor,
             .secret_seed = seed_a,
             .quorum = slcp.Quorum.of(2, &ids),
             .listen_port = 0,
@@ -188,7 +198,7 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
         });
         defer a.deinit();
         const b = try Node.create(gpa, io, .{
-            .network = network,
+            .network = network_descriptor,
             .secret_seed = seed_b,
             .quorum = slcp.Quorum.of(2, &ids),
             .listen_port = 0,
@@ -199,8 +209,11 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
         });
         errdefer b.deinit();
 
-        try a.propose(test_claim_set);
-        try b.propose(registry.TxSet.empty);
+        // The proposers disagree by the full permitted clock window. Close
+        // time remains a deterministic consensus value: both nodes must
+        // externalize the same value and resulting header.
+        try a.propose(registry.proposal(&boot.state, test_claim_set.slice(), genesis_close_time + registry.max_close_time_step).?);
+        try b.propose(registry.proposal(&boot.state, &.{}, genesis_close_time + 1).?);
         try pump(a, b, proposeClaimUntilApplied, proposeEmpty, &ta, &tb, 3, 60_000);
 
         // The claim landed (a re-proposes it until it does — the node
@@ -209,7 +222,15 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
         for (1..4) |s| {
             try testing.expect(ta.hashes[s] != null and tb.hashes[s] != null);
             try testing.expectEqualSlices(u8, &ta.hashes[s].?, &tb.hashes[s].?);
+            try testing.expectEqual(ta.close_times[s].?, tb.close_times[s].?);
+            const previous = if (s == 1) genesis_close_time else ta.close_times[s - 1].?;
+            try testing.expect(ta.close_times[s].? > previous);
+            try testing.expect(ta.close_times[s].? - previous <= registry.max_close_time_step);
         }
+        // A 2-of-2 first slot has observed both endpoint proposals. The
+        // composite must choose the minimum, not merely a mutually agreed
+        // time somewhere inside the permitted interval.
+        try testing.expectEqual(genesis_close_time + 1, ta.close_times[1].?);
         break :blk b;
     };
     defer b.deinit();
@@ -228,7 +249,7 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
     const snap = registry.writeSnapshot(&s3, &snap_buf);
     boot = .{ .state = registry.readSnapshot(snap).?, .slot = 3 };
     const a2 = try Node.create(gpa, io, .{
-        .network = network,
+        .network = network_descriptor,
         .secret_seed = seed_a,
         .quorum = slcp.Quorum.of(2, &ids),
         .listen_port = 0,
@@ -239,12 +260,15 @@ test "registry over AppNode (2-of-2 loopback): a claim applies on both nodes wit
     });
     defer a2.deinit();
     var ta2: Track = .{};
-    try a2.propose(registry.TxSet.empty);
-    try b.propose(registry.TxSet.empty);
+    try a2.propose(proposeClaimUntilApplied(&boot.state));
+    try b.propose(proposeEmpty(&s3));
     try pump(a2, b, proposeClaimUntilApplied, proposeEmpty, &ta2, &tb, 4, 90_000);
     // First applied item after the restart is slot 4 (1..3 skipped), and it
     // matches b's slot 4.
     try testing.expect(ta2.hashes[1] == null and ta2.hashes[2] == null and ta2.hashes[3] == null);
     try testing.expect(ta2.hashes[4] != null and tb.hashes[4] != null);
     try testing.expectEqualSlices(u8, &ta2.hashes[4].?, &tb.hashes[4].?);
+    try testing.expectEqual(ta2.close_times[4].?, tb.close_times[4].?);
+    try testing.expect(ta2.close_times[4].? > s3.head.close_time);
+    try testing.expect(ta2.close_times[4].? - s3.head.close_time <= registry.max_close_time_step);
 }
