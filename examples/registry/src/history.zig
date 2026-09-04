@@ -133,6 +133,26 @@ const RecoveredProof = struct {
     assertion: Assertion,
 };
 
+/// What one retention pass removed. Retention is garbage collection, never
+/// consensus state: every deletion is of an object no durable reference can
+/// reach, an interruption leaves extra files (harmless; the next pass
+/// finishes), and a failure is observable, not fatal.
+pub const PruneStats = struct {
+    ledgers_removed: usize = 0,
+    snapshots_removed: usize = 0,
+    votes_removed: usize = 0,
+    frontiers_removed: usize = 0,
+    staged_removed: usize = 0,
+    signing_votes_removed: usize = 0,
+    temps_removed: usize = 0,
+
+    pub fn removedAnything(self: PruneStats) bool {
+        return self.ledgers_removed + self.snapshots_removed + self.votes_removed +
+            self.frontiers_removed + self.staged_removed + self.signing_votes_removed +
+            self.temps_removed != 0;
+    }
+};
+
 pub const Archive = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -713,6 +733,315 @@ pub const Archive = struct {
         if (self.ready) |*s| s.deinit(self.gpa);
         self.ready = null;
         self.inflight = null; // its state moved into publish_frontier
+    }
+
+    /// Shared-archive retention (ADR 0005). The safety rule: discovery reads
+    /// only the validators' latest pointers, so retention must preserve, for
+    /// every assertion those pointers expose — certified or not — its anchor
+    /// snapshot, its complete ledger chain down to the anchor, and every vote
+    /// naming its digest. Everything else under `ledgers/`, `snapshots/`, and
+    /// `votes/` (exact canonical names only; unrelated or mixed-case names
+    /// and directories are not ours to touch) is unreachable by any recovery
+    /// this archive can perform and is deleted. `latest/` pointers are never
+    /// touched. If any pointer-exposed candidate's chain is not fully
+    /// readable (a publication is still in flight), the pass aborts having
+    /// deleted nothing — retention never widens an availability gap.
+    pub fn pruneShared(self: *Archive) !PruneStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var stats: PruneStats = .{};
+
+        // The candidate set is exactly what recoverLatest's discovery would
+        // consider: every distinct assertion named by a validator's latest
+        // pointer, with no floor (an anti-rollback floor filters selection,
+        // not retention) and no certification requirement (votes for an
+        // uncertified candidate may still be arriving).
+        var candidates: [max_candidates]Assertion = undefined;
+        var n_candidates: usize = 0;
+        for (self.validators) |validator| {
+            var name_buf: [max_name_bytes]u8 = undefined;
+            const raw = try self.readUntrusted(self.latest_dir, latestName(validator, &name_buf), vote_bytes);
+            defer if (raw) |bytes| self.gpa.free(bytes);
+            const vote = decodeVote(raw orelse continue) orelse continue;
+            if (!std.mem.eql(u8, &vote.signer, &validator) or !self.validVote(&vote)) continue;
+            const digest = vote.assertion.digest();
+            var duplicate = false;
+            for (candidates[0..n_candidates]) |known| {
+                if (std.mem.eql(u8, &known.digest(), &digest)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                if (n_candidates == candidates.len) return error.TooManyCheckpointCandidates;
+                candidates[n_candidates] = vote.assertion;
+                n_candidates += 1;
+            }
+        }
+
+        // Walk each candidate's chain tip → anchor, collecting the ledger
+        // hashes a recovery of that candidate would read, its anchor snapshot
+        // hash, and its vote digest. A chain that cannot be walked today is
+        // a candidate recovery could not use today either — but a partially
+        // published successor era is normal, so abort the whole pass instead
+        // of pruning around it.
+        var keep_ledgers: [max_candidates * (64 + 1)][32]u8 = undefined;
+        var n_keep_ledgers: usize = 0;
+        var keep_snapshots: [max_candidates][32]u8 = undefined;
+        var n_keep_snapshots: usize = 0;
+        var keep_votes: [max_candidates][32]u8 = undefined;
+        var n_keep_votes: usize = 0;
+        for (candidates[0..n_candidates]) |assertion| {
+            // Walk tip → anchor INCLUSIVE of both: every ledger a recovery
+            // of this assertion would read, each verified to sit at its slot
+            // and to hash to its own name. A walk longer than one anchor era
+            // is corruption, not history.
+            var head_hash = assertion.head_hash;
+            var slot = assertion.slot;
+            while (true) {
+                if (n_keep_ledgers == keep_ledgers.len) return error.HistoryPruneChainUnavailable;
+                const record = (try self.loadLedger(head_hash)) orelse
+                    return error.HistoryPruneChainUnavailable;
+                if (record.header.slot != slot or
+                    !std.mem.eql(u8, &record.header.hash, &head_hash) or
+                    slot == 0)
+                    return error.HistoryPruneChainUnavailable;
+                keep_ledgers[n_keep_ledgers] = head_hash;
+                n_keep_ledgers += 1;
+                if (slot == assertion.anchor_slot) {
+                    if (!std.mem.eql(u8, &head_hash, &assertion.anchor_head_hash))
+                        return error.HistoryPruneChainUnavailable;
+                    break;
+                }
+                head_hash = record.header.prev_hash;
+                slot -= 1;
+            }
+            keep_snapshots[n_keep_snapshots] = assertion.snapshot_hash;
+            n_keep_snapshots += 1;
+            keep_votes[n_keep_votes] = assertion.digest();
+            n_keep_votes += 1;
+        }
+
+        var removed_any = false;
+        stats.ledgers_removed = try self.sweepCanonicalHashNames(
+            self.ledgers_dir,
+            ".ledger",
+            keep_ledgers[0..n_keep_ledgers],
+            &removed_any,
+        );
+        stats.snapshots_removed = try self.sweepCanonicalHashNames(
+            self.snapshots_dir,
+            ".snap",
+            keep_snapshots[0..n_keep_snapshots],
+            &removed_any,
+        );
+        stats.votes_removed = try self.sweepCanonicalVoteNames(
+            keep_votes[0..n_keep_votes],
+            &removed_any,
+        );
+        if (removed_any) {
+            try self.sync_directory(self.ledgers_dir);
+            try self.sync_directory(self.snapshots_dir);
+            try self.sync_directory(self.votes_dir);
+        }
+        return stats;
+    }
+
+    /// Sweep one shared directory of `<64 lowercase hex><suffix>` names,
+    /// deleting the canonical ones whose hash is not in `keep`. Non-file
+    /// entries, non-canonical names, and `<name>.tmp.<hex>` orphans from
+    /// interrupted writes (collected separately) are not deleted here.
+    /// Returns how many objects it removed.
+    fn sweepCanonicalHashNames(
+        self: *Archive,
+        dir: std.Io.Dir,
+        comptime suffix: []const u8,
+        keep: []const [32]u8,
+        removed_any: *bool,
+    ) !usize {
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (doomed.items) |name| self.gpa.free(name);
+            doomed.deinit(self.gpa);
+        }
+        var temps: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (temps.items) |name| self.gpa.free(name);
+            temps.deinit(self.gpa);
+        }
+        var iterator = dir.iterate();
+        while (iterator.next(self.io) catch |err| return err) |entry| {
+            if (entry.kind == .directory) continue;
+            if (std.mem.indexOf(u8, entry.name, ".tmp.")) |at| {
+                // An interrupted atomic write orphan; the base name decides
+                // whether it is ours.
+                if (parseHashSuffix(entry.name[0..at], suffix) != null) {
+                    try temps.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                }
+                continue;
+            }
+            const name_hash = parseHashSuffix(entry.name, suffix) orelse continue;
+            if (hashIn(keep, &name_hash)) continue;
+            try doomed.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+        }
+        // Deleting after iteration: the iterator never observes its own
+        // effects, and an interruption between deletes is a smaller pass.
+        for (doomed.items) |name| {
+            dir.deleteFile(self.io, name) catch {};
+            removed_any.* = true;
+        }
+        for (temps.items) |name| {
+            dir.deleteFile(self.io, name) catch {};
+            removed_any.* = true;
+        }
+        return doomed.items.len + temps.items.len;
+    }
+
+    /// The votes sweep: names are `<digest hex>-<signer hex>.vote`; retention
+    /// keys on the digest so votes by validators outside this node's
+    /// configured quorum survive too (the archive serves every reader).
+    fn sweepCanonicalVoteNames(
+        self: *Archive,
+        keep: []const [32]u8,
+        removed_any: *bool,
+    ) !usize {
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (doomed.items) |name| self.gpa.free(name);
+            doomed.deinit(self.gpa);
+        }
+        var temps: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (temps.items) |name| self.gpa.free(name);
+            temps.deinit(self.gpa);
+        }
+        var iterator = self.votes_dir.iterate();
+        while (iterator.next(self.io) catch |err| return err) |entry| {
+            if (entry.kind == .directory) continue;
+            if (std.mem.indexOf(u8, entry.name, ".tmp.")) |at| {
+                if (parseVoteName(entry.name[0..at]) != null) {
+                    try temps.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                }
+                continue;
+            }
+            const name_digest = parseVoteName(entry.name) orelse continue;
+            if (hashIn(keep, &name_digest)) continue;
+            try doomed.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+        }
+        for (doomed.items) |name| {
+            self.votes_dir.deleteFile(self.io, name) catch {};
+            removed_any.* = true;
+        }
+        for (temps.items) |name| {
+            self.votes_dir.deleteFile(self.io, name) catch {};
+            removed_any.* = true;
+        }
+        return doomed.items.len + temps.items.len;
+    }
+
+    /// Trusted-side retention (ADR 0005). Everything the durable watermarks
+    /// can reference survives: the activation, published, admitted,
+    /// pending-adoption, boot-provenance, and in-flight frontiers (by head
+    /// hash), and every staged state above the published watermark (live
+    /// backlog). Orphaned `staged-<N>.snap` files at or below `published`
+    /// (a crash between the watermark write and the ack's delete), frontier
+    /// files no watermark names, and stale `<name>.tmp.<hex>` atomic-write
+    /// temps are collected. Per-slot signing votes below the published
+    /// watermark are inert — the high-water fence rejects any re-signing of
+    /// an older slot — so `signing-votes/<N>.vote` below `published` is
+    /// collected while the high-water and newer slots stay.
+    pub fn pruneTrusted(self: *Archive) !PruneStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const published = self.published orelse return error.HistoryFrontierUnprepared;
+        var stats: PruneStats = .{};
+
+        var keep: [6][32]u8 = undefined;
+        var n_keep: usize = 0;
+        for ([_]?Watermark{ self.activation, self.published, self.admitted, self.adoption_pending, self.boot_provenance, self.inflightWatermark() }) |mark| {
+            const watermark = mark orelse continue;
+            if (!hashIn(keep[0..n_keep], &watermark.head_hash)) {
+                keep[n_keep] = watermark.head_hash;
+                n_keep += 1;
+            }
+        }
+
+        var doomed_frontiers: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (doomed_frontiers.items) |name| self.gpa.free(name);
+            doomed_frontiers.deinit(self.gpa);
+        }
+        var doomed_staged: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (doomed_staged.items) |name| self.gpa.free(name);
+            doomed_staged.deinit(self.gpa);
+        }
+        var iterator = self.outbox_dir.iterate();
+        while (iterator.next(self.io) catch |err| return err) |entry| {
+            if (entry.kind == .directory) continue;
+            if (std.mem.indexOf(u8, entry.name, ".tmp.") != null) {
+                // An interrupted atomic write orphan under the trusted outbox;
+                // the fixed-name files (watermarks, policy, adoption, boot
+                // provenance) rewrite in place, so any temp is stale.
+                try doomed_staged.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            }
+            if (parseStagedName(entry.name)) |slot| {
+                if (slot <= published.slot)
+                    try doomed_staged.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            }
+            if (parsePrefixedHashName(entry.name, "frontier-", ".snap")) |name_hash| {
+                if (!hashIn(keep[0..n_keep], &name_hash))
+                    try doomed_frontiers.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            }
+            // Every other name — the fixed watermark/policy files and anything
+            // an operator or attacker placed here — is not ours to touch.
+        }
+        // Deleting after iteration: an interruption between deletes leaves a
+        // smaller pass, never a broken one.
+        for (doomed_frontiers.items) |name| {
+            self.outbox_dir.deleteFile(self.io, name) catch {};
+        }
+        for (doomed_staged.items) |name| {
+            self.outbox_dir.deleteFile(self.io, name) catch {};
+        }
+        stats.frontiers_removed = doomed_frontiers.items.len;
+        stats.staged_removed = doomed_staged.items.len;
+        const outbox_touched = stats.frontiers_removed + stats.staged_removed != 0;
+
+        var doomed_votes: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (doomed_votes.items) |name| self.gpa.free(name);
+            doomed_votes.deinit(self.gpa);
+        }
+        var sv_iterator = self.signing_votes_dir.iterate();
+        while (sv_iterator.next(self.io) catch |err| return err) |entry| {
+            if (entry.kind == .directory) continue;
+            if (std.mem.indexOf(u8, entry.name, ".tmp.") != null) {
+                try doomed_votes.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            }
+            const slot = parseSlotVoteName(entry.name) orelse continue;
+            if (slot < published.slot)
+                try doomed_votes.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+        }
+        for (doomed_votes.items) |name| {
+            self.signing_votes_dir.deleteFile(self.io, name) catch {};
+        }
+        stats.signing_votes_removed = doomed_votes.items.len;
+
+        if (outbox_touched) try self.sync_directory(self.outbox_dir);
+        if (stats.signing_votes_removed != 0) try self.sync_directory(self.signing_votes_dir);
+        return stats;
+    }
+
+    /// The watermark of an in-flight publication, whose frontier file may be
+    /// mid-write; null when none is in flight.
+    fn inflightWatermark(self: *Archive) ?Watermark {
+        const inflight = self.inflight orelse return null;
+        return .{ .slot = inflight.state.head.slot, .head_hash = inflight.state.head.hash };
     }
 
     fn loadPolicyAndWatermarks(self: *Archive) !void {
@@ -2034,6 +2363,67 @@ fn latestName(signer: slcp.NodeId, out: *[max_name_bytes]u8) []const u8 {
 
 fn slotName(slot: u64, out: *[max_name_bytes]u8) []const u8 {
     return std.fmt.bufPrint(out, "{d}.vote", .{slot}) catch unreachable;
+}
+
+/// Retention's canonical-name parsers: a name is owned only when it is the
+/// EXACT lowercase spelling this module generates. Mixed-case aliases,
+/// near-misses, unrelated names, and directories are never prune candidates
+/// (the qset-cache discipline, applied to the archive).
+fn hashIn(set: []const [32]u8, wanted: *const [32]u8) bool {
+    for (set) |known| {
+        if (std.mem.eql(u8, &known, wanted)) return true;
+    }
+    return false;
+}
+
+fn parseHex64(chars: []const u8) ?[32]u8 {
+    if (chars.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, chars) catch return null;
+    return out;
+}
+
+/// `<64 lowercase hex><suffix>` with the exact suffix (".snap"/".ledger").
+fn parseHashSuffix(name: []const u8, suffix: []const u8) ?[32]u8 {
+    if (name.len != 64 + suffix.len) return null;
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    return parseHex64(name[0..64]);
+}
+
+/// `<prefix><64 lowercase hex><suffix>`, e.g. `frontier-<hash>.snap`.
+fn parsePrefixedHashName(name: []const u8, prefix: []const u8, suffix: []const u8) ?[32]u8 {
+    if (name.len != prefix.len + 64 + suffix.len) return null;
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    return parseHex64(name[prefix.len..][0..64]);
+}
+
+/// `<digest hex>-<signer hex>.vote` — the shared vote name.
+fn parseVoteName(name: []const u8) ?[32]u8 {
+    if (name.len != 64 + 1 + 64 + 5) return null;
+    if (name[64] != '-' or !std.mem.endsWith(u8, name, ".vote")) return null;
+    return parseHex64(name[0..64]);
+}
+
+/// `staged-<slot>.snap`.
+fn parseStagedName(name: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, "staged-")) return null;
+    if (!std.mem.endsWith(u8, name, ".snap")) return null;
+    return parseSlotDigits(name[7 .. name.len - 5]);
+}
+
+/// `<slot>.vote` — the trusted per-slot signing fence vote.
+fn parseSlotVoteName(name: []const u8) ?u64 {
+    if (!std.mem.endsWith(u8, name, ".vote")) return null;
+    return parseSlotDigits(name[0 .. name.len - 5]);
+}
+
+fn parseSlotDigits(digits: []const u8) ?u64 {
+    if (digits.len == 0 or digits.len > 20) return null;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+    }
+    return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 
 fn writeHex(bytes: []const u8, out: []u8) void {
@@ -4474,4 +4864,272 @@ test "history archive: a FIFO object is rejected without blocking discovery" {
     if (mkfifoat(archive.latest_dir.handle, name_z.ptr, 0o600) != 0)
         return error.TestFifoCreationFailed;
     try testing.expect((try archive.loadLatest(1)) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Retention (ADR 0005): the archive's growth is bounded by what discovery
+// can still reach, never by consensus needs.
+// ---------------------------------------------------------------------------
+
+/// One writer publishing `slots` empty ledgers with anchors every 4 slots.
+const RetentionSetup = struct {
+    archive: Archive,
+    tip: registry.State,
+    archive_path: []const u8,
+    signing_path: []const u8,
+    reader_signing_path: []const u8,
+
+    fn init(gpa: std.mem.Allocator, io: std.Io, tmp: *testing.TmpDir, slots: u64) !RetentionSetup {
+        var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var reader_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const archive_path = try testPath(tmp, io, "archive", &archive_buf);
+        const signing_path = try testPath(tmp, io, "signing", &signing_buf);
+        const reader_signing_path = try testPath(tmp, io, "reader-signing", &reader_buf);
+        const seed: [32]u8 = @splat(0x5a);
+        const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+        const network_id = testNetworkId("history retention");
+        const cfg: Config = .{
+            .archive_dir = archive_path,
+            .signing_dir = signing_path,
+            .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
+            .quorum = slcp.Quorum.of(1, &.{id}),
+            .signer_seed = seed,
+            .checkpoint_every = 4,
+        };
+        var archive = try Archive.open(gpa, io, cfg);
+        errdefer archive.deinit();
+        var state = try registry.State.genesis(network_id, test_genesis_close_time, gpa);
+        errdefer state.deinit(gpa);
+        for (0..slots) |_| {
+            try applySet(gpa, &state, &registry.TxSet.empty);
+            _ = try recordAndAck(&archive, &state);
+        }
+        return .{
+            .archive = archive,
+            .tip = state,
+            .archive_path = try gpa.dupe(u8, archive_path),
+            .signing_path = try gpa.dupe(u8, signing_path),
+            .reader_signing_path = try gpa.dupe(u8, reader_signing_path),
+        };
+    }
+
+    fn deinit(self: *RetentionSetup, gpa: std.mem.Allocator) void {
+        self.archive.deinit();
+        self.tip.deinit(gpa);
+        gpa.free(self.archive_path);
+        gpa.free(self.signing_path);
+        gpa.free(self.reader_signing_path);
+    }
+
+    /// A second archive over the same shared storage with its own trusted
+    /// signing tree: the reader a lagging node would open.
+    fn reader(self: *RetentionSetup, gpa: std.mem.Allocator, io: std.Io) !Archive {
+        const seed: [32]u8 = @splat(0x5a);
+        const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+        return Archive.open(gpa, io, .{
+            .archive_dir = self.archive_path,
+            .signing_dir = self.reader_signing_path,
+            .network_id = testNetworkId("history retention"),
+            .genesis_close_time = test_genesis_close_time,
+            .quorum = slcp.Quorum.of(1, &.{id}),
+            .signer_seed = seed,
+            .checkpoint_every = 4,
+        });
+    }
+};
+
+fn countCanonical(dir: std.Io.Dir, io: std.Io, suffix: []const u8) !usize {
+    var n: usize = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .directory) continue;
+        if (std.mem.eql(u8, suffix, ".vote")) {
+            if (parseVoteName(entry.name) != null) n += 1;
+        } else if (parseHashSuffix(entry.name, suffix) != null) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// Non-vacuity: after nine slots with anchors at 4 and 8, the latest pointer
+// names tip 9. Retention keeps exactly tip 9's era — ledgers 8..9, the
+// anchor-8 snapshot, and tip 9's vote digest — removes ledgers 1..7, the
+// anchor-4 snapshot, and the eight superseded vote digests, and a fresh
+// reader still recovers the exact same tip bytes afterwards. The second
+// pass removes nothing (idempotent GC).
+test "retention: shared prune keeps the pointer-exposed era and recovery stays exact" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try RetentionSetup.init(gpa, io, &tmp, 9);
+    defer setup.deinit(gpa);
+    try testing.expectEqual(@as(usize, 9), try countCanonical(setup.archive.ledgers_dir, io, ".ledger"));
+    // Anchors at slots 1, 4, and 8: `expectedAnchor` maps the pre-boundary
+    // slots 1..3 onto anchor slot 1.
+    try testing.expectEqual(@as(usize, 3), try countCanonical(setup.archive.snapshots_dir, io, ".snap"));
+    try testing.expectEqual(@as(usize, 9), try countCanonical(setup.archive.votes_dir, io, ".vote"));
+
+    var reader_archive = try setup.reader(gpa, io);
+    defer reader_archive.deinit();
+    var pre = (try reader_archive.recoverLatest(1)) orelse return error.ExpectedCertifiedHistory;
+    defer pre.state.deinit(gpa);
+    try testing.expectEqual(@as(u64, 9), pre.state.head.slot);
+
+    const stats = try setup.archive.pruneShared();
+    try testing.expectEqual(@as(usize, 7), stats.ledgers_removed); // 1..7
+    try testing.expectEqual(@as(usize, 2), stats.snapshots_removed); // anchors 1 and 4
+    try testing.expectEqual(@as(usize, 8), stats.votes_removed); // tips 1..8
+    try testing.expectEqual(@as(usize, 2), try countCanonical(setup.archive.ledgers_dir, io, ".ledger"));
+    try testing.expectEqual(@as(usize, 1), try countCanonical(setup.archive.snapshots_dir, io, ".snap"));
+    try testing.expectEqual(@as(usize, 1), try countCanonical(setup.archive.votes_dir, io, ".vote"));
+
+    // Recovery after pruning returns the exact pre-prune tip.
+    var reader2 = try setup.reader(gpa, io);
+    defer reader2.deinit();
+    var post = (try reader2.recoverLatest(1)) orelse return error.ExpectedCertifiedHistory;
+    defer post.state.deinit(gpa);
+    try testing.expectEqual(pre.state.head.slot, post.state.head.slot);
+    try testing.expectEqualSlices(u8, &pre.state.head.hash, &post.state.head.hash);
+    try testing.expectEqualSlices(u8, &(try pre.state.stateRoot(gpa)), &(try post.state.stateRoot(gpa)));
+
+    // Idempotent: nothing left to collect.
+    const again = try setup.archive.pruneShared();
+    try testing.expectEqual(@as(usize, 0), again.ledgers_removed + again.snapshots_removed + again.votes_removed);
+}
+
+// Non-vacuity: a pointer-named candidate whose chain is not fully readable
+// is a publication still in flight; the pass must abort without deleting
+// anything rather than prune around a gap it cannot see through.
+test "retention: shared prune aborts untouched when a pointer chain is incomplete" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try RetentionSetup.init(gpa, io, &tmp, 9);
+    defer setup.deinit(gpa);
+
+    // Break the chain below the tip: the tip's own ledger disappears.
+    var name_buf: [max_name_bytes]u8 = undefined;
+    try setup.archive.ledgers_dir.deleteFile(io, ledgerName(setup.tip.head.hash, &name_buf));
+    try testing.expectError(error.HistoryPruneChainUnavailable, setup.archive.pruneShared());
+    // Nothing was deleted: the seven prunable ledgers are all still there.
+    try testing.expectEqual(@as(usize, 8), try countCanonical(setup.archive.ledgers_dir, io, ".ledger"));
+}
+
+// Non-vacuity: every keep decision is by exact canonical name. Mixed-case
+// aliases, unrelated files, and directories are not ours; stale objects in
+// our exact spelling are collected, including interrupted-write temps.
+test "retention: canonical names only — hostile and unrelated objects survive, stale temps collect" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try RetentionSetup.init(gpa, io, &tmp, 9);
+    defer setup.deinit(gpa);
+
+    // Uppercase alias of a real stale anchor snapshot: not our spelling.
+    var upper_buf: [max_name_bytes]u8 = undefined;
+    const upper = std.fmt.bufPrint(&upper_buf, "FRONTIER-{s}.snap", .{&registry.hex32(setup.tip.head.hash)}) catch unreachable;
+    {
+        var f = try setup.archive.outbox_dir.createFile(io, upper, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "not ours");
+    }
+    {
+        var notes = try setup.archive.outbox_dir.createFile(io, "operator-notes.txt", .{});
+        defer notes.close(io);
+        try notes.writeStreamingAll(io, "keep");
+    }
+    {
+        var hash_buf: [64]u8 = undefined;
+        @memcpy(&hash_buf, "0101010101010101010101010101010101010101010101010101010101010101");
+        var dir_buf: [max_name_bytes]u8 = undefined;
+        const dir_name = std.fmt.bufPrint(&dir_buf, "frontier-{s}.snap", .{&hash_buf}) catch unreachable;
+        try setup.archive.outbox_dir.createDir(io, dir_name, std.Io.File.Permissions.fromMode(0o755));
+    }
+    // An interrupted shared write: canonical base + temp suffix.
+    {
+        var hash_buf: [64]u8 = undefined;
+        @memcpy(&hash_buf, "0202020202020202020202020202020202020202020202020202020202020202");
+        var temp_buf: [max_name_bytes]u8 = undefined;
+        const temp = std.fmt.bufPrint(&temp_buf, "{s}.ledger.tmp.{s}", .{ &hash_buf, "0123456789abcdef" }) catch unreachable;
+        var f = try setup.archive.ledgers_dir.createFile(io, temp, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "orphan");
+    }
+
+    const shared = try setup.archive.pruneShared();
+    const trusted = try setup.archive.pruneTrusted();
+    try testing.expect(shared.removedAnything());
+    _ = trusted;
+
+    // The hostile and unrelated objects survive.
+    _ = try setup.archive.outbox_dir.statFile(io, upper, .{});
+    _ = try setup.archive.outbox_dir.statFile(io, "operator-notes.txt", .{});
+    // The temp was collected (it counts inside the ledger sweep).
+    try testing.expectEqual(@as(usize, 8), shared.ledgers_removed); // 7 stale + 1 temp
+}
+
+// Non-vacuity: trusted GC keeps exactly the watermark-referenced frontiers,
+// collects orphaned staged files at or below published and signing votes
+// below it, and leaves the archive openable with its published frontier.
+test "retention: trusted GC keeps watermark frontiers, collects staged orphans and old signing votes" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try RetentionSetup.init(gpa, io, &tmp, 9);
+    defer setup.deinit(gpa);
+
+    // Simulate a crash between the published watermark and the ack delete,
+    // plus a stale signing vote and a stale atomic-write temp.
+    {
+        var f = try setup.archive.outbox_dir.createFile(io, "staged-5.snap", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "orphan");
+    }
+    {
+        var f = try setup.archive.signing_votes_dir.createFile(io, "3.vote", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "stale");
+    }
+    {
+        var f = try setup.archive.signing_votes_dir.createFile(io, "published.tmp.0123456789abcdef", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "orphan");
+    }
+
+    const stats = try setup.archive.pruneTrusted();
+    // Nine acked frontiers plus the activation frontier exist; the keep set
+    // is {activation, published(=admitted)} — 8 collected.
+    try testing.expectEqual(@as(usize, 8), stats.frontiers_removed);
+    try testing.expectEqual(@as(usize, 1), stats.staged_removed); // the orphan (temps count here too)
+    try testing.expectEqual(@as(usize, 9), stats.signing_votes_removed); // slots 1..8 + the temp
+    _ = try setup.archive.signing_votes_dir.statFile(io, "9.vote", .{});
+    try testing.expectError(error.FileNotFound, setup.archive.outbox_dir.statFile(io, "staged-5.snap", .{}));
+
+    // The archive reopens on its published frontier and accepts it (the
+    // trusted outbox lives in the writer's signing tree, so reopen with the
+    // writer configuration, not the reader's fresh one). The reopened
+    // archive replaces the closed one inside the setup so the test's single
+    // deinit owns it.
+    setup.archive.deinit();
+    const seed: [32]u8 = @splat(0x5a);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    setup.archive = try Archive.open(gpa, io, .{
+        .archive_dir = setup.archive_path,
+        .signing_dir = setup.signing_path,
+        .network_id = testNetworkId("history retention"),
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 4,
+    });
+    var durable = try setup.archive.loadFrontierState(setup.archive.published.?);
+    defer durable.deinit(gpa);
+    try testing.expectEqual(@as(u64, 9), durable.head.slot);
 }

@@ -11,8 +11,8 @@ local catch-up snapshot, and the heap-state track are implemented: the
 Experimental `slcp.OwnedAppNode` seam (ADR 0003) and the registry's migration
 onto it (ADR 0004 — unbounded heap-backed accounts and names, Snapshot V4,
 the REGISTRY-NET-V3 epoch tag, owned observations end to end, no process
-global). Archive retention, richer per-peer operations, and E3 remain
-designs only.
+global), and archive retention landed with it (ADR 0005). Richer per-peer
+operations and E3 remain designs only.
 
 ## Direction
 
@@ -296,10 +296,16 @@ and the genesis root moved.
 
 Remaining work:
 
-- explicit archive retention, pruning, and operational sizing policy;
 - richer per-peer visibility beyond the local `catchupStats` snapshot;
 - quota-style admission control, since state growth is now bounded by memory
   and disk rather than fixed caps (an E3 concern).
+
+Archive retention is delivered
+([ADR 0005](adr/0005-archive-retention.md)): at each anchor boundary the
+publisher garbage-collects shared objects no latest-pointer candidate
+references and trusted evidence no watermark references — canonical names
+only, walk-abort on incomplete chains, idempotent and nonfatal — with
+recovery to the pointer-exposed tips proven byte-exact after pruning.
 
 ## E3 — Upgrades and operations (planned)
 

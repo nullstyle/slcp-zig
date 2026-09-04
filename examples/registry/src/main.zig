@@ -728,6 +728,34 @@ const HistoryWakeup = struct {
 };
 
 /// The cadence loop durably stages exact successor states in the trusted
+/// One retention pass over both sides of the archive, logged when it removes
+/// anything and nonfatal when it fails: retention is garbage collection, so
+/// a failure degrades disk use until the next anchor boundary retries it.
+fn pruneArchiveNow(archive: *history.Archive, slot: u64) void {
+    const shared = archive.pruneShared() catch |err| {
+        std.debug.print("registry history: shared retention skipped ({t}); disk use keeps growing until it succeeds\n", .{err});
+        return;
+    };
+    const trusted = archive.pruneTrusted() catch |err| {
+        std.debug.print("registry history: trusted retention skipped ({t}); disk use keeps growing until it succeeds\n", .{err});
+        return;
+    };
+    if (shared.removedAnything() or trusted.removedAnything()) {
+        std.debug.print(
+            "registry history: retention at slot {d} removed shared {d} ledgers + {d} snapshots + {d} votes; trusted {d} frontiers + {d} staged + {d} signing votes\n",
+            .{
+                slot,
+                shared.ledgers_removed,
+                shared.snapshots_removed,
+                shared.votes_removed,
+                trusted.frontiers_removed,
+                trusted.staged_removed,
+                trusted.signing_votes_removed,
+            },
+        );
+    }
+}
+
 /// outbox. This worker alone publishes its oldest entry to shared history and
 /// advances the durable published watermark; hostile shared I/O therefore
 /// cannot make a successor overtake a failed ledger.
@@ -806,6 +834,14 @@ const HistoryPublisher = struct {
                 return;
             };
             logHistoryStatus(status, &ledger);
+            // Retention cadence: each anchor boundary completes an era, so
+            // pruning there bounds the archive to roughly one era of shared
+            // objects and one era of trusted frontier files. Retention is
+            // garbage collection — a failure degrades disk use, never
+            // consensus, so it logs and retries at the next boundary.
+            if (ledger.head.slot % self.archive.checkpoint_every == 0) {
+                pruneArchiveNow(&self.archive, ledger.head.slot);
+            }
         }
     }
 };
@@ -1170,6 +1206,9 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     }
     if (replayed_boot) {
         std.debug.print("registry node: local journal advanced boot state from slot {d} through slot {d} before RPC startup\n", .{ selected.state.head.slot, ready_state.head.slot });
+    }
+    if (history_archive) |*archive| {
+        pruneArchiveNow(archive, ready_state.head.slot);
     }
     if (selected.source == .history) {
         const recovered = authenticated_recovery orelse unreachable;

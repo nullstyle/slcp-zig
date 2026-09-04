@@ -27,7 +27,41 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: registry heap-state migration (capacity epoch)
+## Current feature work: archive retention
+
+Both sides of the registry's history are now garbage-collected
+([ADR 0004](docs/adr/0004-registry-capacity-epoch.md) closed the state-growth
+half; [ADR 0005](docs/adr/0005-archive-retention.md) closes the disk-growth
+half). The publisher prunes at each anchor boundary, and startup runs one
+pass before RPC binds. The safety rule: for every assertion the validators'
+latest pointers expose — certified or not — retention keeps its anchor
+snapshot, its complete verified ledger chain to the anchor, and every vote
+naming its digest; everything else in this module's exact canonical spelling
+is unreachable by any recovery this archive can perform and is deleted. On
+the trusted side, the watermark-referenced frontiers and live staged backlog
+survive; per-slot signing votes below the published watermark are inert
+behind the high-water fence and are collected. Deletion candidates must
+match the exact canonical name (mixed-case aliases, unrelated files, and
+directories are untouched — the qset-cache discipline); keep-sets are
+computed before any delete, deletes happen after iteration, and an
+incomplete pointer chain aborts the pass with zero deletions, so retention
+is idempotent, crash-safe, and nonfatal. Four focused tests prove: recovery
+to the pointer-exposed tip stays byte-exact after pruning and a second pass
+removes nothing; a broken pointer chain aborts untouched; hostile and
+unrelated objects survive while stale temps collect; and the trusted GC
+keeps watermark frontiers, collects an orphaned staged file and old signing
+votes, and the archive reopens on its published frontier. A side fix frees
+the publisher worker's per-slot staged state (a slow leak only the real
+process hit).
+
+### Current retention verification
+
+- Registry suite: **PASS** — 104/104 (four new retention tests), zero leaks.
+- Docs-smoke: **PASS** — 436 checks, 0 failures.
+- The three-process registry smoke and the full repository gate are rerun
+  for this change below.
+
+## Historical feature record: registry heap-state migration (capacity epoch)
 
 The registry example now runs on the heap-sized state seam end to end. On top
 of the Experimental `slcp.OwnedAppNode` adapter (ADR 0003, below), the

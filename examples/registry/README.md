@@ -224,8 +224,9 @@ A process whose native node abandons a live-delivery gap still exits with code
 history is globally unavailable: restart it after a certified history tip
 covering the gap is available. A node stopped before its first slot still
 restarts from genesis; a compacted journal without either a usable local
-snapshot or configured certified history is refused. The shared history
-archive grows until an explicit retention design exists.
+snapshot or configured certified history is refused. Shared and trusted
+history are retained by garbage collection at each anchor boundary
+([ADR 0005](../docs/adr/0005-archive-retention.md)).
 
 **Cadence, time, and flooding.** After each applied slot a node proposes
 exactly once for the next: right away when it has pending transactions (after
@@ -464,9 +465,13 @@ These remaining limits are deliberate:
   this binary's default 16-slot native answering window is its bounded
   live-peer catch-up horizon. A compacted journal without a usable local
   snapshot or certified history is refused.
-- **History has no retention policy yet.** Immutable shared ledgers and votes,
-  periodic anchors, and trusted per-slot signing/frontier evidence grow with
-  publication. A blocked publication head retries in order from the durable
+- **Retention keeps what discovery can still reach.** Each anchor boundary,
+  the publisher prunes shared ledgers/anchors/votes that no latest-pointer
+  candidate references and trusted frontier/signing evidence no watermark
+  references, by exact canonical name only; a partially published chain
+  aborts the pass without deleting. Growth is bounded to roughly one era of
+  stale objects between passes; a failed pass is nonfatal and retries at the
+  next boundary. A blocked publication head retries in order from the durable
   outbox; if live consensus fills its 64-state backlog before storage recovers,
   the registry stops rather than discard a history record or let a successor
   overtake it. Boot-time journal replay may publish one oldest entry
@@ -524,9 +529,9 @@ every path/content/signature/network/anchor/ledger/tip relationship, strictly
 replays the selected anchor-to-tip chain, uses only the local quorum policy,
 and caps startup candidates at 16. Those checks protect state integrity;
 archive manipulation can still deny recovery or publication. Mutable latest
-pointers are only bounded discovery hints, never a freshness oracle. Shared
-ledgers, anchors, and votes are not pruned yet, so operators must also provision
-and monitor storage growth.
+pointers are only bounded discovery hints, never a freshness oracle. Retention
+(ADR 0005) bounds disk to the pointer-exposed eras plus one stale era, so
+storage monitoring watches for a wedged publisher, not unbounded growth.
 
 The signing fence at `<data-dir>/history-signing` is trusted validator safety
 state, like the validator key. Keep it local, writable only by that validator,
