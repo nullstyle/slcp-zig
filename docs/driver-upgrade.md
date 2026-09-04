@@ -95,7 +95,7 @@ const App = struct {
   at error level and latches inert instead of balloting a value every peer
   would reject (a silent stall). `.maybe_valid` is fine: a node behind on
   `State` cannot judge what it combines.
-- **State is not persisted** (v1 limitation, plan R17): after a restart
+- **State is not persisted by `AppNode`** (plan R17): after a restart
   `State = initialState()` + `apply` over the replayed journal tail (the last
   ≥ 16 slots). That is why commands must be full values. An app with delta
   semantics persists `State` itself, keyed by the slot it was taken at (every
@@ -103,12 +103,21 @@ const App = struct {
   (the snapshot) and `initialSlot()` (that slot): `create` seeds its
   dedup floor from `initialSlot()` before the tail replays, so journaled
   slots at or below it are skipped instead of being applied a second time on
-  top of the snapshot. Persist at least every 16 applied slots: a snapshot
-  the retained tail cannot catch up — older than the tail's first slot,
-  ahead of its last, or with no journal at all — is refused at `create`
+  top of the snapshot. Persist at least every 16 applied slots: ordinarily a
+  snapshot the retained tail cannot catch up — older than the tail's first
+  slot, ahead of its last, or with no journal at all — is refused at `create`
   with `InitialSlotOutsideJournal` rather than started on a wrong `State`.
-  Expect the first proposal after a restart to be stale — the network
-  rejects it and the loop catches up from the applied stream.
+  There is one explicit external-checkpoint path: after the application has
+  independently authenticated state through slot H, set `initialSlot()` to H
+  and `.start_slot` to exactly H + 1, and expose
+  `initialCommand() ?Command` with the exact value externalized at H. That
+  command is required when the checkpoint is newer than the local journal:
+  next-slot nomination hashes the previous consensus value, so recovered and
+  incumbent validators must seed it identically. A newer gap-free journal
+  continuation supplies and supersedes the checkpoint command. `AppNode`
+  checks only this continuity and binding—the application owns checkpoint
+  authentication and rollback policy. The registry example's history module
+  is the reference recipe.
 - `create` reports failures the same way `Node.create` does: pass a
   `slcp.node.Diagnostic` in `.diagnostic` and print `diag.message()` on
   error (`slcp.node.explain(err)` is the static fallback for the bytes-level

@@ -1023,6 +1023,34 @@ through the single delivery chokepoint in ascending slot order; (4) only
 anti-entropy thread. An explicit `start_slot` declares every lower slot out of
 scope even when the journal is empty.
 
+The Experimental recovery seam runs inside that startup boundary. After the
+store has recovered its high-water mark and gap-free journal suffix, but
+before replay, timer start, listener bind, or worker creation,
+`Node.createWithRecovery` invokes an optional `RecoveryHook` with a
+`RecoveryView`. It then merges an optional application-authenticated
+`RecoveryValue` with the newest journal value: the higher slot wins, while two
+different byte strings for the same slot fail startup. The resulting bytes
+seed the previous-value input only when they are the exact predecessor of the
+effective resume slot. A raw `Node.create` that deliberately sets a start past
+its journal supplies no authenticated predecessor, so it retains the legacy
+empty sentinel instead of misbinding the journal tip. Recovered predecessor
+bytes may exceed the current proposal limit but remain capped by the frozen
+64 KiB wire limit. `AppNode` installs the hook and recovery value internally;
+the application contract gains only the optional `initialSlot()` /
+`initialCommand()` declarations. Stable `DeliveryHook` remains the
+post-journal, slot-ordered delivery interface and is unchanged.
+
+For the typed `AppNode`, a nonzero application `initialSlot()` is normally
+accepted only when a gap-free suffix of the retained journal can continue it.
+An application that has independently authenticated an external checkpoint
+through H may leave an absent, stale, or non-continuing journal behind by
+pairing it with the checked exact successor `.start_slot = H + 1` and the
+exact consensus command at H from `initialCommand()`. A later start is
+accepted only when the journal supplies every intervening slot; a newer
+journal also supplies the nomination predecessor itself. This is an
+application trust seam only. It changes neither the signed consensus schema
+nor the Node's 16-slot answering window.
+
 **Write path**: `persist_own_envelope` → append + fsync `own.log` → only then
 the paired `broadcast_envelope`. A failed append latches the node **inert**
 (no further inputs, no further effects, app waiters woken): a node that

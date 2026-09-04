@@ -164,6 +164,19 @@ append and before the next input. This gives validation and application one
 ordered view of state. Application work that is slow, blocking, or external
 belongs after the applied-value handoff, not inside the hook.
 
+Normally a nonzero `initialSlot()` must be continued by a gap-free suffix of
+the retained local journal. An application that has independently
+authenticated an external checkpoint through slot H may instead leave the
+local journal behind by pairing that state with the exact
+`.start_slot = H + 1` and returning the exact value agreed at H from
+`initialCommand()`. That value preserves the nomination predecessor used by
+incumbent validators. A newer continuing journal supersedes it; a same-slot
+byte mismatch fails before the node goes live. `AppNode` installs an
+Experimental pre-live recovery hook for these checks, while the Stable
+delivery hook remains the post-journal application boundary. `AppNode` does
+not authenticate the checkpoint; that trust decision remains above the
+generic adapter.
+
 ### WASM module
 
 [`src/wasm/slcp_host_abi.zig`](src/wasm/slcp_host_abi.zig) exposes the engine
@@ -261,7 +274,11 @@ The journal is a bounded answering window, not complete application state.
 Applications with delta-like commands must persist their own snapshot and
 reconstruct state from that snapshot plus the retained journal tail. Long-gap
 catch-up requires an application-level archive or a future state-transfer
-interface.
+interface. The registry example demonstrates the application-level path: a
+quorum-authenticated checkpoint supplies state through H, the exact-successor
+cutover starts at H + 1 with the exact value agreed at H as nomination
+context, and live peers supply only the short tail that still fits the
+answering window. This does not turn the Node journal into an archive.
 
 The qset cache is not write-ahead state. Remote entries use FIFO eviction;
 startup reconstructs a deterministic `(mtime, hash)` order, prunes owned

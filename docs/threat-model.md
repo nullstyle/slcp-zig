@@ -469,16 +469,127 @@ writes without stopping consensus.
 - No HSM / external signer in v1: ABI feature bit 1 (`external_signer`) is
   reserved and OFF.
 
-## 8. Out of scope
+## 8. Registry checkpoint archive: application-owned trust
+
+The SLCP core has no archival/state-transfer protocol and does not authenticate
+application snapshots. Its native node answers only from the recent 16-slot
+window. `AppNode` performs a pre-live continuity check against recovered
+journal metadata. After an application has independently authenticated state
+through H, it may leave a stale or empty journal behind only by pairing
+`initialSlot() = H` with `.start_slot = H + 1` and the exact consensus value
+at H from `initialCommand()`; a later start is valid only when the journal
+supplies every intervening slot. Node recovery prefers a newer journal value
+and rejects a same-slot byte mismatch. The application still owns the
+checkpoint format, trust decision, rollback policy, and durable state
+installation.
+
+The registry example is one such application adapter, not a core protocol
+guarantee. With `--history-dir` enabled, a validator signs a domain-separated
+assertion containing the registry network id, slot, ledger head, and exact
+snapshot digest. Import strictly validates that assertion and snapshot, counts
+each signer once, and evaluates the signer set recursively against the
+importing process's normalized local quorum set. No threshold or quorum set
+stored in the archive is trusted. A validator must itself be a member of that
+local set before it may publish.
+
+At every non-genesis slot, Registry Snapshot V2 carries the exact transaction
+set at the checkpoint slot. The set is not part of the replicated state root,
+but import decodes it canonically and binds its hash to the signed ledger header
+before `AppNode` uses it as the next nomination's previous value. Slot 0 is
+only canonical empty genesis (all-zero header, no set) and is never a history
+checkpoint. Non-genesis V1 snapshots remain readable for ordinary local
+journal-backed restart, but the history importer rejects them: an externally
+selected state must carry its own exact predecessor value and be directly
+installable as V2.
+
+The adapter divides storage into two custody classes:
+
+- The shared archive is **untrusted**. It may contain malformed, torn,
+  replayed, wrong-network, bad-signature, non-member, symlink, FIFO, or other
+  adversarial objects. Network and object directories are opened no-follow and
+  pinned; generated basenames are read nonblocking and accepted only when they
+  are regular files. Integrity checks stop those objects from becoming boot
+  state, but the archive can always withhold or delete a valid snapshot or
+  vote and deny recovery.
+- `<data-dir>/history-signing` is **trusted validator safety state**. Its
+  immutable per-slot vote and high-water fence prevent the local key from
+  signing two heads at one slot or signing backward. The entries and their
+  containing directories are synchronized before any shared vote is
+  published, and retries repeat both directory barriers. Operators must keep
+  this tree private to the validator, preserve it with the key across restart
+  or migration, and never restore or delete it independently. The archive and
+  configured roots must have durable existing real parent directories. The
+  shared archive must be disjoint from the entire private data root, not merely
+  this signing subtree: equal paths, filesystem aliases, and either ancestor
+  direction are rejected through pinned directory identities before archive
+  namespaces are created. The archive also may not contain the pinned parent
+  of the validator key; the key must be a regular file rather than a symlink,
+  and Node binds its later read to the public identity already used to open the
+  history signer. A common parent with a sibling archive remains valid. The
+  immediate parents of the configured archive root and `--data-dir` must
+  already exist on durable storage. In history mode
+  the registry creates or opens each final component and synchronizes its
+  parent entry before opening the signing tree. This directory-durability
+  contract is implemented only on Linux and macOS; history mode refuses
+  startup elsewhere.
+
+The ordinary snapshot replacement is random temporary file → write → `fsync`
+and successful macOS `F_FULLFSYNC` → atomic replace → data-directory `fsync`.
+Any barrier failure propagates: an ordinary snapshot failure stops the
+registry because it may no longer advance safely. Archive publication owns the
+same strict barriers on a dedicated worker; an availability failure remains
+pending for retry or is superseded by a newer due checkpoint, so slow or
+hostile shared storage does not block the consensus cadence loop. A trusted
+signing-fence I/O, signing-fence semantic error, or state-integrity failure is
+latched and stops the node. Node-halt, history, and snapshot-write fatal paths
+first drain RPC handlers, then tear down Node and hard-exit without voluntarily
+joining the publisher; this avoids a userspace wait after consensus stops,
+though the OS may still delay final reaping of a kernel-stuck call. Ordinary
+cleanup stops the node before joining the worker.
+
+The archive is also not a freshness oracle. Startup reads one derived latest
+pointer per validator, ignores candidates below
+`max(local snapshot slot, --history-min-slot)`, and refuses more than 16
+distinct valid candidate assertions rather than choosing from an incomplete
+set. Discovery reads and verifies each validator's latest pointer once; each
+distinct candidate then evaluates the normalized quorum tree while reading and
+verifying at most one immutable vote per configured validator. Total work is
+O(V + C·V), with C capped at 16. The floor prevents selection of an older view,
+but cannot make a withheld checkpoint appear.
+Staggered newer latest pointers can also hide a previously discoverable older
+certificate, so the bounded scheme trades archive availability for bounded
+work.
+
+Fork detection is correspondingly narrow: startup fails if two
+**simultaneously discoverable** assertions at one slot each satisfy the local
+quorum. Separately, the selected authenticated checkpoint must agree with the
+eligible local snapshot when they are at the same slot. This is not an
+arbitrary or continuous runtime fork detector; withheld objects and
+alternatives hidden behind latest pointers are outside its view. Likewise, a
+higher isolated certificate is a current-quorum attestation, not a proof that
+its header descends from the node's lower local head. Accepting it relies on
+the same quorum-safety assumption as live consensus: the configured quorum
+will not certify conflicting registry histories.
+
+Finally, these are state checkpoints, not full history. A recovered checkpoint
+must be no more than 15 slots behind a live peer, which supplies and agrees the
+short successor tail. There is no archive of every header and transaction set,
+no independent ancestry replay, and no guarantee of recovery when the archive
+withholds data or no suitable live peer remains. An unrecoverable gap observed
+while the registry is already running still stops that process rather than
+applying a discontinuous transaction set.
+
+## 9. Out of scope
 
 Not addressed by v1 and not claimed:
 
 - **Flow control and fairness** beyond the per-peer budgets in §3.
 - **Peer discovery** — you list peers explicitly; there is no gossip of
   addresses.
-- **History / archival** — the answering window is 16 slots; a node that
-  falls further behind resyncs from the current state, it does not replay
-  history.
+- **Core history / archival** — the native answering window remains 16 slots;
+  the registry adapter in §8 can import authenticated application state plus a
+  short live tail, but SLCP still has no generic state transfer or complete
+  replayable ledger archive.
 - **DoS resistance beyond budgets** — a well-provisioned attacker on the
   port can degrade liveness of a small network (§2 is the mitigation).
 - **Driver nondeterminism** — a `validate` / `combine` / `apply` that gives

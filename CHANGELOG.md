@@ -30,6 +30,22 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   Canonical, network-signed, correctly sequenced transactions are flooded on
   acceptance and reflooded every second while pending; the main loop drains at
   most 64 received messages per tick.
+- Registry quorum-authenticated checkpoint history. Validators sign the
+  network, slot, ledger head, and canonical snapshot digest into an untrusted
+  shared archive, with per-node durable signing fences against rollback and
+  equivocation. Recovery evaluates unique signers against the importing
+  node's current quorum and supports an explicit anti-rollback floor. Snapshot
+  V2 also retains the exact consensus set at the checkpoint slot, and archive
+  publication runs on a coalescing worker so storage stalls do not stall the
+  consensus cadence loop. Legacy V1 snapshots remain readable for local
+  journal-backed restart but are never accepted as external history.
+- Experimental `slcp.node.Node.createWithRecovery`, `RecoveryOptions`,
+  `RecoveryHook`, `RecoveryView`, `RecoveryJournalTail`, and `RecoveryValue`,
+  used by `AppNode` for a pre-live continuity check and nomination-predecessor
+  restore. State authenticated by the application through slot H may leave a
+  stale or empty local journal behind only with `.start_slot = H + 1` and the
+  exact Command externalized at H; otherwise, every later recovered slot must
+  form one gap-free journal continuation.
 
 ### Changed
 
@@ -45,7 +61,12 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 - The registry smoke now uses a three-node line and a nomination-disabled
   submission node. It proves one-hop and two-hop propagation at ledger slot S,
   kills the source, and requires the two survivors to include exactly that
-  transaction in the next slot, S+1.
+  transaction in the next slot, S+1. It then keeps that validator absent for
+  at least 201 slots, requires a certified checkpoint inside the live 16-slot window,
+  restores it from history, and proves its vote is necessary for a transaction
+  in exactly the next slot.
+- Registry busy cadence now remains governed by `--min-slot-ms` whenever a
+  transaction is pending; `--heartbeat-ms` applies only to idle slots.
 
 ### Security
 
@@ -54,6 +75,17 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   deduplicate, and explicitly republish. The registry verifies canonical
   encoding, network-bound Ed25519 signatures, sequence, duplicates, and queue
   capacity before any relay, so invalid peer traffic is not amplified.
+- Checkpoint storage is not trusted to choose quorum policy or state. The
+  registry ignores malformed, torn, wrong-network, bad-signature, non-member,
+  and non-quorum artifacts; rejects two simultaneously discoverable certified
+  startup heads at one slot; pins no-follow namespace handles; accepts only
+  regular-file objects; and publishes no vote before its local signing fence
+  is durably advanced. This is not arbitrary/runtime fork detection. Shared
+  storage can still withhold recovery data; post-start publication availability
+  failures do not stop consensus, while trusted-fence I/O is classified as a
+  fail-stop custody error. The archive may neither overlap the private data
+  tree nor contain the validator key's pinned parent; Node also binds its
+  later key-file read to the identity already used for history signing.
 
 ## [0.2.0] - 2026-09-03
 

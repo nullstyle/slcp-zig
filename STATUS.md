@@ -17,55 +17,93 @@ granted.
 | Package payload freeze | `1b68041` (not pushed or tagged) | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
 | Local repository candidate | code tip `0f39869` plus hash-neutral release records (not pushed or tagged) | Retains the frozen package payload and fixes the example registry's detached RPC-handler teardown race found during release ablation. |
 | E2a implementation and proof | `50456f7` through `0932a83` (including smoke `6899855`, legacy-Hello test `2051f5b`, and waiter/FIFO hardening `0932a83`) | Adds negotiated, bounded Experimental application-message transport, registry-controlled flooding, deterministic source-death proof, outbound isolation, and race-safe inbox teardown. |
+| E2b implementation and proof | `c66b450` through `35ad39b` (registry feature `f77e01c`, exact-current smoke `35ad39b`) | Adds application-owned quorum-authenticated registry checkpoints, durable local signing fences, hostile-archive handling, exact-successor `AppNode` recovery, CLI integration, and a proved long-outage rejoin. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: E2a transaction flooding
+## Current feature work: E2b authenticated checkpoint catch-up
 
-E2a is the first delivered slice of the examples roadmap's second stage. It
-adds append-only overlay negotiation (`Hello.featureFlags` bit 0 and
-`Frame.appMessage` arm 10) plus Experimental native Node
-`publishAppMessage`, `waitAppMessage`, and `appMessageStats` entry points. The
-inbox is lazy opt-in, capped at 64 KiB per payload and 1,024 items / 16 MiB in
-total, and deduplicates by SHA-256 only while a copy remains queued. Delivery
-is best-effort and non-durable. The generic Node does not auto-relay; the
-application validates and explicitly republishes accepted messages. App frames
-from a peer that did not negotiate feature bit 0 are dropped. Per connection,
-outbound app traffic is capped at 256 writer items / 1 MiB inside the unchanged
-1,024-item / 16 MiB aggregate, with 256 items / 4 MiB kept unavailable to app
-traffic. App pressure drops only that frame and does not disconnect the peer
-or consume the ordinary/consensus reserve.
+E2b builds on the delivered E2a transport slice. E2a added append-only
+application-message negotiation, bounded Experimental native Node send/receive
+entry points, and registry-owned transaction authentication, relay, reflood,
+and admission. Delivery remains best-effort and non-durable; the generic Node
+does not authenticate or auto-relay application bytes. The three-node smoke
+still proves that a transaction crosses one and two overlay hops before
+consensus, survives the submitting node's death, and lands in the next
+eligible slot.
 
-Inbox shutdown atomically closes new waiter admission and drains all waiters
-that crossed that gate before teardown. FIFO delivery uses a head index rather
-than shifting attacker-controlled queue contents on every receive; live
-retention remains capped at 1,024 messages and physical item storage at twice
-that bound during churn.
+The new registry history adapter signs the registry network id, checkpoint
+slot, ledger head, and exact snapshot digest. A recovering node counts unique
+valid signers against its own normalized recursive quorum set; no quorum
+policy comes from storage. A separate per-validator signing tree durably fences
+same-slot equivocation and rollback before the shared vote is published. The
+shared archive is hostile input: paths are accessed through pinned no-follow
+directory handles, objects must be regular files, and every name, network,
+signature, head, and snapshot relationship is revalidated. The trusted signing
+tree must remain private, and the shared archive is rejected when it aliases,
+contains, or sits inside the entire private data root. Snapshot V2 authenticates
+the exact consensus set at the checkpoint slot so recovered nomination uses
+the same previous value as incumbents. Post-start archive I/O runs on a
+dedicated worker with a one-slot newest-wins pending mailbox in addition to
+the in-flight checkpoint; availability stalls retry or are superseded without
+blocking the cadence loop. The archive also may not contain the
+validator key's pinned parent; history mode requires a regular non-symlink key
+and binds Node's later read to the identity already used by the history signer.
+Trusted-fence I/O is fail-stop even when the same low-level shared-archive
+failure would be retryable. Cleanup stops the node before joining the worker,
+and post-start fatal paths drain RPC, stop Node, and hard-exit without that
+join. This avoids a userspace wait with a live validator, although the OS may
+still delay final reaping of a kernel-stuck call. At slot 0, V2 accepts only
+canonical empty genesis and no history vote is valid. Non-genesis Snapshot V1
+is retained for local journal-backed restart only; external history requires
+V2.
+The immediate parents of `--history-dir` and `--data-dir` must pre-exist on
+durable storage; the registry creates or opens the final components and
+synchronizes those parent entries. Linux and macOS are the supported
+directory-durability targets.
 
-The registry now gives RPC and gossip bytes one admission path: exact
-canonical transaction encoding, registry-network signature, next sequence,
-duplicate, and pending-cap checks. An accepted transaction is flooded
-immediately after the shared-state lock is released, every accepting node
-relays it under the same policy, and pending bytes are reflooded every second.
-The main loop drains at most 64 gossip messages per tick.
+Startup reads one latest pointer per locally configured validator and refuses
+more than 16 distinct valid assertions. The archive importer accepts only a
+quorum-certified candidate at or above
+`max(local snapshot slot, --history-min-slot)`; boot retains a newer eligible
+local snapshot. The floor prevents accepting an older view but cannot defeat
+withholding. Same-slot fork detection covers simultaneously discoverable
+certified startup candidates, not arbitrary hidden history or continuous
+runtime monitoring. A higher isolated certificate carries no ancestry proof
+to the lower local head; acceptance relies on the same current-quorum safety
+assumption as live consensus.
 
-The strengthened smoke is green as a deterministic application-transport
-witness. In a three-node line, a nomination-disabled end node submitted one
-transaction; both survivors reported it pending at S=6 after 224 ms; the
-source was killed; and both survivors printed `slot 7: txs=1` for S+1=7. The
-source then restarted and caught up in 219 ms. The complete run finished in
-59 s with `[registry-smoke] nodes=3 txs=7 slots=8 head=6420b17d5a264ddd`.
-The result proves next-eligible-slot inclusion and survival of the submission
-node once propagation has occurred. It is fresh post-candidate evidence; the
-ledger in the prior-candidate section below remains historical and is not
-being reused as proof of E2a.
+For an App declaring `initialSlot()`, `AppNode` checks recovered continuity
+before going live and rejects a later non-successor delivery before `apply`.
+An external-checkpoint handoff through H may start at H+1 only when it also
+supplies the exact command at H through `initialCommand()`; a newer journal
+value supersedes it and a same-slot mismatch fails startup. The registry
+installs the authenticated snapshot before serving RPC, then needs a live peer
+to supply a tail of at most 15 slots. This is state checkpoint recovery, not
+complete header/transaction-set replay.
 
-No Stable API declaration changes in E2a. The new Node methods, result types,
-statistics, wire module details, and schema-generated accessors are
-Experimental; the signed consensus schema and sans-I/O Engine are unchanged.
+A focused history implementation run passed the in-tree registry suite at
+66/66 tests, including flat and nested quorum evaluation,
+duplicate/non-member votes, wrong-network and self-consistent snapshot
+tampering, torn objects, rollback/equivocation fences, hostile namespaces and
+special files, directory-durability ablations, the 16-candidate bound, and
+simultaneously discoverable certified forks. The exact-current integrated
+smoke passed in 241,489 ms at `35ad39b`: the outage began at durable S=14;
+survivors certified C=208; the restored node booted from B=208; and the sole
+live incumbent was frozen at H=215. Thus H-S=201 and H-C=7. With the third
+validator still absent, the recovered validator was required for quorum and
+transaction 8 externalized in exactly H+1=216. The third validator then
+rejoined, and all three converged at slot 221 with head
+`3b9eab74b1176856`.
+
+No Stable declaration changed. The registry-specific archive is not exported
+by the library; `slcp.node.Node.createWithRecovery`, `RecoveryOptions`,
+`RecoveryHook`, `RecoveryView`, `RecoveryJournalTail`, and `RecoveryValue` are
+new Experimental recovery surface. The signed consensus schema and sans-I/O
+Engine remain unchanged.
 
 ## Prior v0.2.0 candidate record
 
@@ -193,14 +231,16 @@ test-only scheduler gate makes both old conditions deterministically red; the
 focused registry suite passed 20 consecutive repetitions before the
 post-fix cold runs, and the integrated suite passes under the prescribed Zig.
 
-## Known boundaries after E2a
+## Known boundaries after E2b
 
 - Transport remains unauthenticated and unencrypted; deploy behind a private
   network or authenticated tunnel.
 - Quorum linting cannot prove intersection across independently configured
   nodes.
-- The native node retains only a bounded recent answering window; long-gap
-  state transfer and history archives are future work.
+- The native node still retains only a bounded 16-slot answering window and
+  has no generic state-transfer or archival protocol. The registry can cross
+  a long outage only by importing an application-owned certified checkpoint
+  and obtaining its at-most-15-slot tail from a live peer.
 - The qset cache bounds owned logical payloads, not filesystem allocation:
   directory metadata, block rounding, operator-owned unrelated/mixed-case
   names, and at most one newly stranded atomic-write temp per Node lifetime
@@ -212,13 +252,21 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   as `Node.storageStats()`.
 - Typed application restart still depends on an application snapshot plus the
   retained journal tail for delta-like state.
+- Registry checkpoint storage is not complete replayable history. A hostile
+  archive can withhold data, replay an older valid view when the operator has
+  not set a higher floor, hide older certificates behind newer latest
+  pointers, or exceed the 16-candidate startup bound and deny recovery. The
+  private signing fence must remain durable and paired with its validator key;
+  the shared archive may contain neither the private data tree nor the key's
+  pinned parent, and the configured roots' immediate parents must pre-exist on
+  durable storage. History mode currently supports Linux and macOS only.
 - Fixed ports in some smoke and end-to-end harnesses require those suites to
   run without competing copies, especially on macOS.
 - One identity must never run on two machines; local locking cannot detect a
   copied key or data directory.
-- E2a transaction flooding is delivered, but E2 history archives,
-  checkpoint/state transfer, heap-sized state, and close time remain future
-  work; E3 remains planned.
+- E2a transaction flooding and E2b application checkpoint recovery are
+  delivered through committed proof `35ad39b`. Complete history/ancestry replay,
+  heap-sized state, and close time remain future work; E3 remains planned.
 - Licensing remains an explicit owner decision; this repository grants none.
 
 ## Reading order

@@ -117,6 +117,12 @@ Evidence that a commit range has enough support to become final.
 A node's final decision of a value for a slot.
 _Avoid_: Nomination, delivery
 
+**Previous value**:
+The exact value externalized in the slot immediately before a nomination.
+Leader selection hashes it, so a recovered node must restore the same bytes
+incumbent validators use.
+_Avoid_: Application snapshot, state root
+
 **Equivocation**:
 One node issuing incompatible statements for the same slot.
 
@@ -142,6 +148,29 @@ A value the local application rejects regardless of catch-up.
 The highest contiguous slot whose externalized value has been delivered to the
 application.
 _Avoid_: Consensus frontier
+
+**Application snapshot**:
+A durable encoding of application state at one delivery frontier. Its local
+integrity does not establish that another node should trust its contents.
+_Avoid_: History checkpoint
+
+**History checkpoint**:
+An application snapshot whose ledger head is attested by validators satisfying
+the importing node's quorum set, making it an authenticated external starting
+point.
+_Avoid_: Snapshot, answering window
+
+**History archive**:
+An application-owned durable collection of history checkpoints and their
+validator attestations, used when the live answering window is insufficient.
+_Avoid_: Answering window
+
+**History signing fence**:
+Trusted per-validator state that records immutable checkpoint decisions and a
+monotonic high-water mark before any attestation enters a shared history
+archive. It prevents one retained validator key from signing a rollback or
+same-slot fork across crashes and retries.
+_Avoid_: History archive, application snapshot
 
 **Answering window**:
 The recent span of externalized slots for which a node can still answer a

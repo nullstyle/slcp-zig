@@ -203,6 +203,12 @@ expect in the Stable list and that are deliberately **not**:
   outbound writer sub-caps/reserve, counters, and application-owned
   relay/retry policy may evolve without changing the Stable consensus or
   typed-application interface.
+- `slcp.node.Node.createWithRecovery`, `RecoveryOptions`, `RecoveryHook`,
+  `RecoveryView`, `RecoveryJournalTail`, and `RecoveryValue`: the pre-live
+  recovery seam used internally by `AppNode` to validate snapshot continuity
+  and restore the preceding nomination value before replay, listener bind, or
+  worker startup. The shape may evolve while `Node.create` and the Stable
+  typed-application behavior remain fixed.
 - `slcp.lint_report`: the CLI's rendering of lint findings. The lint
   **codes** are frozen by `schema/host.capnp` and `vectors/lint.json`, not
   by these Zig names.
