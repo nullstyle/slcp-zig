@@ -13,7 +13,11 @@
 //! submitted to the restarted node lands everywhere. It is then killed for
 //! at least 201 slots, restored from a quorum-certified history checkpoint inside
 //! the 16-slot answering window, and shown to be a necessary voter for the
-//! exact next transaction-bearing slot. Before the first crash the
+//! exact next transaction-bearing slot. The validators deliberately propose
+//! from wall clocks skewed by -30/0/+30 seconds; every RPC and durable slot log
+//! must agree on close time, and every observed adjacent ledger must advance it
+//! by 1..60 seconds. Checkpoint boot, exact-H catch-up, and H+1 are all pinned
+//! to that same temporal chain. Before the first crash the
 //! nodes form the deliberate line node2→node1→node0. One transaction is
 //! submitted only to nomination-disabled node2; `head pending=1` proves it
 //! crossed one and two overlay hops while both survivors remain at slot S,
@@ -90,9 +94,16 @@ const pending_cadence_guard_ms: u64 = 1000;
 const rejoin_heartbeat_ms = "1000";
 const disabled_cadence_ms = "18446744073709551615";
 const checkpoint_every = "8";
+/// Deliberately disagreeing proposal clocks. Consensus must still derive one
+/// deterministic close time, and every restart retains its original skew.
+const proposal_clock_offsets = [_][]const u8{ "-30", "0", "30" };
 const absent_slots: u64 = 201;
 const answering_window: u64 = 16;
 const stable_head_ms: u64 = 1000;
+/// Consensus close time must advance on every sequential ledger, but by no
+/// more than this protocol constant. Keep the smoke independent of the
+/// example package while pinning the same wire-level rule.
+const max_close_time_step: u64 = 60;
 
 pub fn listenPort(i: usize) u16 {
     return listen_base + @as(u16, @intCast(i));
@@ -137,6 +148,7 @@ fn kv(tok: []const u8) ?Kv {
 
 pub const Head = struct {
     slot: u64,
+    close_time: u64,
     hash: [64]u8,
     accounts: u64,
     names: u64,
@@ -144,13 +156,15 @@ pub const Head = struct {
     network: [64]u8,
 };
 
-/// `head slot=<n> hash=<hex64> accounts=<n> names=<n> pending=<n> network=<hex64>`,
+/// `head slot=<n> close_time=<unix-seconds> hash=<hex64> accounts=<n>
+/// names=<n> pending=<n> network=<hex64>`,
 /// or null for anything else. Every field is required and strictly typed
 /// (lower-case hex of exactly 64 chars); unknown extra fields are ignored.
 pub fn parseHead(raw: []const u8) ?Head {
     var it = std.mem.tokenizeScalar(u8, trimLine(raw), ' ');
     if (!std.mem.eql(u8, it.next() orelse return null, "head")) return null;
     var slot: ?u64 = null;
+    var close_time: ?u64 = null;
     var hash: ?[64]u8 = null;
     var accounts: ?u64 = null;
     var names: ?u64 = null;
@@ -160,6 +174,8 @@ pub fn parseHead(raw: []const u8) ?Head {
         const f = kv(tok) orelse return null;
         if (std.mem.eql(u8, f.key, "slot")) {
             slot = std.fmt.parseInt(u64, f.val, 10) catch return null;
+        } else if (std.mem.eql(u8, f.key, "close_time")) {
+            close_time = std.fmt.parseInt(u64, f.val, 10) catch return null;
         } else if (std.mem.eql(u8, f.key, "hash")) {
             hash = hex64(f.val) orelse return null;
         } else if (std.mem.eql(u8, f.key, "accounts")) {
@@ -174,6 +190,7 @@ pub fn parseHead(raw: []const u8) ?Head {
     }
     return .{
         .slot = slot orelse return null,
+        .close_time = close_time orelse return null,
         .hash = hash orelse return null,
         .accounts = accounts orelse return null,
         .names = names orelse return null,
@@ -257,10 +274,12 @@ pub fn parseAccount(raw: []const u8) ?AccountReply {
     return .{ .key = key orelse return null, .seq = seq orelse return null };
 }
 
-pub const SlotLine = struct { slot: u64, txs: u64, head16: ?[16]u8 };
+pub const SlotLine = struct { slot: u64, close_time: u64, txs: u64, head16: [16]u8 };
 
-/// A node's stderr `slot N: txs=K ok=J head=<hex16>` line (the `head=` field
-/// is taken when present and well-formed), or null for any other line.
+/// A node's stderr `slot N: close_time=T txs=K ok=J head=<hex16>` line (the
+/// `head=` field is required and well-formed), or null for any other line.
+/// Close time and head are inseparable evidence: accepting only one would let
+/// a malformed diagnostic evade cross-node time or hash comparison.
 pub fn parseSlotLine(raw: []const u8) ?SlotLine {
     const line = trimLine(raw);
     const prefix = "slot ";
@@ -268,18 +287,26 @@ pub fn parseSlotLine(raw: []const u8) ?SlotLine {
     const rest = line[prefix.len..];
     const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
     const slot = std.fmt.parseInt(u64, rest[0..colon], 10) catch return null;
+    var close_time: ?u64 = null;
     var txs: ?u64 = null;
     var head16: ?[16]u8 = null;
     var it = std.mem.tokenizeScalar(u8, rest[colon + 1 ..], ' ');
     while (it.next()) |tok| {
         const f = kv(tok) orelse continue;
-        if (std.mem.eql(u8, f.key, "txs")) {
+        if (std.mem.eql(u8, f.key, "close_time")) {
+            close_time = std.fmt.parseInt(u64, f.val, 10) catch return null;
+        } else if (std.mem.eql(u8, f.key, "txs")) {
             txs = std.fmt.parseInt(u64, f.val, 10) catch return null;
         } else if (std.mem.eql(u8, f.key, "head") and f.val.len == 16 and isLowerHex(f.val)) {
             head16 = f.val[0..16].*;
         }
     }
-    return .{ .slot = slot, .txs = txs orelse return null, .head16 = head16 };
+    return .{
+        .slot = slot,
+        .close_time = close_time orelse return null,
+        .txs = txs orelse return null,
+        .head16 = head16 orelse return null,
+    };
 }
 
 pub const CheckpointKind = enum { signed, certified };
@@ -304,15 +331,80 @@ pub fn parseCheckpointLine(raw: []const u8) ?CheckpointLine {
     return .{ .slot = slot, .kind = kind };
 }
 
-/// Extract the exact checkpoint slot from the normal node startup line. A
-/// local `snapshot` boot must not satisfy this witness.
-pub fn parseHistoryBootSlot(raw: []const u8) ?u64 {
+pub const HistoryBootLine = struct { slot: u64, close_time: u64 };
+
+/// Extract the exact checkpoint slot and close time from the normal node
+/// startup line. A local `snapshot` boot, or a history line without temporal
+/// evidence, must not satisfy this witness.
+pub fn parseHistoryBootLine(raw: []const u8) ?HistoryBootLine {
     const marker = "starting from history checkpoint at slot ";
     const line = trimLine(raw);
     const at = std.mem.indexOf(u8, line, marker) orelse return null;
-    const number = line[at + marker.len ..];
-    if (number.len == 0) return null;
-    return std.fmt.parseInt(u64, number, 10) catch null;
+    var it = std.mem.tokenizeScalar(u8, line[at + marker.len ..], ' ');
+    const slot = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const time = kv(it.next() orelse return null) orelse return null;
+    if (!std.mem.eql(u8, time.key, "close_time")) return null;
+    const close_time = std.fmt.parseInt(u64, time.val, 10) catch return null;
+    if (it.next() != null) return null;
+    return .{ .slot = slot, .close_time = close_time };
+}
+
+/// True only for the deterministic close-time transition allowed between
+/// adjacent ledger slots. The subtraction is reached only after `next > prev`.
+pub fn closeTimeTransitionOk(prev: u64, next: u64) bool {
+    return next > prev and next - prev <= max_close_time_step;
+}
+
+/// A slot's cumulative deterministic interval from the configured genesis
+/// anchor. This catches a self-consistent timeline that starts from the wrong
+/// network epoch even when only a sparse RPC sample is available.
+pub fn closeTimeAtSlotOk(genesis: u64, slot: u64, close_time: u64) bool {
+    const lower = std.math.add(u64, genesis, slot) catch return false;
+    const upper = genesis +| (slot *| max_close_time_step);
+    return close_time >= lower and close_time <= upper;
+}
+
+/// True only when every slot in `[first, last]` has durable log evidence from
+/// all `required_mask` nodes and every adjacent close-time transition is legal.
+fn loggedChainOk(
+    heads: *const std.AutoHashMapUnmanaged(u64, LogHeadSeen),
+    required_mask: u8,
+    first: u64,
+    last: u64,
+) bool {
+    if (required_mask == 0 or last < first) return false;
+    var slot = first;
+    var previous_time: ?u64 = null;
+    while (true) {
+        const seen = heads.get(slot) orelse return false;
+        if (seen.mask & required_mask != required_mask) return false;
+        if (previous_time) |previous| {
+            if (!closeTimeTransitionOk(previous, seen.close_time)) return false;
+        }
+        previous_time = seen.close_time;
+        if (slot == last) return true;
+        slot = std.math.add(u64, slot, 1) catch return false;
+    }
+}
+
+/// The first common transaction-bearing ledger after `frontier` is `tx_slot`:
+/// both live nodes retained every intervening ledger as empty and exactly one
+/// transaction at the endpoint. This keeps the rejoin proof independent of a
+/// harmless race between RPC admission and an already-due idle ledger.
+fn transactionSpanOk(
+    a: *const std.AutoHashMapUnmanaged(u64, u64),
+    b: *const std.AutoHashMapUnmanaged(u64, u64),
+    frontier: u64,
+    tx_slot: u64,
+) bool {
+    if (tx_slot <= frontier) return false;
+    var slot = std.math.add(u64, frontier, 1) catch return false;
+    while (true) {
+        const expected: u64 = if (slot == tx_slot) 1 else 0;
+        if (a.get(slot) != expected or b.get(slot) != expected) return false;
+        if (slot == tx_slot) return true;
+        slot = std.math.add(u64, slot, 1) catch return false;
+    }
 }
 
 /// The two arithmetic acceptance boundaries of the E2b witness. Written as a
@@ -385,15 +477,19 @@ const NodeProc = struct {
     /// Kept across restarts so the crash-survival proof can name the exact
     /// successor slot and show that it carried precisely the flooded tx.
     slot_txs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// slot → deterministic ledger close time, paired with the required
+    /// `slot_heads` evidence and retained across restarts.
+    slot_times: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// checkpoint slot → observed progress bits. `certified` also implies
     /// this validator has emitted its own signed attestation.
     history_checkpoints: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// Set only by the explicit `starting from history checkpoint` boot log.
-    history_boot_slot: ?u64 = null,
+    history_boot: ?HistoryBootLine = null,
     eof: bool = false,
     expect_eof: bool = false,
     /// The first line that contradicted an earlier print of the same slot by
-    /// this node (head or transaction count).
+    /// this node (head, close time, or transaction count), or broke an
+    /// adjacent close-time transition.
     bad: ?[]u8 = null,
     tail: [tail_lines]?[]u8 = @splat(null),
     tail_next: usize = 0,
@@ -426,6 +522,7 @@ const NodeProc = struct {
         if (self.bad) |b| gpa.free(b);
         self.slot_heads.deinit(gpa);
         self.slot_txs.deinit(gpa);
+        self.slot_times.deinit(gpa);
         self.history_checkpoints.deinit(gpa);
         for (self.argv) |s| gpa.free(s);
         gpa.free(self.argv);
@@ -442,7 +539,7 @@ const NodeProc = struct {
         self.eof = false;
         self.expect_eof = false;
         self.max_slot = 0;
-        self.history_boot_slot = null;
+        self.history_boot = null;
         self.mu.unlock(self.io);
         self.child = try std.process.spawn(self.io, .{
             .argv = self.argv,
@@ -530,7 +627,7 @@ const NodeProc = struct {
     fn noteLine(self: *NodeProc, line: []const u8) void {
         const parsed = parseSlotLine(line);
         const checkpoint = parseCheckpointLine(line);
-        const history_boot = parseHistoryBootSlot(line);
+        const history_boot = parseHistoryBootLine(line);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const copy = self.gpa.dupe(u8, line) catch return;
@@ -545,21 +642,45 @@ const NodeProc = struct {
                 .certified => checkpoint_signed_bit | checkpoint_certified_bit,
             };
         }
-        if (history_boot) |slot| {
-            if (self.history_boot_slot) |old| {
-                if (old != slot and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+        if (history_boot) |boot| {
+            if (self.history_boot) |old| {
+                if ((old.slot != boot.slot or old.close_time != boot.close_time) and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
             } else {
-                self.history_boot_slot = slot;
+                self.history_boot = boot;
             }
         }
         const p = parsed orelse return;
+        if (self.slot_times.get(p.slot)) |prev| {
+            if (prev != p.close_time) {
+                if (self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+                return;
+            }
+        } else {
+            if (p.slot > 0) {
+                if (self.slot_times.get(p.slot - 1)) |prev| {
+                    if (!closeTimeTransitionOk(prev, p.close_time)) {
+                        if (self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+                        return;
+                    }
+                }
+            }
+            if (p.slot < std.math.maxInt(u64)) {
+                if (self.slot_times.get(p.slot + 1)) |next| {
+                    if (!closeTimeTransitionOk(p.close_time, next)) {
+                        if (self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
+                        return;
+                    }
+                }
+            }
+            self.slot_times.put(self.gpa, p.slot, p.close_time) catch return;
+        }
         if (p.slot > self.max_slot) self.max_slot = p.slot;
         if (self.slot_txs.get(p.slot)) |prev| {
             if (prev != p.txs and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
         } else {
             self.slot_txs.put(self.gpa, p.slot, p.txs) catch {};
         }
-        const h = p.head16 orelse return;
+        const h = p.head16;
         if (self.slot_heads.get(p.slot)) |prev| {
             if (!std.mem.eql(u8, &prev, &h) and self.bad == null) self.bad = self.gpa.dupe(u8, line) catch null;
         } else {
@@ -585,6 +706,56 @@ const NodeProc = struct {
     }
 };
 
+/// Process-boundary hard-epoch proof. Preserve the raw SLCP data directory,
+/// remove only the application snapshot that would independently reject a
+/// different registry network id, then restart with the same passphrase and
+/// a different G. The process must reach Node's descriptor fence and report
+/// `DataDirOtherNetwork`; staying live would mean the CLI failed to bind G
+/// into the raw consensus signing domain.
+fn proveHardNetworkEpochRefusal(io: std.Io, gpa: std.mem.Allocator, proc: *NodeProc, genesis: u64) !void {
+    const other_genesis = std.math.add(u64, genesis, 1) catch return error.GenesisTimeOverflow;
+    var other_buf: [20]u8 = undefined;
+    const other = try std.fmt.bufPrint(&other_buf, "{d}", .{other_genesis});
+    try proc.setFlagValue("--genesis-close-time", other);
+
+    const snapshot_path = try std.fmt.allocPrint(gpa, "{s}/data/snapshot", .{proc.dir});
+    defer gpa.free(snapshot_path);
+    try std.Io.Dir.cwd().deleteFile(io, snapshot_path);
+
+    try proc.spawn();
+    proc.mu.lockUncancelable(io);
+    proc.expect_eof = true;
+    proc.mu.unlock(io);
+
+    const started = std.Io.Timestamp.now(io, .awake);
+    while (elapsedMs(io, started) < 10_000) {
+        var eof = false;
+        var saw_fence = false;
+        proc.mu.lockUncancelable(io);
+        eof = proc.eof;
+        for (proc.tail) |line| {
+            if (line) |text| {
+                if (std.mem.indexOf(u8, text, "DataDirOtherNetwork") != null)
+                    saw_fence = true;
+            }
+        }
+        proc.mu.unlock(io);
+        if (eof) {
+            proc.stop();
+            if (!saw_fence) {
+                proc.dumpTail();
+                return error.HardEpochWrongRefusal;
+            }
+            std.debug.print("[registry-smoke] hard epoch: same passphrase with G={d} refused the G={d} raw data directory (DataDirOtherNetwork)\n", .{ other_genesis, genesis });
+            return;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    }
+    proc.stop();
+    proc.dumpTail();
+    return error.HardEpochAccepted;
+}
+
 // ---------------------------------------------------------------------------
 // The cluster: three nodes, two clients, the CLI as the only probe
 // ---------------------------------------------------------------------------
@@ -595,8 +766,8 @@ const n_clients = client_names.len;
 
 /// A `head` answer folded into the slot → hash table: the bit mask says which
 /// nodes reported it.
-const HeadSeen = struct { hash: [64]u8, mask: u8 };
-const LogHeadSeen = struct { head16: [16]u8, mask: u8 };
+const HeadSeen = struct { hash: [64]u8, close_time: u64, mask: u8 };
+const LogHeadSeen = struct { head16: [16]u8, close_time: u64, mask: u8 };
 
 /// What a `get` poll waits for.
 const GetWant = union(enum) {
@@ -641,6 +812,12 @@ fn elapsedMs(io: std.Io, since: std.Io.Timestamp) u64 {
     return if (d < 0) 0 else @intCast(d);
 }
 
+fn wallSeconds(io: std.Io) u64 {
+    const ns = std.Io.Clock.now(.real, io).nanoseconds;
+    if (ns <= 0) return 0;
+    return std.math.cast(u64, @divFloor(ns, std.time.ns_per_s)) orelse std.math.maxInt(u64) - 1;
+}
+
 /// One bounded wait. `tick` sleeps a poll interval after checking the
 /// processes, the whole-run deadline and this wait's own bound.
 const Poll = struct {
@@ -676,6 +853,8 @@ const Poll = struct {
 const Cluster = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Network epoch used to derive every legal ledger-time interval.
+    genesis_close_time: u64,
     /// Absolute scratch dir (the CLI's cwd).
     scratch: []const u8,
     /// The consumer-built `registry` binary (absolute).
@@ -687,8 +866,8 @@ const Cluster = struct {
     started: std.Io.Timestamp,
     deadline_ms: u64,
     last_report: std.Io.Timestamp,
-    /// Every `head` answer ever received: slot → hash + reporting nodes. A
-    /// second hash for a slot is a fork.
+    /// Every `head` answer ever received: slot → hash/time + reporting
+    /// nodes. A second hash or time for a slot is a fork.
     rpc_heads: std.AutoHashMapUnmanaged(u64, HeadSeen) = .empty,
     /// Every `slot N: … head=` stderr line, merged across nodes.
     log_heads: std.AutoHashMapUnmanaged(u64, LogHeadSeen) = .empty,
@@ -740,15 +919,48 @@ const Cluster = struct {
             }
             var it = p.slot_heads.iterator();
             while (it.next()) |e| {
-                const gop = try self.log_heads.getOrPut(self.gpa, e.key_ptr.*);
-                if (gop.found_existing) {
-                    if (!std.mem.eql(u8, &gop.value_ptr.head16, e.value_ptr)) {
-                        std.debug.print("[registry-smoke] fork in the logs at slot {d}: node{d} printed head={s}, an earlier node printed head={s}\n", .{ e.key_ptr.*, p.index, e.value_ptr, &gop.value_ptr.head16 });
+                const slot = e.key_ptr.*;
+                const close_time = p.slot_times.get(slot) orelse return error.MissingSlotTime;
+                if (!closeTimeAtSlotOk(self.genesis_close_time, slot, close_time)) {
+                    std.debug.print("[registry-smoke] node{d} log time at slot {d} is outside the genesis-anchored interval: G={d}, close_time={d}\n", .{
+                        p.index, slot, self.genesis_close_time, close_time,
+                    });
+                    return error.LogTimeOutsideGenesisInterval;
+                }
+                if (self.log_heads.getPtr(slot)) |seen| {
+                    if (!std.mem.eql(u8, &seen.head16, e.value_ptr)) {
+                        std.debug.print("[registry-smoke] fork in the logs at slot {d}: node{d} printed head={s}, an earlier node printed head={s}\n", .{ slot, p.index, e.value_ptr, &seen.head16 });
                         return error.LogHeadDisagreement;
                     }
-                    gop.value_ptr.mask |= bit(p.index);
+                    if (seen.close_time != close_time) {
+                        std.debug.print("[registry-smoke] close-time disagreement in the logs at slot {d}: node{d} printed {d}, an earlier node printed {d}\n", .{ slot, p.index, close_time, seen.close_time });
+                        return error.LogTimeDisagreement;
+                    }
+                    seen.mask |= bit(p.index);
                 } else {
-                    gop.value_ptr.* = .{ .head16 = e.value_ptr.*, .mask = bit(p.index) };
+                    if (slot > 0) {
+                        if (self.log_heads.get(slot - 1)) |prev| {
+                            if (!closeTimeTransitionOk(prev.close_time, close_time)) {
+                                std.debug.print("[registry-smoke] illegal log close-time step {d}→{d}: {d}→{d}\n", .{ slot - 1, slot, prev.close_time, close_time });
+                                return error.BadLogTimeTransition;
+                            }
+                        }
+                    }
+                    if (slot < std.math.maxInt(u64)) {
+                        if (self.log_heads.get(slot + 1)) |next| {
+                            if (!closeTimeTransitionOk(close_time, next.close_time)) {
+                                std.debug.print("[registry-smoke] illegal log close-time step {d}→{d}: {d}→{d}\n", .{ slot, slot + 1, close_time, next.close_time });
+                                return error.BadLogTimeTransition;
+                            }
+                        }
+                    }
+                    try self.log_heads.put(self.gpa, slot, .{ .head16 = e.value_ptr.*, .close_time = close_time, .mask = bit(p.index) });
+                }
+                if (self.rpc_heads.get(slot)) |rpc| {
+                    if (!std.mem.eql(u8, rpc.hash[0..16], e.value_ptr) or rpc.close_time != close_time) {
+                        std.debug.print("[registry-smoke] RPC/log disagreement at slot {d}: rpc head={s} time={d}, log head={s} time={d}\n", .{ slot, rpc.hash[0..16], rpc.close_time, e.value_ptr, close_time });
+                        return error.RpcLogDisagreement;
+                    }
                 }
             }
         }
@@ -814,15 +1026,46 @@ const Cluster = struct {
             std.debug.print("[registry-smoke] unparseable head reply from node{d}: \"{s}\"\n", .{ i, r.line });
             return error.BadHeadReply;
         };
-        const gop = try self.rpc_heads.getOrPut(self.gpa, h.slot);
-        if (gop.found_existing) {
-            if (!std.mem.eql(u8, &gop.value_ptr.hash, &h.hash)) {
-                std.debug.print("[registry-smoke] fork at slot {d}: node{d} says hash={s}, an earlier node said {s}\n", .{ h.slot, i, &h.hash, &gop.value_ptr.hash });
+        if (!closeTimeAtSlotOk(self.genesis_close_time, h.slot, h.close_time)) {
+            std.debug.print("[registry-smoke] node{d} RPC time at slot {d} is outside the genesis-anchored interval: G={d}, close_time={d}\n", .{
+                i, h.slot, self.genesis_close_time, h.close_time,
+            });
+            return error.HeadTimeOutsideGenesisInterval;
+        }
+        if (self.rpc_heads.getPtr(h.slot)) |seen| {
+            if (!std.mem.eql(u8, &seen.hash, &h.hash)) {
+                std.debug.print("[registry-smoke] fork at slot {d}: node{d} says hash={s}, an earlier node said {s}\n", .{ h.slot, i, &h.hash, &seen.hash });
                 return error.HeadDisagreement;
             }
-            gop.value_ptr.mask |= bit(i);
+            if (seen.close_time != h.close_time) {
+                std.debug.print("[registry-smoke] close-time disagreement at slot {d}: node{d} says {d}, an earlier node said {d}\n", .{ h.slot, i, h.close_time, seen.close_time });
+                return error.HeadTimeDisagreement;
+            }
+            seen.mask |= bit(i);
         } else {
-            gop.value_ptr.* = .{ .hash = h.hash, .mask = bit(i) };
+            if (h.slot > 0) {
+                if (self.rpc_heads.get(h.slot - 1)) |prev| {
+                    if (!closeTimeTransitionOk(prev.close_time, h.close_time)) {
+                        std.debug.print("[registry-smoke] illegal RPC close-time step {d}→{d}: {d}→{d}\n", .{ h.slot - 1, h.slot, prev.close_time, h.close_time });
+                        return error.BadHeadTimeTransition;
+                    }
+                }
+            }
+            if (h.slot < std.math.maxInt(u64)) {
+                if (self.rpc_heads.get(h.slot + 1)) |next| {
+                    if (!closeTimeTransitionOk(h.close_time, next.close_time)) {
+                        std.debug.print("[registry-smoke] illegal RPC close-time step {d}→{d}: {d}→{d}\n", .{ h.slot, h.slot + 1, h.close_time, next.close_time });
+                        return error.BadHeadTimeTransition;
+                    }
+                }
+            }
+            try self.rpc_heads.put(self.gpa, h.slot, .{ .hash = h.hash, .close_time = h.close_time, .mask = bit(i) });
+        }
+        if (self.log_heads.get(h.slot)) |logged| {
+            if (!std.mem.eql(u8, h.hash[0..16], &logged.head16) or h.close_time != logged.close_time) {
+                std.debug.print("[registry-smoke] RPC/log disagreement at slot {d}: rpc head={s} time={d}, log head={s} time={d}\n", .{ h.slot, h.hash[0..16], h.close_time, &logged.head16, logged.close_time });
+                return error.RpcLogDisagreement;
+            }
         }
         return h;
     }
@@ -846,7 +1089,7 @@ const Cluster = struct {
                 if (ready[i]) continue;
                 if (try self.queryHead(i)) |h| {
                     ready[i] = true;
-                    std.debug.print("[registry-smoke] node{d} rpc up ({s}): slot={d} network={s}\n", .{ i, self.rpc[i], h.slot, h.network[0..16] });
+                    std.debug.print("[registry-smoke] node{d} rpc up ({s}): slot={d} close_time={d} network={s}\n", .{ i, self.rpc[i], h.slot, h.close_time, h.network[0..16] });
                 } else all = false;
             }
             if (all) return;
@@ -986,7 +1229,7 @@ const Cluster = struct {
         while (true) {
             if (try self.queryHead(i)) |h| {
                 if (h.slot >= min_slot) {
-                    std.debug.print("[registry-smoke] ok after {d} ms: {s} (node{d} at slot {d})\n", .{ poll.elapsed(self.io), what, i, h.slot });
+                    std.debug.print("[registry-smoke] ok after {d} ms: {s} (node{d} at slot {d}, close_time={d})\n", .{ poll.elapsed(self.io), what, i, h.slot, h.close_time });
                     return h;
                 }
             }
@@ -1019,7 +1262,7 @@ const Cluster = struct {
             if (poll.elapsed(self.io) >= agreement_min_ms) {
                 if (full) |slot| {
                     const seen = self.rpc_heads.get(slot).?;
-                    std.debug.print("[registry-smoke] head agreement: slot {d} hash={s}… reported by all three ({d} samples, {d} distinct slots)\n", .{ slot, seen.hash[0..16], samples, fresh.count() });
+                    std.debug.print("[registry-smoke] head agreement: slot {d} close_time={d} hash={s}… reported by all three ({d} samples, {d} distinct slots)\n", .{ slot, seen.close_time, seen.hash[0..16], samples, fresh.count() });
                     return slot;
                 }
             }
@@ -1050,15 +1293,15 @@ const Cluster = struct {
                 };
                 if (h.slot < min_slot or h.pending != want_pending) all_met = false;
                 if (common) |first| {
-                    if (h.slot != first.slot or !std.mem.eql(u8, &h.hash, &first.hash)) all_met = false;
+                    if (h.slot != first.slot or h.close_time != first.close_time or !std.mem.eql(u8, &h.hash, &first.hash)) all_met = false;
                 } else {
                     common = h;
                 }
             }
             if (all_met) {
                 const h = common orelse return error.NoNodes;
-                std.debug.print("[registry-smoke] ok after {d} ms: {s} (slot {d}, pending={d}, head={s}…)\n", .{
-                    poll.elapsed(self.io), what, h.slot, h.pending, h.hash[0..16],
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (slot {d}, close_time={d}, pending={d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, h.slot, h.close_time, h.pending, h.hash[0..16],
                 });
                 return h;
             }
@@ -1202,8 +1445,8 @@ const Cluster = struct {
             try self.checkProcs();
             if (self.commonLoggedSlotNow(nodes, min_slot, want_txs)) |slot| {
                 const seen = self.log_heads.get(slot).?;
-                std.debug.print("[registry-smoke] ok after {d} ms: {s} (durable slot {d}, head={s}…)\n", .{
-                    poll.elapsed(self.io), what, slot, &seen.head16,
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (durable slot {d}, close_time={d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, slot, seen.close_time, &seen.head16,
                 });
                 return slot;
             }
@@ -1225,8 +1468,8 @@ const Cluster = struct {
             try self.checkProcs();
             if (self.commonLoggedSlotNow(nodes, min_slot, 0)) |slot| {
                 const seen = self.log_heads.get(slot).?;
-                std.debug.print("[registry-smoke] ok after {d} ms: {s} (fresh durable slot {d}, head={s}…)\n", .{
-                    poll.elapsed(self.io), what, slot, &seen.head16,
+                std.debug.print("[registry-smoke] ok after {d} ms: {s} (fresh durable slot {d}, close_time={d}, head={s}…)\n", .{
+                    poll.elapsed(self.io), what, slot, seen.close_time, &seen.head16,
                 });
                 return slot;
             }
@@ -1264,7 +1507,7 @@ const Cluster = struct {
     /// for C, at least one to report C certified, and both to have durably
     /// applied C with the same head. The returned live head is within the
     /// protocol's 16-slot answering window of C.
-    fn waitCertifiedCheckpoint(self: *Cluster, nodes: *const [2]usize, min_live_slot: u64) !CertifiedWitness {
+    fn waitCertifiedCheckpoint(self: *Cluster, nodes: *const [2]usize, first_slot: u64, min_live_slot: u64) !CertifiedWitness {
         var poll = Poll.init(self.io, history_bound_ms, "a recent two-signer certified history checkpoint after at least 201 missed slots");
         while (true) {
             try self.checkProcs();
@@ -1272,6 +1515,13 @@ const Cluster = struct {
             if (live_head) |h| {
                 if (self.certifiedCheckpointNow(nodes, h)) |c| {
                     if (h - c >= answering_window) {
+                        try poll.tick(self);
+                        continue;
+                    }
+                    // This is a temporal-chain witness, not merely two sparse
+                    // endpoints: both survivors must have printed every slot
+                    // from the outage origin through the live frontier.
+                    if (!loggedChainOk(&self.log_heads, nodesMask(nodes), first_slot, h)) {
                         try poll.tick(self);
                         continue;
                     }
@@ -1301,12 +1551,12 @@ const Cluster = struct {
                 try poll.tick(self);
                 continue;
             }
-            if (candidate == null or candidate.?.slot != h.slot or !std.mem.eql(u8, &candidate.?.hash, &h.hash)) {
+            if (candidate == null or candidate.?.slot != h.slot or candidate.?.close_time != h.close_time or !std.mem.eql(u8, &candidate.?.hash, &h.hash)) {
                 candidate = h;
                 since = std.Io.Timestamp.now(self.io, .awake);
             } else if (elapsedMs(self.io, since) >= stable_ms) {
-                std.debug.print("[registry-smoke] ok after {d} ms: node{d} stalled without quorum at H={d} head={s}… for >= {d} ms\n", .{
-                    poll.elapsed(self.io), i, h.slot, h.hash[0..16], stable_ms,
+                std.debug.print("[registry-smoke] ok after {d} ms: node{d} stalled without quorum at H={d} close_time={d} head={s}… for >= {d} ms\n", .{
+                    poll.elapsed(self.io), i, h.slot, h.close_time, h.hash[0..16], stable_ms,
                 });
                 return h;
             }
@@ -1314,28 +1564,43 @@ const Cluster = struct {
         }
     }
 
-    fn waitHistoryBoot(self: *Cluster, i: usize, min_slot: u64, stable_head: u64) !u64 {
+    fn waitHistoryBoot(self: *Cluster, i: usize, certifiers: *const [2]usize, min_slot: u64, stable_head: u64) !HistoryBootLine {
         var poll = Poll.init(self.io, ready_bound_ms, "node2's explicit history-checkpoint boot log");
         while (true) {
+            try self.checkProcs();
             const p = self.procs[i];
             p.mu.lockUncancelable(self.io);
-            const got = p.history_boot_slot;
+            const got = p.history_boot;
             p.mu.unlock(self.io);
-            if (got) |slot| {
+            if (got) |boot| {
                 // A second certificate can become complete after the harness
                 // sampled C but before node0's kill reaches it. loadLatest
                 // correctly chooses that newer artifact, so accept B >= C
                 // while retaining the same stable-H/window proof.
-                if (slot < min_slot or slot > stable_head or stable_head - slot >= answering_window) {
+                if (boot.slot < min_slot or boot.slot > stable_head or stable_head - boot.slot >= answering_window) {
                     std.debug.print("[registry-smoke] node{d} booted from history checkpoint B={d}; expected C={d} <= B <= H={d} and H-B < {d}\n", .{
-                        i, slot, min_slot, stable_head, answering_window,
+                        i, boot.slot, min_slot, stable_head, answering_window,
                     });
                     return error.WrongHistoryCheckpoint;
                 }
-                std.debug.print("[registry-smoke] ok after {d} ms: node{d} booted from history checkpoint B={d} (requested minimum C={d}, stable H={d})\n", .{
-                    poll.elapsed(self.io), i, slot, min_slot, stable_head,
+                // If startup legitimately selected a certificate newer than
+                // the requested floor, prove that exact B—not just some older
+                // C—was signed by both frozen survivors and certified.
+                if (self.certifiedCheckpointNow(certifiers, boot.slot) != boot.slot) {
+                    std.debug.print("[registry-smoke] node{d} booted from B={d}, but that exact checkpoint lacks frozen two-signer certification and durable quorum logs\n", .{ i, boot.slot });
+                    return error.UncertifiedHistoryBoot;
+                }
+                const recorded = self.log_heads.get(boot.slot) orelse return error.MissingCheckpointTimeEvidence;
+                if (recorded.close_time != boot.close_time) {
+                    std.debug.print("[registry-smoke] node{d} history boot B={d} has close_time={d}; durable quorum evidence says {d}\n", .{
+                        i, boot.slot, boot.close_time, recorded.close_time,
+                    });
+                    return error.HistoryBootTimeDisagreement;
+                }
+                std.debug.print("[registry-smoke] ok after {d} ms: node{d} booted from history checkpoint B={d} close_time={d} (requested minimum C={d}, stable H={d})\n", .{
+                    poll.elapsed(self.io), i, boot.slot, boot.close_time, min_slot, stable_head,
                 });
-                return slot;
+                return boot;
             }
             try poll.tick(self);
         }
@@ -1353,8 +1618,9 @@ const Cluster = struct {
                 }
                 if (h.slot == want.slot) {
                     if (!std.mem.eql(u8, &h.hash, &want.hash)) return error.HeadDisagreement;
-                    std.debug.print("[registry-smoke] ok after {d} ms: node{d} caught exact H={d} head={s}…\n", .{
-                        poll.elapsed(self.io), i, h.slot, h.hash[0..16],
+                    if (h.close_time != want.close_time) return error.HeadTimeDisagreement;
+                    std.debug.print("[registry-smoke] ok after {d} ms: node{d} caught exact H={d} close_time={d} head={s}…\n", .{
+                        poll.elapsed(self.io), i, h.slot, h.close_time, h.hash[0..16],
                     });
                     return h;
                 }
@@ -1380,7 +1646,7 @@ const Cluster = struct {
                         }
                     }
                     if (seen_other) {
-                        std.debug.print("[registry-smoke] ok after {d} ms: node{d} caught up: slot {d} hash={s}… matches the others\n", .{ poll.elapsed(self.io), i, h.slot, h.hash[0..16] });
+                        std.debug.print("[registry-smoke] ok after {d} ms: node{d} caught up: slot {d} close_time={d} hash={s}… matches the others\n", .{ poll.elapsed(self.io), i, h.slot, h.close_time, h.hash[0..16] });
                         return;
                     }
                 }
@@ -1523,7 +1789,7 @@ const Cluster = struct {
         // signed by both, certified by the local qset, and no more than 15
         // slots behind the live common head.
         const survivors = [_]usize{ 0, 1 };
-        const certified = try self.waitCertifiedCheckpoint(&survivors, absent_at + absent_slots);
+        const certified = try self.waitCertifiedCheckpoint(&survivors, absent_at, absent_at + absent_slots);
 
         // Remove node0 as well. node1 may finish already-buffered work, so the
         // stable H is measured after the kill; five or more independent head
@@ -1536,6 +1802,12 @@ const Cluster = struct {
             p0.stop();
         }
         const stable = try self.waitHeadStable(1, certified.live_head, stable_head_ms);
+        // Buffered votes may let the remaining process finish a few ledgers
+        // after node0 dies. Its own complete log must extend the already
+        // two-survivor-certified chain through the exact stable H.
+        try self.checkProcs();
+        if (!loggedChainOk(&self.log_heads, bit(1), absent_at, stable.slot))
+            return error.IncompleteHistoryTimeChain;
         // node0's reader is joined, so freeze the newest certificate both
         // survivors actually logged before selecting the import floor. This
         // closes the C→C+8 race between the earlier sample and SIGKILL.
@@ -1570,19 +1842,44 @@ const Cluster = struct {
             std.debug.print("[registry-smoke] cannot respawn node2 from history: {t}\n", .{err});
             return err;
         };
-        const boot_checkpoint = try self.waitHistoryBoot(2, checkpoint_floor, stable.slot);
-        if (!historyWitnessOk(absent_at, stable.slot, boot_checkpoint)) return error.HistoryWitnessOutOfRange;
+        const boot = try self.waitHistoryBoot(2, &survivors, checkpoint_floor, stable.slot);
+        if (!historyWitnessOk(absent_at, stable.slot, boot.slot)) return error.HistoryWitnessOutOfRange;
         _ = try self.waitHeadExact(2, stable);
 
-        // tx8 changes state and must land in exactly H+1 on both live nodes.
-        // node1 was proved stalled at H, so this externalization proves the
-        // checkpoint-restored node has rejoined as a necessary voter.
+        // tx8 changes state and must occupy the first common transaction-
+        // bearing ledger after H on both live nodes. An idle H+1 may already
+        // have been proposed while the CLI process starts; if so, retain and
+        // prove it as an agreed empty ledger instead of making correctness
+        // depend on a sub-second scheduling race. Node1 was proved stalled at
+        // H, so every post-H externalization still requires the restored node.
         _ = try self.submit(.bob, 2, &.{ "set", "alice", "history" });
-        const rejoined_slot = stable.slot + 1;
-        try self.waitSlotTxs(&.{ 1, 2 }, rejoined_slot, 1, "node1+node2 externalized tx8 in exactly H+1 after checkpoint catch-up");
+        const first_post_h = std.math.add(u64, stable.slot, 1) catch return error.StableHeadAtMaxSlot;
+        const rejoined_slot = try self.waitCommonLoggedSlot(
+            &.{ 1, 2 },
+            first_post_h,
+            1,
+            "node1+node2 externalized the first transaction-bearing ledger after checkpoint catch-up",
+        );
+        try self.checkProcs();
+
+        const p1 = self.procs[1];
+        const p2 = self.procs[2];
+        p1.mu.lockUncancelable(self.io);
+        p2.mu.lockUncancelable(self.io);
+        const exact_span = transactionSpanOk(&p1.slot_txs, &p2.slot_txs, stable.slot, rejoined_slot);
+        p2.mu.unlock(self.io);
+        p1.mu.unlock(self.io);
+        if (!exact_span) return error.BadRejoinTransactionSpan;
+        if (!loggedChainOk(&self.log_heads, bit(1) | bit(2), stable.slot, rejoined_slot))
+            return error.IncompleteRejoinTimeChain;
+
+        const rejoined = self.log_heads.get(rejoined_slot) orelse return error.MissingSlotTime;
+        std.debug.print("[registry-smoke] tx8 temporal witness: H={d} close_time={d}; first tx ledger={d} close_time={d} after {d} complete post-H ledger(s)\n", .{
+            stable.slot, stable.close_time, rejoined_slot, rejoined.close_time, rejoined_slot - stable.slot,
+        });
         try self.waitGet("alice", .{ .value = "686973746f7279" }, &.{ 1, 2 }, "tx8 state agrees on node1+node2 at the rejoined frontier");
 
-        // (11) Finally restart node0. Depending on whether H+1 was itself an
+        // (11) Finally restart node0. Depending on whether a post-H ledger was an
         // 8-slot boundary it may select local persistence or the newer shared
         // certificate; either path must converge with the two-node chain.
         // (The exact tx8 line is already pinned on its necessary voters.)
@@ -1603,6 +1900,13 @@ const Cluster = struct {
             return error.TxCountDrift;
         }
         const top = self.highestHead() orelse return error.NoHeadSeen;
+
+        // All state assertions are complete. Stop the validators, then use
+        // node0's real process/data directory to pin the CLI→Node hard epoch
+        // before emitting the sole success evidence line.
+        for (self.procs) |proc| proc.stop();
+        try proveHardNetworkEpochRefusal(self.io, self.gpa, self.procs[0], self.genesis_close_time);
+
         var buf: [128]u8 = undefined;
         const line = try evidenceLine(&buf, n_nodes, self.txs, top.slot, top.hash[0..16]);
         var out_buf: [256]u8 = undefined;
@@ -1823,6 +2127,12 @@ fn run(init: std.process.Init, args: Args) !void {
     const history_dir = try std.fmt.allocPrint(gpa, "{s}/history", .{scratch});
     defer gpa.free(history_dir);
     try cwd.createDirPath(io, history_dir);
+    // One absolute anchor shared by all validators. Only proposal clocks are
+    // skewed; a restart reuses its fully owned argv and therefore preserves
+    // both this genesis anchor and its original offset.
+    const genesis_close_time = wallSeconds(io);
+    var genesis_buf: [20]u8 = undefined;
+    const genesis_s = try std.fmt.bufPrint(&genesis_buf, "{d}", .{genesis_close_time});
     for (0..n_nodes) |i| {
         const dir = try std.fmt.allocPrint(gpa, "{s}/node{d}", .{ scratch, i });
         defer gpa.free(dir);
@@ -1838,17 +2148,19 @@ fn run(init: std.process.Init, args: Args) !void {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.appendSlice(gpa, &.{
-            exe,                  "node",
-            "--network",          network,
-            "--key",              node_key_paths[i],
-            "--data-dir",         "data",
-            "--quorum",           quorum_path,
-            "--listen",           listen_s,
-            "--rpc",              rpc_s,
-            "--min-slot-ms",      min_slot,
-            "--heartbeat-ms",     heartbeat,
-            "--history-dir",      history_dir,
-            "--checkpoint-every", checkpoint_every,
+            exe,                         "node",
+            "--network",                 network,
+            "--genesis-close-time",      genesis_s,
+            "--proposal-clock-offset-s", proposal_clock_offsets[i],
+            "--key",                     node_key_paths[i],
+            "--data-dir",                "data",
+            "--quorum",                  quorum_path,
+            "--listen",                  listen_s,
+            "--rpc",                     rpc_s,
+            "--min-slot-ms",             min_slot,
+            "--heartbeat-ms",            heartbeat,
+            "--history-dir",             history_dir,
+            "--checkpoint-every",        checkpoint_every,
         });
         // A deliberate line, with arrows denoting the only configured dial:
         // node2 --peer node1; node1 --peer node0; node0 has no peer argument.
@@ -1866,8 +2178,8 @@ fn run(init: std.process.Init, args: Args) !void {
         std.debug.print("[registry-smoke] cannot spawn node{d} ({s}): {t}\n", .{ p.index, p.argv[0], err });
         return err;
     };
-    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; busy min {s} ms, idle heartbeat {s} ms, checkpoint every {s}; node2 nomination disabled\n", .{
-        listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), survivor_min_slot_ms, survivor_heartbeat_ms, checkpoint_every,
+    std.debug.print("[registry-smoke] 3 nodes spawned in line node2→node1→node0: listen {d}..{d}, rpc {d}..{d}; genesis close_time={d}; proposal clock offsets {any}; busy min {s} ms, idle heartbeat {s} ms, checkpoint every {s}; node2 nomination disabled\n", .{
+        listenPort(0), listenPort(n_nodes - 1), rpcPort(0), rpcPort(n_nodes - 1), genesis_close_time, proposal_clock_offsets, survivor_min_slot_ms, survivor_heartbeat_ms, checkpoint_every,
     });
 
     // ---- (5)–(9) the acceptance script ----
@@ -1875,6 +2187,7 @@ fn run(init: std.process.Init, args: Args) !void {
     var cluster: Cluster = .{
         .gpa = gpa,
         .io = io,
+        .genesis_close_time = genesis_close_time,
         .scratch = scratch,
         .exe = exe,
         .key_paths = .{ client_key_paths[0], client_key_paths[1] },
@@ -1909,20 +2222,23 @@ const hex_upper: [64]u8 = @splat('A');
 // upper-casing it makes `parseHead` return null (the poll then never
 // completes), and the other verbs' replies must not pass as a head.
 test "parseHead: the §3.10 head line field by field; malformed lines are null" {
-    const line = "head slot=12 hash=" ++ hex_a ++ " accounts=2 names=1 pending=0 network=" ++ hex_b ++ "\n";
+    const line = "head slot=12 close_time=1700000012 hash=" ++ hex_a ++ " accounts=2 names=1 pending=0 network=" ++ hex_b ++ "\n";
     const h = parseHead(line).?;
     try testing.expectEqual(@as(u64, 12), h.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_012), h.close_time);
     try testing.expectEqualStrings(&hex_a, &h.hash);
     try testing.expectEqual(@as(u64, 2), h.accounts);
     try testing.expectEqual(@as(u64, 1), h.names);
     try testing.expectEqual(@as(u64, 0), h.pending);
     try testing.expectEqualStrings(&hex_b, &h.network);
     // An extra field is tolerated; a missing, short, or upper-case one is not.
-    try testing.expect(parseHead("head slot=1 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b ++ " peers=2") != null);
-    try testing.expect(parseHead("head slot=1 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0") == null);
-    try testing.expect(parseHead("head slot=1 hash=abc accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
-    try testing.expect(parseHead("head slot=1 hash=" ++ hex_upper ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
-    try testing.expect(parseHead("head slot=x hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
+    try testing.expect(parseHead("head slot=1 close_time=2 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b ++ " peers=2") != null);
+    try testing.expect(parseHead("head slot=1 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
+    try testing.expect(parseHead("head slot=1 close_time=2 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0") == null);
+    try testing.expect(parseHead("head slot=1 close_time=2 hash=abc accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
+    try testing.expect(parseHead("head slot=1 close_time=2 hash=" ++ hex_upper ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
+    try testing.expect(parseHead("head slot=1 close_time=x hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
+    try testing.expect(parseHead("head slot=x close_time=2 hash=" ++ hex_a ++ " accounts=0 names=0 pending=0 network=" ++ hex_b) == null);
     try testing.expect(parseHead("entry name=alice owner=" ++ hex_a ++ " value=") == null);
     try testing.expect(parseHead("") == null);
 }
@@ -1991,19 +2307,19 @@ test "parseAccount: account key=<hex64> seq=<n>" {
 // Non-vacuity: the per-node stderr parser feeds the progress report and the
 // cross-node fork check on the logs; the library's own `slot` mentions
 // (`info(slcp_node): …`) must not be mistaken for the program's line.
-test "parseSlotLine: the node's `slot N: txs=K ok=J head=<hex16>` line" {
-    const p = parseSlotLine("slot 12: txs=2 ok=2 head=0123456789abcdef").?;
+test "parseSlotLine: the node's timed `slot N: ...` line" {
+    const p = parseSlotLine("slot 12: close_time=1700000012 txs=2 ok=2 head=0123456789abcdef").?;
     try testing.expectEqual(@as(u64, 12), p.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_012), p.close_time);
     try testing.expectEqual(@as(u64, 2), p.txs);
-    try testing.expectEqualStrings("0123456789abcdef", &p.head16.?);
-    const no_head = parseSlotLine("slot 3: txs=0 ok=0").?;
-    try testing.expectEqual(@as(u64, 3), no_head.slot);
-    try testing.expectEqual(@as(u64, 0), no_head.txs);
-    try testing.expect(no_head.head16 == null);
-    try testing.expect(parseSlotLine("slot 3: ok=0 head=0123456789abcdef") == null);
-    try testing.expect(parseSlotLine("slot 3: txs=x ok=0 head=0123456789abcdef") == null);
+    try testing.expectEqualStrings("0123456789abcdef", &p.head16);
+    try testing.expect(parseSlotLine("slot 3: close_time=1700000003 txs=0 ok=0") == null);
+    try testing.expect(parseSlotLine("slot 3: txs=0 ok=0 head=0123456789abcdef") == null);
+    try testing.expect(parseSlotLine("slot 3: close_time=4 ok=0 head=0123456789abcdef") == null);
+    try testing.expect(parseSlotLine("slot 3: close_time=4 txs=x ok=0 head=0123456789abcdef") == null);
+    try testing.expect(parseSlotLine("slot 3: close_time=x txs=0 ok=0 head=0123456789abcdef") == null);
     try testing.expect(parseSlotLine("info(slcp_node): slot 3 externalized") == null);
-    try testing.expect(parseSlotLine("slot x: txs=0 ok=0") == null);
+    try testing.expect(parseSlotLine("slot x: close_time=4 txs=0 ok=0") == null);
     try testing.expect(parseSlotLine("") == null);
 }
 
@@ -2023,12 +2339,74 @@ test "parseCheckpointLine: signed and certified are distinct exact statuses" {
     try testing.expect(parseCheckpointLine("slot 216: txs=0 ok=0") == null);
 }
 
-test "parseHistoryBootSlot: only an explicit history-checkpoint boot satisfies it" {
-    const line = "registry: node abc listening on port 1; 1 peer(s); data in data; starting from history checkpoint at slot 208";
-    try testing.expectEqual(@as(?u64, 208), parseHistoryBootSlot(line));
-    try testing.expect(parseHistoryBootSlot("registry: node abc; starting from the snapshot at slot 208") == null);
-    try testing.expect(parseHistoryBootSlot("registry: node abc; starting from history checkpoint at slot nope") == null);
-    try testing.expect(parseHistoryBootSlot("history checkpoint slot 208 certified") == null);
+test "parseHistoryBootLine: only an explicitly timed history-checkpoint boot satisfies it" {
+    const line = "registry: node abc listening on port 1; 1 peer(s); data in data; starting from history checkpoint at slot 208 close_time=1700000208";
+    const boot = parseHistoryBootLine(line).?;
+    try testing.expectEqual(@as(u64, 208), boot.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_208), boot.close_time);
+    try testing.expect(parseHistoryBootLine("registry: node abc; starting from the snapshot at slot 208 close_time=1700000208") == null);
+    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot 208") == null);
+    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot nope close_time=1700000208") == null);
+    try testing.expect(parseHistoryBootLine("registry: node abc; starting from history checkpoint at slot 208 close_time=nope") == null);
+    try testing.expect(parseHistoryBootLine("history checkpoint slot 208 certified") == null);
+}
+
+test "close-time transition permits exactly 1 through 60 seconds" {
+    try testing.expect(closeTimeTransitionOk(100, 101));
+    try testing.expect(closeTimeTransitionOk(100, 160));
+    try testing.expect(!closeTimeTransitionOk(100, 100));
+    try testing.expect(!closeTimeTransitionOk(100, 99));
+    try testing.expect(!closeTimeTransitionOk(100, 161));
+    try testing.expect(closeTimeTransitionOk(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
+}
+
+test "close time remains inside the cumulative interval anchored at genesis" {
+    try testing.expect(closeTimeAtSlotOk(1000, 0, 1000));
+    try testing.expect(!closeTimeAtSlotOk(1000, 0, 1001));
+    try testing.expect(closeTimeAtSlotOk(1000, 1, 1001));
+    try testing.expect(closeTimeAtSlotOk(1000, 1, 1060));
+    try testing.expect(!closeTimeAtSlotOk(1000, 1, 1061));
+    try testing.expect(closeTimeAtSlotOk(1000, 3, 1003));
+    try testing.expect(closeTimeAtSlotOk(1000, 3, 1180));
+    try testing.expect(!closeTimeAtSlotOk(1000, 3, 1002));
+    try testing.expect(!closeTimeAtSlotOk(std.math.maxInt(u64) - 1, 2, std.math.maxInt(u64)));
+}
+
+test "logged history witness is complete, masked, and sequential" {
+    const gpa = testing.allocator;
+    var heads: std.AutoHashMapUnmanaged(u64, LogHeadSeen) = .empty;
+    defer heads.deinit(gpa);
+    try heads.put(gpa, 10, .{ .head16 = @splat('a'), .close_time = 1010, .mask = 0b011 });
+    try heads.put(gpa, 11, .{ .head16 = @splat('b'), .close_time = 1011, .mask = 0b111 });
+    try heads.put(gpa, 12, .{ .head16 = @splat('c'), .close_time = 1071, .mask = 0b011 });
+    try testing.expect(loggedChainOk(&heads, 0b011, 10, 12));
+    try testing.expect(!loggedChainOk(&heads, 0b111, 10, 12));
+
+    _ = heads.remove(11);
+    try testing.expect(!loggedChainOk(&heads, 0b011, 10, 12));
+    try heads.put(gpa, 11, .{ .head16 = @splat('b'), .close_time = 1010, .mask = 0b011 });
+    try testing.expect(!loggedChainOk(&heads, 0b011, 10, 12));
+    try testing.expect(!loggedChainOk(&heads, 0b011, 12, 10));
+}
+
+test "rejoin transaction span permits agreed empty ledgers before the first transaction slot" {
+    const gpa = testing.allocator;
+    var a: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+    defer a.deinit(gpa);
+    var b: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+    defer b.deinit(gpa);
+    try a.put(gpa, 212, 0);
+    try b.put(gpa, 212, 0);
+    try a.put(gpa, 213, 1);
+    try b.put(gpa, 213, 1);
+
+    try testing.expect(transactionSpanOk(&a, &b, 211, 213));
+    try testing.expect(transactionSpanOk(&a, &b, 212, 213));
+    try testing.expect(!transactionSpanOk(&a, &b, 213, 213));
+    _ = b.remove(212);
+    try testing.expect(!transactionSpanOk(&a, &b, 211, 213));
+    try b.put(gpa, 212, 2);
+    try testing.expect(!transactionSpanOk(&a, &b, 211, 213));
 }
 
 test "history witness boundaries: more than 200 absent slots and checkpoint inside 16-slot window" {
@@ -2055,15 +2433,44 @@ test "NodeProc retains per-slot tx counts and rejects contradictory evidence" {
         if (p.bad) |s| gpa.free(s);
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
+        p.slot_times.deinit(gpa);
         p.history_checkpoints.deinit(gpa);
     }
 
-    p.noteLine("slot 7: txs=1 ok=1 head=0123456789abcdef");
+    p.noteLine("slot 7: close_time=1007 txs=1 ok=1 head=0123456789abcdef");
     try testing.expectEqual(@as(?u64, 1), p.slot_txs.get(7));
+    try testing.expectEqual(@as(?u64, 1007), p.slot_times.get(7));
     try testing.expect(p.bad == null);
-    p.noteLine("slot 7: txs=1 ok=1 head=0123456789abcdef");
+    p.noteLine("slot 7: close_time=1007 txs=1 ok=1 head=0123456789abcdef");
     try testing.expect(p.bad == null);
-    p.noteLine("slot 7: txs=2 ok=1 head=0123456789abcdef");
+    p.noteLine("slot 7: close_time=1007 txs=2 ok=1 head=0123456789abcdef");
+    try testing.expect(p.bad != null);
+}
+
+test "NodeProc rejects close-time disagreement and illegal adjacent steps in either observation order" {
+    const gpa = testing.allocator;
+    var empty_buf: [0]u8 = .{};
+    var p: NodeProc = .{ .gpa = gpa, .io = testing.io, .index = 0, .dir = "", .argv = &.{}, .rdr_buf = &empty_buf };
+    defer {
+        for (&p.tail) |*line| if (line.*) |s| gpa.free(s);
+        if (p.bad) |s| gpa.free(s);
+        p.slot_heads.deinit(gpa);
+        p.slot_txs.deinit(gpa);
+        p.slot_times.deinit(gpa);
+        p.history_checkpoints.deinit(gpa);
+    }
+
+    // Observe the successor first: inserting its predecessor must still check
+    // the 60-second upper bound.
+    p.noteLine("slot 9: close_time=1068 txs=0 head=2222222222222222");
+    p.noteLine("slot 8: close_time=1007 txs=0 head=1111111111111111");
+    try testing.expect(p.bad != null);
+
+    gpa.free(p.bad.?);
+    p.bad = null;
+    p.noteLine("slot 9: close_time=1068 txs=0 head=2222222222222222");
+    try testing.expect(p.bad == null);
+    p.noteLine("slot 9: close_time=1067 txs=0 head=2222222222222222");
     try testing.expect(p.bad != null);
 }
 
@@ -2083,6 +2490,7 @@ test "NodeProc retains history attestations, certification, and boot source" {
         if (p.bad) |s| gpa.free(s);
         p.slot_heads.deinit(gpa);
         p.slot_txs.deinit(gpa);
+        p.slot_times.deinit(gpa);
         p.history_checkpoints.deinit(gpa);
     }
 
@@ -2090,19 +2498,27 @@ test "NodeProc retains history attestations, certification, and boot source" {
     try testing.expectEqual(checkpoint_signed_bit, p.history_checkpoints.get(208).?);
     p.noteLine("history checkpoint slot 208 certified signers=2");
     try testing.expectEqual(checkpoint_signed_bit | checkpoint_certified_bit, p.history_checkpoints.get(208).?);
-    p.noteLine("registry: node abc; starting from history checkpoint at slot 208");
-    try testing.expectEqual(@as(?u64, 208), p.history_boot_slot);
+    p.noteLine("registry: node abc; starting from history checkpoint at slot 208 close_time=1700000208");
+    try testing.expectEqual(@as(u64, 208), p.history_boot.?.slot);
+    try testing.expectEqual(@as(u64, 1_700_000_208), p.history_boot.?.close_time);
 }
 
-test "NodeProc restart argv replaces cadence and appends history minimum" {
+test "NodeProc restart argv preserves genesis and clock skew while replacing cadence" {
     const gpa = testing.allocator;
-    const p = try NodeProc.create(gpa, testing.io, 2, "", &.{ "registry", "node", "--heartbeat-ms", disabled_cadence_ms });
+    const p = try NodeProc.create(gpa, testing.io, 2, "", &.{
+        "registry",                  "node",
+        "--genesis-close-time",      "1700000000",
+        "--proposal-clock-offset-s", "30",
+        "--heartbeat-ms",            disabled_cadence_ms,
+    });
     defer p.destroy();
     try p.setFlagValue("--heartbeat-ms", rejoin_heartbeat_ms);
-    try testing.expectEqualStrings(rejoin_heartbeat_ms, p.argv[3]);
+    try testing.expectEqualStrings("1700000000", p.argv[3]);
+    try testing.expectEqualStrings("30", p.argv[5]);
+    try testing.expectEqualStrings(rejoin_heartbeat_ms, p.argv[7]);
     try p.setFlagValue("--history-min-slot", "208");
-    try testing.expectEqualStrings("--history-min-slot", p.argv[4]);
-    try testing.expectEqualStrings("208", p.argv[5]);
+    try testing.expectEqualStrings("--history-min-slot", p.argv[8]);
+    try testing.expectEqualStrings("208", p.argv[9]);
 }
 
 // Non-vacuity: the evidence literal is what `just preflight` greps; a typo
