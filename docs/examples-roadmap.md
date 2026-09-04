@@ -7,8 +7,11 @@ that a future Stable interface already exists.
 **Status as of 2026-09-04:** E1, E2a transaction flooding, E2b authenticated
 checkpoint catch-up, E2c deterministic ledger close time, and E2d replayable
 registry history are implemented. Configurable native answering and an initial
-local catch-up snapshot are also implemented. Heap state, archive retention,
-richer per-peer operations, and E3 remain designs only.
+local catch-up snapshot are also implemented. The library seam for heap-sized
+application state — Experimental `slcp.OwnedAppNode` (ADR 0003) — is
+implemented and proved in its own test suite; migrating the registry example
+onto it, archive retention, richer per-peer operations, and E3 remain
+designs only.
 
 ## Direction
 
@@ -274,12 +277,28 @@ recorded in [`STATUS.md`](../STATUS.md).
 
 ## E2 remainder — State and retention (planned)
 
+The heap-state library seam is delivered: Experimental `slcp.OwnedAppNode(App)`
+owns allocation, initialization, mutation, observation, and cleanup behind one
+lifecycle (see [`ADR 0003`](adr/0003-owned-application-state.md)), with the
+same restart continuity rules as `AppNode`. Its tests are the working recipe
+for a snapshot loaded through the startup context with no process global, an
+observation that owns a deep copy, and a 2-of-2 loopback restart.
+
 Remaining work includes:
 
-- heap-sized account and name state;
+- the registry migration onto `OwnedAppNode`: heap-backed sorted account and
+  name storage with the artificial 64/128 caps removed. This is its own
+  application storage epoch, not a library change: Snapshot V3 and the
+  replayable-history formats encode fixed-width counts (u8 account/name
+  counts) and fixed per-entry widths, so growing past them needs a V4
+  snapshot plus anchor/history format decision with the same migration care
+  as E2d's `history-v1` boundary (trusted signing fences bind anchor snapshot
+  digests). The migration then threads ownership through `main.zig`'s boot
+  selection (the `selected.state` copies become explicit clones with release
+  points), `rpc.zig`'s shared state (an owned clone swapped under the lock,
+  freeing the previous one), and `history.zig`'s outbox (owned clones or
+  pre-serialized snapshot bytes per staged entry);
 - explicit archive retention, pruning, and operational sizing policy;
-- either a heap-aware typed application interface or a first-class raw-driver
-  recipe;
 - richer per-peer visibility beyond the local `catchupStats` snapshot.
 
 ## E3 — Upgrades and operations (planned)

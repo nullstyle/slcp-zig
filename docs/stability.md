@@ -204,6 +204,17 @@ expect in the Stable list and that are deliberately **not**:
 
 ## What is Experimental (and why)
 
+- `slcp.OwnedAppNode` / `slcp.owned_app_node`: the heap-state sibling of the
+  typed adapter (ADR 0003). `OwnedAppNode(App)` owns the application state's
+  lifecycle — `initState` from a caller-supplied `Context` (the durable
+  snapshot handoff, no global), in-place allocating `apply` whose only
+  expressible failure latches the node inert, an app-defined `Obs`
+  observation per applied slot (plain data, or owned memory returned through
+  `release`), and `deinitState` after the engine thread joins. The call
+  shapes, the `Obs` ownership rule, and the create error taxonomy
+  (`AppInitFailed` …) may evolve while the by-value `AppNode(Counter)`
+  contract stays frozen. A reference instantiation over a heap counter is
+  walked into the Experimental snapshot so the surface stays reviewable.
 - `slcp.node.Node.catchupStats` and `slcp.node.CatchupStats`: a coherent
   node-local snapshot of cached own-statement count and bounds for slots at or
   below the ordered-delivery frontier, queued catch-up work, held-statement

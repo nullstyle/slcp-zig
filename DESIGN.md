@@ -189,6 +189,27 @@ append and before the next input. This gives validation and application one
 ordered view of state. Application work that is slow, blocking, or external
 belongs after the applied-value handoff, not inside the hook.
 
+`AppNode` assumes `State` is plain by-value data: every `waitApplied` item
+carries a copy, `initialState()` takes no argument, and nothing is freed.
+For heap-sized state, [`src/node/owned_app_node.zig`](src/node/owned_app_node.zig)
+adds the Experimental `OwnedAppNode(App)` sibling (ADR 0003). One adapter owns
+the state's whole lifecycle: `initState(context, gpa)` loads a durable
+snapshot or builds genesis on the creating thread before any engine exists
+(the `Context` argument replaces the process-global handoff the registry
+example needed); `validate` and `combine` read `*const State` with no
+allocator; `apply` mutates in place and may allocate, with `OutOfMemory` as
+its only expressible failure — the delivery hook propagates it and the node
+latches inert, because consensus already decided the value and a halted node
+cannot fork anything; `observe` produces an application-defined `Obs` on the
+engine thread after each applied slot, and that observation — never a
+reference into live state — is all the user thread sees (plain data needs no
+cleanup; an `Obs` that owns memory declares `deinitObs` and each taken
+`Applied` returns through `release`); `deinitState` frees everything,
+including queued-but-unconsumed observations, after the engine thread joins.
+Restart continuity is unchanged: `initialSlot`/`initialCommand` are read from
+the loaded state and obey the same recovery rules, and the replayed journal
+tail's observations queue for `waitApplied` exactly like live ones.
+
 Normally a nonzero `initialSlot()` must be continued by a gap-free suffix of
 the retained local journal. An application that has independently
 authenticated an external checkpoint through slot H may instead leave the

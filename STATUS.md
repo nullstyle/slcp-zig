@@ -27,7 +27,62 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: configurable native answering window
+## Current feature work: heap-sized application state seam
+
+Experimental `slcp.OwnedAppNode(App)` (ADR 0003) is the opt-in sibling of the
+typed `AppNode` for state that does not fit by-value copies: one adapter owns
+allocation, initialization, mutation, observation, and cleanup.
+`initState(context, gpa)` loads a durable snapshot or builds genesis on the
+creating thread before any engine exists — the caller-supplied context is the
+explicit snapshot handoff, replacing the registry example's process-global
+`boot`. `validate` and `combine` read `*const State` with no allocator;
+`apply` mutates in place and may allocate, with `OutOfMemory` as its only
+expressible failure (the signature enforces it) — the delivery hook
+propagates it and the node latches inert, so engine-thread allocation failure
+is fail-stop liveness loss, never a consensus divergence, and a partially
+applied state is never consulted again. `observe` produces an
+application-defined observation on the engine thread after each applied slot;
+plain data needs no cleanup, while an observation that owns memory declares
+`deinitObs` and every taken `Applied` returns through `release`.
+`deinitState` frees everything after the engine thread joins, including
+queued-but-unconsumed observations. Restart continuity keeps `AppNode`'s
+rules: `initialSlot`/`initialCommand` read from the loaded state, journal-tail
+replay through `apply` on the creating thread (its observations queue for
+`waitApplied` like live ones), and the exact-successor external-checkpoint
+start with its preceding command. The contract is comptime-checked with 25
+teaching errors, each pinned by a `tests/appnode_errors/owned_*.zig`
+expected-fail object behind the new `owned-appnode-errors` build step, with a
+docs-smoke liveness count. Thirteen tests prove the lifecycle, including zero
+allocations per applied slot over a 100,000-entry heap state (a deep-copy
+notification path would allocate ~800 KB per slot), observation immunity to
+later mutation, complete unwinding of `initState` and replay-OOM failures
+with nothing started, and a 2-of-2 loopback restart whose snapshot travels
+through the context. The Stable `AppNode(Counter)` surface is byte-identical.
+
+Migrating the registry example onto this seam is the next E2-remainder step
+and is its own application storage epoch: Snapshot V3 and the replayable
+history formats carry fixed-width counts and entry widths, so removing the
+64-account/128-name caps requires a V4 snapshot and anchor/history format
+decision with E2d-grade migration care (`docs/examples-roadmap.md`).
+
+### Current owned-state verification
+
+- Repository gate: **PASS** — 113/113 build steps; 203/203 tests passed in
+  the recorded run (the gate includes the 25 new expected-fail compile
+  objects and the new liveness test).
+- Native node suite: **PASS** — 206 passed plus 1 expected platform skip out
+  of 207 (193 before; the 13 new owned-adapter tests include the 2-of-2
+  loopback restart).
+- API gate: **PASS** — the 292 Stable declarations are byte-identical;
+  1,574 Experimental declarations verified, now including a reference
+  instantiation of `OwnedAppNode` over a heap counter so the Experimental
+  file tracks the real surface.
+- Docs-smoke: **PASS** — 436 checks plus 18/18 tests (one new
+  owned-appnode-errors liveness test).
+- The real-socket E2E suite is unchanged by this seam (no Node behavior
+  touched) and is rerun as part of the final gate below.
+
+## Historical feature record: configurable native answering window
 
 Each native Node now accepts an `answering_window_slots` value from 1 through
 62, defaulting to 16. That window bounds retained own statements used to help
@@ -387,9 +442,12 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   copied key or data directory.
 - E2a transaction flooding, E2b application checkpoint recovery, E2c
   deterministic close time, and E2d application-owned replayable history are
-  delivered. The post-E2d native answering-window control and local catch-up
-  snapshot are also delivered. Heap-sized state, explicit archive retention,
-  and richer per-peer visibility remain future work; E3 remains planned.
+  delivered. The post-E2d native answering-window control, local catch-up
+  snapshot, and the Experimental heap-state application seam
+  (`slcp.OwnedAppNode`, ADR 0003) are also delivered. Migrating the registry
+  example onto that seam (a snapshot/history storage epoch), explicit archive
+  retention, and richer per-peer visibility remain future work; E3 remains
+  planned.
 - Licensing remains an explicit owner decision; this repository grants none.
 
 ## Reading order

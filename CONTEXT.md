@@ -235,6 +235,24 @@ Deterministic metadata about one value check, currently its slot and protocol
 phase, supplied by the host to an application driver.
 _Avoid_: Local clock, application state
 
+**Owned state**:
+Application state whose storage the application adapter allocates and frees
+through one lifecycle, rather than copying by value through notifications.
+_Avoid_: Shared state, cached state
+
+**State context**:
+The application-defined value an operator passes to owned-state
+initialization at create. It is the explicit handoff for durable snapshot
+bytes, replacing any process-global startup channel.
+_Avoid_: Boot global, initial state
+
+**Observation**:
+The application-defined value produced on the engine thread immediately
+after each applied slot and handed to the application's user thread. It
+never aliases live application state; when it owns memory, returning it to
+the adapter frees it.
+_Avoid_: State copy, snapshot, view
+
 **Close time**:
 The registry's agreed logical timestamp for a ledger. It advances within
 deterministic bounds but is not proof of truthful wall-clock time.

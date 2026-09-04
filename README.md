@@ -33,7 +33,9 @@ The library is two layers in one package:
   answering cache, an Ed25519 key file, quorum linting at startup, and two
   app-facing APIs — the typed `slcp.AppNode(App)` (a pure `validate` / `apply`
   state machine over an auto-derived canonical encoding) and the bytes-level
-  `slcp.Node`.
+  `slcp.Node`. The Experimental `slcp.OwnedAppNode(App)` is the heap-state
+  sibling of the typed layer for state that does not fit by-value copies
+  ([ADR 0003](docs/adr/0003-owned-application-state.md)).
 
 The program every design decision is derived from is a replicated counter on
 three hobbyist machines: each proposes "the count becomes N+1", the network
