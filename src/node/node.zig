@@ -24,6 +24,7 @@ const core = @import("slcp-core");
 
 const wire = @import("wire.zig");
 const overlay_mod = @import("overlay.zig");
+const app_gossip = @import("app_gossip.zig");
 const timers_mod = @import("timers.zig");
 const store_mod = @import("store.zig");
 const qset_disk_cache = @import("qset_disk_cache.zig");
@@ -40,6 +41,7 @@ const QsetDiskCache = qset_disk_cache.QsetDiskCache;
 
 test {
     _ = qset_disk_cache;
+    _ = app_gossip;
 }
 
 const log = std.log.scoped(.slcp_node);
@@ -111,6 +113,8 @@ pub const CreateError = error{
 pub const Error = CreateError;
 
 pub const ProposeError = error{ WatcherCannotPropose, ValueEmpty, ValueTooLarge } || std.mem.Allocator.Error;
+pub const PublishAppMessageError = app_gossip.PublishError;
+pub const AppMessageStats = app_gossip.Stats;
 
 /// Static, value-free explanation of a `CreateError` — the fallback when the
 /// caller did not pass a `Diagnostic`. Non-empty and unique per member (the
@@ -1015,6 +1019,7 @@ pub const Node = struct {
     qset_cache: QsetDiskCache,
     wheel: timers_mod.Wheel,
     ov: overlay_mod.Overlay,
+    app_gossip: app_gossip.State,
 
     engine_thread: ?std.Thread = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1355,6 +1360,7 @@ pub const Node = struct {
             .qset_cache = undefined,
             .wheel = undefined,
             .ov = undefined,
+            .app_gossip = app_gossip.State.init(gpa, io),
             .current_slot = opts.start_slot,
             .next_deliver = opts.start_slot,
             .last_ext_value = &.{},
@@ -1705,6 +1711,11 @@ pub const Node = struct {
         self.resync_stop.store(true, .release);
         if (self.resync_thread) |t| t.join();
 
+        // App-message waiters are public callers, not overlay workers. Wake
+        // and drain them before teardown, but retain the inbox until ov.stop
+        // joins every reader that can still call receive().
+        self.app_gossip.closeAndDrain();
+
         // Wake any app thread blocked in waitExternalized so it returns null,
         // and wait until every waiter has left (a woken waiter re-locks
         // ext_mu on its way out — that must happen before the free below).
@@ -1766,6 +1777,7 @@ pub const Node = struct {
         }
         self.qset_requests.deinit();
         self.hold.deinit(self.gpa);
+        self.app_gossip.deinit();
     }
 
     // -------------------------------------------------------------------
@@ -1831,6 +1843,26 @@ pub const Node = struct {
         }
         if (self.ext_queue.items.len == 0) return null;
         return self.ext_queue.orderedRemove(0);
+    }
+
+    /// Best-effort, non-durable application broadcast to capable peers.
+    /// The consensus Engine never sees these opaque bytes. Applications must
+    /// authenticate, validate, deduplicate, and retry their own messages.
+    pub fn publishAppMessage(self: *Node, payload: []const u8) PublishAppMessageError!void {
+        try self.app_gossip.validatePublish(payload);
+        self.ov.broadcast(.{ .app_message = payload });
+    }
+
+    /// Opt this node into bounded application-message retention and wait for
+    /// one FIFO payload. Returns null on timeout or shutdown; returned bytes
+    /// are owned by the caller and must be freed with `node.allocator()`.
+    pub fn waitAppMessage(self: *Node, wopts: WaitOptions) ?[]u8 {
+        return self.app_gossip.wait(wopts.timeout_ms);
+    }
+
+    /// Bounded application inbox accounting. Experimental.
+    pub fn appMessageStats(self: *Node) AppMessageStats {
+        return self.app_gossip.snapshot();
     }
 
     /// Coherent observability snapshot published by the engine thread after
@@ -2475,6 +2507,7 @@ pub const Node = struct {
             .slot_state => |ss| for (ss.envelopes) |env| self.enqueueEnvelope(env, peer_id),
             .ping => |n| self.ov.send(peer_id, .{ .pong = n }),
             .pong => {},
+            .app_message => |payload| self.app_gossip.receive(payload),
         }
     }
 
@@ -2644,7 +2677,8 @@ test "node: every method compiles (forces body analysis without instantiation)" 
     // runtime.
     const fns = .{
         Node.create,           Node.deinit,             Node.propose,
-        Node.waitExternalized, Node.stats,              Node.boundPort,
+        Node.waitExternalized, Node.waitAppMessage,     Node.publishAppMessage,
+        Node.appMessageStats,  Node.stats,              Node.boundPort,
         Node.engineLoop,       Node.applyInput,         Node.markFailed,
         Node.dispatch,         Node.onExternalized,     Node.maybeStartNomination,
         Node.recordOwnLatest,  Node.pruneOwnLatest,     Node.onRecv,
@@ -3643,6 +3677,64 @@ test "peer up/down: two loopback Nodes, deinit one; the survivor's peerCount dro
     try std.testing.expectEqual(@as(usize, 0), a.peers_live.load(.acquire));
 }
 
+test "app messages: a published payload crosses a real loopback connection as owned bytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
+    const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
+
+    const seed_a: [32]u8 = @splat(0x71);
+    const seed_b: [32]u8 = @splat(0x72);
+    const ids = [2][32]u8{ try crypto.publicKeyFromSeed(seed_a), try crypto.publicKeyFromSeed(seed_b) };
+    var diag: Diagnostic = .{};
+
+    const a = try Node.create(gpa, io, .{
+        .network = "app-message-loopback v1",
+        .secret_seed = seed_a,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .data_dir = dir_a,
+        .diagnostic = &diag,
+    });
+    defer a.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{a.boundPort()});
+    const b = try Node.create(gpa, io, .{
+        .network = "app-message-loopback v1",
+        .secret_seed = seed_b,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .peers = &.{spec},
+        .data_dir = dir_b,
+        .diagnostic = &diag,
+    });
+    defer b.deinit();
+
+    const Probe = struct {
+        fn connected(n: *Node) bool {
+            return n.peers_live.load(.acquire) >= 1;
+        }
+    };
+    try pollUntil(io, 10_000, a, Probe.connected);
+    try pollUntil(io, 10_000, b, Probe.connected);
+
+    // The first wait opts this consumer into inbox retention. Nodes that
+    // never consume app messages retain no untrusted application payloads.
+    try std.testing.expect(b.waitAppMessage(.{ .timeout_ms = 1 }) == null);
+
+    const want = "opaque signed registry transaction";
+    try a.publishAppMessage(want);
+    const got = b.waitAppMessage(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, want, got);
+}
+
 // -- S8 D2: compaction cadence vs. multi-slot drains ---------------------------
 
 /// Journal slots 1..62 into a fresh data_dir, create a hooked Node (the tail
@@ -4380,6 +4472,54 @@ test "deinit while another thread is parked in waitExternalized: the waiter retu
     if (!w.done.load(.acquire)) return error.WaiterHungAfterDeinit;
     t.join();
     try std.testing.expect(w.saw_null.load(.acquire));
+}
+
+const AppMessageDeinitWaiter = struct {
+    n: *Node,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_null: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *AppMessageDeinitWaiter) void {
+        const payload = self.n.waitAppMessage(.{ .timeout_ms = null });
+        if (payload) |bytes| self.n.gpa.free(bytes);
+        self.saw_null.store(payload == null, .release);
+        self.done.store(true, .release);
+    }
+};
+
+// The inbox is closed and all public waiter frames drain before Node storage
+// is freed; overlay reader callbacks may still observe the closed state until
+// ov.stop joins them later in teardown.
+test "deinit while another thread is parked in waitAppMessage returns null before the Node is freed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const seed: [32]u8 = @splat(0x73);
+    const me = try crypto.publicKeyFromSeed(seed);
+
+    const n = try Node.create(gpa, io, .{
+        .network = "app-message-deinit-waiter v1",
+        .secret_seed = seed,
+        .quorum = core.quorum.Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+    });
+    var waiter: AppMessageDeinitWaiter = .{ .n = n };
+    const thread = try std.Thread.spawn(.{}, AppMessageDeinitWaiter.run, .{&waiter});
+
+    var waited_ms: u64 = 0;
+    while (!n.appMessageStats().receiving and waited_ms < 1_000) : (waited_ms += 1) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(n.appMessageStats().receiving);
+
+    n.deinit();
+    thread.join();
+    try std.testing.expect(waiter.done.load(.acquire));
+    try std.testing.expect(waiter.saw_null.load(.acquire));
 }
 
 // -- S8 D1: the hold buffer (host-side per-slot gate) --------------------------
