@@ -1,5 +1,5 @@
-//! main.zig — the `registry` process (docs/examples-roadmap.md E1–E2c:
-//! persistence, flooding, authenticated checkpoint recovery, cadence, and
+//! main.zig — the `registry` process (docs/examples-roadmap.md E1–E2d:
+//! persistence, flooding, authenticated history replay, cadence, and
 //! CLI). `registry node …` runs one validator: the typed node from
 //! app.zig, the RPC server from rpc.zig, the snapshot file, and the cadence
 //! loop that turns the pending queue into proposals. `submit`, `get`,
@@ -182,7 +182,7 @@ fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool)
             f.history_dir = value;
         } else if (eql(name, "checkpoint-every")) {
             f.checkpoint_every = std.fmt.parseInt(u64, value, 10) catch return error.BadCheckpointInterval;
-            if (f.checkpoint_every == 0 or f.checkpoint_every > 16) return error.BadCheckpointInterval;
+            if (f.checkpoint_every == 0 or f.checkpoint_every > 64) return error.BadCheckpointInterval;
             f.history_policy_set = true;
         } else if (eql(name, "history-min-slot")) {
             f.history_min_slot = std.fmt.parseInt(u64, value, 10) catch return error.BadSlot;
@@ -204,7 +204,7 @@ fn flagsOrUsage(gpa: std.mem.Allocator, args: []const []const u8, node_mode: boo
             error.BadMillis => "--min-slot-ms / --heartbeat-ms take milliseconds (heartbeat > 0)",
             error.BadGenesisCloseTime => "--genesis-close-time must be a Unix-seconds integer below 18446744073709551615",
             error.BadClockOffset => "--proposal-clock-offset-s must be a signed seconds integer",
-            error.BadCheckpointInterval => "--checkpoint-every must be a number in 1..16",
+            error.BadCheckpointInterval => "--checkpoint-every must be a number in 1..64",
             error.BadSlot => "--history-min-slot must be a non-negative slot number",
             error.OutOfMemory => "out of memory",
         });
@@ -226,12 +226,34 @@ const history_retry_ms: u64 = 1_000;
 /// retries in the background.
 fn historyFailureIsFatal(err: anyerror) bool {
     return err == error.InvalidAppliedState or
+        err == error.InvalidGenesisState or
         err == error.SigningFenceCorrupt or
         err == error.SigningFenceUnavailable or
         err == error.SigningEquivocation or
         err == error.SigningRollback or
         err == error.CheckpointSlotOverflow or
-        err == error.CertifiedFork;
+        err == error.CertifiedFork or
+        err == error.CertifiedHistoryInvalid or
+        err == error.HistoryAckRequired or
+        err == error.HistoryActivationMismatch or
+        err == error.HistoryAdoptionNotInstalled or
+        err == error.HistoryAnchorInvalid or
+        err == error.HistoryBacklogFull or
+        err == error.HistoryBootProvenanceConflict or
+        err == error.HistoryBootProvenanceRollback or
+        err == error.HistoryFrontierMismatch or
+        err == error.HistoryFrontierUnprepared or
+        err == error.HistoryNotPublished or
+        err == error.HistoryOutboxCorrupt or
+        err == error.HistoryOutboxSequence or
+        err == error.HistoryOutboxStateMismatch or
+        err == error.HistoryOutboxUnavailable or
+        err == error.HistoryPolicyCorrupt or
+        err == error.HistoryPolicyMismatch or
+        err == error.HistoryPublisherRace or
+        err == error.HistoryStagedStateNotLoaded or
+        err == error.HistoryTransitionInvalid or
+        err == error.OutOfMemory;
 }
 
 fn nowMs(io: std.Io) u64 {
@@ -318,12 +340,12 @@ fn writeSnapshotFile(io: std.Io, dir: std.Io.Dir, state: *const registry.State) 
     try syncDirectory(dir);
 }
 
-const BootSource = enum { genesis, local_snapshot, history };
+const BootSource = enum { genesis, local_snapshot, history, history_outbox, trusted_local };
 
 const BootSelection = struct {
     state: registry.State,
     source: BootSource,
-    /// The default `1` lets Node resume its own journal. A history checkpoint
+    /// The default `1` lets Node resume its own journal. A recovered history tip
     /// is different: its exact successor declares the older journal prefix
     /// permanently out of scope.
     start_slot: u64,
@@ -340,7 +362,7 @@ const BootSelectionError = error{
 };
 
 /// Choose between locally persisted state and an independently authenticated
-/// checkpoint. `min_slot` is an operator's anti-rollback policy, not a search
+/// history tip. `min_slot` is an operator's anti-rollback policy, not a search
 /// hint: if nothing reaches it, boot must fail instead of quietly starting
 /// from older state.
 fn selectBootState(
@@ -387,21 +409,183 @@ fn selectBootState(
     return .{ .state = registry.State.genesis(network_id, genesis_close_time), .source = .genesis, .start_slot = 1 };
 }
 
+/// A trusted local adoption marker is an unfinished install transaction, so
+/// it outranks any newer proof visible in mutable shared storage. The ordinary
+/// anti-rollback floor still applies to the chosen state.
+fn selectHistoryBootState(
+    network_id: [32]u8,
+    genesis_close_time: u64,
+    local: ?registry.State,
+    authenticated: ?registry.State,
+    pending_install: ?registry.State,
+    min_slot: u64,
+) BootSelectionError!BootSelection {
+    var selected = try selectBootState(
+        network_id,
+        genesis_close_time,
+        local,
+        pending_install orelse authenticated,
+        min_slot,
+    );
+    if (pending_install != null and selected.source == .history)
+        selected.source = .history_outbox;
+    return selected;
+}
+
+/// Create an AppNode at an already selected application frontier. A history
+/// checkpoint may overlap a locally durable journal tail; retrying from the
+/// ordinary journal start is safe only because AppNode revalidates that the
+/// retained tail is the exact continuation of the selected state.
+fn createBootNode(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_options: app.Node.Options,
+    selected: BootSelection,
+) !*app.Node {
+    var options = base_options;
+    options.start_slot = selected.start_slot;
+    return app.Node.create(gpa, io, options) catch |err| {
+        if ((selected.source == .history or
+            selected.source == .history_outbox or
+            selected.source == .trusted_local) and
+            err == error.StartSlotBehindJournal)
+        {
+            std.debug.print("registry node: authenticated history tip slot {d} overlaps a newer local journal; verifying that journal as its continuation\n", .{selected.state.head.slot});
+            options.start_slot = 1;
+            return app.Node.create(gpa, io, options);
+        }
+        return err;
+    };
+}
+
 /// Drain the synchronous journal replay that `AppNode.create` queued before
 /// returning. The caller must do this before publishing application state to
 /// RPC or installing a replacement snapshot: `initial` can be older than the
 /// Node journal when the previous process crashed between those two durable
 /// writes.
-fn drainBootReplay(node: *app.Node, initial: registry.State) !registry.State {
+fn drainBootReplay(
+    node: *app.Node,
+    initial: registry.State,
+    history_archive: ?*history.Archive,
+) !registry.State {
     var ready = initial;
     while (try node.waitApplied(.{ .timeout_ms = 0 })) |applied| {
         const successor = std.math.add(u64, ready.head.slot, 1) catch
             return error.BootReplayDiscontinuity;
         if (applied.slot != successor or applied.state.head.slot != applied.slot)
             return error.BootReplayDiscontinuity;
+        // AppNode's journal is already durable. Admit every replayed state to
+        // the trusted history outbox before allowing the ordinary snapshot to
+        // catch up, exactly as the live cadence path does.
+        if (history_archive) |archive| try stageBootHistory(archive, &applied.state);
         ready = applied.state;
     }
     return ready;
+}
+
+/// Complete one already-staged publication. The shared archive phase and the
+/// trusted acknowledgement phase stay explicit so only the former may be
+/// retried as an availability failure by the background worker.
+fn publishStagedHistory(archive: *history.Archive, state: *const registry.State) !history.RecordStatus {
+    const status = try archive.recordApplied(state);
+    try archive.ackStaged(state.head.slot);
+    return status;
+}
+
+fn logHistoryStatus(status: history.RecordStatus, state: *const registry.State) void {
+    switch (status) {
+        .not_due => {},
+        .published => {
+            const head_hex = registry.hex32(state.head.hash);
+            std.debug.print("history tip slot {d} signed head={s}\n", .{ state.head.slot, &head_hex });
+        },
+        .certified => {
+            const head_hex = registry.hex32(state.head.hash);
+            std.debug.print("history tip slot {d} signed head={s}\n", .{ state.head.slot, &head_hex });
+            std.debug.print("history tip slot {d} certified head={s}\n", .{ state.head.slot, &head_hex });
+        },
+    }
+}
+
+/// Startup has no worker yet. Drain previously admitted history before boot
+/// selection adopts a newer certified frontier; otherwise a full or older
+/// pending outbox could make every restart repeat the same refusal.
+fn drainStartupHistory(archive: *history.Archive) !void {
+    while (try archive.nextStaged()) |state| {
+        const status = try publishStagedHistory(archive, &state);
+        logHistoryStatus(status, &state);
+    }
+}
+
+const LatestHistoryBoot = struct {
+    selected: BootSelection,
+    recovery: ?history.Recovery,
+};
+
+/// Once Archive accepts a selected local snapshot as represented by its
+/// trusted frontier, preserve that external-state provenance for AppNode.
+/// This is derived again on every restart, so clearing a completed adoption
+/// marker cannot turn T back into an ordinary snapshot that needs a retained
+/// journal predecessor.
+fn prepareHistoryBoot(archive: *history.Archive, selected: *BootSelection) !void {
+    try archive.prepareFrontier(&selected.state);
+    if (selected.source == .local_snapshot and
+        try archive.hasTrustedBootProvenance(&selected.state))
+    {
+        selected.source = .trusted_local;
+        selected.start_slot = std.math.add(u64, selected.state.head.slot, 1) catch
+            return error.HistoryCheckpointAtMaxSlot;
+    }
+}
+
+/// Reconcile the ordered outbox, recover the newest independently certified
+/// state no older than `installed`, and prepare that final frontier. This is
+/// intentionally called again after a pending adoption T is confirmed: T is
+/// the crash-safe install transaction, not necessarily the best available
+/// point from which to join the live network.
+fn selectLatestHistoryBoot(
+    archive: *history.Archive,
+    network_id: [32]u8,
+    genesis_close_time: u64,
+    installed: registry.State,
+    min_slot: u64,
+) !LatestHistoryBoot {
+    try drainStartupHistory(archive);
+    const floor = @max(min_slot, installed.head.slot);
+    const recovery = try archive.recoverLatest(floor);
+    const authenticated = if (recovery) |recovered| recovered.state else null;
+    var selected = try selectHistoryBootState(
+        network_id,
+        genesis_close_time,
+        installed,
+        authenticated,
+        null,
+        min_slot,
+    );
+    // `installed` originated at trusted history T, even when no newer U is
+    // currently discoverable. `prepareHistoryBoot` preserves the explicit
+    // successor handoff; createBootNode still rechecks a later journal tail.
+    try prepareHistoryBoot(archive, &selected);
+    return .{ .selected = selected, .recovery = recovery };
+}
+
+/// Journal recovery can expose one state beyond an outbox that was full when
+/// the previous process stopped. Free the oldest durable slot synchronously
+/// and retry admission instead of reproducing that permanent startup wedge.
+fn stageBootHistory(archive: *history.Archive, state: *const registry.State) !void {
+    while (true) {
+        archive.stageApplied(state) catch |err| switch (err) {
+            error.HistoryBacklogFull => {
+                const oldest = (try archive.nextStaged()) orelse
+                    return error.HistoryOutboxCorrupt;
+                const status = try publishStagedHistory(archive, &oldest);
+                logHistoryStatus(status, &oldest);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
 }
 
 const HistoryPublicationFailure = struct {
@@ -409,119 +593,89 @@ const HistoryPublicationFailure = struct {
     err: anyerror,
 };
 
-/// The producer/consumer seam between the cadence loop and shared history.
-/// It owns at most one waiting checkpoint; the worker's currently active
-/// checkpoint is outside the lock, so even a wedged archive operation cannot
-/// make `offer` wait for shared storage.
-const HistoryMailbox = struct {
-    const RequeueResult = union(enum) {
-        retry,
-        superseded: u64,
-        stopped,
-    };
-
+/// Wakeup and fatal-error channel for the history worker. Applied states do
+/// not live here: `Archive.stageApplied` has already placed them in the
+/// checksummed, fsync'd trusted outbox before this signal is sent.
+const HistoryWakeup = struct {
     io: std.Io,
     mu: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
-    pending: ?registry.State = null,
-    /// Highest slot ever accepted from the cadence loop. This keeps a failed
-    /// older publication from being restored over a newer pending one.
-    newest_slot: u64 = 0,
-    retry_slot: ?u64 = null,
-    retry_deadline_ns: i96 = 0,
+    generation: u64 = 0,
     fatal: ?HistoryPublicationFailure = null,
     stopping: bool = false,
 
-    fn init(io: std.Io) HistoryMailbox {
+    fn init(io: std.Io) HistoryWakeup {
         return .{ .io = io };
     }
 
-    /// Keep only the newest due checkpoint awaiting publication. Returns the
-    /// slot evicted from the one-element mailbox, if any. The active worker
-    /// never holds `mu` while touching the archive.
-    fn offer(self: *HistoryMailbox, next: registry.State) ?u64 {
+    fn accepting(self: *HistoryWakeup) bool {
         const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
-        if (self.stopping or self.fatal != null or next.head.slot <= self.newest_slot)
-            return null;
-
-        const replaced = if (self.pending) |old| old.head.slot else null;
-        self.pending = next;
-        self.newest_slot = next.head.slot;
-        // A new checkpoint supersedes any retry deadline attached to the old
-        // mailbox occupant and should be attempted immediately.
-        self.retry_slot = null;
-        self.changed.signal(io);
-        return replaced;
+        return !self.stopping and self.fatal == null;
     }
 
-    /// Wait for the next checkpoint or shutdown. Availability retries sleep
-    /// on the condition variable so a newer offer wakes and supersedes them.
-    fn take(self: *HistoryMailbox) ?registry.State {
+    fn notify(self: *HistoryWakeup) !void {
         const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
+        if (self.stopping or self.fatal != null) return error.HistoryPublisherStopped;
+        self.generation +%= 1;
+        self.changed.signal(io);
+    }
 
-        while (!self.stopping) {
-            const pending = self.pending orelse {
-                self.changed.waitUncancelable(io, &self.mu);
-                continue;
-            };
-            if (self.retry_slot != null and self.retry_slot.? == pending.head.slot) {
-                const now_ns = std.Io.Clock.now(.awake, io).nanoseconds;
-                if (now_ns < self.retry_deadline_ns) {
-                    const deadline: std.Io.Clock.Timestamp = .{
-                        .raw = .{ .nanoseconds = self.retry_deadline_ns },
-                        .clock = .awake,
-                    };
-                    self.changed.waitTimeout(io, &self.mu, .{ .deadline = deadline }) catch {};
-                    continue;
-                }
-            }
-            self.pending = null;
-            self.retry_slot = null;
-            return pending;
+    /// Wait after observing an empty outbox. The generation check closes the
+    /// race where a producer stages and signals between `nextStaged` and the
+    /// worker taking this lock.
+    fn waitForChange(self: *HistoryWakeup, observed: *u64) bool {
+        const io = self.io;
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        while (!self.stopping and self.fatal == null and self.generation == observed.*) {
+            self.changed.waitUncancelable(io, &self.mu);
         }
-        return null;
+        observed.* = self.generation;
+        return !self.stopping and self.fatal == null;
     }
 
-    /// Restore an availability-failed checkpoint for a delayed retry unless a
-    /// newer offer arrived while the worker was in shared/trusted storage.
-    fn requeueAvailabilityFailure(self: *HistoryMailbox, checkpoint: registry.State) RequeueResult {
+    /// Shared archive availability failures retry in place. Stop signals wake
+    /// this bounded delay promptly; newly staged successors do not overtake
+    /// the failed durable head.
+    fn waitForRetry(self: *HistoryWakeup) bool {
         const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
-        if (self.stopping) return .stopped;
-        if (self.newest_slot > checkpoint.head.slot)
-            return .{ .superseded = self.newest_slot };
-
-        self.pending = checkpoint;
-        self.retry_slot = checkpoint.head.slot;
-        self.retry_deadline_ns = std.Io.Clock.now(.awake, io).nanoseconds +
+        const retry_deadline_ns = std.Io.Clock.now(.awake, io).nanoseconds +
             @as(i96, history_retry_ms) * std.time.ns_per_ms;
-        self.changed.signal(io);
-        return .retry;
+        while (!self.stopping and self.fatal == null) {
+            const now_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+            if (now_ns >= retry_deadline_ns) break;
+            const deadline: std.Io.Clock.Timestamp = .{
+                .raw = .{ .nanoseconds = retry_deadline_ns },
+                .clock = .awake,
+            };
+            self.changed.waitTimeout(io, &self.mu, .{ .deadline = deadline }) catch {};
+        }
+        return !self.stopping and self.fatal == null;
     }
 
-    fn latchFatal(self: *HistoryMailbox, slot: u64, err: anyerror) void {
+    fn latchFatal(self: *HistoryWakeup, slot: u64, err: anyerror) void {
         const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
         if (self.fatal == null) self.fatal = .{ .slot = slot, .err = err };
-        self.pending = null;
         self.stopping = true;
         self.changed.broadcast(io);
     }
 
-    fn fatalFailure(self: *HistoryMailbox) ?HistoryPublicationFailure {
+    fn fatalFailure(self: *HistoryWakeup) ?HistoryPublicationFailure {
         const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
         return self.fatal;
     }
 
-    fn stop(self: *HistoryMailbox) void {
+    fn stop(self: *HistoryWakeup) void {
         const io = self.io;
         self.mu.lockUncancelable(io);
         self.stopping = true;
@@ -530,13 +684,14 @@ const HistoryMailbox = struct {
     }
 };
 
-/// Sole post-startup owner of the archive and its trusted signing fence. The
-/// cadence loop only copies a bounded State into `mailbox`; all filesystem
-/// access, including retries, happens on this native worker thread.
+/// The cadence loop durably stages exact successor states in the trusted
+/// outbox. This worker alone publishes its oldest entry to shared history and
+/// advances the durable published watermark; hostile shared I/O therefore
+/// cannot make a successor overtake a failed ledger.
 const HistoryPublisher = struct {
     gpa: std.mem.Allocator,
     archive: history.Archive,
-    mailbox: HistoryMailbox,
+    wakeup: HistoryWakeup,
     thread: std.Thread,
 
     fn start(gpa: std.mem.Allocator, io: std.Io, archive: history.Archive) !*HistoryPublisher {
@@ -545,25 +700,32 @@ const HistoryPublisher = struct {
         self.* = .{
             .gpa = gpa,
             .archive = archive,
-            .mailbox = .init(io),
+            .wakeup = .init(io),
             .thread = undefined,
         };
         self.thread = try std.Thread.spawn(.{}, HistoryPublisher.run, .{self});
         return self;
     }
 
-    fn offer(self: *HistoryPublisher, checkpoint: registry.State) void {
-        if (self.mailbox.offer(checkpoint)) |old_slot| {
-            std.debug.print("registry history: checkpoint slot {d} supersedes queued slot {d}\n", .{ checkpoint.head.slot, old_slot });
-        }
+    fn offer(self: *HistoryPublisher, ledger: registry.State) !void {
+        if (!self.wakeup.accepting()) return error.HistoryPublisherStopped;
+        try self.archive.stageApplied(&ledger);
+        try self.wakeup.notify();
     }
 
     fn fatalFailure(self: *HistoryPublisher) ?HistoryPublicationFailure {
-        return self.mailbox.fatalFailure();
+        return self.wakeup.fatalFailure();
+    }
+
+    /// Called only after the ordinary application snapshot is durable. Once
+    /// certified provenance exists, this advances its crash-safe boot point
+    /// across exact states already admitted to the ordered outbox.
+    fn confirmSnapshot(self: *HistoryPublisher, state: *const registry.State) !void {
+        try self.archive.confirmInstalled(state);
     }
 
     fn deinit(self: *HistoryPublisher) void {
-        self.mailbox.stop();
+        self.wakeup.stop();
         self.thread.join();
         self.archive.deinit();
         const gpa = self.gpa;
@@ -571,31 +733,33 @@ const HistoryPublisher = struct {
     }
 
     fn run(self: *HistoryPublisher) void {
-        while (self.mailbox.take()) |checkpoint| {
-            const status = self.archive.recordApplied(&checkpoint) catch |err| {
-                if (historyFailureIsFatal(err)) {
-                    self.mailbox.latchFatal(checkpoint.head.slot, err);
-                    return;
-                }
-                switch (self.mailbox.requeueAvailabilityFailure(checkpoint)) {
-                    .retry => std.debug.print("registry history: cannot publish checkpoint slot {d}: {t}; consensus continues and publication will retry\n", .{ checkpoint.head.slot, err }),
-                    .superseded => |newer_slot| std.debug.print("registry history: checkpoint slot {d} supersedes availability-blocked slot {d}\n", .{ newer_slot, checkpoint.head.slot }),
-                    .stopped => return,
-                }
+        var observed_generation: u64 = 0;
+        while (true) {
+            if (!self.wakeup.accepting()) return;
+            const staged = self.archive.nextStaged() catch |err| {
+                self.wakeup.latchFatal(0, err);
+                return;
+            };
+            const ledger = staged orelse {
+                if (!self.wakeup.waitForChange(&observed_generation)) return;
                 continue;
             };
-            switch (status) {
-                .not_due => {},
-                .published => {
-                    const head_hex = registry.hex32(checkpoint.head.hash);
-                    std.debug.print("history checkpoint slot {d} signed head={s}\n", .{ checkpoint.head.slot, head_hex[0..16] });
-                },
-                .certified => {
-                    const head_hex = registry.hex32(checkpoint.head.hash);
-                    std.debug.print("history checkpoint slot {d} signed head={s}\n", .{ checkpoint.head.slot, head_hex[0..16] });
-                    std.debug.print("history checkpoint slot {d} certified head={s}\n", .{ checkpoint.head.slot, head_hex[0..16] });
-                },
-            }
+            const status = self.archive.recordApplied(&ledger) catch |err| {
+                if (historyFailureIsFatal(err)) {
+                    self.wakeup.latchFatal(ledger.head.slot, err);
+                    return;
+                }
+                std.debug.print("registry history: cannot publish ledger slot {d}: {t}; consensus continues and ordered publication will retry\n", .{ ledger.head.slot, err });
+                if (!self.wakeup.waitForRetry()) return;
+                continue;
+            };
+            self.archive.ackStaged(ledger.head.slot) catch |err| {
+                // This mutates only the trusted outbox and its watermarks; an
+                // uncertain acknowledgement is a local safety failure.
+                self.wakeup.latchFatal(ledger.head.slot, err);
+                return;
+            };
+            logHistoryStatus(status, &ledger);
         }
     }
 };
@@ -666,7 +830,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         };
     }
 
-    // Boot state: prefer a newer quorum-authenticated history checkpoint,
+    // Boot state: prefer a newer quorum-authenticated replayed history tip,
     // otherwise resume the local snapshot (or genesis for a fresh node).
     const nid = registry.networkId(network, genesis_close_time);
     const descriptor_buf = try gpa.alloc(u8, registry.tag_net.len + 8 + network.len);
@@ -703,7 +867,9 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
 
     var history_archive: ?history.Archive = null;
     defer if (history_archive) |*archive| archive.deinit();
+    var authenticated_recovery: ?history.Recovery = null;
     var authenticated: ?registry.State = null;
+    var pending_install: ?registry.State = null;
     if (f.history_dir) |archive_dir| {
         const signing_dir = try std.fmt.allocPrint(gpa, "{s}/history-signing", .{data_dir});
         defer gpa.free(signing_dir);
@@ -713,6 +879,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             .private_data_root_dir = dir,
             .private_key_parent_dir = key_parent_dir,
             .network_id = nid,
+            .genesis_close_time = genesis_close_time,
             .quorum = quorum,
             .signer_seed = kp.seed,
             .checkpoint_every = f.checkpoint_every,
@@ -724,30 +891,68 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             }
             return 1;
         };
-        const floor = @max(f.history_min_slot, if (local_snapshot) |snap| snap.head.slot else 0);
-        authenticated = history_archive.?.loadLatest(floor) catch |err| {
-            std.debug.print("registry node: cannot authenticate a history checkpoint at or above slot {d} in {s}: {t}\n", .{ floor, archive_dir, err });
+
+        // Reconcile the private outbox before consulting mutable shared
+        // history. In particular, a certified adoption marker is a trusted
+        // local install obligation: it must participate in boot selection
+        // before --history-min-slot is enforced, and a newer shared proof
+        // must not replace it until this exact state reaches `snapshot`.
+        const local_history_base = local_snapshot orelse
+            registry.State.genesis(nid, genesis_close_time);
+        history_archive.?.prepareFrontier(&local_history_base) catch |err| {
+            std.debug.print("registry node: cannot prepare the durable history outbox at local slot {d}: {t}; keep this node stopped\n", .{ local_history_base.head.slot, err });
             return 1;
         };
+        pending_install = history_archive.?.pendingInstall() catch |err| {
+            std.debug.print("registry node: cannot read the trusted pending history installation: {t}; keep this node stopped\n", .{err});
+            return 1;
+        };
+        if (pending_install == null) {
+            // Finish older admitted work before a newer shared certificate
+            // can move the outbox frontier.
+            drainStartupHistory(&history_archive.?) catch |err| {
+                std.debug.print("registry node: cannot finish the durable history backlog before boot: {t}; keep this node stopped and restore shared archive availability\n", .{err});
+                return 1;
+            };
+            const floor = @max(f.history_min_slot, local_history_base.head.slot);
+            authenticated_recovery = history_archive.?.recoverLatest(floor) catch |err| {
+                std.debug.print("registry node: cannot authenticate and replay a history tip at or above slot {d} in {s}: {t}\n", .{ floor, archive_dir, err });
+                return 1;
+            };
+            authenticated = if (authenticated_recovery) |recovered| recovered.state else null;
+        }
     }
 
-    const selected = selectBootState(nid, genesis_close_time, local_snapshot, authenticated, f.history_min_slot) catch |err| {
+    var selected = selectHistoryBootState(
+        nid,
+        genesis_close_time,
+        local_snapshot,
+        authenticated,
+        pending_install,
+        f.history_min_slot,
+    ) catch |err| {
         switch (err) {
             error.SnapshotWrongGenesisCloseTime => std.debug.print("registry node: the local snapshot's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped and restore a snapshot from this network epoch\n", .{genesis_close_time}),
-            error.HistoryCheckpointWrongGenesisCloseTime => std.debug.print("registry node: the authenticated history checkpoint's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped\n", .{genesis_close_time}),
-            error.HistoryCheckpointConflict => std.debug.print("registry node: the authenticated history checkpoint and local snapshot claim different heads at the same slot; keep this node stopped\n", .{}),
-            error.HistoryFloorUnavailable => std.debug.print("registry node: no local snapshot or authenticated history checkpoint reaches --history-min-slot {d}; refusing an anti-rollback downgrade\n", .{f.history_min_slot}),
+            error.HistoryCheckpointWrongGenesisCloseTime => std.debug.print("registry node: the authenticated history tip's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped\n", .{genesis_close_time}),
+            error.HistoryCheckpointConflict => std.debug.print("registry node: the authenticated history tip and local snapshot claim different heads at the same slot; keep this node stopped\n", .{}),
+            error.HistoryFloorUnavailable => std.debug.print("registry node: no local snapshot or authenticated history tip reaches --history-min-slot {d}; refusing an anti-rollback downgrade\n", .{f.history_min_slot}),
             else => std.debug.print("registry node: cannot select boot state: {t}\n", .{err}),
         }
         return 1;
     };
+    if (history_archive) |*archive| {
+        prepareHistoryBoot(archive, &selected) catch |err| {
+            std.debug.print("registry node: cannot adopt the selected history frontier at slot {d}: {t}; keep this node stopped\n", .{ selected.state.head.slot, err });
+            return 1;
+        };
+    }
     app.boot = .{ .state = selected.state, .slot = selected.state.head.slot };
 
     const slcp_dir = try std.fmt.allocPrint(gpa, "{s}/slcp", .{data_dir});
     defer gpa.free(slcp_dir);
 
     var diag: slcp.node.Diagnostic = .{};
-    var node_options: app.Node.Options = .{
+    const node_options: app.Node.Options = .{
         // Registry schema and genesis time are part of the raw SLCP signing
         // domain too, so old nodes cannot enter this network and merely stall.
         .network = network_descriptor,
@@ -764,21 +969,77 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         .start_slot = selected.start_slot,
         .diagnostic = &diag,
     };
-    const node = app.Node.create(gpa, io, node_options) catch |err| retry: {
-        // Crash window: Node persists an externalized slot before the main
-        // loop persists its resulting application snapshot. If a history
-        // checkpoint at C is therefore paired with a local journal already
-        // beyond C, its explicit C+1 start is intentionally rejected. Retry
-        // with the same authenticated state and ordinary journal resumption;
-        // AppNode will accept only when the retained tail continues C.
-        if (selected.source == .history and err == error.StartSlotBehindJournal) {
-            std.debug.print("registry node: authenticated checkpoint slot {d} overlaps a newer local journal; verifying that journal as its continuation\n", .{selected.state.head.slot});
-            node_options.start_slot = 1;
-            break :retry app.Node.create(gpa, io, node_options) catch |retry_err| {
-                std.debug.print("registry node: cannot continue authenticated checkpoint through the local journal ({t}): {s}\n", .{ retry_err, diag.message() });
+
+    if (pending_install != null) {
+        // A previous process crashed after trusting certified T but before
+        // completing T's ordinary snapshot installation. Validate and finish
+        // that transaction on an isolated listener first. Only then may this
+        // boot consult shared storage for a newer U; otherwise replacing T's
+        // marker is unsafe, while joining live consensus from T+1 can strand
+        // a node that is already beyond the peers' answering window.
+        if (selected.source != .history_outbox) {
+            std.debug.print("registry node: trusted pending history did not select its exact install frontier; keep this node stopped\n", .{});
+            return 1;
+        }
+        var installed = selected.state;
+        {
+            var isolated_options = node_options;
+            isolated_options.listen_port = 0;
+            isolated_options.peers = &.{};
+            const validation_node = createBootNode(gpa, io, isolated_options, selected) catch |err| {
+                std.debug.print("registry node: cannot validate trusted pending history against the local journal ({t}): {s}\n", .{ err, diag.message() });
+                return 1;
+            };
+            defer validation_node.deinit();
+
+            writeSnapshotFile(io, dir, &selected.state) catch |err| {
+                std.debug.print("registry node: cannot install trusted pending history in {s}/snapshot: {t}; stopping\n", .{ data_dir, err });
+                return 1;
+            };
+            history_archive.?.confirmInstalled(&selected.state) catch |err| {
+                std.debug.print("registry node: cannot confirm trusted pending history slot {d}: {t}; keep this node stopped\n", .{ selected.state.head.slot, err });
+                return 1;
+            };
+            installed = drainBootReplay(validation_node, selected.state, &history_archive.?) catch |err| {
+                if (err == error.NodeHalted) {
+                    std.debug.print("registry node: halted while validating trusted pending history against the local journal; see the log above\n", .{});
+                } else {
+                    std.debug.print("registry node: the local journal does not continue trusted pending history slot {d} one slot at a time ({t}); keep this node stopped\n", .{ selected.state.head.slot, err });
+                }
+                return 1;
+            };
+            if (installed.head.slot > selected.state.head.slot) {
+                writeSnapshotFile(io, dir, &installed) catch |err| {
+                    std.debug.print("registry node: cannot install the journal continuation in {s}/snapshot: {t}; stopping\n", .{ data_dir, err });
+                    return 1;
+                };
+            }
+            history_archive.?.confirmInstalled(&installed) catch |err| {
+                std.debug.print("registry node: cannot preserve trusted boot provenance at journal slot {d}: {t}; keep this node stopped\n", .{ installed.head.slot, err });
                 return 1;
             };
         }
+        std.debug.print("history install resumed from trusted outbox tip {d}\n", .{selected.state.head.slot});
+
+        // Publication of any journal continuation is reconciled before the
+        // second adoption, preserving one ordered outbox frontier.
+        const latest = selectLatestHistoryBoot(
+            &history_archive.?,
+            nid,
+            genesis_close_time,
+            installed,
+            f.history_min_slot,
+        ) catch |err| {
+            std.debug.print("registry node: cannot reconcile or select final history after installing trusted slot {d} in {s}: {t}; keep this node stopped\n", .{ installed.head.slot, f.history_dir.?, err });
+            return 1;
+        };
+        selected = latest.selected;
+        authenticated_recovery = latest.recovery;
+        pending_install = null;
+        app.boot = .{ .state = selected.state, .slot = selected.state.head.slot };
+    }
+
+    const node = createBootNode(gpa, io, node_options, selected) catch |err| {
         std.debug.print("registry node: cannot start ({t}): {s}\n", .{ err, diag.message() });
         return 1;
     };
@@ -791,11 +1052,29 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     if (node.raw().waitAppMessage(.{ .timeout_ms = 0 })) |message| {
         node.raw().allocator().free(message);
     }
+    // A certified adoption remains explicitly pending until AppNode accepts
+    // its recovery boundary and the exact selected state is also durable in
+    // the ordinary snapshot. Only then may journal successors enter the
+    // outbox; this makes every crash point choose either the old installed
+    // state or the trusted adopted state, never an unrepresented middle.
+    if (selected.source == .history or selected.source == .history_outbox) {
+        writeSnapshotFile(io, dir, &selected.state) catch |err| {
+            std.debug.print("registry node: cannot install recovered state in {s}/snapshot: {t}; stopping\n", .{ data_dir, err });
+            return 1;
+        };
+    }
+    if (history_archive) |*archive| {
+        archive.confirmInstalled(&selected.state) catch |err| {
+            std.debug.print("registry node: cannot confirm the selected history installation at slot {d}: {t}; keep this node stopped\n", .{ selected.state.head.slot, err });
+            return 1;
+        };
+    }
     // Node recovery is synchronous, but AppNode exposes the resulting state
     // copies through its queue. Drain those copies before RPC can observe the
-    // initial checkpoint/snapshot. This closes the crash window where the
+    // initial history/local snapshot. This closes the crash window where the
     // consensus journal is durably ahead of the application snapshot.
-    const ready_state = drainBootReplay(node, selected.state) catch |err| {
+    const boot_history: ?*history.Archive = if (history_archive) |*archive| archive else null;
+    const ready_state = drainBootReplay(node, selected.state, boot_history) catch |err| {
         if (err == error.NodeHalted) {
             std.debug.print("registry node: halted while recovering the local journal; see the log above\n", .{});
         } else {
@@ -805,24 +1084,40 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     };
     const replayed_boot = ready_state.head.slot > selected.state.head.slot;
 
-    // Only after AppNode accepts the checkpoint/start-slot pair and any local
+    // Only after AppNode accepts the recovered-state/start-slot pair and any local
     // continuation may the replacement snapshot become durable. A failed
     // create leaves prior state intact; a successful replay persists its
-    // newest state, never the stale checkpoint that preceded it.
-    if (selected.source == .history or replayed_boot) {
+    // newest state, never the stale history anchor that preceded it.
+    if (replayed_boot) {
         writeSnapshotFile(io, dir, &ready_state) catch |err| {
             std.debug.print("registry node: cannot install recovered state in {s}/snapshot: {t}; stopping\n", .{ data_dir, err });
+            return 1;
+        };
+    }
+    if (history_archive) |*archive| {
+        archive.confirmInstalled(&ready_state) catch |err| {
+            std.debug.print("registry node: cannot preserve trusted boot provenance at recovered slot {d}: {t}; keep this node stopped\n", .{ ready_state.head.slot, err });
             return 1;
         };
     }
     if (replayed_boot) {
         std.debug.print("registry node: local journal advanced boot state from slot {d} through slot {d} before RPC startup\n", .{ selected.state.head.slot, ready_state.head.slot });
     }
+    if (selected.source == .history) {
+        const recovered = authenticated_recovery orelse unreachable;
+        std.debug.print("history replay anchor {d} through tip {d} ({d} ledgers)\n", .{
+            recovered.anchor_slot,
+            recovered.state.head.slot,
+            recovered.replayed_ledgers,
+        });
+    } else if (selected.source == .history_outbox) {
+        std.debug.print("history install resumed from trusted outbox tip {d}\n", .{selected.state.head.slot});
+    }
 
-    // Startup archive discovery is synchronous because it selects the boot
-    // state. Once recovery is complete, move the archive into its sole worker
-    // owner so neither shared nor trusted history I/O can stall consensus,
-    // RPC, gossip, or ordinary snapshot persistence.
+    // Startup archive discovery and backlog reconciliation are synchronous.
+    // The archive moves into the publisher only after every other fallible
+    // startup gate: once its worker can enter hostile shared I/O, ordinary
+    // error unwinding must never wait on an uninterruptible syscall.
     var history_publisher: ?*HistoryPublisher = null;
     defer {
         // A shared filesystem syscall may be uninterruptible. Stop consensus
@@ -835,14 +1130,6 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
         if (history_publisher) |publisher| publisher.deinit();
     }
-    if (history_archive) |archive| {
-        history_publisher = HistoryPublisher.start(gpa, io, archive) catch |err| {
-            std.debug.print("registry node: cannot start the history publisher: {t}\n", .{err});
-            return 1;
-        };
-        history_archive = null;
-    }
-
     var publisher = GossipPublisher{ .node = node.raw() };
     var shared = rpc.Shared{ .io = io, .state = ready_state, .publisher = publisher.publisher() };
     const server = rpc.Server.start(gpa, io, &shared, rpc_port) catch |err| {
@@ -851,10 +1138,20 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     };
     defer server.stop();
 
+    if (history_archive) |archive| {
+        history_publisher = HistoryPublisher.start(gpa, io, archive) catch |err| {
+            std.debug.print("registry node: cannot start the history publisher: {t}\n", .{err});
+            return 1;
+        };
+        history_archive = null;
+    }
+
     const boot_source = switch (selected.source) {
         .genesis => "genesis",
         .local_snapshot => "the snapshot",
-        .history => "history checkpoint",
+        .history => "history replay",
+        .history_outbox => "trusted history",
+        .trusted_local => "a trusted local history frontier",
     };
     std.debug.print("registry: node {s} listening on port {d}; {d} peer(s); data in {s}; starting from {s} at slot {d} close_time={d}\n", .{
         &registry.hex32(kp.public_key), node.raw().boundPort(), f.peers.items.len, data_dir, boot_source, selected.state.head.slot, selected.state.head.close_time,
@@ -864,7 +1161,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     });
     std.debug.print("registry: rpc listening on 127.0.0.1:{d}\n", .{server.port});
     if (f.history_dir) |archive_dir| {
-        std.debug.print("registry: authenticated history in {s}; checkpoint every {d} slots; anti-rollback floor {d}\n", .{
+        std.debug.print("registry: authenticated history in {s}; snapshot anchor every {d} slots; anti-rollback floor {d}\n", .{
             archive_dir, f.checkpoint_every, f.history_min_slot,
         });
     }
@@ -904,28 +1201,39 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
                 // once — `exit`, not a return through `deinit`, so the
                 // engine thread applies nothing more meanwhile.
                 if (f.history_dir != null) {
-                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: this process crossed a gap outside live history. Exiting with code 3; restart it from a recent certified checkpoint whose successor is still inside a peer's answering window.\n", .{ a.slot, a.state.head.slot });
+                    std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: this process crossed a gap outside live history. Exiting with code 3; restart from a certified history tip at or beyond the gap.\n", .{ a.slot, a.state.head.slot });
                 } else {
                     std.debug.print("registry node: applied slot {d} but the state's header is at slot {d}: this node missed slots the peers have already compacted. Exiting with code 3; configure authenticated history or rejoin only when the whole network starts over.\n", .{ a.slot, a.state.head.slot });
                 }
                 std.process.exit(3);
             }
-            shared.lock();
-            shared.state = a.state;
-            shared.prune();
-            shared.unlock();
+            // In history mode the trusted, ordered outbox is the first
+            // application-level durable write after AppNode's journal. A
+            // crash before the ordinary snapshot is repaired by journal
+            // replay, while a crash afterward can never erase this ledger
+            // from the publication backlog.
+            if (history_publisher) |history_worker| {
+                history_worker.offer(a.state) catch |err| {
+                    std.debug.print("registry node: cannot durably stage history ledger slot {d}: {t}; stopping before history can skip a ledger\n", .{ a.slot, err });
+                    stopNodeAndExit(server, node, &node_needs_deinit, 1);
+                };
+            }
             writeSnapshotFile(io, dir, &a.state) catch |err| {
                 std.debug.print("registry node: cannot write {s}/snapshot: {t}; stopping (a node that cannot persist must stop)\n", .{ data_dir, err });
                 stopNodeAndExit(server, node, &node_needs_deinit, 1);
             };
-            // The ordinary snapshot is durable before the state enters the
-            // one-element history mailbox. Publication and all retry I/O are
-            // owned by the worker, so this cadence loop remains live even if
-            // the shared archive or trusted signing storage stalls.
             if (history_publisher) |history_worker| {
-                if (a.slot % f.checkpoint_every == 0)
-                    history_worker.offer(a.state);
+                history_worker.confirmSnapshot(&a.state) catch |err| {
+                    std.debug.print("registry node: cannot preserve trusted boot provenance at slot {d}: {t}; stopping\n", .{ a.slot, err });
+                    stopNodeAndExit(server, node, &node_needs_deinit, 1);
+                };
             }
+            // RPC only observes the new head once both application durability
+            // barriers above have completed.
+            shared.lock();
+            shared.state = a.state;
+            shared.prune();
+            shared.unlock();
             var ok: usize = 0;
             for (a.state.lastResults()) |r| {
                 if (r == .ok) ok += 1;
@@ -953,7 +1261,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
         if (now >= next_stall_warn) {
             if (f.history_dir != null) {
-                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or this process fell beyond live history; in the latter case stop and restart it only after a recent certified checkpoint is available inside a peer's answering window\n", .{(nowMs(io) -| last_close) / 1000});
+                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or this process fell beyond live history; in the latter case restart it after a certified history tip covering the gap is available\n", .{(nowMs(io) -| last_close) / 1000});
             } else {
                 std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or this node fell beyond live history; configure authenticated history for catch-up, or use a fresh --data-dir only when the whole network starts over\n", .{(nowMs(io) -| last_close) / 1000});
             }
@@ -1096,23 +1404,23 @@ fn advanceEmpty(state: *registry.State) void {
     registry.apply(state, &value);
 }
 
-test "registry main: history flags parse and checkpoint cadence is bounded by the answering window" {
+test "registry main: history snapshot cadence has a bounded replay span" {
     var parsed = try parseFlags(testing.allocator, &.{
         "--genesis-close-time",      "1700000000",
         "--proposal-clock-offset-s", "-30",
         "--history-dir",             "/shared/history",
-        "--checkpoint-every",        "16",
+        "--checkpoint-every",        "64",
         "--history-min-slot",        "240",
     }, true);
     defer parsed.deinit(testing.allocator);
     try testing.expectEqualStrings("/shared/history", parsed.history_dir.?);
     try testing.expectEqual(test_genesis_close_time, parsed.genesis_close_time.?);
     try testing.expectEqual(@as(i64, -30), parsed.proposal_clock_offset_s);
-    try testing.expectEqual(@as(u64, 16), parsed.checkpoint_every);
+    try testing.expectEqual(@as(u64, 64), parsed.checkpoint_every);
     try testing.expectEqual(@as(u64, 240), parsed.history_min_slot);
 
     try testing.expectError(error.BadCheckpointInterval, parseFlags(testing.allocator, &.{ "--checkpoint-every", "0" }, true));
-    try testing.expectError(error.BadCheckpointInterval, parseFlags(testing.allocator, &.{ "--checkpoint-every", "17" }, true));
+    try testing.expectError(error.BadCheckpointInterval, parseFlags(testing.allocator, &.{ "--checkpoint-every", "65" }, true));
     try testing.expectError(error.BadSlot, parseFlags(testing.allocator, &.{ "--history-min-slot", "not-a-slot" }, true));
     try testing.expectError(error.BadGenesisCloseTime, parseFlags(testing.allocator, &.{ "--genesis-close-time", "18446744073709551615" }, true));
     try testing.expectError(error.BadClockOffset, parseFlags(testing.allocator, &.{ "--proposal-clock-offset-s", "fast" }, true));
@@ -1152,6 +1460,355 @@ test "registry main: boot selection prefers authenticated history and treats its
     fork.head.hash = @splat(0xff);
     try testing.expectError(error.HistoryCheckpointConflict, selectBootState(nid, test_genesis_close_time, checkpoint, fork, 0));
     try testing.expectError(error.HistoryFloorUnavailable, selectBootState(nid, test_genesis_close_time, local, null, 11));
+}
+
+test "registry main: pending history install outranks a newer shared tip before floor enforcement" {
+    const nid = testNetworkId("registry main pending install selection");
+    var local: registry.State = .{ .network_id = nid };
+    local.head.slot = 5;
+    local.head.close_time = test_genesis_close_time + 5;
+    local.head.hash = @splat(0x05);
+    var pending = local;
+    pending.head.slot = 7;
+    pending.head.close_time = test_genesis_close_time + 7;
+    pending.head.hash = @splat(0x07);
+    var shared = pending;
+    shared.head.slot = 9;
+    shared.head.close_time = test_genesis_close_time + 9;
+    shared.head.hash = @splat(0x09);
+
+    const selected = try selectHistoryBootState(
+        nid,
+        test_genesis_close_time,
+        local,
+        shared,
+        pending,
+        6,
+    );
+    try testing.expectEqual(BootSource.history_outbox, selected.source);
+    try testing.expectEqual(@as(u64, 7), selected.state.head.slot);
+    try testing.expectEqual(@as(u64, 8), selected.start_slot);
+
+    // The operator cannot silently skip an unfinished trusted install even
+    // when mutable shared storage currently advertises a newer certificate.
+    try testing.expectError(error.HistoryFloorUnavailable, selectHistoryBootState(
+        nid,
+        test_genesis_close_time,
+        local,
+        shared,
+        pending,
+        8,
+    ));
+}
+
+test "registry main: fresh history activation does not grant external boot provenance" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var journal_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_buf, "{s}/archive", .{root});
+    const signing_path = try std.fmt.bufPrint(&signing_buf, "{s}/signing", .{root});
+    const journal_path = try std.fmt.bufPrint(&journal_buf, "{s}/empty-journal", .{root});
+    const seed: [32]u8 = @splat(0xe0);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_name = "registry fresh history activation provenance";
+    const network_id = testNetworkId(network_name);
+    var archive = try history.Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    });
+    defer archive.deinit();
+
+    var local = registry.State.genesis(network_id, test_genesis_close_time);
+    for (0..7) |_| advanceEmpty(&local);
+    var selected: BootSelection = .{
+        .state = local,
+        .source = .local_snapshot,
+        .start_slot = 1,
+    };
+    try prepareHistoryBoot(&archive, &selected);
+    try testing.expectEqual(BootSource.local_snapshot, selected.source);
+    try testing.expectEqual(@as(u64, 1), selected.start_slot);
+    try testing.expect(!try archive.hasTrustedBootProvenance(&local));
+
+    var descriptor_buf: [160]u8 = undefined;
+    const descriptor = registry.networkDescriptor(
+        test_genesis_close_time,
+        network_name,
+        &descriptor_buf,
+    );
+    var diag: slcp.node.Diagnostic = .{};
+    const saved_boot = app.boot;
+    defer app.boot = saved_boot;
+    app.boot = .{ .state = local, .slot = local.head.slot };
+    try testing.expectError(error.InitialSlotOutsideJournal, createBootNode(gpa, io, .{
+        .network = descriptor,
+        .secret_seed = seed,
+        .listen_port = 0,
+        .peers = &.{},
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .include_self = false,
+        .data_dir = journal_path,
+        .max_value_bytes = registry.max_value_bytes,
+        .diagnostic = &diag,
+    }, selected));
+}
+
+test "registry main: confirmed pending install is followed by fresh recovery before network boot" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_c_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_buf, "{s}/archive", .{root});
+    const sign_a = try std.fmt.bufPrint(&sign_a_buf, "{s}/sign-a", .{root});
+    const sign_b = try std.fmt.bufPrint(&sign_b_buf, "{s}/sign-b", .{root});
+    const sign_c = try std.fmt.bufPrint(&sign_c_buf, "{s}/sign-c", .{root});
+    const seeds = [3][32]u8{ @splat(0xe1), @splat(0xe2), @splat(0xe3) };
+    const ids = [3]slcp.NodeId{
+        try slcp.core.crypto.publicKeyFromSeed(seeds[0]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[1]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
+    };
+    const network_name = "registry two-phase history startup";
+    const network_id = testNetworkId(network_name);
+    const config_a: history.Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = sign_a,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(2, &ids),
+        .signer_seed = seeds[0],
+        .checkpoint_every = 8,
+    };
+    var config_b = config_a;
+    config_b.signing_dir = sign_b;
+    config_b.signer_seed = seeds[1];
+    var config_c = config_a;
+    config_c.signing_dir = sign_c;
+    config_c.signer_seed = seeds[2];
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+
+    // Initialize A's private outbox at the old local snapshot frontier.
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&genesis);
+    }
+
+    const Publisher = struct {
+        fn publish(archive: *history.Archive, state: *const registry.State) !void {
+            try archive.stageApplied(state);
+            const staged = (try archive.nextStaged()) orelse
+                return error.ExpectedStagedHistory;
+            _ = try publishStagedHistory(archive, &staged);
+        }
+    };
+    var b = try history.Archive.open(gpa, io, config_b);
+    defer b.deinit();
+    var c = try history.Archive.open(gpa, io, config_c);
+    defer c.deinit();
+    try b.prepareFrontier(&genesis);
+    try c.prepareFrontier(&genesis);
+
+    // Two independent validators certify T at slot 7.
+    var remote = genesis;
+    for (0..7) |_| {
+        advanceEmpty(&remote);
+        try Publisher.publish(&b, &remote);
+        try Publisher.publish(&c, &remote);
+    }
+    const expected_t = remote;
+
+    // A adopts T, then crashes before the ordinary snapshot transaction.
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&genesis);
+        const recovered_t = (try a.recoverLatest(expected_t.head.slot)) orelse
+            return error.ExpectedCertifiedHistory;
+        try testing.expectEqual(expected_t.head.slot, recovered_t.state.head.slot);
+        try testing.expectEqualSlices(u8, &expected_t.head.hash, &recovered_t.state.head.hash);
+        try a.prepareFrontier(&recovered_t.state);
+        try testing.expectEqual(expected_t.head.slot, (try a.pendingInstall()).?.head.slot);
+    }
+
+    // While A is stopped, shared history advances more than two full cadence
+    // intervals beyond T. This models a tip beyond the live answering window.
+    for (7..40) |_| {
+        advanceEmpty(&remote);
+        try Publisher.publish(&b, &remote);
+        try Publisher.publish(&c, &remote);
+    }
+    const expected_u = remote;
+
+    // Restart first selects and durably installs the trusted T, never the
+    // newer mutable shared tip. Crash once more before confirmation.
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&genesis);
+        const pending_t = (try a.pendingInstall()) orelse
+            return error.ExpectedPendingHistoryInstall;
+        var first = try selectHistoryBootState(
+            network_id,
+            test_genesis_close_time,
+            genesis,
+            expected_u,
+            pending_t,
+            5,
+        );
+        try prepareHistoryBoot(&a, &first);
+        try testing.expectEqual(BootSource.history_outbox, first.source);
+        try testing.expectEqual(expected_t.head.slot, first.state.head.slot);
+        try writeSnapshotFile(io, tmp.dir, &first.state);
+    }
+
+    const installed_t = (try readSnapshotFile(io, tmp.dir, gpa)) orelse
+        return error.SnapshotMissing;
+    try testing.expectEqual(expected_t.head.slot, installed_t.head.slot);
+    try testing.expectEqualSlices(u8, &expected_t.head.hash, &installed_t.head.hash);
+
+    // The marker survives the snapshot-before-confirm crash. Confirm T, then
+    // crash at the other edge of that transaction before consulting shared
+    // history again.
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&installed_t);
+        try testing.expectEqual(expected_t.head.slot, (try a.pendingInstall()).?.head.slot);
+        try a.confirmInstalled(&installed_t);
+        try testing.expect((try a.pendingInstall()) == null);
+    }
+
+    // Withhold the mutable latest pointers after T commits. The fallback must
+    // retain authenticated-history provenance and its exact T+1 handoff; an
+    // empty local journal is allowed to accept that externally proved state.
+    var latest_b_name_buf: [96]u8 = undefined;
+    var latest_c_name_buf: [96]u8 = undefined;
+    const latest_b_name = try std.fmt.bufPrint(&latest_b_name_buf, "{s}.vote", .{&registry.hex32(ids[1])});
+    const latest_c_name = try std.fmt.bufPrint(&latest_c_name_buf, "{s}.vote", .{&registry.hex32(ids[2])});
+    var latest_dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const latest_dir_path = try std.fmt.bufPrint(
+        &latest_dir_path_buf,
+        "archive/{s}/history-v1/latest",
+        .{&registry.hex32(network_id)},
+    );
+    const latest_dir = try tmp.dir.openDir(io, latest_dir_path, .{});
+    defer latest_dir.close(io);
+    const latest_b_bytes = try latest_dir.readFileAlloc(io, latest_b_name, gpa, .limited(4 * 1024));
+    defer gpa.free(latest_b_bytes);
+    const latest_c_bytes = try latest_dir.readFileAlloc(io, latest_c_name, gpa, .limited(4 * 1024));
+    defer gpa.free(latest_c_bytes);
+    try latest_dir.deleteFile(io, latest_b_name);
+    try latest_dir.deleteFile(io, latest_c_name);
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&installed_t);
+        const withheld = try selectLatestHistoryBoot(
+            &a,
+            network_id,
+            test_genesis_close_time,
+            installed_t,
+            5,
+        );
+        try testing.expect(withheld.recovery == null);
+        try testing.expectEqual(BootSource.trusted_local, withheld.selected.source);
+        try testing.expectEqual(installed_t.head.slot, withheld.selected.state.head.slot);
+        try testing.expectEqual(installed_t.head.slot + 1, withheld.selected.start_slot);
+
+        var descriptor_buf: [128]u8 = undefined;
+        const descriptor = registry.networkDescriptor(
+            test_genesis_close_time,
+            network_name,
+            &descriptor_buf,
+        );
+        var empty_journal_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const empty_journal_path = try std.fmt.bufPrint(&empty_journal_buf, "{s}/empty-journal", .{root});
+        var diag: slcp.node.Diagnostic = .{};
+        const saved_boot = app.boot;
+        defer app.boot = saved_boot;
+        app.boot = .{ .state = withheld.selected.state, .slot = withheld.selected.state.head.slot };
+        const validation_node = try createBootNode(gpa, io, .{
+            .network = descriptor,
+            .secret_seed = seeds[0],
+            .listen_port = 0,
+            .peers = &.{},
+            .quorum = slcp.Quorum.of(2, &ids),
+            .include_self = false,
+            .data_dir = empty_journal_path,
+            .max_value_bytes = registry.max_value_bytes,
+            .diagnostic = &diag,
+        }, withheld.selected);
+        validation_node.deinit();
+    }
+
+    // Make the same certified U discoverable again. The next call must not
+    // cache the previous absence: it performs a genuinely fresh recovery.
+    try latest_dir.writeFile(io, .{ .sub_path = latest_b_name, .data = latest_b_bytes });
+    try latest_dir.writeFile(io, .{ .sub_path = latest_c_name, .data = latest_c_bytes });
+
+    var final_selection: BootSelection = undefined;
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&installed_t);
+        try testing.expect((try a.pendingInstall()) == null);
+
+        // This is the pre-network startup seam: after T is confirmed it must
+        // perform a new shared recovery, select U, and prepare U's own durable
+        // install marker before the real peer-bearing AppNode is constructed.
+        const latest = try selectLatestHistoryBoot(
+            &a,
+            network_id,
+            test_genesis_close_time,
+            installed_t,
+            5,
+        );
+        final_selection = latest.selected;
+        try testing.expect(latest.recovery != null);
+        try testing.expectEqual(BootSource.history, final_selection.source);
+        try testing.expectEqual(expected_u.head.slot, final_selection.state.head.slot);
+        try testing.expectEqualSlices(u8, &expected_u.head.hash, &final_selection.state.head.hash);
+        try testing.expectEqual(expected_u.head.slot + 1, final_selection.start_slot);
+        try testing.expectEqual(expected_u.head.slot, (try a.pendingInstall()).?.head.slot);
+    }
+
+    // A crash after choosing U but before its ordinary snapshot is also
+    // recoverable solely from the trusted marker installed by the seam.
+    {
+        var a = try history.Archive.open(gpa, io, config_a);
+        defer a.deinit();
+        try a.prepareFrontier(&installed_t);
+        const pending_u = (try a.pendingInstall()) orelse
+            return error.ExpectedPendingHistoryInstall;
+        try testing.expectEqual(final_selection.state.head.slot, pending_u.head.slot);
+        try testing.expectEqualSlices(u8, &final_selection.state.head.hash, &pending_u.head.hash);
+        try writeSnapshotFile(io, tmp.dir, &pending_u);
+        try a.confirmInstalled(&pending_u);
+        try testing.expect((try a.pendingInstall()) == null);
+    }
+
+    const installed_u = (try readSnapshotFile(io, tmp.dir, gpa)) orelse
+        return error.SnapshotMissing;
+    try testing.expectEqual(expected_u.head.slot, installed_u.head.slot);
+    try testing.expectEqualSlices(u8, &expected_u.head.hash, &installed_u.head.hash);
 }
 
 test "registry main: boot selection rejects a local genesis from a different close-time epoch" {
@@ -1392,12 +2049,20 @@ test "registry main: history data-dir creation is fenced in its existing parent"
 
 test "registry main: only history safety failures are process-fatal" {
     try testing.expect(historyFailureIsFatal(error.InvalidAppliedState));
+    try testing.expect(historyFailureIsFatal(error.InvalidGenesisState));
     try testing.expect(historyFailureIsFatal(error.SigningFenceCorrupt));
     try testing.expect(historyFailureIsFatal(error.SigningFenceUnavailable));
     try testing.expect(historyFailureIsFatal(error.SigningEquivocation));
     try testing.expect(historyFailureIsFatal(error.SigningRollback));
     try testing.expect(historyFailureIsFatal(error.CheckpointSlotOverflow));
     try testing.expect(historyFailureIsFatal(error.CertifiedFork));
+    try testing.expect(historyFailureIsFatal(error.CertifiedHistoryInvalid));
+    try testing.expect(historyFailureIsFatal(error.HistoryBootProvenanceConflict));
+    try testing.expect(historyFailureIsFatal(error.HistoryBootProvenanceRollback));
+    try testing.expect(historyFailureIsFatal(error.HistoryOutboxCorrupt));
+    try testing.expect(historyFailureIsFatal(error.HistoryOutboxSequence));
+    try testing.expect(historyFailureIsFatal(error.HistoryPolicyMismatch));
+    try testing.expect(historyFailureIsFatal(error.HistoryTransitionInvalid));
     // A hostile shared archive can pre-create a content-addressed path. It
     // may deny history availability, but must not halt consensus.
     try testing.expect(!historyFailureIsFatal(error.ImmutableFileConflict));
@@ -1406,8 +2071,12 @@ test "registry main: only history safety failures are process-fatal" {
 }
 
 const PublisherSigningFenceFault = struct {
-    fn sync(_: std.Io.Dir) !void {
-        return error.InjectedDirectorySyncFailure;
+    var target: ?std.Io.Dir.Handle = null;
+
+    fn sync(dir: std.Io.Dir) !void {
+        if (target != null and target.? == dir.handle)
+            return error.InjectedDirectorySyncFailure;
+        try syncDirectory(dir);
     }
 };
 
@@ -1429,20 +2098,24 @@ test "registry main: the publisher latches trusted fence I/O as fatal" {
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     var archive_live = true;
     defer if (archive_live) archive.deinit();
+    PublisherSigningFenceFault.target = archive.signing_votes_dir.handle;
+    defer PublisherSigningFenceFault.target = null;
     archive.sync_directory = PublisherSigningFenceFault.sync;
 
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    try archive.prepareFrontier(&state);
     const publisher = try HistoryPublisher.start(gpa, io, archive);
     archive_live = false;
     defer publisher.deinit();
-    var state = registry.State.genesis(network_id, test_genesis_close_time);
     advanceEmpty(&state);
-    publisher.offer(state);
+    try publisher.offer(state);
 
     const deadline = nowMs(io) + 5_000;
     var failure: ?HistoryPublicationFailure = null;
@@ -1455,91 +2128,108 @@ test "registry main: the publisher latches trusted fence I/O as fatal" {
     try testing.expectEqual(error.SigningFenceUnavailable, latched.err);
 }
 
-test "registry main: an availability-blocked checkpoint is coalesced to the newest due state" {
-    const nid = testNetworkId("registry main checkpoint coalescing");
-    var eight = registry.State.genesis(nid, test_genesis_close_time);
-    for (0..8) |_| advanceEmpty(&eight);
-    var sixteen = eight;
-    for (8..16) |_| advanceEmpty(&sixteen);
-
-    var mailbox = HistoryMailbox.init(testing.io);
-    defer mailbox.stop();
-    try testing.expect(mailbox.offer(eight) == null);
-    try testing.expectEqual(@as(u64, 8), mailbox.offer(sixteen).?);
-    const pending = mailbox.take().?;
-    try testing.expectEqual(@as(u64, 16), pending.head.slot);
-    try testing.expectEqualSlices(u8, &sixteen.head.hash, &pending.head.hash);
-}
-
-test "registry main: a newer checkpoint supersedes an active publication after availability failure" {
-    const nid = testNetworkId("registry main active history supersession");
-    var eight = registry.State.genesis(nid, test_genesis_close_time);
-    for (0..8) |_| advanceEmpty(&eight);
-    var sixteen = eight;
-    for (8..16) |_| advanceEmpty(&sixteen);
-
-    var mailbox = HistoryMailbox.init(testing.io);
-    defer mailbox.stop();
-    try testing.expect(mailbox.offer(eight) == null);
-    const active = mailbox.take().?;
-    try testing.expectEqual(@as(u64, 8), active.head.slot);
-    try testing.expect(mailbox.offer(sixteen) == null);
-    switch (mailbox.requeueAvailabilityFailure(active)) {
-        .superseded => |slot| try testing.expectEqual(@as(u64, 16), slot),
-        else => return error.ExpectedHistoryCheckpointSupersession,
-    }
-    try testing.expectEqual(@as(u64, 16), mailbox.take().?.head.slot);
-}
-
-const SlowHistoryMailboxConsumer = struct {
-    mailbox: *HistoryMailbox,
-    first_slot: std.atomic.Value(u64) = .init(0),
-    release: std.atomic.Value(bool) = .init(false),
-    second_slot: std.atomic.Value(u64) = .init(0),
-
-    fn run(self: *@This()) void {
-        const first = self.mailbox.take() orelse return;
-        self.first_slot.store(first.head.slot, .release);
-        while (!self.release.load(.acquire)) std.Thread.yield() catch {};
-        const second = self.mailbox.take() orelse return;
-        self.second_slot.store(second.head.slot, .release);
-    }
-};
-
-test "registry main: a slow history consumer does not block offers and sees only the newest queued checkpoint" {
+test "registry main: the publisher drains a crash-durable outbox without a new offer" {
+    const gpa = testing.allocator;
     const io = testing.io;
-    const nid = testNetworkId("registry main slow history consumer");
-    var eight = registry.State.genesis(nid, test_genesis_close_time);
-    for (0..8) |_| advanceEmpty(&eight);
-    var sixteen = eight;
-    for (8..16) |_| advanceEmpty(&sixteen);
-    var twenty_four = sixteen;
-    for (16..24) |_| advanceEmpty(&twenty_four);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_buf, "{s}/archive", .{root});
+    const signing_path = try std.fmt.bufPrint(&signing_buf, "{s}/signing", .{root});
+    const seed: [32]u8 = @splat(0xd2);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("registry publisher durable outbox restart");
+    const cfg: history.Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
 
-    var mailbox = HistoryMailbox.init(io);
-    var consumer = SlowHistoryMailboxConsumer{ .mailbox = &mailbox };
-    try testing.expect(mailbox.offer(eight) == null);
-    var thread: ?std.Thread = try std.Thread.spawn(.{}, SlowHistoryMailboxConsumer.run, .{&consumer});
-    defer {
-        consumer.release.store(true, .release);
-        mailbox.stop();
-        if (thread) |t| t.join();
-    }
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var one = genesis;
+    advanceEmpty(&one);
+    var before_crash = try history.Archive.open(gpa, io, cfg);
+    try before_crash.prepareFrontier(&genesis);
+    try before_crash.stageApplied(&one);
+    before_crash.deinit();
 
-    const wait_deadline = nowMs(io) + 5_000;
-    while (consumer.first_slot.load(.acquire) == 0 and nowMs(io) < wait_deadline)
+    var resumed = try history.Archive.open(gpa, io, cfg);
+    var resumed_live = true;
+    defer if (resumed_live) resumed.deinit();
+    try resumed.prepareFrontier(&genesis);
+    const publisher = try HistoryPublisher.start(gpa, io, resumed);
+    resumed_live = false;
+    var publisher_live = true;
+    defer if (publisher_live) publisher.deinit();
+
+    const deadline = nowMs(io) + 5_000;
+    var drained = false;
+    while (nowMs(io) < deadline) {
+        if (publisher.fatalFailure()) |failure| return failure.err;
+        if (try publisher.archive.nextStaged() == null) {
+            drained = true;
+            break;
+        }
         std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
-    try testing.expectEqual(@as(u64, 8), consumer.first_slot.load(.acquire));
+    }
+    try testing.expect(drained);
+    publisher.deinit();
+    publisher_live = false;
 
-    // The consumer is deliberately held outside the mailbox, modeling a
-    // blocked archive syscall. Producers can still replace the sole queued
-    // element without waiting for it.
-    try testing.expect(mailbox.offer(sixteen) == null);
-    try testing.expectEqual(@as(u64, 16), mailbox.offer(twenty_four).?);
-    consumer.release.store(true, .release);
-    thread.?.join();
-    thread = null;
-    try testing.expectEqual(@as(u64, 24), consumer.second_slot.load(.acquire));
+    var verifier = try history.Archive.open(gpa, io, cfg);
+    defer verifier.deinit();
+    const recovered = (try verifier.recoverLatest(1)) orelse
+        return error.ExpectedCertifiedHistory;
+    try testing.expectEqual(@as(u64, 1), recovered.state.head.slot);
+    try testing.expectEqualSlices(u8, &one.head.hash, &recovered.state.head.hash);
+}
+
+test "registry main: startup frees durable capacity for a journal-only successor" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_buf, "{s}/archive", .{root});
+    const signing_path = try std.fmt.bufPrint(&signing_buf, "{s}/signing", .{root});
+    const seed: [32]u8 = @splat(0xd3);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("registry full outbox journal successor");
+    var archive = try history.Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 64,
+    });
+    defer archive.deinit();
+
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    try archive.prepareFrontier(&genesis);
+    var state = genesis;
+    for (0..64) |_| {
+        advanceEmpty(&state);
+        try archive.stageApplied(&state);
+    }
+    var journal_only = state;
+    advanceEmpty(&journal_only);
+    try testing.expectError(error.HistoryBacklogFull, archive.stageApplied(&journal_only));
+
+    try stageBootHistory(&archive, &journal_only);
+    const oldest = (try archive.nextStaged()) orelse return error.ExpectedLedgerRecord;
+    try testing.expectEqual(@as(u64, 2), oldest.head.slot);
 }
 
 test "registry main: a checkpoint can resume the journal after the snapshot write crash window" {
@@ -1605,7 +2295,7 @@ test "registry main: a checkpoint can resume the journal after the snapshot writ
         .diagnostic = &diag,
     });
     defer resumed.deinit();
-    const ready = try drainBootReplay(resumed, checkpoint);
+    const ready = try drainBootReplay(resumed, checkpoint, null);
     try testing.expectEqual(@as(u64, 2), ready.head.slot);
     try testing.expectEqualSlices(u8, &after.head.hash, &ready.head.hash);
     try testing.expectEqual(after.head.close_time, ready.head.close_time);

@@ -1,25 +1,31 @@
-//! history.zig — quorum-authenticated registry checkpoint archive.
+//! history.zig — quorum-authenticated replayable registry history.
 //!
 //! The archive tree is untrusted shared storage. Under its network-id
-//! namespace it contains canonical registry snapshots named by SHA-256,
-//! fixed-width validator votes named by assertion digest and signer, and one
-//! mutable latest-vote pointer per validator. The separate signing tree is
-//! trusted local storage; immutable per-slot votes plus a monotonic high-water
-//! vote prevent this validator from signing a rollback or equivocation.
+//! and `history-v1` namespaces it contains immutable ledger records, canonical
+//! registry anchor snapshots, fixed-width validator tip votes, and one mutable
+//! latest-vote pointer per validator. The separate signing tree is trusted
+//! local storage; immutable per-slot votes plus a monotonic high-water vote
+//! prevent this validator from signing a rollback or equivocation.
 //!
-//! A vote signs SHA-256("REGISTRY-CKPT-V2" || network_id || slot_be ||
-//! head_hash || snapshot_hash). Imported votes are evaluated only against the
-//! caller-supplied, normalized quorum set. No quorum policy comes from the
-//! archive.
+//! A vote signs SHA-256("REGISTRY-HIST-V1" || network_id || tip slot/head ||
+//! anchor cadence || anchor slot/head/snapshot hash). Imported votes are
+//! evaluated only against the caller-supplied, normalized quorum set. No
+//! quorum policy comes from the archive. Slot one and every cadence
+//! boundary are deterministic anchor slots. On fresh non-genesis activation,
+//! the existing base is not republished or treated as continuity-proven, even
+//! when it occupies an anchor slot. Successor ledgers are recorded immediately;
+//! attestation starts when a newly applied successor reaches the next anchor.
+//! Ledger records contain no cadence or anchor metadata, so different writer
+//! cadences produce identical content-addressed records.
 //!
-//! The fixed-width vote is 216 bytes: tag[16], network_id[32], slot[8]
-//! big-endian, head_hash[32], snapshot_hash[32], signer[32], signature[64].
-//! Files under `<archive>/<network-hex>/` are:
+//! Files under `<archive>/<network-hex>/history-v1/` are:
 //! `snapshots/<snapshot-hash>.snap`,
 //! `votes/<assertion-digest>-<signer>.vote`, and mutable
-//! `latest/<signer>.vote`. Trusted files under
-//! `<signing>/<network-hex>/` are immutable `votes/<slot>.vote` plus mutable
-//! `high-water.vote`.
+//! `latest/<signer>.vote`, plus `ledgers/<head-hash>.ledger`. Trusted files
+//! under `<signing>/<network-hex>/history-v1/` are an immutable cadence/epoch/
+//! activation policy, immutable `votes/<slot>.vote`, mutable `high-water.vote`,
+//! and a checksummed, crash-durable bounded outbox with explicit trusted boot
+//! provenance.
 //! Every directory component below the configured roots is opened without
 //! following symlinks and retained by handle; all object access is by a
 //! generated basename with final-component no-follow. The parent directory of
@@ -31,7 +37,7 @@
 //! after materialization. Archive history is therefore supported only on
 //! Linux and macOS, where these directory barriers exist.
 //! The archive also may not contain the caller-pinned validator-key parent.
-//! Pre-E2c Snapshot V1/V2 objects are not eligible external checkpoints:
+//! Pre-E2c Snapshot V1/V2 objects are not eligible history anchors:
 //! neither carries the versioned ledger value and close time required for
 //! exact previous-value recovery. Snapshot V3 is the sole accepted format.
 //!
@@ -52,11 +58,22 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 extern "c" fn mkfifoat(dir_fd: std.posix.fd_t, path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
-const tag: *const [16]u8 = "REGISTRY-CKPT-V2";
-const assertion_bytes = tag.len + 32 + 8 + 32 + 32;
+const tag: *const [16]u8 = "REGISTRY-HIST-V1";
+const ledger_magic = "REGISTRY-LEDGER-V1\n";
+const policy_magic = "REGISTRY-HISTORY-POLICY-V1\n";
+const watermark_magic = "REGISTRY-HISTORY-WATERMARK-V1\n";
+const boot_provenance_magic = "REGISTRY-HISTORY-BOOT-V1\n";
+const boot_provenance_name = "boot-provenance";
+const assertion_bytes = tag.len + 32 + 8 + 32 + 1 + 8 + 32 + 32;
 const vote_bytes = assertion_bytes + 32 + 64;
 const max_candidates = 16;
+const max_backlog: u64 = 64;
 const max_name_bytes = 160;
+const ledger_fixed_bytes = ledger_magic.len + 32 + 8 + 8 + 4 * 32 + 2;
+const ledger_max_bytes = ledger_fixed_bytes + registry.max_ledger_value_bytes + 32;
+const policy_bytes = policy_magic.len + 32 + 8 + 1 + 8 + 32 + 32;
+const watermark_bytes = watermark_magic.len + 32 + 8 + 32 + 32;
+const boot_provenance_bytes = boot_provenance_magic.len + 32 + 8 + 32 + 32;
 
 pub const Config = struct {
     archive_dir: []const u8,
@@ -69,13 +86,18 @@ pub const Config = struct {
     /// (and therefore the key itself).
     private_key_parent_dir: ?std.Io.Dir = null,
     network_id: [32]u8,
+    genesis_close_time: u64,
     quorum: slcp.Quorum,
     signer_seed: [32]u8,
     checkpoint_every: u64 = 8,
 };
 
 pub const RecordStatus = enum {
-    /// This slot is not a configured checkpoint boundary.
+    /// The canonical ledger was archived, but this signing tree has not yet
+    /// published a continuity-proven anchor. A fresh non-genesis activation
+    /// base is never republished as that anchor, even at slot 1 or an N-slot
+    /// boundary; attestation starts when a newly applied successor reaches the
+    /// next deterministic anchor.
     not_due,
     /// This validator's vote was durably fenced and published. This does not
     /// imply that enough other validators have published for a quorum yet.
@@ -85,20 +107,59 @@ pub const RecordStatus = enum {
     certified,
 };
 
+pub const Recovery = struct {
+    state: registry.State,
+    anchor_slot: u64,
+    /// Number of ledger records applied after the authenticated anchor.
+    replayed_ledgers: u64,
+};
+
+const Watermark = struct {
+    slot: u64,
+    head_hash: [32]u8,
+};
+
+const Inflight = struct {
+    state: registry.State,
+    assertion: ?Assertion,
+};
+
+const RecoveredProof = struct {
+    recovery: Recovery,
+    assertion: Assertion,
+};
+
 pub const Archive = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     snapshots_dir: std.Io.Dir,
+    ledgers_dir: std.Io.Dir,
     votes_dir: std.Io.Dir,
     latest_dir: std.Io.Dir,
     signing_dir: std.Io.Dir,
     signing_votes_dir: std.Io.Dir,
+    outbox_dir: std.Io.Dir,
     network_id: [32]u8,
+    genesis_close_time: u64,
     quorum: slcp.core.qset.QuorumSetOwned,
     validators: []slcp.NodeId,
     signer_seed: [32]u8,
     signer_id: slcp.NodeId,
     checkpoint_every: u64,
+    policy_initialized: bool,
+    activation: ?Watermark,
+    adoption_pending: ?Watermark,
+    boot_provenance: ?Watermark,
+    admitted: ?Watermark,
+    published: ?Watermark,
+    stage_frontier: ?registry.State,
+    publish_frontier: ?registry.State,
+    publish_assertion: ?Assertion,
+    fenced_pending: ?Assertion,
+    ready: ?registry.State,
+    inflight: ?Inflight,
+    recovered_proof: ?RecoveredProof,
+    mutex: std.Io.Mutex,
     sync_directory: *const fn (std.Io.Dir) anyerror!void,
     sync_file: *const fn (std.Io, std.Io.File) anyerror!void,
 
@@ -107,7 +168,7 @@ pub const Archive = struct {
     pub fn open(gpa: std.mem.Allocator, io: std.Io, cfg: Config) !Archive {
         if (comptime !durabilitySupported(builtin.os.tag))
             return error.UnsupportedHistoryDurability;
-        if (cfg.checkpoint_every == 0 or cfg.checkpoint_every > 16)
+        if (cfg.checkpoint_every == 0 or cfg.checkpoint_every > 64)
             return error.BadCheckpointInterval;
 
         var quorum = try cfg.quorum.toOwned(gpa);
@@ -156,55 +217,88 @@ pub const Archive = struct {
         const archive_network = try archive_base.createDirPathOpen(io, &network_hex, no_follow);
         defer archive_network.close(io);
         try syncDir(archive_base);
-        const snapshots_dir = try archive_network.createDirPathOpen(io, "snapshots", no_follow);
-        errdefer snapshots_dir.close(io);
-        const votes_dir = try archive_network.createDirPathOpen(io, "votes", no_follow);
-        errdefer votes_dir.close(io);
-        const latest_dir = try archive_network.createDirPathOpen(io, "latest", no_follow);
-        errdefer latest_dir.close(io);
+        const archive_version = try archive_network.createDirPathOpen(io, "history-v1", no_follow);
+        defer archive_version.close(io);
         try syncDir(archive_network);
+        const snapshots_dir = try archive_version.createDirPathOpen(io, "snapshots", no_follow);
+        errdefer snapshots_dir.close(io);
+        const ledgers_dir = try archive_version.createDirPathOpen(io, "ledgers", no_follow);
+        errdefer ledgers_dir.close(io);
+        const votes_dir = try archive_version.createDirPathOpen(io, "votes", no_follow);
+        errdefer votes_dir.close(io);
+        const latest_dir = try archive_version.createDirPathOpen(io, "latest", no_follow);
+        errdefer latest_dir.close(io);
+        try syncDir(archive_version);
 
-        const signing_dir = try signing_base.createDirPathOpen(io, &network_hex, no_follow);
-        errdefer signing_dir.close(io);
+        const signing_network = try signing_base.createDirPathOpen(io, &network_hex, no_follow);
+        defer signing_network.close(io);
         try syncDir(signing_base);
+        const signing_dir = try signing_network.createDirPathOpen(io, "history-v1", no_follow);
+        errdefer signing_dir.close(io);
+        try syncDir(signing_network);
         const signing_votes_dir = try signing_dir.createDirPathOpen(io, "votes", no_follow);
         errdefer signing_votes_dir.close(io);
+        const outbox_dir = try signing_dir.createDirPathOpen(io, "outbox", no_follow);
+        errdefer outbox_dir.close(io);
         try syncDir(signing_dir);
 
-        return .{
+        var archive: Archive = .{
             .gpa = gpa,
             .io = io,
             .snapshots_dir = snapshots_dir,
+            .ledgers_dir = ledgers_dir,
             .votes_dir = votes_dir,
             .latest_dir = latest_dir,
             .signing_dir = signing_dir,
             .signing_votes_dir = signing_votes_dir,
+            .outbox_dir = outbox_dir,
             .network_id = cfg.network_id,
+            .genesis_close_time = cfg.genesis_close_time,
             .quorum = quorum,
             .validators = validators,
             .signer_seed = cfg.signer_seed,
             .signer_id = signer_id,
             .checkpoint_every = cfg.checkpoint_every,
+            .policy_initialized = false,
+            .activation = null,
+            .adoption_pending = null,
+            .boot_provenance = null,
+            .admitted = null,
+            .published = null,
+            .stage_frontier = null,
+            .publish_frontier = null,
+            .publish_assertion = null,
+            .fenced_pending = null,
+            .ready = null,
+            .inflight = null,
+            .recovered_proof = null,
+            .mutex = .init,
             .sync_directory = syncDir,
             .sync_file = fullSync,
         };
+        try archive.loadPolicyAndWatermarks();
+        return archive;
     }
 
     pub fn deinit(self: *Archive) void {
+        self.outbox_dir.close(self.io);
         self.signing_votes_dir.close(self.io);
         self.signing_dir.close(self.io);
         self.latest_dir.close(self.io);
         self.votes_dir.close(self.io);
+        self.ledgers_dir.close(self.io);
         self.snapshots_dir.close(self.io);
         self.quorum.deinit(self.gpa);
         self.gpa.free(self.validators);
         self.* = undefined;
     }
 
-    /// Loads the highest discoverable quorum-certified state at or above the
-    /// inclusive floor. Malformed/unavailable untrusted objects do not count;
-    /// two discoverable certified assertions at one slot are a hard fork.
-    pub fn loadLatest(self: *Archive, min_slot: u64) !?registry.State {
+    /// Recovers the highest discoverable quorum-certified tip at or above the
+    /// inclusive floor. Discovery is bounded by the configured validators and
+    /// `max_candidates`; replay is bounded by signed `anchor_every - 1`.
+    /// Malformed or unavailable shared objects cannot become state. Two
+    /// discoverable certified assertions at one slot are a hard fork.
+    pub fn recoverLatest(self: *Archive, min_slot: u64) !?Recovery {
         var candidates: [max_candidates]Vote = undefined;
         var n_candidates: usize = 0;
 
@@ -232,7 +326,7 @@ pub const Archive = struct {
             }
         }
 
-        var best: ?registry.State = null;
+        var best: ?RecoveredProof = null;
         var certified: [max_candidates]Assertion = undefined;
         var n_certified: usize = 0;
         for (candidates[0..n_candidates]) |candidate| {
@@ -244,34 +338,274 @@ pub const Archive = struct {
             certified[n_certified] = candidate.assertion;
             n_certified += 1;
 
-            const state = (try self.loadSnapshot(candidate.assertion)) orelse continue;
+            const recovered = (try self.recoverAssertion(candidate.assertion)) orelse continue;
             if (best) |current| {
-                if (state.head.slot < current.head.slot) continue;
+                if (recovered.state.head.slot < current.recovery.state.head.slot) continue;
             }
-            best = state;
+            best = .{ .recovery = recovered, .assertion = candidate.assertion };
         }
-        return best;
+        self.recovered_proof = best;
+        return if (best) |proof| proof.recovery else null;
     }
 
-    /// At checkpoint boundaries, validates the applied state, durably advances
-    /// the trusted signing fence, then publishes the snapshot and local vote.
-    pub fn recordApplied(self: *Archive, state: *const registry.State) !RecordStatus {
-        if (state.head.slot == 0 or state.head.slot % self.checkpoint_every != 0) return .not_due;
-        if (state.head.slot == std.math.maxInt(u64)) return error.CheckpointSlotOverflow;
-        if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
-            !std.mem.eql(u8, &state.head.state_root, &state.stateRoot()) or
-            !std.mem.eql(u8, &state.head.hash, &registry.headerHash(state.network_id, &state.head)) or
-            !hasExactLastValue(state))
-            return error.InvalidAppliedState;
+    /// Compatibility wrapper for the E2c caller. New code should retain the
+    /// recovery metadata returned by `recoverLatest`.
+    pub fn loadLatest(self: *Archive, min_slot: u64) !?registry.State {
+        return if (try self.recoverLatest(min_slot)) |recovered| recovered.state else null;
+    }
+
+    /// Establishes the trusted outbox frontier. A fresh history-v1 tree may
+    /// adopt exactly one caller-supplied local base. Thereafter the base must
+    /// match durable outbox state, unless it is the exact quorum-certified
+    /// state most recently returned by `recoverLatest`.
+    pub fn prepareFrontier(self: *Archive, base: *const registry.State) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.validateState(base);
+        if (self.stage_frontier) |frontier| {
+            if (sameDurableState(&frontier, base)) return;
+            const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+            const published = self.published orelse return error.HistoryOutboxCorrupt;
+            if (admitted.slot == published.slot) {
+                if (self.recovered_proof) |proof| {
+                    if (proof.recovery.state.head.slot > published.slot and
+                        sameDurableState(base, &proof.recovery.state))
+                    {
+                        if (self.adoption_pending != null)
+                            return error.HistoryAdoptionNotInstalled;
+                        const target: Watermark = .{ .slot = base.head.slot, .head_hash = base.head.hash };
+                        try self.beginCertifiedAdoption(target, base);
+                        self.admitted = target;
+                        self.published = target;
+                        self.stage_frontier = base.*;
+                        self.publish_frontier = base.*;
+                        self.ready = null;
+                        self.publish_assertion = if (proof.assertion.anchor_every == self.checkpoint_every)
+                            proof.assertion
+                        else
+                            null;
+                        self.fenced_pending = null;
+                        return;
+                    }
+                }
+            }
+            if (try self.preparedBaseIsRepresented(base, published, admitted)) return;
+            return error.HistoryFrontierMismatch;
+        }
+        if (!self.policy_initialized) {
+            try self.initializePolicy(base);
+        } else {
+            try self.prepareExistingFrontier(base);
+        }
+    }
+
+    /// Returns a trusted certified-adoption target that still must be written
+    /// to the application's ordinary snapshot store, if one exists.
+    pub fn pendingInstall(self: *Archive) !?registry.State {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const target = self.adoption_pending orelse return null;
+        return try self.loadFrontierState(target);
+    }
+
+    /// Reports whether `state` has the exact durable semantics of the ordinary
+    /// snapshot most recently confirmed as descending from certified history.
+    pub fn hasTrustedBootProvenance(self: *Archive, state: *const registry.State) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const trusted = self.boot_provenance orelse return false;
+        if (!watermarkMatchesState(trusted, state)) return false;
+        const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        const represented = try self.loadRepresentedState(trusted, published, admitted);
+        return sameDurableState(&represented, state);
+    }
+
+    /// Durably admits one exact successor without touching shared storage.
+    /// This method is safe to call from the cadence thread while a worker is
+    /// blocked in `recordApplied` on the hostile archive.
+    pub fn stageApplied(self: *Archive, state: *const registry.State) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.adoption_pending != null) return error.HistoryAdoptionNotInstalled;
+        const previous = self.stage_frontier orelse return error.HistoryFrontierUnprepared;
+        const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+
+        if (state.head.slot <= admitted.slot) {
+            const durable = if (state.head.slot > published.slot)
+                try self.loadStagedState(state.head.slot)
+            else blk: {
+                var name_buf: [max_name_bytes]u8 = undefined;
+                break :blk try self.loadTrustedState(frontierName(state.head.hash, &name_buf));
+            };
+            if (!sameDurableState(&durable, state)) return error.HistoryOutboxStateMismatch;
+            return;
+        }
+        if (state.head.slot <= admitted.slot or admitted.slot == std.math.maxInt(u64) or
+            state.head.slot != admitted.slot + 1)
+            return error.HistoryOutboxSequence;
+        if (state.head.slot - published.slot > max_backlog)
+            return error.HistoryBacklogFull;
+        try self.validateSuccessor(&previous, state, true);
 
         var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
         const snapshot = registry.writeSnapshot(state, &snapshot_buf);
-        const assertion: Assertion = .{
+        var name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeTrustedImmutableFixed(
+            self.outbox_dir,
+            stagedName(state.head.slot, &name_buf),
+            snapshot,
+        );
+        try self.sync_directory(self.outbox_dir);
+        const next: Watermark = .{ .slot = state.head.slot, .head_hash = state.head.hash };
+        try self.writeWatermark("admitted", next);
+        try self.sync_directory(self.outbox_dir);
+        self.admitted = next;
+        self.stage_frontier = state.*;
+    }
+
+    /// Confirms that the application has durably installed `state`. A pending
+    /// certified adoption seeds trusted boot provenance before its marker is
+    /// cleared. Existing provenance may advance through represented outbox
+    /// successors; an exact cached certificate may seed an equal frontier.
+    /// Without one of those trust roots, confirmation is intentionally a no-op.
+    pub fn confirmInstalled(self: *Archive, state: *const registry.State) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.validateState(state);
+        const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        if (self.adoption_pending) |target| {
+            if (state.head.slot < target.slot) return error.HistoryAdoptionNotInstalled;
+            if (state.head.slot > published.slot) return error.HistoryFrontierMismatch;
+            if (!watermarkMatchesState(target, state)) return error.HistoryFrontierMismatch;
+            if (!try self.stateIsRepresented(state, published, admitted))
+                return error.HistoryFrontierMismatch;
+            try self.advanceBootProvenance(state);
+            try self.clearAdoptionMarker();
+            return;
+        }
+
+        if (self.boot_provenance == null) {
+            const proof = self.recovered_proof orelse return;
+            if (!sameDurableState(&proof.recovery.state, state)) return;
+        }
+        if (!try self.stateIsRepresented(state, published, admitted))
+            return error.HistoryFrontierMismatch;
+        try self.advanceBootProvenance(state);
+    }
+
+    /// Returns the oldest unacknowledged durable state, or null when caught
+    /// up. Snapshot V3 deliberately normalizes its transient result vector.
+    pub fn nextStaged(self: *Archive) !?registry.State {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const admitted = self.admitted orelse return error.HistoryFrontierUnprepared;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        if (published.slot == admitted.slot) return null;
+        if (published.slot == std.math.maxInt(u64)) return error.HistoryOutboxCorrupt;
+        const state = try self.loadStagedState(published.slot + 1);
+        const previous = self.publish_frontier orelse return error.HistoryOutboxCorrupt;
+        try self.validateSuccessor(&previous, &state, false);
+        self.ready = state;
+        return state;
+    }
+
+    /// Publishes the oldest staged state. No mutex is held across any shared
+    /// archive operation; the cadence thread can continue filling the bounded
+    /// trusted outbox while the shared filesystem is wedged.
+    pub fn recordApplied(self: *Archive, state: *const registry.State) !RecordStatus {
+        try self.validateState(state);
+        const context = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.inflight != null) return error.HistoryAckRequired;
+            const published = self.published orelse return error.HistoryFrontierUnprepared;
+            if (published.slot == std.math.maxInt(u64) or state.head.slot != published.slot + 1)
+                return error.HistoryOutboxSequence;
+            const staged = self.ready orelse return error.HistoryStagedStateNotLoaded;
+            if (!sameDurableState(&staged, state)) return error.HistoryOutboxStateMismatch;
+            const previous = self.publish_frontier orelse return error.HistoryOutboxCorrupt;
+            break :blk .{
+                .previous = previous,
+                .prior_assertion = self.publish_assertion,
+                .fenced_pending = self.fenced_pending,
+                .published = published,
+            };
+        };
+        try self.validateSuccessor(&context.previous, state, false);
+
+        const record: LedgerRecord = .{
+            .network_id = self.network_id,
+            .header = state.head,
+            .value = state.last_value.?,
+        };
+        var ledger_buf: [ledger_max_bytes]u8 = undefined;
+        const ledger = record.encode(&ledger_buf);
+        var ledger_name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeImmutable(self.ledgers_dir, ledgerName(record.header.hash, &ledger_name_buf), ledger);
+        try self.sync_directory(self.ledgers_dir);
+
+        const anchor_slot = expectedAnchor(state.head.slot, self.checkpoint_every);
+        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        var anchor_head_hash: [32]u8 = undefined;
+        var anchor_snapshot_hash: [32]u8 = undefined;
+        if (anchor_slot == state.head.slot) {
+            const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+            anchor_head_hash = state.head.hash;
+            anchor_snapshot_hash = hash(snapshot);
+            if (context.fenced_pending) |pending| {
+                if (pending.slot != state.head.slot or
+                    pending.anchor_every != self.checkpoint_every or
+                    pending.anchor_slot != state.head.slot or
+                    !std.mem.eql(u8, &pending.head_hash, &state.head.hash) or
+                    !std.mem.eql(u8, &pending.anchor_head_hash, &anchor_head_hash) or
+                    !std.mem.eql(u8, &pending.snapshot_hash, &anchor_snapshot_hash))
+                    return error.SigningFenceCorrupt;
+            }
+            var snapshot_name_buf: [max_name_bytes]u8 = undefined;
+            try self.writeImmutable(
+                self.snapshots_dir,
+                snapshotName(anchor_snapshot_hash, &snapshot_name_buf),
+                snapshot,
+            );
+            try self.sync_directory(self.snapshots_dir);
+        } else if (context.fenced_pending) |pending| {
+            if (pending.slot != state.head.slot or
+                !std.mem.eql(u8, &pending.head_hash, &state.head.hash) or
+                pending.anchor_every != self.checkpoint_every or
+                pending.anchor_slot != anchor_slot)
+                return error.SigningFenceCorrupt;
+            anchor_head_hash = pending.anchor_head_hash;
+            anchor_snapshot_hash = pending.snapshot_hash;
+        } else if (context.prior_assertion) |prior| {
+            if (prior.anchor_every != self.checkpoint_every or prior.anchor_slot != anchor_slot)
+                return error.HistoryAnchorInvalid;
+            anchor_head_hash = prior.anchor_head_hash;
+            anchor_snapshot_hash = prior.snapshot_hash;
+        } else {
+            try self.setInflight(context.published, state, null);
+            return .not_due;
+        }
+
+        const assertion: Assertion = context.fenced_pending orelse .{
             .network_id = self.network_id,
             .slot = state.head.slot,
             .head_hash = state.head.hash,
-            .snapshot_hash = hash(snapshot),
+            .anchor_every = @intCast(self.checkpoint_every),
+            .anchor_slot = anchor_slot,
+            .anchor_head_hash = anchor_head_hash,
+            .snapshot_hash = anchor_snapshot_hash,
         };
+        const recovered = (try self.recoverAssertion(assertion)) orelse
+            return error.HistoryChainUnavailable;
+        // `state` came from durable Snapshot V3 outbox bytes, which omit the
+        // transient result vector. Admission already compared those results
+        // before persistence; publication compares only durable semantics.
+        if (!sameRecoveredState(&recovered.state, state, false))
+            return error.HistoryTransitionInvalid;
+
         const vote = Vote{
             .assertion = assertion,
             .signer = self.signer_id,
@@ -279,32 +613,577 @@ pub const Archive = struct {
         };
         var vote_buf: [vote_bytes]u8 = undefined;
         encodeVote(vote, &vote_buf);
-
-        // The trusted local files are the crash fence: no vote is published
-        // until both the per-slot decision and the monotonic high-water mark
-        // have reached stable storage.
         self.fence(vote, &vote_buf) catch |err| switch (err) {
             error.SigningFenceCorrupt,
             error.SigningEquivocation,
             error.SigningRollback,
             => |semantic| return semantic,
-            // The same OS error can arise from trusted local custody or the
-            // hostile shared archive. Preserve that boundary explicitly so
-            // the process fails closed only when its signing fence could not
-            // be durably advanced.
             else => return error.SigningFenceUnavailable,
         };
 
-        var snapshot_name_buf: [max_name_bytes]u8 = undefined;
-        try self.writeImmutable(self.snapshots_dir, snapshotName(assertion.snapshot_hash, &snapshot_name_buf), snapshot);
-        try self.sync_directory(self.snapshots_dir);
         var vote_name_buf: [max_name_bytes]u8 = undefined;
         try self.writeImmutable(self.votes_dir, voteName(assertion.digest(), self.signer_id, &vote_name_buf), &vote_buf);
         try self.sync_directory(self.votes_dir);
         var latest_name_buf: [max_name_bytes]u8 = undefined;
         try self.writeAtomic(self.latest_dir, latestName(self.signer_id, &latest_name_buf), &vote_buf);
         try self.sync_directory(self.latest_dir);
-        return if (try self.isCertified(assertion)) .certified else .published;
+        const status: RecordStatus = if (try self.isCertified(assertion)) .certified else .published;
+        try self.setInflight(context.published, state, assertion);
+        return status;
+    }
+
+    /// Commits publication locally before deleting the staged object. Calling
+    /// it twice for the same already-acknowledged slot is idempotent.
+    pub fn ackStaged(self: *Archive, slot: u64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const published = self.published orelse return error.HistoryFrontierUnprepared;
+        if (slot == published.slot and self.inflight == null) return;
+        if (published.slot == std.math.maxInt(u64) or slot != published.slot + 1)
+            return error.HistoryOutboxSequence;
+        const inflight = self.inflight orelse return error.HistoryNotPublished;
+        if (inflight.state.head.slot != slot) return error.HistoryOutboxSequence;
+
+        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        const snapshot = registry.writeSnapshot(&inflight.state, &snapshot_buf);
+        var frontier_name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeTrustedImmutableFixed(
+            self.outbox_dir,
+            frontierName(inflight.state.head.hash, &frontier_name_buf),
+            snapshot,
+        );
+        try self.sync_directory(self.outbox_dir);
+        const next: Watermark = .{ .slot = slot, .head_hash = inflight.state.head.hash };
+        try self.writeWatermark("published", next);
+        try self.sync_directory(self.outbox_dir);
+
+        var staged_name_buf: [max_name_bytes]u8 = undefined;
+        self.outbox_dir.deleteFile(self.io, stagedName(slot, &staged_name_buf)) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.HistoryOutboxUnavailable,
+        };
+        try self.sync_directory(self.outbox_dir);
+        self.published = next;
+        self.publish_frontier = inflight.state;
+        if (inflight.assertion) |assertion| self.publish_assertion = assertion;
+        if (self.fenced_pending) |pending| {
+            if (pending.slot == slot) self.fenced_pending = null;
+        }
+        self.ready = null;
+        self.inflight = null;
+    }
+
+    fn loadPolicyAndWatermarks(self: *Archive) !void {
+        var policy_buf: [policy_bytes]u8 = undefined;
+        const raw = self.readTrustedFixed(self.signing_dir, "policy", &policy_buf) catch |err| switch (err) {
+            error.FileNotFound => {
+                if ((self.readBootProvenance() catch return error.HistoryOutboxCorrupt) != null)
+                    return error.HistoryOutboxCorrupt;
+                return;
+            },
+            else => return error.HistoryPolicyCorrupt,
+        };
+        const policy = decodePolicy(raw) orelse return error.HistoryPolicyCorrupt;
+        if (!std.mem.eql(u8, &policy.network_id, &self.network_id) or
+            policy.genesis_close_time != self.genesis_close_time or
+            policy.anchor_every != self.checkpoint_every)
+            return error.HistoryPolicyMismatch;
+        self.policy_initialized = true;
+        self.activation = policy.activation;
+        self.admitted = self.readWatermark("admitted") catch return error.HistoryOutboxCorrupt;
+        self.published = self.readWatermark("published") catch return error.HistoryOutboxCorrupt;
+        self.adoption_pending = self.readWatermark("adoption") catch return error.HistoryOutboxCorrupt;
+        self.boot_provenance = self.readBootProvenance() catch return error.HistoryOutboxCorrupt;
+        const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        _ = self.loadFrontierState(policy.activation) catch return error.HistoryOutboxCorrupt;
+        if (published.slot > admitted.slot) return error.HistoryOutboxCorrupt;
+        if (self.adoption_pending) |target| {
+            if (!adoptionWatermarksReachable(target, published, admitted))
+                return error.HistoryOutboxCorrupt;
+        }
+        if (admitted.slot - published.slot > max_backlog and self.adoption_pending == null)
+            return error.HistoryOutboxCorrupt;
+        if (self.boot_provenance) |trusted| {
+            if (trusted.slot < policy.activation.slot) return error.HistoryOutboxCorrupt;
+            _ = self.loadRepresentedState(trusted, published, admitted) catch
+                return error.HistoryOutboxCorrupt;
+            if (self.adoption_pending) |target| {
+                if (trusted.slot > target.slot or
+                    (trusted.slot == target.slot and !sameWatermark(trusted, target)))
+                    return error.HistoryOutboxCorrupt;
+            }
+        }
+    }
+
+    fn initializePolicy(self: *Archive, base: *const registry.State) !void {
+        const initial: Watermark = .{ .slot = base.head.slot, .head_hash = base.head.hash };
+        const old_admitted = try self.readWatermark("admitted");
+        const old_published = try self.readWatermark("published");
+        inline for (.{ old_admitted, old_published }) |old| if (old) |watermark| {
+            if (!sameWatermark(watermark, initial)) return error.HistoryActivationMismatch;
+        };
+
+        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        const snapshot = registry.writeSnapshot(base, &snapshot_buf);
+        var frontier_name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeTrustedImmutableFixed(
+            self.outbox_dir,
+            frontierName(base.head.hash, &frontier_name_buf),
+            snapshot,
+        );
+        try self.sync_directory(self.outbox_dir);
+        try self.writeWatermark("admitted", initial);
+        try self.writeWatermark("published", initial);
+        try self.sync_directory(self.outbox_dir);
+
+        var policy_buf: [policy_bytes]u8 = undefined;
+        encodePolicy(.{
+            .network_id = self.network_id,
+            .genesis_close_time = self.genesis_close_time,
+            .anchor_every = @intCast(self.checkpoint_every),
+            .activation = initial,
+        }, &policy_buf);
+        try self.writeTrustedImmutableFixed(self.signing_dir, "policy", &policy_buf);
+        try self.sync_directory(self.signing_dir);
+        self.policy_initialized = true;
+        self.activation = initial;
+        self.adoption_pending = null;
+        self.boot_provenance = null;
+        self.admitted = initial;
+        self.published = initial;
+        self.stage_frontier = base.*;
+        self.publish_frontier = base.*;
+        self.ready = null;
+        try self.restorePublicationAssertions(initial, initial);
+    }
+
+    fn prepareExistingFrontier(self: *Archive, base: *const registry.State) !void {
+        var admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        var published = self.published orelse return error.HistoryOutboxCorrupt;
+
+        if (self.adoption_pending) |target| {
+            if (!adoptionWatermarksReachable(target, published, admitted))
+                return error.HistoryOutboxCorrupt;
+            var target_name_buf: [max_name_bytes]u8 = undefined;
+            const target_state = try self.loadOptionalTrustedState(frontierName(target.head_hash, &target_name_buf));
+            if (target_state == null) {
+                // `beginCertifiedAdoption` writes the trusted marker before
+                // materializing its frontier. A crash in that first window
+                // leaves both watermarks at the same old frontier and is the
+                // only safe case in which the marker can be aborted.
+                if (sameWatermark(admitted, published) and published.slot < target.slot) {
+                    try self.clearAdoptionMarker();
+                } else {
+                    return error.HistoryOutboxCorrupt;
+                }
+            } else if (!watermarkMatchesState(target, &target_state.?)) {
+                return error.HistoryOutboxCorrupt;
+            } else {
+                const trusted_target = target_state.?;
+                try self.finishCertifiedAdoption(target, &trusted_target);
+                admitted = target;
+                published = target;
+            }
+        }
+
+        var published_state = try self.loadFrontierState(published);
+        var staged_state = published_state;
+        var slot = published.slot;
+        while (slot < admitted.slot) {
+            slot += 1;
+            const next = try self.loadStagedState(slot);
+            try self.validateSuccessor(&staged_state, &next, false);
+            staged_state = next;
+        }
+
+        var represented = sameDurableState(base, &staged_state) or
+            sameDurableState(base, &published_state);
+        if (!represented and base.head.slot > published.slot and base.head.slot <= admitted.slot) {
+            const pending = try self.loadStagedState(base.head.slot);
+            represented = sameDurableState(base, &pending);
+        }
+        if (!represented and base.head.slot <= published.slot) {
+            var name_buf: [max_name_bytes]u8 = undefined;
+            const ancestor = self.loadTrustedState(frontierName(base.head.hash, &name_buf)) catch null;
+            if (ancestor) |state| represented = sameDurableState(base, &state);
+        }
+        if (!represented) {
+            const proof = self.recovered_proof orelse return error.HistoryFrontierMismatch;
+            if (admitted.slot != published.slot or
+                proof.recovery.state.head.slot <= published.slot or
+                !sameDurableState(base, &proof.recovery.state))
+                return error.HistoryFrontierMismatch;
+            const target: Watermark = .{ .slot = base.head.slot, .head_hash = base.head.hash };
+            try self.beginCertifiedAdoption(target, base);
+            admitted = target;
+            published = target;
+            published_state = base.*;
+            staged_state = base.*;
+        }
+
+        self.admitted = admitted;
+        self.published = published;
+        self.stage_frontier = staged_state;
+        self.publish_frontier = published_state;
+        self.ready = null;
+        try self.restorePublicationAssertions(published, admitted);
+    }
+
+    fn preparedBaseIsRepresented(
+        self: *Archive,
+        base: *const registry.State,
+        published: Watermark,
+        admitted: Watermark,
+    ) !bool {
+        if (base.head.slot > published.slot and base.head.slot <= admitted.slot) {
+            const pending = try self.loadStagedState(base.head.slot);
+            return sameDurableState(base, &pending);
+        }
+        if (base.head.slot <= published.slot) {
+            var name_buf: [max_name_bytes]u8 = undefined;
+            const ancestor = self.loadTrustedState(frontierName(base.head.hash, &name_buf)) catch return false;
+            return sameDurableState(base, &ancestor);
+        }
+        return false;
+    }
+
+    fn beginCertifiedAdoption(self: *Archive, target: Watermark, state: *const registry.State) !void {
+        var marker_buf: [watermark_bytes]u8 = undefined;
+        encodeWatermark(self.network_id, target, &marker_buf);
+        try self.writeTrustedImmutableFixed(self.outbox_dir, "adoption", &marker_buf);
+        try self.sync_directory(self.outbox_dir);
+        self.adoption_pending = target;
+        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+        var name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeTrustedImmutableFixed(self.outbox_dir, frontierName(target.head_hash, &name_buf), snapshot);
+        try self.sync_directory(self.outbox_dir);
+        try self.finishCertifiedAdoption(target, state);
+    }
+
+    fn finishCertifiedAdoption(self: *Archive, target: Watermark, state: *const registry.State) !void {
+        const admitted = self.admitted orelse return error.HistoryOutboxCorrupt;
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        if (!watermarkMatchesState(target, state) or
+            !adoptionWatermarksReachable(target, published, admitted))
+            return error.HistoryOutboxCorrupt;
+        var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        const snapshot = registry.writeSnapshot(state, &snapshot_buf);
+        var name_buf: [max_name_bytes]u8 = undefined;
+        try self.writeTrustedImmutableFixed(self.outbox_dir, frontierName(target.head_hash, &name_buf), snapshot);
+        try self.sync_directory(self.outbox_dir);
+        try self.writeWatermark("admitted", target);
+        try self.sync_directory(self.outbox_dir);
+        try self.writeWatermark("published", target);
+        try self.sync_directory(self.outbox_dir);
+    }
+
+    fn clearAdoptionMarker(self: *Archive) !void {
+        self.outbox_dir.deleteFile(self.io, "adoption") catch |err| switch (err) {
+            error.FileNotFound => return error.HistoryOutboxCorrupt,
+            else => return error.HistoryOutboxUnavailable,
+        };
+        try self.sync_directory(self.outbox_dir);
+        self.adoption_pending = null;
+    }
+
+    fn restorePublicationAssertions(self: *Archive, published: Watermark, admitted: Watermark) !void {
+        self.publish_assertion = null;
+        self.fenced_pending = null;
+        if (self.recovered_proof) |proof| {
+            if (watermarkMatchesState(published, &proof.recovery.state) and
+                proof.assertion.anchor_every == self.checkpoint_every)
+                self.publish_assertion = proof.assertion;
+        }
+        const high = try self.readTrustedVote(self.signing_dir, "high-water.vote");
+        if (high) |vote| {
+            if (vote.assertion.slot <= published.slot and
+                vote.assertion.anchor_every == self.checkpoint_every and
+                expectedAnchor(published.slot +| 1, self.checkpoint_every) == vote.assertion.anchor_slot)
+                self.publish_assertion = vote.assertion
+            else if (published.slot != std.math.maxInt(u64) and
+                vote.assertion.slot == published.slot + 1 and
+                vote.assertion.slot <= admitted.slot)
+            {
+                if (vote.assertion.anchor_every != self.checkpoint_every)
+                    return error.SigningFenceCorrupt;
+                const staged = try self.loadStagedState(vote.assertion.slot);
+                if (!std.mem.eql(u8, &staged.head.hash, &vote.assertion.head_hash))
+                    return error.SigningFenceCorrupt;
+                self.fenced_pending = vote.assertion;
+            } else if (vote.assertion.slot > published.slot) {
+                return error.SigningFenceCorrupt;
+            }
+        }
+    }
+
+    fn setInflight(self: *Archive, expected: Watermark, state: *const registry.State, assertion: ?Assertion) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const published = self.published orelse return error.HistoryOutboxCorrupt;
+        if (!sameWatermark(published, expected) or self.inflight != null)
+            return error.HistoryPublisherRace;
+        self.inflight = .{ .state = state.*, .assertion = assertion };
+    }
+
+    fn validateState(self: *const Archive, state: *const registry.State) !void {
+        if (state.n_accounts > registry.max_accounts or
+            state.n_names > registry.max_names or
+            state.last_count > registry.max_txs or
+            (state.last_value != null and state.last_value.?.txs.count > registry.max_txs))
+            return error.InvalidAppliedState;
+        if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
+            !std.mem.eql(u8, &state.head.state_root, &state.stateRoot()) or
+            !std.mem.eql(u8, &state.head.hash, &registry.headerHash(state.network_id, &state.head)) or
+            !registry.closeTimeAtSlotOk(self.genesis_close_time, state.head.slot, state.head.close_time) or
+            !hasExactLastValue(state))
+            return error.InvalidAppliedState;
+        if (state.head.slot == 0) {
+            const genesis = registry.State.genesis(self.network_id, self.genesis_close_time);
+            if (!sameDurableState(&genesis, state)) return error.InvalidGenesisState;
+        } else if (state.head.slot == std.math.maxInt(u64)) {
+            return error.CheckpointSlotOverflow;
+        }
+    }
+
+    fn validateSuccessor(
+        self: *const Archive,
+        previous: *const registry.State,
+        state: *const registry.State,
+        compare_results: bool,
+    ) !void {
+        try self.validateState(previous);
+        try self.validateState(state);
+        if (previous.head.slot == std.math.maxInt(u64) or
+            state.head.slot != previous.head.slot + 1 or
+            !std.mem.eql(u8, &state.head.prev_hash, &previous.head.hash))
+            return error.HistoryTransitionInvalid;
+        const value = state.last_value orelse return error.InvalidAppliedState;
+        if (registry.validate(previous, &value, state.head.slot) != .valid)
+            return error.HistoryTransitionInvalid;
+        var rebuilt = previous.*;
+        registry.apply(&rebuilt, &value);
+        if (!sameRecoveredState(&rebuilt, state, compare_results))
+            return error.HistoryTransitionInvalid;
+    }
+
+    fn loadStagedState(self: *Archive, slot: u64) !registry.State {
+        var name_buf: [max_name_bytes]u8 = undefined;
+        return self.loadTrustedState(stagedName(slot, &name_buf));
+    }
+
+    fn loadFrontierState(self: *Archive, watermark: Watermark) !registry.State {
+        var name_buf: [max_name_bytes]u8 = undefined;
+        const state = try self.loadTrustedState(frontierName(watermark.head_hash, &name_buf));
+        if (!watermarkMatchesState(watermark, &state)) return error.HistoryOutboxCorrupt;
+        return state;
+    }
+
+    fn loadRepresentedState(
+        self: *Archive,
+        watermark: Watermark,
+        published: Watermark,
+        admitted: Watermark,
+    ) !registry.State {
+        if (watermark.slot > admitted.slot) return error.HistoryOutboxCorrupt;
+        const state = if (watermark.slot > published.slot)
+            try self.loadStagedState(watermark.slot)
+        else
+            try self.loadFrontierState(watermark);
+        if (!watermarkMatchesState(watermark, &state)) return error.HistoryOutboxCorrupt;
+        return state;
+    }
+
+    fn stateIsRepresented(
+        self: *Archive,
+        state: *const registry.State,
+        published: Watermark,
+        admitted: Watermark,
+    ) !bool {
+        if (state.head.slot > admitted.slot) return false;
+        if (state.head.slot > published.slot) {
+            const staged = try self.loadStagedState(state.head.slot);
+            return sameDurableState(&staged, state);
+        }
+        var name_buf: [max_name_bytes]u8 = undefined;
+        const represented = (try self.loadOptionalTrustedState(frontierName(state.head.hash, &name_buf))) orelse
+            return false;
+        return sameDurableState(&represented, state);
+    }
+
+    fn advanceBootProvenance(self: *Archive, state: *const registry.State) !void {
+        const next: Watermark = .{ .slot = state.head.slot, .head_hash = state.head.hash };
+        if (self.boot_provenance) |current| {
+            if (next.slot < current.slot) return error.HistoryBootProvenanceRollback;
+            if (next.slot == current.slot) {
+                if (!sameWatermark(next, current)) return error.HistoryBootProvenanceConflict;
+                // A previous attempt can leave the atomic rename visible but
+                // fail before its directory barrier. Re-establish that barrier
+                // before a caller may clear the certified-adoption marker.
+                try self.sync_directory(self.outbox_dir);
+                return;
+            }
+        }
+        try self.writeBootProvenance(next);
+        try self.sync_directory(self.outbox_dir);
+        self.boot_provenance = next;
+    }
+
+    fn loadTrustedState(self: *Archive, name: []const u8) !registry.State {
+        return (try self.loadOptionalTrustedState(name)) orelse return error.HistoryOutboxCorrupt;
+    }
+
+    fn loadOptionalTrustedState(self: *Archive, name: []const u8) !?registry.State {
+        var buf: [registry.snapshot_max_bytes]u8 = undefined;
+        const raw = self.readTrustedFixed(self.outbox_dir, name, &buf) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return error.HistoryOutboxCorrupt,
+        };
+        const state = registry.readSnapshot(raw) orelse return error.HistoryOutboxCorrupt;
+        self.validateState(&state) catch return error.HistoryOutboxCorrupt;
+        return state;
+    }
+
+    fn readWatermark(self: *Archive, name: []const u8) !?Watermark {
+        var buf: [watermark_bytes]u8 = undefined;
+        const raw = self.readTrustedFixed(self.outbox_dir, name, &buf) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return error.HistoryOutboxCorrupt,
+        };
+        return decodeWatermark(raw, self.network_id) orelse return error.HistoryOutboxCorrupt;
+    }
+
+    fn writeWatermark(self: *Archive, name: []const u8, watermark: Watermark) !void {
+        var buf: [watermark_bytes]u8 = undefined;
+        encodeWatermark(self.network_id, watermark, &buf);
+        try self.writeAtomic(self.outbox_dir, name, &buf);
+    }
+
+    fn readBootProvenance(self: *Archive) !?Watermark {
+        var buf: [boot_provenance_bytes]u8 = undefined;
+        const raw = self.readTrustedFixed(self.outbox_dir, boot_provenance_name, &buf) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return error.HistoryOutboxCorrupt,
+        };
+        return decodeBootProvenance(raw, self.network_id) orelse return error.HistoryOutboxCorrupt;
+    }
+
+    fn writeBootProvenance(self: *Archive, watermark: Watermark) !void {
+        var buf: [boot_provenance_bytes]u8 = undefined;
+        encodeBootProvenance(self.network_id, watermark, &buf);
+        try self.writeAtomic(self.outbox_dir, boot_provenance_name, &buf);
+    }
+
+    fn readTrustedFixed(self: *Archive, dir: std.Io.Dir, name: []const u8, out: []u8) ![]const u8 {
+        if (comptime !durabilitySupported(builtin.os.tag))
+            return error.UnsupportedHistoryDurability;
+        var flags: std.posix.O = .{ .ACCMODE = .RDONLY };
+        flags.NONBLOCK = true;
+        flags.NOFOLLOW = true;
+        if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+        if (@hasField(std.posix.O, "RESOLVE_BENEATH")) flags.RESOLVE_BENEATH = true;
+        const fd = try std.posix.openat(dir.handle, name, flags, 0);
+        var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        var off: usize = 0;
+        while (off < out.len) {
+            const n = try std.posix.read(fd, out[off..]);
+            if (n == 0) return out[0..off];
+            off += n;
+        }
+        var extra: [1]u8 = undefined;
+        if (try std.posix.read(fd, &extra) != 0) return error.StreamTooLong;
+        return out;
+    }
+
+    fn writeTrustedImmutableFixed(self: *Archive, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+        var old_buf: [registry.snapshot_max_bytes]u8 = undefined;
+        if (self.readTrustedFixed(dir, name, old_buf[0..@min(old_buf.len, bytes.len)])) |old| {
+            if (!std.mem.eql(u8, old, bytes)) return error.ImmutableFileConflict;
+            return;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.StreamTooLong, error.SymLinkLoop, error.IsDir, error.NotRegularFile => return error.ImmutableFileConflict,
+            else => return err,
+        }
+
+        var temp_buf: [max_name_bytes + 21]u8 = undefined;
+        const temp = self.tempName(name, &temp_buf);
+        var file = try dir.createFile(self.io, temp, .{ .exclusive = true, .resolve_beneath = true });
+        var file_open = true;
+        var temp_exists = true;
+        defer if (file_open) file.close(self.io);
+        defer if (temp_exists) dir.deleteFile(self.io, temp) catch {};
+        try file.writeStreamingAll(self.io, bytes);
+        try self.sync_file(self.io, file);
+        dir.renamePreserve(temp, dir, name, self.io) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const old = try self.readTrustedFixed(dir, name, old_buf[0..@min(old_buf.len, bytes.len)]);
+                if (!std.mem.eql(u8, old, bytes)) return error.ImmutableFileConflict;
+                return;
+            },
+            else => return err,
+        };
+        temp_exists = false;
+        try self.sync_file(self.io, file);
+        file.close(self.io);
+        file_open = false;
+    }
+
+    fn recoverAssertion(self: *Archive, assertion: Assertion) !?Recovery {
+        if (!self.validAssertion(assertion)) return null;
+        var current = (try self.loadLedger(assertion.head_hash)) orelse return null;
+        if (!recordMatchesAssertion(&current, assertion)) return error.CertifiedHistoryInvalid;
+
+        var replay_hashes: [63][32]u8 = undefined;
+        var replay_count: usize = 0;
+        while (current.header.slot > assertion.anchor_slot) {
+            if (replay_count == replay_hashes.len) return error.CertifiedHistoryInvalid;
+            replay_hashes[replay_count] = current.header.hash;
+            replay_count += 1;
+            const child = current;
+            current = (try self.loadLedger(child.header.prev_hash)) orelse return null;
+            if (current.header.slot == std.math.maxInt(u64) or
+                current.header.slot + 1 != child.header.slot or
+                !std.mem.eql(u8, &current.header.hash, &child.header.prev_hash))
+                return error.HistoryTransitionInvalid;
+        }
+        if (current.header.slot != assertion.anchor_slot or
+            !std.mem.eql(u8, &current.header.hash, &assertion.anchor_head_hash))
+            return error.CertifiedHistoryInvalid;
+
+        var state = (try self.loadAnchorSnapshot(assertion)) orelse return null;
+        if (!std.meta.eql(state.head, current.header) or
+            state.last_value == null or
+            !sameLedgerValue(&state.last_value.?, &current.value))
+            return error.CertifiedHistoryInvalid;
+        try self.validateState(&state);
+
+        var i = replay_count;
+        while (i > 0) {
+            i -= 1;
+            const next = (try self.loadLedger(replay_hashes[i])) orelse return null;
+            if (next.header.slot != state.head.slot + 1 or
+                !std.mem.eql(u8, &next.header.prev_hash, &state.head.hash))
+                return error.HistoryTransitionInvalid;
+            if (registry.validate(&state, &next.value, next.header.slot) != .valid)
+                return error.HistoryTransitionInvalid;
+            registry.apply(&state, &next.value);
+            if (!std.meta.eql(state.head, next.header) or
+                state.last_value == null or
+                !sameLedgerValue(&state.last_value.?, &next.value))
+                return error.HistoryTransitionInvalid;
+        }
+        if (!std.mem.eql(u8, &state.head.hash, &assertion.head_hash))
+            return error.CertifiedHistoryInvalid;
+        return .{
+            .state = state,
+            .anchor_slot = assertion.anchor_slot,
+            .replayed_ledgers = @intCast(replay_count),
+        };
     }
 
     fn fence(self: *Archive, vote: Vote, bytes: *const [vote_bytes]u8) !void {
@@ -364,7 +1243,7 @@ pub const Archive = struct {
         return satisfied >= quorum.threshold;
     }
 
-    fn loadSnapshot(self: *Archive, assertion: Assertion) !?registry.State {
+    fn loadAnchorSnapshot(self: *Archive, assertion: Assertion) !?registry.State {
         var name_buf: [max_name_bytes]u8 = undefined;
         const name = snapshotName(assertion.snapshot_hash, &name_buf);
         const raw = try self.readUntrusted(self.snapshots_dir, name, registry.snapshot_max_bytes);
@@ -373,13 +1252,44 @@ pub const Archive = struct {
         if (!std.mem.eql(u8, &hash(bytes), &assertion.snapshot_hash)) return null;
         const state = registry.readSnapshot(bytes) orelse return null;
         if (!std.mem.eql(u8, &state.network_id, &self.network_id) or
-            state.head.slot != assertion.slot or
-            !std.mem.eql(u8, &state.head.hash, &assertion.head_hash)) return null;
+            state.head.slot != assertion.anchor_slot or
+            !std.mem.eql(u8, &state.head.hash, &assertion.anchor_head_hash)) return null;
         // Every external checkpoint must carry the exact value needed as the
         // next slot's previous-value context. Pre-E2c snapshots cannot supply
         // that value and are therefore never eligible for import.
         if (!hasExactLastValue(&state)) return null;
         return state;
+    }
+
+    // Kept as an internal test seam while the E2c adversarial snapshot cases
+    // are expressed in terms of the new anchor-bearing assertion.
+    fn loadSnapshot(self: *Archive, assertion: Assertion) !?registry.State {
+        return self.loadAnchorSnapshot(assertion);
+    }
+
+    fn loadLedger(self: *Archive, head_hash: [32]u8) !?LedgerRecord {
+        var name_buf: [max_name_bytes]u8 = undefined;
+        const raw = try self.readUntrusted(
+            self.ledgers_dir,
+            ledgerName(head_hash, &name_buf),
+            ledger_max_bytes,
+        );
+        defer if (raw) |bytes| self.gpa.free(bytes);
+        const record = LedgerRecord.decode(raw orelse return null) orelse return null;
+        if (!std.mem.eql(u8, &record.network_id, &self.network_id) or
+            !std.mem.eql(u8, &record.header.hash, &head_hash)) return null;
+        return record;
+    }
+
+    fn validAssertion(self: *const Archive, assertion: Assertion) bool {
+        return std.mem.eql(u8, &assertion.network_id, &self.network_id) and
+            assertion.slot > 0 and
+            assertion.slot < std.math.maxInt(u64) and
+            assertion.anchor_every > 0 and assertion.anchor_every <= 64 and
+            assertion.anchor_slot == expectedAnchor(assertion.slot, assertion.anchor_every) and
+            !allZero(&assertion.head_hash) and
+            !allZero(&assertion.anchor_head_hash) and
+            !allZero(&assertion.snapshot_hash);
     }
 
     fn validVote(self: *const Archive, vote: *const Vote) bool {
@@ -388,9 +1298,7 @@ pub const Archive = struct {
         // flattened validator list), while trusted reads require
         // self.signer_id. Re-scanning the quorum tree here would turn
         // certificate verification from O(V) into O(V^2).
-        return std.mem.eql(u8, &vote.assertion.network_id, &self.network_id) and
-            vote.assertion.slot > 0 and
-            vote.assertion.slot < std.math.maxInt(u64) and
+        return self.validAssertion(vote.assertion) and
             slcp.core.crypto.verify(vote.signer, vote.assertion.digest(), vote.signature);
     }
 
@@ -619,10 +1527,209 @@ fn fullSync(io: std.Io, file: std.Io.File) !void {
     }
 }
 
+const Policy = struct {
+    network_id: [32]u8,
+    genesis_close_time: u64,
+    anchor_every: u8,
+    activation: Watermark,
+};
+
+fn encodePolicy(policy: Policy, out: *[policy_bytes]u8) void {
+    var off: usize = 0;
+    @memcpy(out[off..][0..policy_magic.len], policy_magic);
+    off += policy_magic.len;
+    @memcpy(out[off..][0..32], &policy.network_id);
+    off += 32;
+    std.mem.writeInt(u64, out[off..][0..8], policy.genesis_close_time, .big);
+    off += 8;
+    out[off] = policy.anchor_every;
+    off += 1;
+    std.mem.writeInt(u64, out[off..][0..8], policy.activation.slot, .big);
+    off += 8;
+    @memcpy(out[off..][0..32], &policy.activation.head_hash);
+    off += 32;
+    const checksum = hash(out[0..off]);
+    @memcpy(out[off..][0..32], &checksum);
+}
+
+fn decodePolicy(bytes: []const u8) ?Policy {
+    if (bytes.len != policy_bytes or !std.mem.eql(u8, bytes[0..policy_magic.len], policy_magic))
+        return null;
+    const body_end = bytes.len - 32;
+    if (!std.mem.eql(u8, &hash(bytes[0..body_end]), bytes[body_end..])) return null;
+    var off: usize = policy_magic.len;
+    const network_id = bytes[off..][0..32].*;
+    off += 32;
+    const genesis_close_time = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
+    const anchor_every = bytes[off];
+    off += 1;
+    if (anchor_every == 0 or anchor_every > 64) return null;
+    const activation_slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
+    const activation_head_hash = bytes[off..][0..32].*;
+    if (allZero(&activation_head_hash)) return null;
+    return .{
+        .network_id = network_id,
+        .genesis_close_time = genesis_close_time,
+        .anchor_every = anchor_every,
+        .activation = .{ .slot = activation_slot, .head_hash = activation_head_hash },
+    };
+}
+
+fn encodeWatermark(network_id: [32]u8, watermark: Watermark, out: *[watermark_bytes]u8) void {
+    var off: usize = 0;
+    @memcpy(out[off..][0..watermark_magic.len], watermark_magic);
+    off += watermark_magic.len;
+    @memcpy(out[off..][0..32], &network_id);
+    off += 32;
+    std.mem.writeInt(u64, out[off..][0..8], watermark.slot, .big);
+    off += 8;
+    @memcpy(out[off..][0..32], &watermark.head_hash);
+    off += 32;
+    const checksum = hash(out[0..off]);
+    @memcpy(out[off..][0..32], &checksum);
+}
+
+fn decodeWatermark(bytes: []const u8, network_id: [32]u8) ?Watermark {
+    if (bytes.len != watermark_bytes or
+        !std.mem.eql(u8, bytes[0..watermark_magic.len], watermark_magic))
+        return null;
+    const body_end = bytes.len - 32;
+    if (!std.mem.eql(u8, &hash(bytes[0..body_end]), bytes[body_end..])) return null;
+    var off: usize = watermark_magic.len;
+    if (!std.mem.eql(u8, bytes[off..][0..32], &network_id)) return null;
+    off += 32;
+    const slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
+    const head_hash = bytes[off..][0..32].*;
+    if (allZero(&head_hash)) return null;
+    return .{ .slot = slot, .head_hash = head_hash };
+}
+
+fn encodeBootProvenance(
+    network_id: [32]u8,
+    watermark: Watermark,
+    out: *[boot_provenance_bytes]u8,
+) void {
+    var off: usize = 0;
+    @memcpy(out[off..][0..boot_provenance_magic.len], boot_provenance_magic);
+    off += boot_provenance_magic.len;
+    @memcpy(out[off..][0..32], &network_id);
+    off += 32;
+    std.mem.writeInt(u64, out[off..][0..8], watermark.slot, .big);
+    off += 8;
+    @memcpy(out[off..][0..32], &watermark.head_hash);
+    off += 32;
+    const checksum = hash(out[0..off]);
+    @memcpy(out[off..][0..32], &checksum);
+}
+
+fn decodeBootProvenance(bytes: []const u8, network_id: [32]u8) ?Watermark {
+    if (bytes.len != boot_provenance_bytes or
+        !std.mem.eql(u8, bytes[0..boot_provenance_magic.len], boot_provenance_magic))
+        return null;
+    const body_end = bytes.len - 32;
+    if (!std.mem.eql(u8, &hash(bytes[0..body_end]), bytes[body_end..])) return null;
+    var off: usize = boot_provenance_magic.len;
+    if (!std.mem.eql(u8, bytes[off..][0..32], &network_id)) return null;
+    off += 32;
+    const slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
+    const head_hash = bytes[off..][0..32].*;
+    if (allZero(&head_hash)) return null;
+    return .{ .slot = slot, .head_hash = head_hash };
+}
+
+const LedgerRecord = struct {
+    network_id: [32]u8,
+    header: registry.Header,
+    value: registry.LedgerValue,
+
+    fn encode(self: *const LedgerRecord, out: []u8) []u8 {
+        std.debug.assert(out.len >= ledger_max_bytes);
+        var off: usize = 0;
+        @memcpy(out[off..][0..ledger_magic.len], ledger_magic);
+        off += ledger_magic.len;
+        @memcpy(out[off..][0..32], &self.network_id);
+        off += 32;
+        std.mem.writeInt(u64, out[off..][0..8], self.header.slot, .big);
+        off += 8;
+        std.mem.writeInt(u64, out[off..][0..8], self.header.close_time, .big);
+        off += 8;
+        inline for (.{ &self.header.hash, &self.header.prev_hash, &self.header.txset_hash, &self.header.state_root }) |field| {
+            @memcpy(out[off..][0..32], field);
+            off += 32;
+        }
+        var value_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+        const value = self.value.encode(&value_buf);
+        std.mem.writeInt(u16, out[off..][0..2], @intCast(value.len), .big);
+        off += 2;
+        @memcpy(out[off..][0..value.len], value);
+        off += value.len;
+        const checksum = hash(out[0..off]);
+        @memcpy(out[off..][0..32], &checksum);
+        off += 32;
+        return out[0..off];
+    }
+
+    fn decode(bytes: []const u8) ?LedgerRecord {
+        if (bytes.len < ledger_fixed_bytes + valueMinimumBytes() + 32 or
+            bytes.len > ledger_max_bytes or
+            !std.mem.eql(u8, bytes[0..ledger_magic.len], ledger_magic))
+            return null;
+        const body_end = bytes.len - 32;
+        if (!std.mem.eql(u8, &hash(bytes[0..body_end]), bytes[body_end..])) return null;
+
+        var off: usize = ledger_magic.len;
+        const network_id = bytes[off..][0..32].*;
+        off += 32;
+        var header: registry.Header = .{};
+        header.slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+        off += 8;
+        header.close_time = std.mem.readInt(u64, bytes[off..][0..8], .big);
+        off += 8;
+        header.hash = bytes[off..][0..32].*;
+        off += 32;
+        header.prev_hash = bytes[off..][0..32].*;
+        off += 32;
+        header.txset_hash = bytes[off..][0..32].*;
+        off += 32;
+        header.state_root = bytes[off..][0..32].*;
+        off += 32;
+        if (body_end < off + 2) return null;
+        const value_len: usize = std.mem.readInt(u16, bytes[off..][0..2], .big);
+        off += 2;
+        if (value_len > registry.max_ledger_value_bytes or body_end != off + value_len)
+            return null;
+        const value_bytes = bytes[off..body_end];
+        const value = registry.LedgerValue.decode(value_bytes) orelse return null;
+        var canonical_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+        if (!std.mem.eql(u8, value.encode(&canonical_buf), value_bytes)) return null;
+        if (header.slot == 0 or
+            value.close_time != header.close_time or
+            !std.mem.eql(u8, &header.txset_hash, &value.txs.hash()) or
+            !std.mem.eql(u8, &header.hash, &registry.headerHash(network_id, &header)))
+            return null;
+        return .{
+            .network_id = network_id,
+            .header = header,
+            .value = value,
+        };
+    }
+};
+
+fn valueMinimumBytes() usize {
+    return registry.value_magic.len + 8 + 1;
+}
+
 const Assertion = struct {
     network_id: [32]u8,
     slot: u64,
     head_hash: [32]u8,
+    anchor_every: u8 = 1,
+    anchor_slot: u64 = 0,
+    anchor_head_hash: [32]u8 = @splat(0),
     snapshot_hash: [32]u8,
 
     fn digest(self: Assertion) [32]u8 {
@@ -648,6 +1755,12 @@ fn encodeAssertion(assertion: Assertion, out: *[assertion_bytes]u8) void {
     off += 8;
     @memcpy(out[off..][0..32], &assertion.head_hash);
     off += 32;
+    out[off] = assertion.anchor_every;
+    off += 1;
+    std.mem.writeInt(u64, out[off..][0..8], assertion.anchor_slot, .big);
+    off += 8;
+    @memcpy(out[off..][0..32], &assertion.anchor_head_hash);
+    off += 32;
     @memcpy(out[off..][0..32], &assertion.snapshot_hash);
 }
 
@@ -666,10 +1779,24 @@ fn decodeVote(bytes: []const u8) ?Vote {
     off += 8;
     const head_hash = bytes[off..][0..32].*;
     off += 32;
+    const anchor_every = bytes[off];
+    off += 1;
+    const anchor_slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    off += 8;
+    const anchor_head_hash = bytes[off..][0..32].*;
+    off += 32;
     const snapshot_hash = bytes[off..][0..32].*;
     off += 32;
     return .{
-        .assertion = .{ .network_id = network_id, .slot = slot, .head_hash = head_hash, .snapshot_hash = snapshot_hash },
+        .assertion = .{
+            .network_id = network_id,
+            .slot = slot,
+            .head_hash = head_hash,
+            .anchor_every = anchor_every,
+            .anchor_slot = anchor_slot,
+            .anchor_head_hash = anchor_head_hash,
+            .snapshot_hash = snapshot_hash,
+        },
         .signer = bytes[off..][0..32].*,
         .signature = bytes[off + 32 ..][0..64].*,
     };
@@ -679,13 +1806,84 @@ fn sameAssertion(a: Assertion, b: Assertion) bool {
     return a.slot == b.slot and
         std.mem.eql(u8, &a.network_id, &b.network_id) and
         std.mem.eql(u8, &a.head_hash, &b.head_hash) and
+        a.anchor_every == b.anchor_every and
+        a.anchor_slot == b.anchor_slot and
+        std.mem.eql(u8, &a.anchor_head_hash, &b.anchor_head_hash) and
         std.mem.eql(u8, &a.snapshot_hash, &b.snapshot_hash);
+}
+
+fn recordMatchesAssertion(record: *const LedgerRecord, assertion: Assertion) bool {
+    return record.header.slot == assertion.slot and
+        std.mem.eql(u8, &record.header.hash, &assertion.head_hash);
+}
+
+fn sameRecoveredState(a: *const registry.State, b: *const registry.State, compare_results: bool) bool {
+    const durable_equal = std.mem.eql(u8, &a.network_id, &b.network_id) and
+        std.meta.eql(a.head, b.head) and
+        std.mem.eql(u8, &a.stateRoot(), &b.stateRoot()) and
+        a.last_value != null and b.last_value != null and
+        sameLedgerValue(&a.last_value.?, &b.last_value.?);
+    if (!durable_equal) return false;
+    // Snapshot V3 intentionally normalizes an anchor's transient result
+    // vector to empty. Once at least one ledger is replayed, `apply` rebuilds
+    // the tip's semantic results and they must match the offered state too.
+    return !compare_results or
+        (a.last_count == b.last_count and
+            std.mem.eql(u8, std.mem.sliceAsBytes(a.lastResults()), std.mem.sliceAsBytes(b.lastResults())));
+}
+
+fn sameDurableState(a: *const registry.State, b: *const registry.State) bool {
+    if (!std.mem.eql(u8, &a.network_id, &b.network_id) or
+        !std.meta.eql(a.head, b.head) or
+        a.n_accounts != b.n_accounts or a.n_names != b.n_names or
+        !std.mem.eql(u8, std.mem.sliceAsBytes(a.accountsSlice()), std.mem.sliceAsBytes(b.accountsSlice())) or
+        !std.mem.eql(u8, std.mem.sliceAsBytes(a.namesSlice()), std.mem.sliceAsBytes(b.namesSlice())))
+        return false;
+    if (a.last_value == null or b.last_value == null)
+        return a.last_value == null and b.last_value == null;
+    return sameLedgerValue(&a.last_value.?, &b.last_value.?);
+}
+
+fn expectedAnchor(slot: u64, anchor_every: u64) u64 {
+    std.debug.assert(slot > 0 and anchor_every > 0 and anchor_every <= 64);
+    if (slot < anchor_every) return 1;
+    return slot - (slot % anchor_every);
+}
+
+fn sameWatermark(a: Watermark, b: Watermark) bool {
+    return a.slot == b.slot and std.mem.eql(u8, &a.head_hash, &b.head_hash);
+}
+
+fn adoptionWatermarksReachable(target: Watermark, published: Watermark, admitted: Watermark) bool {
+    // `beginCertifiedAdoption` starts only from a drained outbox, then writes
+    // admitted and published to `target` in that order. These are the only
+    // three states a crash can expose; accepting anything else could turn a
+    // stale trusted marker into a durable rollback.
+    return (sameWatermark(published, admitted) and published.slot < target.slot) or
+        (published.slot < target.slot and sameWatermark(admitted, target)) or
+        (sameWatermark(published, target) and sameWatermark(admitted, target));
+}
+
+fn watermarkMatchesState(watermark: Watermark, state: *const registry.State) bool {
+    return watermark.slot == state.head.slot and
+        std.mem.eql(u8, &watermark.head_hash, &state.head.hash);
+}
+
+fn sameLedgerValue(a: *const registry.LedgerValue, b: *const registry.LedgerValue) bool {
+    var a_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+    var b_buf: [registry.max_ledger_value_bytes]u8 = undefined;
+    return std.mem.eql(u8, a.encode(&a_buf), b.encode(&b_buf));
 }
 
 fn hash(bytes: []const u8) [32]u8 {
     var h = Sha256.init(.{});
     h.update(bytes);
     return h.finalResult();
+}
+
+fn allZero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
 }
 
 fn hasExactLastValue(state: *const registry.State) bool {
@@ -706,6 +1904,18 @@ fn collectValidators(gpa: std.mem.Allocator, quorum: *const slcp.core.qset.Quoru
 
 fn snapshotName(snapshot_hash: [32]u8, out: *[max_name_bytes]u8) []const u8 {
     return std.fmt.bufPrint(out, "{s}.snap", .{&registry.hex32(snapshot_hash)}) catch unreachable;
+}
+
+fn ledgerName(head_hash: [32]u8, out: *[max_name_bytes]u8) []const u8 {
+    return std.fmt.bufPrint(out, "{s}.ledger", .{&registry.hex32(head_hash)}) catch unreachable;
+}
+
+fn stagedName(slot: u64, out: *[max_name_bytes]u8) []const u8 {
+    return std.fmt.bufPrint(out, "staged-{d}.snap", .{slot}) catch unreachable;
+}
+
+fn frontierName(head_hash: [32]u8, out: *[max_name_bytes]u8) []const u8 {
+    return std.fmt.bufPrint(out, "frontier-{s}.snap", .{&registry.hex32(head_hash)}) catch unreachable;
 }
 
 fn voteName(candidate: [32]u8, signer: slcp.NodeId, out: *[max_name_bytes]u8) []const u8 {
@@ -739,15 +1949,18 @@ fn testNetworkId(passphrase: []const u8) [32]u8 {
     return registry.networkId(passphrase, test_genesis_close_time);
 }
 
-test "history checkpoint: V2 signing domain has a fixed digest and rejects V1 vote bytes" {
+test "history tip: V1 signing domain has a fixed digest and rejects checkpoint vote bytes" {
     const assertion: Assertion = .{
         .network_id = @splat(0x11),
         .slot = 0x0102030405060708,
         .head_hash = @splat(0x22),
-        .snapshot_hash = @splat(0x33),
+        .anchor_every = 8,
+        .anchor_slot = 0x1112131415161718,
+        .anchor_head_hash = @splat(0x33),
+        .snapshot_hash = @splat(0x44),
     };
     var expected: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&expected, "85c437499c76a987150ce38fca3098c8deb6571ebc72a710ec55cf6df2188028");
+    _ = try std.fmt.hexToBytes(&expected, "7a5b05b8413534374fb2aa98575938d466c513e0e533a0015070a8b6fe152da1");
     try testing.expectEqualSlices(u8, &expected, &assertion.digest());
 
     var encoded: [vote_bytes]u8 = undefined;
@@ -756,11 +1969,42 @@ test "history checkpoint: V2 signing domain has a fixed digest and rejects V1 vo
         .signer = @splat(0x44),
         .signature = @splat(0x55),
     }, &encoded);
-    try testing.expectEqualStrings("REGISTRY-CKPT-V2", encoded[0..tag.len]);
+    try testing.expectEqualStrings("REGISTRY-HIST-V1", encoded[0..tag.len]);
 
     var legacy = encoded;
-    @memcpy(legacy[0..tag.len], "REGISTRY-CKPT-V1");
+    @memcpy(legacy[0..tag.len], "REGISTRY-CKPT-V2");
     try testing.expect(decodeVote(&legacy) == null);
+}
+
+test "history ledger: V1 record is canonical and binds its full header and exact value" {
+    const network_id = testNetworkId("history ledger encoding");
+    const state = stateAt(network_id, 1);
+    const record: LedgerRecord = .{
+        .network_id = network_id,
+        .header = state.head,
+        .value = state.last_value.?,
+    };
+    var encoded_buf: [ledger_max_bytes + 1]u8 = undefined;
+    const encoded = record.encode(encoded_buf[0..ledger_max_bytes]);
+    const decoded = LedgerRecord.decode(encoded) orelse return error.ExpectedLedgerRecord;
+    try testing.expectEqualStrings(ledger_magic, encoded[0..ledger_magic.len]);
+    try testing.expectEqual(record.header, decoded.header);
+    try testing.expect(sameLedgerValue(&record.value, &decoded.value));
+
+    encoded_buf[encoded.len] = 0;
+    try testing.expect(LedgerRecord.decode(encoded_buf[0 .. encoded.len + 1]) == null);
+
+    var tampered = encoded_buf;
+    tampered[encoded.len - 1] ^= 1;
+    try testing.expect(LedgerRecord.decode(tampered[0..encoded.len]) == null);
+
+    tampered = encoded_buf;
+    const header_close_offset = ledger_magic.len + 32 + 8 + 32 + 32 + 8;
+    tampered[header_close_offset + 7] ^= 1;
+    const body_end = encoded.len - 32;
+    const repaired = hash(tampered[0..body_end]);
+    @memcpy(tampered[body_end..][0..32], &repaired);
+    try testing.expect(LedgerRecord.decode(tampered[0..encoded.len]) == null);
 }
 
 fn testPath(tmp: *std.testing.TmpDir, io: std.Io, suffix: []const u8, buf: []u8) ![]const u8 {
@@ -781,6 +2025,873 @@ fn applySet(state: *registry.State, set: *const registry.TxSet) void {
         .txs = set.*,
     };
     registry.apply(state, &value);
+}
+
+fn anchorAssertion(state: *const registry.State, snapshot: []const u8) Assertion {
+    return .{
+        .network_id = state.network_id,
+        .slot = state.head.slot,
+        .head_hash = state.head.hash,
+        .anchor_slot = state.head.slot,
+        .anchor_head_hash = state.head.hash,
+        .snapshot_hash = hash(snapshot),
+    };
+}
+
+fn recordAndAck(archive: *Archive, state: *const registry.State) !RecordStatus {
+    if (archive.stage_frontier == null) {
+        if (archive.policy_initialized) {
+            const published = archive.published orelse return error.HistoryOutboxCorrupt;
+            const durable = try archive.loadFrontierState(published);
+            try archive.prepareFrontier(&durable);
+        } else {
+            const genesis = registry.State.genesis(archive.network_id, archive.genesis_close_time);
+            try archive.prepareFrontier(&genesis);
+        }
+    }
+    try archive.stageApplied(state);
+    const staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    if (staged.head.slot != state.head.slot) return error.UnexpectedStagedState;
+    const status = try archive.recordApplied(&staged);
+    try archive.ackStaged(staged.head.slot);
+    return status;
+}
+
+test "history boot provenance: fresh activation is not independently trusted" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x41);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history untrusted fresh activation");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var archive = try Archive.open(gpa, io, cfg);
+    defer archive.deinit();
+
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    try archive.prepareFrontier(&genesis);
+    try archive.confirmInstalled(&genesis);
+    try testing.expect(!try archive.hasTrustedBootProvenance(&genesis));
+
+    const one = stateAt(network_id, 1);
+    try archive.stageApplied(&one);
+    try archive.confirmInstalled(&one);
+    try testing.expect(!try archive.hasTrustedBootProvenance(&one));
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    try testing.expect(!try archive.hasTrustedBootProvenance(&genesis));
+    try testing.expect(!try archive.hasTrustedBootProvenance(&one));
+}
+
+test "history boot provenance: certified install survives restart and advances on confirmation" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var writer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var reader_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const writer_path = try testPath(&tmp, io, "writer", &writer_buf);
+    const reader_path = try testPath(&tmp, io, "reader", &reader_buf);
+    const seed: [32]u8 = @splat(0x42);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history durable boot provenance");
+    const writer_cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = writer_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var reader_cfg = writer_cfg;
+    reader_cfg.signing_dir = reader_path;
+
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var tip = genesis;
+    var writer = try Archive.open(gpa, io, writer_cfg);
+    for (0..3) |_| {
+        applySet(&tip, &registry.TxSet.empty);
+        _ = try recordAndAck(&writer, &tip);
+    }
+    writer.deinit();
+
+    var reader = try Archive.open(gpa, io, reader_cfg);
+    try reader.prepareFrontier(&genesis);
+    const recovered = (try reader.recoverLatest(tip.head.slot)) orelse
+        return error.ExpectedCertifiedHistory;
+    try reader.prepareFrontier(&recovered.state);
+    try testing.expect(!try reader.hasTrustedBootProvenance(&recovered.state));
+    try reader.confirmInstalled(&recovered.state);
+    try testing.expect((try reader.pendingInstall()) == null);
+    try testing.expect(try reader.hasTrustedBootProvenance(&recovered.state));
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    try testing.expect(try reader.hasTrustedBootProvenance(&recovered.state));
+    try reader.prepareFrontier(&recovered.state);
+    var successor = recovered.state;
+    applySet(&successor, &registry.TxSet.empty);
+    try reader.stageApplied(&successor);
+    try testing.expect(try reader.hasTrustedBootProvenance(&recovered.state));
+    try testing.expect(!try reader.hasTrustedBootProvenance(&successor));
+    try reader.confirmInstalled(&successor);
+    try testing.expect(!try reader.hasTrustedBootProvenance(&recovered.state));
+    try testing.expect(try reader.hasTrustedBootProvenance(&successor));
+    try testing.expectError(
+        error.HistoryBootProvenanceRollback,
+        reader.confirmInstalled(&recovered.state),
+    );
+    var unrepresented = successor;
+    applySet(&unrepresented, &registry.TxSet.empty);
+    try testing.expectError(error.HistoryFrontierMismatch, reader.confirmInstalled(&unrepresented));
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    try testing.expect(try reader.hasTrustedBootProvenance(&successor));
+    try reader.prepareFrontier(&successor);
+    const staged = (try reader.nextStaged()) orelse return error.ExpectedStagedState;
+    _ = try reader.recordApplied(&staged);
+    try reader.ackStaged(staged.head.slot);
+    try testing.expect(try reader.hasTrustedBootProvenance(&successor));
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    defer reader.deinit();
+    try testing.expect(try reader.hasTrustedBootProvenance(&successor));
+}
+
+test "history boot provenance: exact certified activation becomes trusted only on confirmation" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var writer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var reader_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const writer_path = try testPath(&tmp, io, "writer", &writer_buf);
+    const reader_path = try testPath(&tmp, io, "reader", &reader_buf);
+    const seed: [32]u8 = @splat(0x43);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history exact certified activation provenance");
+    const writer_cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = writer_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var reader_cfg = writer_cfg;
+    reader_cfg.signing_dir = reader_path;
+
+    const one = stateAt(network_id, 1);
+    var writer = try Archive.open(gpa, io, writer_cfg);
+    _ = try recordAndAck(&writer, &one);
+    writer.deinit();
+
+    var reader = try Archive.open(gpa, io, reader_cfg);
+    try reader.prepareFrontier(&one);
+    try testing.expect(!try reader.hasTrustedBootProvenance(&one));
+    const recovered = (try reader.recoverLatest(1)) orelse
+        return error.ExpectedCertifiedHistory;
+    try reader.prepareFrontier(&recovered.state);
+    try testing.expect(!try reader.hasTrustedBootProvenance(&one));
+    try reader.confirmInstalled(&one);
+    try testing.expect(try reader.hasTrustedBootProvenance(&one));
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    defer reader.deinit();
+    try testing.expect(try reader.hasTrustedBootProvenance(&one));
+}
+
+test "history boot provenance: crash after provenance write retains an idempotent adoption" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var writer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var reader_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const writer_path = try testPath(&tmp, io, "writer", &writer_buf);
+    const reader_path = try testPath(&tmp, io, "reader", &reader_buf);
+    const seed: [32]u8 = @splat(0x44);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history boot provenance crash ordering");
+    const writer_cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = writer_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var reader_cfg = writer_cfg;
+    reader_cfg.signing_dir = reader_path;
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    const one = stateAt(network_id, 1);
+
+    var writer = try Archive.open(gpa, io, writer_cfg);
+    _ = try recordAndAck(&writer, &one);
+    writer.deinit();
+
+    var reader = try Archive.open(gpa, io, reader_cfg);
+    try reader.prepareFrontier(&genesis);
+    const recovered = (try reader.recoverLatest(1)) orelse
+        return error.ExpectedCertifiedHistory;
+    try reader.prepareFrontier(&recovered.state);
+    reader.sync_directory = TestDirSyncFault.sync;
+    {
+        TestDirSyncFault.target = reader.outbox_dir.handle;
+        defer TestDirSyncFault.target = null;
+        try testing.expectError(error.InjectedDirectorySyncFailure, reader.confirmInstalled(&one));
+    }
+    try testing.expect((try reader.pendingInstall()) != null);
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    try testing.expect(try reader.hasTrustedBootProvenance(&one));
+    try reader.prepareFrontier(&genesis);
+    try testing.expect((try reader.pendingInstall()) != null);
+
+    // The first failed confirmation left the provenance rename visible but
+    // without a successful directory barrier. A retry must re-establish that
+    // barrier before it can delete the adoption marker. Fail that retry, then
+    // model a crash that loses the earlier unbarriered provenance entry while
+    // retaining the marker state visible at the last successful barrier.
+    reader.sync_directory = TestDirSyncFault.sync;
+    {
+        TestDirSyncFault.target = reader.outbox_dir.handle;
+        defer TestDirSyncFault.target = null;
+        try testing.expectError(error.InjectedDirectorySyncFailure, reader.confirmInstalled(&one));
+    }
+    try reader.outbox_dir.deleteFile(io, boot_provenance_name);
+    reader.deinit();
+
+    reader = try Archive.open(gpa, io, reader_cfg);
+    defer reader.deinit();
+    try testing.expect(!try reader.hasTrustedBootProvenance(&one));
+    try testing.expect((try reader.pendingInstall()) != null);
+    try reader.prepareFrontier(&genesis);
+    try reader.confirmInstalled(&one);
+    try testing.expect((try reader.pendingInstall()) == null);
+    try testing.expect(try reader.hasTrustedBootProvenance(&one));
+}
+
+test "history boot provenance: corrupt or unrepresented trusted watermark fails closed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var malformed_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var unrepresented_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const malformed_path = try testPath(&tmp, io, "malformed", &malformed_buf);
+    const unrepresented_path = try testPath(&tmp, io, "unrepresented", &unrepresented_buf);
+    const seed: [32]u8 = @splat(0x45);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history corrupt boot provenance");
+    const base: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = malformed_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+
+    var archive = try Archive.open(gpa, io, base);
+    try archive.prepareFrontier(&genesis);
+    try overwriteTestFileAt(io, archive.outbox_dir, boot_provenance_name, "torn");
+    archive.deinit();
+    try testing.expectError(error.HistoryOutboxCorrupt, Archive.open(gpa, io, base));
+
+    var unrepresented_cfg = base;
+    unrepresented_cfg.signing_dir = unrepresented_path;
+    archive = try Archive.open(gpa, io, unrepresented_cfg);
+    try archive.prepareFrontier(&genesis);
+    var encoded: [boot_provenance_bytes]u8 = undefined;
+    encodeBootProvenance(network_id, .{ .slot = 1, .head_hash = @splat(0xa5) }, &encoded);
+    try overwriteTestFileAt(io, archive.outbox_dir, boot_provenance_name, &encoded);
+    archive.deinit();
+    try testing.expectError(error.HistoryOutboxCorrupt, Archive.open(gpa, io, unrepresented_cfg));
+}
+
+test "history adoption: stale lower marker cannot roll durable watermarks backward" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x46);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history stale adoption marker");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+
+    var archive = try Archive.open(gpa, io, cfg);
+    const one = stateAt(network_id, 1);
+    const two = stateAt(network_id, 2);
+    _ = try recordAndAck(&archive, &one);
+    _ = try recordAndAck(&archive, &two);
+    try archive.writeWatermark("adoption", .{ .slot = one.head.slot, .head_hash = one.head.hash });
+    try archive.sync_directory(archive.outbox_dir);
+    archive.deinit();
+
+    try testing.expectError(error.HistoryOutboxCorrupt, Archive.open(gpa, io, cfg));
+}
+
+test "history archive: certified per-ledger tip replays a long outage without a live peer" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_reader_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const sign_a_path = try testPath(&tmp, io, "sign-a", &sign_a_buf);
+    const sign_b_path = try testPath(&tmp, io, "sign-b", &sign_b_buf);
+    const sign_reader_path = try testPath(&tmp, io, "sign-reader", &sign_reader_buf);
+
+    const seeds = [3][32]u8{ @splat(0x31), @splat(0x32), @splat(0x33) };
+    const ids = [3]slcp.NodeId{
+        try slcp.core.crypto.publicKeyFromSeed(seeds[0]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[1]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
+    };
+    const quorum = slcp.Quorum.of(2, &ids);
+    const network_id = testNetworkId("history standalone replay");
+    const cfg_a: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = sign_a_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = quorum,
+        .signer_seed = seeds[0],
+        .checkpoint_every = 64,
+    };
+    var cfg_b = cfg_a;
+    cfg_b.signing_dir = sign_b_path;
+    cfg_b.signer_seed = seeds[1];
+
+    var a = try Archive.open(gpa, io, cfg_a);
+    defer a.deinit();
+    var b = try Archive.open(gpa, io, cfg_b);
+    defer b.deinit();
+
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    var slot_34_hash: [32]u8 = undefined;
+    for (1..36) |slot| {
+        applySet(&state, &registry.TxSet.empty);
+        if (slot == 34) slot_34_hash = state.head.hash;
+        _ = try recordAndAck(&a, &state);
+        _ = try recordAndAck(&b, &state);
+    }
+
+    var cfg_reader = cfg_a;
+    cfg_reader.signing_dir = sign_reader_path;
+    cfg_reader.signer_seed = seeds[2];
+    // Import geometry is signed by the writers, not imposed by this reader.
+    cfg_reader.checkpoint_every = 8;
+    var reader = try Archive.open(gpa, io, cfg_reader);
+    defer reader.deinit();
+
+    const recovered = (try reader.recoverLatest(35)) orelse return error.ExpectedCertifiedHistory;
+    try testing.expectEqual(@as(u64, 35), recovered.state.head.slot);
+    try testing.expectEqualSlices(u8, &state.head.hash, &recovered.state.head.hash);
+    try testing.expectEqual(@as(u64, 1), recovered.anchor_slot);
+    try testing.expectEqual(@as(u64, 34), recovered.replayed_ledgers);
+    try testing.expect(sameLedgerValue(&state.last_value.?, &recovered.state.last_value.?));
+
+    var ledger_name_buf: [max_name_bytes]u8 = undefined;
+    try overwriteTestFileAt(io, reader.ledgers_dir, ledgerName(slot_34_hash, &ledger_name_buf), "torn");
+    try testing.expect((try reader.recoverLatest(35)) == null);
+}
+
+test "history archive: every boundary is contiguous and replay remains bounded at sixty-four" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x35);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history max replay geometry");
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 64,
+    });
+    defer archive.deinit();
+
+    const one = stateAt(network_id, 1);
+    _ = try recordAndAck(&archive, &one);
+    const eight = stateAt(network_id, 8);
+    try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&eight));
+
+    var state = one;
+    for (2..128) |slot| {
+        applySet(&state, &registry.TxSet.empty);
+        try testing.expectEqual(@as(u64, slot), state.head.slot);
+        _ = try recordAndAck(&archive, &state);
+        if (slot == 63) {
+            const recovered = (try archive.recoverLatest(63)) orelse return error.ExpectedCertifiedHistory;
+            try testing.expectEqual(@as(u64, 1), recovered.anchor_slot);
+            try testing.expectEqual(@as(u64, 62), recovered.replayed_ledgers);
+        } else if (slot == 64) {
+            const recovered = (try archive.recoverLatest(64)) orelse return error.ExpectedCertifiedHistory;
+            try testing.expectEqual(@as(u64, 64), recovered.anchor_slot);
+            try testing.expectEqual(@as(u64, 0), recovered.replayed_ledgers);
+        } else if (slot == 127) {
+            const recovered = (try archive.recoverLatest(127)) orelse return error.ExpectedCertifiedHistory;
+            try testing.expectEqual(@as(u64, 64), recovered.anchor_slot);
+            try testing.expectEqual(@as(u64, 63), recovered.replayed_ledgers);
+        }
+    }
+}
+
+test "history archive: slot one must extend the configured canonical genesis" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x34);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history configured genesis");
+    const wrong_g = test_genesis_close_time - 1;
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = wrong_g,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    });
+    defer archive.deinit();
+    const wrong_genesis = registry.State.genesis(network_id, wrong_g);
+    try archive.prepareFrontier(&wrong_genesis);
+    const one = stateAt(network_id, 1);
+    try testing.expectError(error.HistoryTransitionInvalid, archive.stageApplied(&one));
+}
+
+test "history ledger: cadence is absent from canonical bytes and trusted policy is immutable" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_8_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_16_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const sign_8_path = try testPath(&tmp, io, "sign-8", &sign_8_buf);
+    const sign_16_path = try testPath(&tmp, io, "sign-16", &sign_16_buf);
+    const seed: [32]u8 = @splat(0x36);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history cadence-free ledger");
+    const base: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = sign_8_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var cfg_16 = base;
+    cfg_16.signing_dir = sign_16_path;
+    cfg_16.checkpoint_every = 16;
+    var a = try Archive.open(gpa, io, base);
+    defer a.deinit();
+    var b = try Archive.open(gpa, io, cfg_16);
+    defer b.deinit();
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    for (1..18) |_| {
+        applySet(&state, &registry.TxSet.empty);
+        _ = try recordAndAck(&a, &state);
+        _ = try recordAndAck(&b, &state);
+    }
+
+    // Reopening the same trusted signing tree with another cadence cannot
+    // reinterpret either its fence or its outbox.
+    a.deinit();
+    var mismatch = base;
+    mismatch.checkpoint_every = 16;
+    try testing.expectError(error.HistoryPolicyMismatch, Archive.open(gpa, io, mismatch));
+    mismatch = base;
+    mismatch.genesis_close_time -= 1;
+    try testing.expectError(error.HistoryPolicyMismatch, Archive.open(gpa, io, mismatch));
+    a = try Archive.open(gpa, io, base);
+}
+
+test "history outbox: restart accepts pending and published snapshot ancestors" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x37);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history outbox ancestors");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    const one = stateAt(network_id, 1);
+    const two = stateAt(network_id, 2);
+
+    var archive = try Archive.open(gpa, io, cfg);
+    try archive.prepareFrontier(&genesis);
+    try archive.stageApplied(&one);
+    try archive.stageApplied(&two);
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    try archive.prepareFrontier(&one); // ordinary snapshot at P+1
+    try archive.stageApplied(&one); // journal re-delivery is exact/idempotent
+    try archive.stageApplied(&two);
+    const pending_one = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    _ = try recordAndAck(&archive, &pending_one);
+    const pending_two = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    _ = try recordAndAck(&archive, &pending_two);
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    try archive.prepareFrontier(&genesis); // local snapshot lags published P+2
+    try archive.stageApplied(&one);
+    try archive.stageApplied(&two);
+    archive.deinit();
+}
+
+test "history outbox: missing trusted pending state and backlog overflow fail closed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x38);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history outbox corruption");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 64,
+    };
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    var archive = try Archive.open(gpa, io, cfg);
+    try archive.prepareFrontier(&genesis);
+    var state = genesis;
+    for (1..65) |_| {
+        applySet(&state, &registry.TxSet.empty);
+        try archive.stageApplied(&state);
+    }
+    applySet(&state, &registry.TxSet.empty);
+    try testing.expectError(error.HistoryBacklogFull, archive.stageApplied(&state));
+    var name_buf: [max_name_bytes]u8 = undefined;
+    try archive.outbox_dir.deleteFile(io, stagedName(34, &name_buf));
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    defer archive.deinit();
+    try testing.expectError(error.HistoryOutboxCorrupt, archive.prepareFrontier(&genesis));
+}
+
+test "history archive: recordApplied validates the immediate predecessor at an anchor" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x39);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history anchor predecessor");
+    var archive = try Archive.open(gpa, io, .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    });
+    defer archive.deinit();
+    for (1..8) |slot| {
+        const state = stateAt(network_id, slot);
+        _ = try recordAndAck(&archive, &state);
+    }
+    const eight = stateAt(network_id, 8);
+    try archive.stageApplied(&eight);
+    _ = try archive.nextStaged();
+    // This private-seam corruption models an implementation that tries to
+    // treat slot 8 as an independent snapshot reset. Publication must still
+    // reject it before signing.
+    archive.publish_frontier = stateAt(network_id, 6);
+    try testing.expectError(error.HistoryTransitionInvalid, archive.recordApplied(&eight));
+}
+
+test "history outbox: a fenced pending non-anchor is retried identically after restart" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x3a);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history fenced pending retry");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    const one = stateAt(network_id, 1);
+    const two = stateAt(network_id, 2);
+    var archive = try Archive.open(gpa, io, cfg);
+    _ = try recordAndAck(&archive, &one);
+    try archive.stageApplied(&two);
+    const pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&pending));
+    const fenced = (try archive.readTrustedVote(archive.signing_dir, "high-water.vote")) orelse
+        return error.ExpectedSigningFence;
+    var name_buf: [max_name_bytes]u8 = undefined;
+    try archive.votes_dir.deleteFile(io, voteName(fenced.assertion.digest(), id, &name_buf));
+    try archive.latest_dir.deleteFile(io, latestName(id, &name_buf));
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    defer archive.deinit();
+    try archive.prepareFrontier(&one);
+    const retry = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&retry));
+    try archive.ackStaged(2);
+    try testing.expectEqual(@as(u64, 2), (try archive.recoverLatest(2)).?.state.head.slot);
+}
+
+test "history outbox: transaction results are validated before admission but not persisted" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const signing_path = try testPath(&tmp, io, "signing", &signing_buf);
+    const seed: [32]u8 = @splat(0x3e);
+    const id = try slcp.core.crypto.publicKeyFromSeed(seed);
+    const network_id = testNetworkId("history transient outbox results");
+    const cfg: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = signing_path,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(1, &.{id}),
+        .signer_seed = seed,
+        .checkpoint_every = 8,
+    };
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    applySet(&state, &registry.TxSet.empty);
+    var archive = try Archive.open(gpa, io, cfg);
+    _ = try recordAndAck(&archive, &state);
+
+    var tx = registry.Tx.init(id, 1, .claim, "durable", "", registry.zero_key).?;
+    try tx.sign(seed, network_id);
+    var set: registry.TxSet = .{ .count = 1 };
+    set.txs[0] = tx;
+    applySet(&state, &set);
+    try testing.expectEqual(@as(u8, 1), state.last_count);
+    try archive.stageApplied(&state);
+    archive.deinit();
+
+    archive = try Archive.open(gpa, io, cfg);
+    defer archive.deinit();
+    const one = stateAt(network_id, 1);
+    try archive.prepareFrontier(&one);
+    const staged = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    try testing.expectEqual(@as(u8, 0), staged.last_count);
+    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&staged));
+    try archive.ackStaged(2);
+    const recovered = (try archive.recoverLatest(2)) orelse return error.ExpectedCertifiedHistory;
+    try testing.expectEqual(@as(u8, 1), recovered.state.last_count);
+    try testing.expectEqual(registry.Result.ok, recovered.state.lastResults()[0]);
+}
+
+test "history outbox: drain may be followed by adoption of newer certified history" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var sign_c_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try testPath(&tmp, io, "archive", &archive_buf);
+    const sign_a = try testPath(&tmp, io, "sign-a", &sign_a_buf);
+    const sign_b = try testPath(&tmp, io, "sign-b", &sign_b_buf);
+    const sign_c = try testPath(&tmp, io, "sign-c", &sign_c_buf);
+    const seeds = [3][32]u8{ @splat(0x3b), @splat(0x3c), @splat(0x3d) };
+    const ids = [3]slcp.NodeId{
+        try slcp.core.crypto.publicKeyFromSeed(seeds[0]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[1]),
+        try slcp.core.crypto.publicKeyFromSeed(seeds[2]),
+    };
+    const network_id = testNetworkId("history adopt after drain");
+    const base: Config = .{
+        .archive_dir = archive_path,
+        .signing_dir = sign_a,
+        .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
+        .quorum = slcp.Quorum.of(2, &ids),
+        .signer_seed = seeds[0],
+        .checkpoint_every = 8,
+    };
+    var cfg_b = base;
+    cfg_b.signing_dir = sign_b;
+    cfg_b.signer_seed = seeds[1];
+    var cfg_c = base;
+    cfg_c.signing_dir = sign_c;
+    cfg_c.signer_seed = seeds[2];
+    var a = try Archive.open(gpa, io, base);
+    defer a.deinit();
+    var b = try Archive.open(gpa, io, cfg_b);
+    defer b.deinit();
+    var c = try Archive.open(gpa, io, cfg_c);
+    defer c.deinit();
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    try a.prepareFrontier(&genesis);
+    const one = stateAt(network_id, 1);
+    const two = stateAt(network_id, 2);
+    try a.stageApplied(&one);
+    try a.stageApplied(&two);
+
+    var remote = genesis;
+    for (1..6) |_| {
+        applySet(&remote, &registry.TxSet.empty);
+        _ = try recordAndAck(&b, &remote);
+        _ = try recordAndAck(&c, &remote);
+    }
+    while (try a.nextStaged()) |pending| {
+        _ = try a.recordApplied(&pending);
+        try a.ackStaged(pending.head.slot);
+    }
+    const recovered = (try a.recoverLatest(5)) orelse return error.ExpectedCertifiedHistory;
+    try testing.expectEqual(@as(u64, 5), recovered.state.head.slot);
+    try a.prepareFrontier(&recovered.state);
+    try testing.expect((try a.nextStaged()) == null);
+    try a.confirmInstalled(&recovered.state);
+
+    // Advance the remote certificate again, then model a crash after the
+    // adoption marker and admitted watermark but before published advances.
+    for (6..8) |_| {
+        applySet(&remote, &registry.TxSet.empty);
+        _ = try recordAndAck(&b, &remote);
+        _ = try recordAndAck(&c, &remote);
+    }
+    const seven = (try a.recoverLatest(7)) orelse return error.ExpectedCertifiedHistory;
+    const target: Watermark = .{ .slot = seven.state.head.slot, .head_hash = seven.state.head.hash };
+    try a.writeWatermark("adoption", target);
+    try a.sync_directory(a.outbox_dir);
+    var adopted_snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
+    const adopted_snapshot = registry.writeSnapshot(&seven.state, &adopted_snapshot_buf);
+    var adopted_name_buf: [max_name_bytes]u8 = undefined;
+    try a.writeTrustedImmutableFixed(
+        a.outbox_dir,
+        frontierName(target.head_hash, &adopted_name_buf),
+        adopted_snapshot,
+    );
+    try a.sync_directory(a.outbox_dir);
+    try a.writeWatermark("admitted", target);
+    try a.sync_directory(a.outbox_dir);
+    applySet(&remote, &registry.TxSet.empty); // latest proof U advances beyond marker T
+    _ = try recordAndAck(&b, &remote);
+    _ = try recordAndAck(&c, &remote);
+    a.deinit();
+
+    a = try Archive.open(gpa, io, base);
+    const newer = (try a.recoverLatest(8)) orelse return error.ExpectedCertifiedHistory;
+    try a.prepareFrontier(&recovered.state); // represented local snapshot at 5
+    try testing.expectEqual(@as(u64, 7), a.published.?.slot);
+    try testing.expectEqual(@as(u64, 7), (try a.pendingInstall()).?.head.slot);
+    const eight = stateAt(network_id, 8);
+    try testing.expectError(error.HistoryAdoptionNotInstalled, a.stageApplied(&eight));
+    try a.confirmInstalled(&seven.state);
+    try a.prepareFrontier(&newer.state);
+    try a.confirmInstalled(&newer.state);
+    const nine = stateAt(network_id, 9);
+    try a.stageApplied(&nine);
+    try testing.expectEqual(@as(u64, 9), (try a.nextStaged()).?.head.slot);
 }
 
 fn overwriteTestFileAt(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
@@ -815,7 +2926,7 @@ test "history archive: crash-safe directory barriers have an explicit platform b
     try testing.expect(!durabilitySupported(.freebsd));
 }
 
-test "history archive: checkpoint cadence defaults to eight and is bounded by the answering window" {
+test "history archive: anchor cadence defaults to eight and is bounded at sixty-four" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -831,6 +2942,7 @@ test "history archive: checkpoint cadence defaults to eight and is bounded by th
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
     };
@@ -838,16 +2950,18 @@ test "history archive: checkpoint cadence defaults to eight and is bounded by th
     var zero = base;
     zero.checkpoint_every = 0;
     try testing.expectError(error.BadCheckpointInterval, Archive.open(gpa, io, zero));
-    var seventeen = base;
-    seventeen.checkpoint_every = 17;
-    try testing.expectError(error.BadCheckpointInterval, Archive.open(gpa, io, seventeen));
+    var sixty_five = base;
+    sixty_five.checkpoint_every = 65;
+    try testing.expectError(error.BadCheckpointInterval, Archive.open(gpa, io, sixty_five));
 
     var archive = try Archive.open(gpa, io, base);
     defer archive.deinit();
     const one = stateAt(network_id, 1);
-    try testing.expectEqual(RecordStatus.not_due, try archive.recordApplied(&one));
-    const eight = stateAt(network_id, 8);
-    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&eight));
+    try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &one));
+    for (2..9) |slot| {
+        const state = stateAt(network_id, slot);
+        try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &state));
+    }
 }
 
 test "history archive: recordApplied requires the exact last ledger value time and transaction hash" {
@@ -866,6 +2980,7 @@ test "history archive: recordApplied requires the exact last ledger value time a
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -899,10 +3014,10 @@ test "history archive: recordApplied requires the exact last ledger value time a
     ).?;
     try testing.expectError(error.InvalidAppliedState, archive.recordApplied(&wrong_txs));
 
-    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&canonical));
+    try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &canonical));
 }
 
-test "history archive: a persistently blocked checkpoint does not pin the signing fence" {
+test "history archive: a blocked anchor remains the oldest durable outbox item" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -919,28 +3034,30 @@ test "history archive: a persistently blocked checkpoint does not pin the signin
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 8,
     });
     defer archive.deinit();
 
+    const one = stateAt(network_id, 1);
+    _ = try recordAndAck(&archive, &one);
+    for (2..8) |slot| {
+        const state = stateAt(network_id, slot);
+        _ = try recordAndAck(&archive, &state);
+    }
     const eight = stateAt(network_id, 8);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&eight, &snapshot_buf);
     var name_buf: [max_name_bytes]u8 = undefined;
     const name = snapshotName(hash(snapshot), &name_buf);
     try overwriteTestFileAt(io, archive.snapshots_dir, name, "hostile immutable occupant");
+    try archive.stageApplied(&eight);
+    _ = try archive.nextStaged();
     try testing.expectError(error.ImmutableFileConflict, archive.recordApplied(&eight));
-
-    // Slot 8 is durably fenced even though its shared publication can never
-    // succeed. Advancing to slot 16 remains safe and must restore this
-    // validator's archive availability.
-    const sixteen = stateAt(network_id, 16);
-    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&sixteen));
-    const restored = (try archive.loadLatest(16)) orelse return error.ExpectedCertifiedCheckpoint;
-    try testing.expectEqual(@as(u64, 16), restored.head.slot);
-    try testing.expectEqualSlices(u8, &sixteen.head.hash, &restored.head.hash);
+    const pending = (try archive.nextStaged()) orelse return error.ExpectedStagedState;
+    try testing.expectEqual(@as(u64, 8), pending.head.slot);
 }
 
 test "history archive: trusted signing custody must not overlap the untrusted archive" {
@@ -977,6 +3094,7 @@ test "history archive: trusted signing custody must not overlap the untrusted ar
             .archive_dir = paths[0],
             .signing_dir = paths[1],
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = quorum,
             .signer_seed = seed,
         })) |opened| {
@@ -1029,6 +3147,7 @@ test "history archive: the untrusted archive must be disjoint from the entire pr
             .signing_dir = signing_path,
             .private_data_root_dir = private_data_root,
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = slcp.Quorum.of(1, &.{id}),
             .signer_seed = seed,
         })) |opened| {
@@ -1072,6 +3191,7 @@ test "history archive: the untrusted archive may share a parent with, but cannot
         .signing_dir = signing_path,
         .private_key_parent_dir = key_parent,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
     }));
@@ -1087,6 +3207,7 @@ test "history archive: the untrusted archive may share a parent with, but cannot
         .signing_dir = safe_signing,
         .private_key_parent_dir = tmp.dir,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
     });
@@ -1120,24 +3241,26 @@ test "history archive: a flat 2-of-3 checkpoint needs two distinct validator sig
         .archive_dir = archive_path,
         .signing_dir = sign_a_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = quorum,
         .signer_seed = seeds[0],
         .checkpoint_every = 1,
     });
     defer a.deinit();
-    try testing.expectEqual(RecordStatus.published, try a.recordApplied(&state));
+    try testing.expectEqual(RecordStatus.published, try recordAndAck(&a, &state));
     try testing.expect((try a.loadLatest(1)) == null);
 
     var b = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = sign_b_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = quorum,
         .signer_seed = seeds[1],
         .checkpoint_every = 1,
     });
     defer b.deinit();
-    try testing.expectEqual(RecordStatus.certified, try b.recordApplied(&state));
+    try testing.expectEqual(RecordStatus.certified, try recordAndAck(&b, &state));
 
     const restored = (try a.loadLatest(1)) orelse return error.ExpectedCertifiedCheckpoint;
     try testing.expectEqual(@as(u64, 1), restored.head.slot);
@@ -1170,19 +3293,19 @@ test "history archive: nested quorum satisfaction is not a flat signer count" {
     const network_id = testNetworkId("history nested quorum");
     const state = stateAt(network_id, 1);
 
-    var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
+    var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer a.deinit();
-    var b = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_b_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
+    var b = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_b_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
     defer b.deinit();
-    var c = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_c_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[2], .checkpoint_every = 1 });
+    var c = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_c_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[2], .checkpoint_every = 1 });
     defer c.deinit();
 
-    _ = try a.recordApplied(&state);
-    _ = try b.recordApplied(&state);
+    _ = try recordAndAck(&a, &state);
+    _ = try recordAndAck(&b, &state);
     // Two flat signatures are not enough: the second root member is the
     // inner 2-of-2 set, which B alone does not satisfy.
     try testing.expect((try a.loadLatest(1)) == null);
-    _ = try c.recordApplied(&state);
+    _ = try recordAndAck(&c, &state);
     try testing.expectEqual(@as(u64, 1), (try a.loadLatest(1)).?.head.slot);
 }
 
@@ -1211,13 +3334,16 @@ test "history archive: candidate discovery fails closed beyond its linear-work c
             .archive_dir = archive_path,
             .signing_dir = signing_path,
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = quorum,
             .signer_seed = seed,
             .checkpoint_every = 1,
         });
         defer writer.deinit();
+        const base = stateAt(network_id, i);
+        try writer.prepareFrontier(&base);
         const state = stateAt(network_id, i + 1);
-        try testing.expectEqual(RecordStatus.published, try writer.recordApplied(&state));
+        try testing.expectEqual(RecordStatus.published, try recordAndAck(&writer, &state));
     }
 
     var reader_signing_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1226,6 +3352,7 @@ test "history archive: candidate discovery fails closed beyond its linear-work c
         .archive_dir = archive_path,
         .signing_dir = reader_signing,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = quorum,
         .signer_seed = seeds[0],
         .checkpoint_every = 1,
@@ -1250,13 +3377,17 @@ test "history archive: bootstrap floor prevents rollback to an older valid check
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    const state = stateAt(network_id, 3);
-    _ = try archive.recordApplied(&state);
+    var state = registry.State.genesis(network_id, test_genesis_close_time);
+    for (1..4) |slot| {
+        state = stateAt(network_id, slot);
+        _ = try recordAndAck(&archive, &state);
+    }
     try testing.expect((try archive.loadLatest(4)) == null);
     try testing.expectEqual(@as(u64, 3), (try archive.loadLatest(3)).?.head.slot);
 }
@@ -1277,6 +3408,7 @@ test "history archive: durable signing fences reject same-slot equivocation and 
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -1284,12 +3416,13 @@ test "history archive: durable signing fences reject same-slot equivocation and 
     defer archive.deinit();
 
     const one = stateAt(network_id, 1);
-    _ = try archive.recordApplied(&one);
+    _ = try recordAndAck(&archive, &one);
     archive.deinit();
     archive = try Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -1301,11 +3434,11 @@ test "history archive: durable signing fences reject same-slot equivocation and 
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
     applySet(&conflicting, &set);
-    try testing.expectError(error.SigningEquivocation, archive.recordApplied(&conflicting));
+    try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&conflicting));
 
     const two = stateAt(network_id, 2);
-    _ = try archive.recordApplied(&two);
-    try testing.expectError(error.SigningRollback, archive.recordApplied(&one));
+    _ = try recordAndAck(&archive, &two);
+    try testing.expectError(error.HistoryOutboxSequence, archive.recordApplied(&one));
 }
 
 test "history archive: duplicate, outsider, and misnamed votes do not satisfy 2-of-3" {
@@ -1329,31 +3462,27 @@ test "history archive: duplicate, outsider, and misnamed votes do not satisfy 2-
     };
     const network_id = testNetworkId("history distinct signers");
     const quorum = slcp.Quorum.of(2, &ids);
-    var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
+    var a = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer a.deinit();
-    var a_copy = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_copy_path, .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
+    var a_copy = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_a_copy_path, .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer a_copy.deinit();
     try testing.expectError(error.SignerNotInQuorum, Archive.open(gpa, io, .{
         .archive_dir = archive_path,
         .signing_dir = sign_x_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = quorum,
         .signer_seed = seeds[3],
         .checkpoint_every = 1,
     }));
     const state = stateAt(network_id, 1);
-    _ = try a.recordApplied(&state);
-    _ = try a_copy.recordApplied(&state);
+    _ = try recordAndAck(&a, &state);
+    _ = try recordAndAck(&a_copy, &state);
     try testing.expect((try a.loadLatest(1)) == null);
 
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
-    const assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = state.head.slot,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(snapshot),
-    };
+    const assertion = anchorAssertion(&state, snapshot);
     const outsider_id = try slcp.core.crypto.publicKeyFromSeed(seeds[3]);
     const outsider_vote: Vote = .{
         .assertion = assertion,
@@ -1395,13 +3524,14 @@ test "history archive: snapshot hash and signed network/head bind imported state
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
     const state = stateAt(network_id, 1);
-    _ = try archive.recordApplied(&state);
+    _ = try recordAndAck(&archive, &state);
 
     // Replace the object with a different snapshot that is internally
     // canonical and self-consistent. Its checksum, state root and head all
@@ -1430,6 +3560,8 @@ test "history archive: snapshot hash and signed network/head bind imported state
         .network_id = testNetworkId("foreign assertion network"),
         .slot = 1,
         .head_hash = state.head.hash,
+        .anchor_slot = 1,
+        .anchor_head_hash = state.head.hash,
         .snapshot_hash = hash(original),
     };
     const foreign_vote = Vote{
@@ -1442,12 +3574,7 @@ test "history archive: snapshot hash and signed network/head bind imported state
     try archive.writeAtomic(archive.latest_dir, latest_name, &hostile_buf);
     try testing.expect((try archive.loadLatest(1)) == null);
 
-    const correct_assertion = Assertion{
-        .network_id = network_id,
-        .slot = 1,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(original),
-    };
+    const correct_assertion = anchorAssertion(&state, original);
     var bad_signature = Vote{
         .assertion = correct_assertion,
         .signer = id,
@@ -1477,6 +3604,8 @@ test "history archive: snapshot hash and signed network/head bind imported state
         .network_id = network_id,
         .slot = 1,
         .head_hash = wrong_head,
+        .anchor_slot = 1,
+        .anchor_head_hash = wrong_head,
         .snapshot_hash = hash(original),
     };
     const vote = Vote{
@@ -1521,6 +3650,7 @@ test "history archive: pre-E2c snapshot versions are never external checkpoints"
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -1540,12 +3670,7 @@ test "history archive: pre-E2c snapshot versions are never external checkpoints"
     const legacy = legacy_buf[0..current.len];
     try testing.expect(registry.readSnapshot(legacy) == null);
 
-    const assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = state.head.slot,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(legacy),
-    };
+    const assertion = anchorAssertion(&state, legacy);
     var name_buf: [max_name_bytes]u8 = undefined;
     try archive.writeImmutable(archive.snapshots_dir, snapshotName(assertion.snapshot_hash, &name_buf), legacy);
     try testing.expect((try archive.loadSnapshot(assertion)) == null);
@@ -1567,6 +3692,7 @@ test "history archive: imported snapshots bind the last value close time and tra
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -1586,12 +3712,7 @@ test "history archive: imported snapshots bind the last value close time and tra
     const tampered_time = time_buf[0..time_snapshot.len];
     const time_value_len: usize = std.mem.readInt(u16, time_buf[fixed_prefix..][0..2], .big);
     try testing.expect(registry.LedgerValue.decode(time_buf[value_offset..][0..time_value_len]) != null);
-    const time_assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = empty.head.slot,
-        .head_hash = empty.head.hash,
-        .snapshot_hash = hash(tampered_time),
-    };
+    const time_assertion = anchorAssertion(&empty, tampered_time);
     var name_buf: [max_name_bytes]u8 = undefined;
     try archive.writeImmutable(
         archive.snapshots_dir,
@@ -1614,12 +3735,7 @@ test "history archive: imported snapshots bind the last value close time and tra
     const tampered_tx = tx_buf[0..tx_snapshot.len];
     const tx_value_len: usize = std.mem.readInt(u16, tx_buf[fixed_prefix..][0..2], .big);
     try testing.expect(registry.LedgerValue.decode(tx_buf[value_offset..][0..tx_value_len]) != null);
-    const tx_assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = with_tx.head.slot,
-        .head_hash = with_tx.head.hash,
-        .snapshot_hash = hash(tampered_tx),
-    };
+    const tx_assertion = anchorAssertion(&with_tx, tampered_tx);
     try archive.writeImmutable(
         archive.snapshots_dir,
         snapshotName(tx_assertion.snapshot_hash, &name_buf),
@@ -1644,25 +3760,27 @@ test "history archive: torn untrusted pointer, snapshot, or vote is ignored" {
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
     const state = stateAt(network_id, 1);
-    _ = try archive.recordApplied(&state);
+    _ = try recordAndAck(&archive, &state);
 
     var latest_name_buf: [max_name_bytes]u8 = undefined;
     const latest_name = latestName(id, &latest_name_buf);
     try overwriteTestFileAt(io, archive.latest_dir, latest_name, "torn");
     try testing.expect((try archive.loadLatest(1)) == null);
 
-    // Idempotent publication repairs only the mutable pointer.
-    _ = try archive.recordApplied(&state);
-    try testing.expect((try archive.loadLatest(1)) != null);
+    // A subsequent publication repairs the mutable pointer.
+    const state_two = stateAt(network_id, 2);
+    _ = try recordAndAck(&archive, &state_two);
+    try testing.expect((try archive.loadLatest(2)) != null);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
-    const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
-    const assertion = Assertion{ .network_id = network_id, .slot = 1, .head_hash = state.head.hash, .snapshot_hash = hash(snapshot) };
+    const snapshot = registry.writeSnapshot(&state_two, &snapshot_buf);
+    const assertion = anchorAssertion(&state_two, snapshot);
     var snapshot_name_buf: [max_name_bytes]u8 = undefined;
     const snapshot_name = snapshotName(assertion.snapshot_hash, &snapshot_name_buf);
     try overwriteTestFileAt(io, archive.snapshots_dir, snapshot_name, "torn");
@@ -1691,15 +3809,18 @@ test "history archive: a torn trusted signing fence fails closed" {
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
     const one = stateAt(network_id, 1);
-    _ = try archive.recordApplied(&one);
-    try overwriteTestFileAt(io, archive.signing_dir, "high-water.vote", "torn");
+    _ = try recordAndAck(&archive, &one);
     const two = stateAt(network_id, 2);
+    try archive.stageApplied(&two);
+    _ = try archive.nextStaged();
+    try overwriteTestFileAt(io, archive.signing_dir, "high-water.vote", "torn");
     try testing.expectError(error.SigningFenceCorrupt, archive.recordApplied(&two));
 }
 
@@ -1719,6 +3840,7 @@ test "history archive: a V1 trusted signing fence fails closed during migration"
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
@@ -1728,12 +3850,11 @@ test "history archive: a V1 trusted signing fence fails closed during migration"
     const state = stateAt(network_id, 1);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
-    const assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = state.head.slot,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(snapshot),
-    };
+    const assertion = anchorAssertion(&state, snapshot);
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    try archive.prepareFrontier(&genesis);
+    try archive.stageApplied(&state);
+    _ = try archive.nextStaged();
     var legacy: [vote_bytes]u8 = undefined;
     encodeVote(.{
         .assertion = assertion,
@@ -1760,9 +3881,9 @@ test "history archive: each trusted directory barrier precedes shared publicatio
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
 
     // First fail the per-slot-vote directory fsync, then the high-water
-    // directory fsync. Neither trusted failure may occur after a shared
-    // object write. Finally fail the shared snapshot-directory barrier to
-    // prove the identical low-level error retains availability semantics.
+    // directory fsync. Ledger and anchor objects deliberately precede the
+    // fence, but neither trusted failure may publish a shared vote or latest
+    // pointer. Finally fail the shared snapshot-directory barrier.
     for (0..3) |which| {
         var archive_buf: [std.fs.max_path_bytes]u8 = undefined;
         var signing_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1776,11 +3897,16 @@ test "history archive: each trusted directory barrier precedes shared publicatio
             .archive_dir = archive_path,
             .signing_dir = signing_path,
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = slcp.Quorum.of(1, &.{id}),
             .signer_seed = seed,
             .checkpoint_every = 1,
         });
         defer archive.deinit();
+        const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+        try archive.prepareFrontier(&genesis);
+        try archive.stageApplied(&state);
+        _ = try archive.nextStaged();
         archive.sync_directory = TestDirSyncFault.sync;
         TestDirSyncFault.target = switch (which) {
             0 => archive.signing_votes_dir.handle,
@@ -1793,9 +3919,20 @@ test "history archive: each trusted directory barrier precedes shared publicatio
         if (which < 2) {
             try testing.expectError(error.SigningFenceUnavailable, archive.recordApplied(&state));
             var name_buf: [max_name_bytes]u8 = undefined;
-            try testing.expectError(error.FileNotFound, archive.snapshots_dir.statFile(
+            _ = try archive.snapshots_dir.statFile(
                 io,
                 snapshotName(hash(snapshot), &name_buf),
+                .{ .follow_symlinks = false },
+            );
+            const assertion = anchorAssertion(&state, snapshot);
+            try testing.expectError(error.FileNotFound, archive.votes_dir.statFile(
+                io,
+                voteName(assertion.digest(), id, &name_buf),
+                .{ .follow_symlinks = false },
+            ));
+            try testing.expectError(error.FileNotFound, archive.latest_dir.statFile(
+                io,
+                latestName(id, &name_buf),
                 .{ .follow_symlinks = false },
             ));
         } else {
@@ -1804,7 +3941,7 @@ test "history archive: each trusted directory barrier precedes shared publicatio
     }
 }
 
-test "history archive: a trusted file-sync failure precedes shared publication" {
+test "history archive: a shared object file-sync failure precedes signing" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1822,20 +3959,25 @@ test "history archive: a trusted file-sync failure precedes shared publication" 
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
+    const genesis = registry.State.genesis(network_id, test_genesis_close_time);
+    try archive.prepareFrontier(&genesis);
+    try archive.stageApplied(&state);
+    _ = try archive.nextStaged();
     archive.sync_file = TestFileSyncFault.sync;
     TestFileSyncFault.fail = true;
     defer TestFileSyncFault.fail = false;
 
-    try testing.expectError(error.SigningFenceUnavailable, archive.recordApplied(&state));
+    try testing.expectError(error.InjectedFileSyncFailure, archive.recordApplied(&state));
     try testing.expect((try archive.loadLatest(1)) == null);
 
     TestFileSyncFault.fail = false;
-    try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&state));
+    try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &state));
     try testing.expectEqual(@as(u64, 1), (try archive.loadLatest(1)).?.head.slot);
 }
 
@@ -1861,28 +4003,30 @@ test "history archive: two quorum-certified heads at one slot fail closed" {
     };
     const network_id = testNetworkId("history certified fork");
     const quorum = slcp.Quorum.of(2, &ids);
-    var ax = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[0], .network_id = network_id, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
+    var ax = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[0], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[0], .checkpoint_every = 1 });
     defer ax.deinit();
-    var bx = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[1], .network_id = network_id, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
+    var bx = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[1], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
     defer bx.deinit();
     const x = stateAt(network_id, 1);
-    _ = try ax.recordApplied(&x);
-    _ = try bx.recordApplied(&x);
+    _ = try recordAndAck(&ax, &x);
+    _ = try recordAndAck(&bx, &x);
 
     // Simulate copied validator identities with independent trusted signing
     // directories: B and C attest a different, self-consistent head.
-    var by = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[2], .network_id = network_id, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
+    var by = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[2], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[1], .checkpoint_every = 1 });
     defer by.deinit();
-    var cy = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[3], .network_id = network_id, .quorum = quorum, .signer_seed = seeds[2], .checkpoint_every = 1 });
+    var cy = try Archive.open(gpa, io, .{ .archive_dir = archive_path, .signing_dir = sign_paths[3], .network_id = network_id, .genesis_close_time = test_genesis_close_time, .quorum = quorum, .signer_seed = seeds[2], .checkpoint_every = 1 });
     defer cy.deinit();
-    var y: registry.State = .{ .network_id = network_id };
-    const source: registry.Key = @splat(0xa9);
-    const tx = registry.Tx.init(source, 1, .claim, "other-head", "", registry.zero_key).?;
+    var y = registry.State.genesis(network_id, test_genesis_close_time);
+    const fork_seed: [32]u8 = @splat(0xa9);
+    const source = try slcp.core.crypto.publicKeyFromSeed(fork_seed);
+    var tx = registry.Tx.init(source, 1, .claim, "other-head", "", registry.zero_key).?;
+    try tx.sign(fork_seed, network_id);
     var set: registry.TxSet = .{ .count = 1 };
     set.txs[0] = tx;
     applySet(&y, &set);
-    _ = try by.recordApplied(&y);
-    _ = try cy.recordApplied(&y);
+    _ = try recordAndAck(&by, &y);
+    _ = try recordAndAck(&cy, &y);
 
     // The signatures themselves are enough to prove a same-slot safety fork;
     // an attacker cannot suppress that hard failure by tearing one snapshot.
@@ -1902,7 +4046,14 @@ test "history archive: untrusted namespace directories may not be symlinks" {
     const id = try slcp.core.crypto.publicKeyFromSeed(seed);
     const network_id = testNetworkId("history namespace symlinks");
     const network_hex = registry.hex32(network_id);
-    const cases = [_]?[]const u8{ null, "snapshots", "votes", "latest" };
+    const cases = [_]?[]const u8{
+        null,
+        "history-v1",
+        "history-v1/snapshots",
+        "history-v1/ledgers",
+        "history-v1/votes",
+        "history-v1/latest",
+    };
     var archive_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
     var signing_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
     var outside_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
@@ -1923,7 +4074,12 @@ test "history archive: untrusted namespace directories may not be symlinks" {
         var network_rel_buf: [160]u8 = undefined;
         const network_rel = try std.fmt.bufPrint(&network_rel_buf, "{s}/{s}", .{ archive_rel, &network_hex });
         if (child) |name| {
-            try tmp.dir.createDirPath(io, network_rel);
+            var parent_rel_buf: [192]u8 = undefined;
+            const parent_rel = if (std.fs.path.dirname(name)) |parent|
+                try std.fmt.bufPrint(&parent_rel_buf, "{s}/{s}", .{ network_rel, parent })
+            else
+                network_rel;
+            try tmp.dir.createDirPath(io, parent_rel);
             var link_rel_buf: [192]u8 = undefined;
             const link_rel = try std.fmt.bufPrint(&link_rel_buf, "{s}/{s}", .{ network_rel, name });
             try tmp.dir.symLink(io, outside_path, link_rel, .{ .is_directory = true });
@@ -1935,6 +4091,7 @@ test "history archive: untrusted namespace directories may not be symlinks" {
             .archive_dir = archive_path,
             .signing_dir = signing_path,
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = slcp.Quorum.of(1, &.{id}),
             .signer_seed = seed,
             .checkpoint_every = 1,
@@ -1958,13 +4115,15 @@ test "history archive: replacing an opened namespace with symlinks cannot redire
     const state = stateAt(network_id, 1);
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
-    const assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = 1,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(snapshot),
+    const assertion = anchorAssertion(&state, snapshot);
+    const cases = [_]?[]const u8{
+        null,
+        "history-v1",
+        "history-v1/snapshots",
+        "history-v1/ledgers",
+        "history-v1/votes",
+        "history-v1/latest",
     };
-    const cases = [_]?[]const u8{ null, "snapshots", "votes", "latest" };
     var archive_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
     var signing_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
     var outside_path_bufs: [cases.len][std.fs.max_path_bytes]u8 = undefined;
@@ -1985,6 +4144,7 @@ test "history archive: replacing an opened namespace with symlinks cannot redire
             .archive_dir = archive_path,
             .signing_dir = signing_path,
             .network_id = network_id,
+            .genesis_close_time = test_genesis_close_time,
             .quorum = slcp.Quorum.of(1, &.{id}),
             .signer_seed = seed,
             .checkpoint_every = 1,
@@ -2001,26 +4161,32 @@ test "history archive: replacing an opened namespace with symlinks cannot redire
         var real_rel_buf: [224]u8 = undefined;
         const real_rel = try std.fmt.bufPrint(&real_rel_buf, "{s}.real", .{target_rel});
         try tmp.dir.rename(target_rel, tmp.dir, real_rel, io);
-        if (child == null) {
-            try std.Io.Dir.cwd().createDirPath(io, outside_path);
-            inline for (.{ "snapshots", "votes", "latest" }) |name| {
-                var child_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const child_path = try std.fmt.bufPrint(&child_path_buf, "{s}/{s}", .{ outside_path, name });
-                try std.Io.Dir.cwd().createDirPath(io, child_path);
-            }
-        }
         try tmp.dir.symLink(io, outside_path, target_rel, .{ .is_directory = true });
 
-        try testing.expectEqual(RecordStatus.certified, try archive.recordApplied(&state));
+        try testing.expectEqual(RecordStatus.certified, try recordAndAck(&archive, &state));
 
         var escaped_rel_buf: [384]u8 = undefined;
-        const escaped_rel = if (child == null or std.mem.eql(u8, child.?, "snapshots"))
-            try std.fmt.bufPrint(&escaped_rel_buf, "{s}{s}{s}.snap", .{
+        const prefix = if (child == null)
+            "history-v1/snapshots"
+        else if (std.mem.eql(u8, child.?, "history-v1"))
+            "snapshots"
+        else
+            "";
+        const escaped_rel = if (child == null or
+            std.mem.eql(u8, child.?, "history-v1") or
+            std.mem.endsWith(u8, child.?, "/snapshots"))
+            try std.fmt.bufPrint(&escaped_rel_buf, "{s}/{s}{s}{s}.snap", .{
                 outside_rel,
-                if (child == null) "/snapshots/" else "/",
+                prefix,
+                if (prefix.len == 0) "" else "/",
                 &registry.hex32(assertion.snapshot_hash),
             })
-        else if (std.mem.eql(u8, child.?, "votes"))
+        else if (std.mem.endsWith(u8, child.?, "/ledgers"))
+            try std.fmt.bufPrint(&escaped_rel_buf, "{s}/{s}.ledger", .{
+                outside_rel,
+                &registry.hex32(state.head.hash),
+            })
+        else if (std.mem.endsWith(u8, child.?, "/votes"))
             try std.fmt.bufPrint(&escaped_rel_buf, "{s}/{s}-{s}.vote", .{
                 outside_rel,
                 &registry.hex32(assertion.digest()),
@@ -2049,28 +4215,25 @@ test "history archive: exact object symlinks are never followed" {
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
     });
     defer archive.deinit();
-    _ = try archive.recordApplied(&state);
+    _ = try recordAndAck(&archive, &state);
     try testing.expect((try archive.loadLatest(1)) != null);
 
     var snapshot_buf: [registry.snapshot_max_bytes]u8 = undefined;
     const snapshot = registry.writeSnapshot(&state, &snapshot_buf);
-    const assertion: Assertion = .{
-        .network_id = network_id,
-        .slot = 1,
-        .head_hash = state.head.hash,
-        .snapshot_hash = hash(snapshot),
-    };
-    const dirs = [_]std.Io.Dir{ archive.snapshots_dir, archive.votes_dir, archive.latest_dir };
-    var name_bufs: [3][max_name_bytes]u8 = undefined;
-    const names = [3][]const u8{
+    const assertion = anchorAssertion(&state, snapshot);
+    const dirs = [_]std.Io.Dir{ archive.snapshots_dir, archive.ledgers_dir, archive.votes_dir, archive.latest_dir };
+    var name_bufs: [4][max_name_bytes]u8 = undefined;
+    const names = [4][]const u8{
         snapshotName(assertion.snapshot_hash, &name_bufs[0]),
-        voteName(assertion.digest(), id, &name_bufs[1]),
-        latestName(id, &name_bufs[2]),
+        ledgerName(state.head.hash, &name_bufs[1]),
+        voteName(assertion.digest(), id, &name_bufs[2]),
+        latestName(id, &name_bufs[3]),
     };
 
     for (dirs, names) |dir, name| {
@@ -2102,6 +4265,7 @@ test "history archive: a FIFO object is rejected without blocking discovery" {
         .archive_dir = archive_path,
         .signing_dir = signing_path,
         .network_id = network_id,
+        .genesis_close_time = test_genesis_close_time,
         .quorum = slcp.Quorum.of(1, &.{id}),
         .signer_seed = seed,
         .checkpoint_every = 1,
