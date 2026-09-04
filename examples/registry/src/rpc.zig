@@ -196,6 +196,18 @@ pub const max_conns: usize = 64;
 /// A connection that sends nothing for this long is dropped.
 pub const idle_timeout_ms: u64 = 30_000;
 
+/// A test-only scheduling gate. Production servers leave
+/// `Server.test_teardown_gate` null; the lifecycle regression parks handlers
+/// after socket-list removal so the otherwise tiny teardown window is exact.
+const TeardownGate = struct {
+    entered: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    rejected: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    stop_waiting: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    before_destroy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    allow_destroy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -206,9 +218,12 @@ pub const Server = struct {
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mu: std.Io.Mutex = .init,
     drained: std.Io.Condition = .init,
-    /// Live connections (under `mu`); `stop` shuts their sockets down and
-    /// waits for the list to empty before freeing anything.
+    /// Live sockets (under `mu`); `stop` shuts these down. A connection leaves
+    /// this list before closing, but remains counted in `active_conn_threads`
+    /// until its detached thread has destroyed every allocator-owned byte.
     conns: std.ArrayList(*Conn) = .empty,
+    active_conn_threads: usize = 0,
+    test_teardown_gate: ?*TeardownGate = null,
 
     /// Bind 127.0.0.1:`port` (0 = ephemeral; see `port`) and start accepting.
     /// A port somebody already answers on is refused (`AddressInUse`): on
@@ -225,7 +240,8 @@ pub const Server = struct {
         const self = try gpa.create(Server);
         errdefer gpa.destroy(self);
         var addr = try net.IpAddress.parse("127.0.0.1", port);
-        const srv = try net.IpAddress.listen(&addr, io, .{ .mode = .stream, .reuse_address = true });
+        var srv = try net.IpAddress.listen(&addr, io, .{ .mode = .stream, .reuse_address = true });
+        errdefer srv.deinit(io);
         self.* = .{ .gpa = gpa, .io = io, .shared = shared, .server = srv, .port = portOf(srv.socket.address) };
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
         return self;
@@ -244,8 +260,17 @@ pub const Server = struct {
         if (self.thread) |t| t.join();
         self.mu.lockUncancelable(io);
         for (self.conns.items) |c| c.stream.shutdown(io, .both) catch {};
-        while (self.conns.items.len > 0) self.drained.waitUncancelable(io, &self.mu);
+        while (self.active_conn_threads > 0) {
+            if (self.test_teardown_gate) |gate| gate.stop_waiting.store(true, .release);
+            self.drained.waitUncancelable(io, &self.mu);
+        }
         self.mu.unlock(io);
+        if (self.test_teardown_gate) |gate| {
+            gate.before_destroy.store(true, .release);
+            while (!gate.allow_destroy.load(.acquire)) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            }
+        }
         self.server.deinit(io);
         const gpa = self.gpa;
         self.conns.deinit(gpa);
@@ -256,21 +281,39 @@ pub const Server = struct {
     fn register(self: *Server, conn: *Conn) bool {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        if (self.conns.items.len >= max_conns) return false;
+        if (self.active_conn_threads >= max_conns) {
+            if (self.test_teardown_gate) |gate| _ = gate.rejected.fetchAdd(1, .release);
+            return false;
+        }
         self.conns.append(self.gpa, conn) catch return false;
+        self.active_conn_threads += 1;
         return true;
     }
 
-    fn unregister(self: *Server, conn: *Conn) void {
+    fn unregister(self: *Server, conn: *Conn) ?*TeardownGate {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        var found = false;
         for (self.conns.items, 0..) |c, i| {
             if (c == conn) {
                 _ = self.conns.swapRemove(i);
+                found = true;
                 break;
             }
         }
-        if (self.conns.items.len == 0) self.drained.broadcast(self.io);
+        std.debug.assert(found);
+        return self.test_teardown_gate;
+    }
+
+    /// Called only after the detached connection thread has closed its stream
+    /// and freed its `Conn`. The counter, not list removal, is the lifetime
+    /// barrier that lets `stop` safely release Server and allocator state.
+    fn finishConn(self: *Server) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        std.debug.assert(self.active_conn_threads > 0);
+        self.active_conn_threads -= 1;
+        if (self.active_conn_threads == 0) self.drained.broadcast(self.io);
     }
 
     fn acceptLoop(self: *Server) void {
@@ -294,9 +337,10 @@ pub const Server = struct {
                 continue;
             }
             const t = std.Thread.spawn(.{}, Conn.run, .{conn}) catch {
-                self.unregister(conn);
+                _ = self.unregister(conn);
                 stream.close(self.io);
                 self.gpa.destroy(conn);
+                self.finishConn();
                 continue;
             };
             t.detach();
@@ -309,14 +353,22 @@ const Conn = struct {
     stream: net.Stream,
 
     fn run(self: *Conn) void {
-        // Locals: after `unregister` the Server may already be freed by `stop`.
+        // Locals survive `gpa.destroy(self)` below. `finishConn` is last, so
+        // stop keeps the Server alive until every earlier teardown step ends.
         const srv = self.server;
         const io = srv.io;
         const gpa = srv.gpa;
         defer {
-            srv.unregister(self); // first: `stop` only touches registered sockets
+            const gate = srv.unregister(self); // first: stop only shuts registered sockets
+            if (gate) |g| {
+                _ = g.entered.fetchAdd(1, .release);
+                while (!g.release.load(.acquire)) {
+                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+                }
+            }
             self.stream.close(io);
             gpa.destroy(self);
+            srv.finishConn(); // last: `stop` keeps srv + gpa alive through here
         }
         var buf: [max_line]u8 = undefined;
         var len: usize = 0;
@@ -548,4 +600,135 @@ test "server: a port somebody already answers on is refused" {
     } else |err| {
         try testing.expectEqual(error.AddressInUse, err);
     }
+}
+
+test "server caps outstanding teardown and stop waits through allocator deinit" {
+    const io = testing.io;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    var allocator_live = true;
+    defer if (allocator_live) {
+        _ = da.deinit();
+    };
+    var sh = testShared();
+    const srv = try Server.start(da.allocator(), io, &sh, 0);
+    var server_live = true;
+    defer if (server_live) srv.stop();
+    var gate: TeardownGate = .{};
+    srv.mu.lockUncancelable(io);
+    srv.test_teardown_gate = &gate;
+    srv.mu.unlock(io);
+    defer {
+        gate.release.store(true, .release);
+        gate.allow_destroy.store(true, .release);
+    }
+
+    var clients: [max_conns]net.Stream = undefined;
+    var connected: usize = 0;
+    defer for (clients[0..connected]) |stream| stream.close(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", srv.port);
+    while (connected < clients.len) : (connected += 1) {
+        clients[connected] = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    }
+
+    var all_accepted = false;
+    for (0..5_000) |_| {
+        srv.mu.lockUncancelable(io);
+        const live = srv.conns.items.len;
+        srv.mu.unlock(io);
+        if (live == clients.len) {
+            all_accepted = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(all_accepted);
+
+    for (clients[0..connected]) |stream| stream.close(io);
+    connected = 0;
+    var all_parked = false;
+    for (0..5_000) |_| {
+        srv.mu.lockUncancelable(io);
+        const live_sockets = srv.conns.items.len;
+        const live_threads = srv.active_conn_threads;
+        srv.mu.unlock(io);
+        if (gate.entered.load(.acquire) == max_conns and live_sockets == 0 and live_threads == max_conns) {
+            all_parked = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(all_parked);
+
+    // List slots are now empty, but all 64 allocator-owning threads remain.
+    // Admission must use the latter count: the old list-length check serves
+    // this request and lets outstanding handler allocations grow past 64.
+    const overflow = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    var overflow_live = true;
+    defer if (overflow_live) overflow.close(io);
+    var overflow_rejected = false;
+    for (0..5_000) |_| {
+        if (gate.rejected.load(.acquire) == 1) {
+            overflow_rejected = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(overflow_rejected);
+    overflow.close(io);
+    overflow_live = false;
+
+    const StopWaiter = struct {
+        server: *Server,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            self.server.stop();
+            self.done.store(true, .release);
+        }
+    };
+    var waiter: StopWaiter = .{ .server = srv };
+    const stop_thread = try std.Thread.spawn(.{}, StopWaiter.run, .{&waiter});
+    var stop_joined = false;
+    defer if (!stop_joined) {
+        gate.release.store(true, .release);
+        while (true) {
+            srv.mu.lockUncancelable(io);
+            const drained = srv.active_conn_threads == 0;
+            srv.mu.unlock(io);
+            if (drained) break;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        gate.allow_destroy.store(true, .release);
+        stop_thread.join();
+        server_live = false;
+    };
+    var reached_lifetime_wait = false;
+    for (0..5_000) |_| {
+        if (gate.stop_waiting.load(.acquire)) {
+            reached_lifetime_wait = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(reached_lifetime_wait);
+    try testing.expect(!waiter.done.load(.acquire));
+
+    gate.release.store(true, .release);
+    var reached_destroy = false;
+    for (0..5_000) |_| {
+        if (gate.before_destroy.load(.acquire)) {
+            reached_destroy = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(reached_destroy);
+    gate.allow_destroy.store(true, .release);
+    stop_thread.join();
+    stop_joined = true;
+    server_live = false;
+    try testing.expect(waiter.done.load(.acquire));
+    const check = da.deinit();
+    allocator_live = false;
+    try testing.expectEqual(std.heap.Check.ok, check);
 }
