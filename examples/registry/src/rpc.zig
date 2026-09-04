@@ -20,9 +20,33 @@ pub const max_line: usize = 2048;
 // Shared state between the main thread and the RPC threads
 // ---------------------------------------------------------------------------
 
-pub const SubmitOutcome = union(enum) {
+const SubmitOutcome = union(enum) {
     ok,
     bad_seq: u64, // the seq the node expects from this source
+    duplicate,
+    queue_full,
+};
+
+/// Synchronous boundary from registry admission to the best-effort
+/// application-message transport. `bytes` is borrowed for the call only;
+/// implementations that retain it must copy it.
+pub const Publisher = struct {
+    ctx: *anyopaque,
+    publishFn: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+
+    fn publish(self: Publisher, bytes: []const u8) void {
+        self.publishFn(self.ctx, bytes);
+    }
+};
+
+/// Every result of admitting canonical transaction bytes. Keeping parsing,
+/// signature checking, and queue policy behind this one result prevents the
+/// RPC and gossip ports from drifting into different trust rules.
+pub const Admission = union(enum) {
+    accepted: [32]u8,
+    bad_tx,
+    bad_sig,
+    bad_seq: struct { expected: u64, got: u64 },
     duplicate,
     queue_full,
 };
@@ -34,6 +58,7 @@ pub const Shared = struct {
     state: registry.State,
     pending: [registry.max_pending]Tx = undefined,
     n_pending: usize = 0,
+    publisher: ?Publisher = null,
 
     pub fn lock(self: *Shared) void {
         self.mu.lockUncancelable(self.io);
@@ -63,7 +88,7 @@ pub const Shared = struct {
 
     /// Under `mu`: the §3.10 submit rules. The signature and canonical
     /// form were checked by the caller.
-    pub fn submit(self: *Shared, tx: *const Tx) SubmitOutcome {
+    fn submitLocked(self: *Shared, tx: *const Tx) SubmitOutcome {
         for (self.pending[0..self.n_pending]) |*p| {
             if (std.mem.eql(u8, &p.source, &tx.source) and p.seq == tx.seq) return .duplicate;
         }
@@ -73,6 +98,56 @@ pub const Shared = struct {
         self.pending[self.n_pending] = tx.*;
         self.n_pending += 1;
         return .ok;
+    }
+
+    /// Admit raw transaction bytes from any client port. On acceptance the
+    /// publisher is called only after `mu` is released, so a transport
+    /// adapter may safely re-enter Shared. Invalid and rejected inputs never
+    /// cross that boundary.
+    pub fn admit(self: *Shared, bytes: []const u8) Admission {
+        const tx = Tx.decode(bytes) orelse return .bad_tx;
+        var canonical: [registry.tx_bytes]u8 = undefined;
+        tx.encode(&canonical);
+        if (!std.mem.eql(u8, bytes, &canonical)) return .bad_tx;
+
+        self.lock();
+        const network_id = self.state.network_id;
+        if (!tx.verify(network_id)) {
+            self.unlock();
+            return .bad_sig;
+        }
+        const outcome = self.submitLocked(&tx);
+        const publisher = self.publisher;
+        self.unlock();
+
+        return switch (outcome) {
+            .ok => accepted: {
+                if (publisher) |p| p.publish(&canonical);
+                break :accepted .{ .accepted = tx.digest(network_id) };
+            },
+            .bad_seq => |expected| .{ .bad_seq = .{ .expected = expected, .got = tx.seq } },
+            .duplicate => .duplicate,
+            .queue_full => .queue_full,
+        };
+    }
+
+    /// Re-publish a point-in-time copy of the pending queue. The fixed array
+    /// makes the operation bounded by `registry.max_pending`; both encoding
+    /// and calls into the transport happen without exposing queue storage,
+    /// and transport calls happen after `mu` is released.
+    pub fn refloodPending(self: *Shared) usize {
+        var snapshot: [registry.max_pending][registry.tx_bytes]u8 = undefined;
+        self.lock();
+        const publisher = self.publisher orelse {
+            self.unlock();
+            return 0;
+        };
+        const count = self.n_pending;
+        for (self.pending[0..count], 0..) |*tx, i| tx.encode(&snapshot[i]);
+        self.unlock();
+
+        for (snapshot[0..count]) |*raw| publisher.publish(raw);
+        return count;
     }
 
     /// Under `mu`, after `state` was refreshed: drop every pending
@@ -139,13 +214,11 @@ pub fn handle(shared: *Shared, line: []const u8, out: []u8) []const u8 {
         if (hex.len != 2 * registry.tx_bytes) return fmt(out, "err bad_tx expected {d} hex chars, got {d}", .{ 2 * registry.tx_bytes, hex.len });
         var raw: [registry.tx_bytes]u8 = undefined;
         _ = std.fmt.hexToBytes(&raw, hex) catch return fmt(out, "err bad_tx not hex", .{});
-        const tx = Tx.decode(&raw) orelse return fmt(out, "err bad_tx not a canonical transaction", .{});
-        shared.lock();
-        defer shared.unlock();
-        if (!tx.verify(shared.state.network_id)) return fmt(out, "err bad_sig signature does not verify for this network", .{});
-        return switch (shared.submit(&tx)) {
-            .ok => fmt(out, "ok txid={s}", .{&registry.hex32(tx.digest(shared.state.network_id))}),
-            .bad_seq => |want| fmt(out, "err bad_seq expected={d} got={d}", .{ want, tx.seq }),
+        return switch (shared.admit(&raw)) {
+            .accepted => |txid| fmt(out, "ok txid={s}", .{&registry.hex32(txid)}),
+            .bad_tx => fmt(out, "err bad_tx not a canonical transaction", .{}),
+            .bad_sig => fmt(out, "err bad_sig signature does not verify for this network", .{}),
+            .bad_seq => |seq| fmt(out, "err bad_seq expected={d} got={d}", .{ seq.expected, seq.got }),
             .duplicate => fmt(out, "err duplicate a transaction with this source and seq is already queued", .{}),
             .queue_full => fmt(out, "err queue_full {d} transactions are queued; try again after the next slot", .{registry.max_pending}),
         };
@@ -454,18 +527,155 @@ fn signedTx(seed_byte: u8, seq: u64, name: []const u8, nid: [32]u8) Tx {
     return tx;
 }
 
-// Non-vacuity: each SubmitOutcome variant is produced once; `prune` must
-// drop exactly the applied/superseded entries.
-test "shared: submit rules (seq, duplicate, queue) and prune after apply" {
+fn signedIndexedTx(index: usize, nid: [32]u8) Tx {
+    var seed: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, seed[24..32], @intCast(index + 1), .big);
+    const pk = registry.publicKeyOf(seed) catch unreachable;
+    var tx = Tx.init(pk, 1, .claim, "x", "", registry.zero_key).?;
+    tx.sign(seed, nid) catch unreachable;
+    return tx;
+}
+
+const PublishRecorder = struct {
+    shared: *Shared,
+    calls: usize = 0,
+    pending_seen: usize = 0,
+    raw: [4][registry.tx_bytes]u8 = undefined,
+
+    fn publisher(self: *@This()) Publisher {
+        return .{ .ctx = self, .publishFn = publish };
+    }
+
+    fn publish(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        // Re-entering the public lock here pins the lifetime rule: admission
+        // must release Shared before crossing into the transport adapter.
+        self.shared.lock();
+        defer self.shared.unlock();
+        self.pending_seen = self.shared.n_pending;
+        std.debug.assert(bytes.len == registry.tx_bytes);
+        std.debug.assert(self.calls < self.raw.len);
+        @memcpy(&self.raw[self.calls], bytes);
+        self.calls += 1;
+    }
+};
+
+test "shared admission accepts a canonical network transaction and publishes after unlocking" {
+    var sh = testShared();
+    var recorder = PublishRecorder{ .shared = &sh };
+    sh.publisher = recorder.publisher();
+    const tx = signedTx(0x20, 1, "alice", sh.state.network_id);
+    var raw: [registry.tx_bytes]u8 = undefined;
+    tx.encode(&raw);
+
+    const admission = sh.admit(&raw);
+
+    try testing.expectEqual(tx.digest(sh.state.network_id), admission.accepted);
+    try testing.expectEqual(@as(usize, 1), sh.n_pending);
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    try testing.expectEqual(@as(usize, 1), recorder.pending_seen);
+    try testing.expectEqualSlices(u8, &raw, &recorder.raw[0]);
+}
+
+test "RPC submit crosses the same admission and publisher boundary" {
+    var sh = testShared();
+    var recorder = PublishRecorder{ .shared = &sh };
+    sh.publisher = recorder.publisher();
+    const tx = signedTx(0x22, 1, "rpc", sh.state.network_id);
+    var raw: [registry.tx_bytes]u8 = undefined;
+    tx.encode(&raw);
+    var hex_buf: [2 * registry.tx_bytes]u8 = undefined;
+    var line_buf: [max_line]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "submit {s}", .{hexOf(&raw, &hex_buf)});
+    var out: [max_line]u8 = undefined;
+
+    const response = handle(&sh, line, &out);
+
+    try testing.expect(std.mem.startsWith(u8, response, "ok txid="));
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    try testing.expectEqualSlices(u8, &raw, &recorder.raw[0]);
+}
+
+test "admission rejects malformed, wrong-network, out-of-sequence, duplicate, and full input without publishing" {
+    var sh = testShared();
+    var recorder = PublishRecorder{ .shared = &sh };
+    sh.publisher = recorder.publisher();
+
+    const tx = signedTx(0x24, 1, "alice", sh.state.network_id);
+    var raw: [registry.tx_bytes]u8 = undefined;
+    tx.encode(&raw);
+    var malformed = raw;
+    malformed[73] = 1; // non-zero name padding is not canonical
+    try testing.expectEqual(Admission.bad_tx, sh.admit(&malformed));
+
+    const wrong_network = signedTx(0x24, 1, "alice", registry.networkId("not rpc test"));
+    var wrong_raw: [registry.tx_bytes]u8 = undefined;
+    wrong_network.encode(&wrong_raw);
+    try testing.expectEqual(Admission.bad_sig, sh.admit(&wrong_raw));
+
+    const future = signedTx(0x24, 3, "future", sh.state.network_id);
+    var future_raw: [registry.tx_bytes]u8 = undefined;
+    future.encode(&future_raw);
+    const bad_seq = sh.admit(&future_raw).bad_seq;
+    try testing.expectEqual(@as(u64, 1), bad_seq.expected);
+    try testing.expectEqual(@as(u64, 3), bad_seq.got);
+    try testing.expectEqual(@as(usize, 0), recorder.calls);
+
+    _ = sh.admit(&raw).accepted;
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    try testing.expectEqual(Admission.duplicate, sh.admit(&raw));
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+
+    var full = testShared();
+    for (0..registry.max_pending) |i| {
+        const item = signedIndexedTx(i, full.state.network_id);
+        var item_raw: [registry.tx_bytes]u8 = undefined;
+        item.encode(&item_raw);
+        _ = full.admit(&item_raw).accepted;
+    }
+    var full_recorder = PublishRecorder{ .shared = &full };
+    full.publisher = full_recorder.publisher();
+    const overflow = signedTx(0xfe, 1, "overflow", full.state.network_id);
+    var overflow_raw: [registry.tx_bytes]u8 = undefined;
+    overflow.encode(&overflow_raw);
+    try testing.expectEqual(Admission.queue_full, full.admit(&overflow_raw));
+    try testing.expectEqual(@as(usize, 0), full_recorder.calls);
+}
+
+test "reflood snapshots the bounded pending set and publishes outside the lock" {
+    var sh = testShared();
+    const tx1 = signedTx(0x23, 1, "one", sh.state.network_id);
+    const tx2 = signedTx(0x23, 2, "two", sh.state.network_id);
+    var raw1: [registry.tx_bytes]u8 = undefined;
+    var raw2: [registry.tx_bytes]u8 = undefined;
+    tx1.encode(&raw1);
+    tx2.encode(&raw2);
+    try testing.expectEqual(tx1.digest(sh.state.network_id), sh.admit(&raw1).accepted);
+    try testing.expectEqual(tx2.digest(sh.state.network_id), sh.admit(&raw2).accepted);
+
+    var recorder = PublishRecorder{ .shared = &sh };
+    sh.publisher = recorder.publisher();
+
+    try testing.expectEqual(@as(usize, 2), sh.refloodPending());
+    try testing.expectEqual(@as(usize, 2), recorder.calls);
+    try testing.expectEqual(@as(usize, 2), recorder.pending_seen);
+    try testing.expectEqualSlices(u8, &raw1, &recorder.raw[0]);
+    try testing.expectEqualSlices(u8, &raw2, &recorder.raw[1]);
+}
+
+// `prune` must drop exactly the applied/superseded entries while retaining a
+// later accepted transaction from the same source.
+test "shared: prune drops applied pending transactions and retains later ones" {
     var sh = testShared();
     const nid = sh.state.network_id;
     const t1 = signedTx(0x21, 1, "a", nid);
     const t2 = signedTx(0x21, 2, "b", nid);
-    const t3 = signedTx(0x21, 3, "c", nid);
-    try testing.expectEqual(SubmitOutcome.ok, sh.submit(&t1));
-    try testing.expectEqual(SubmitOutcome.duplicate, sh.submit(&t1));
-    try testing.expectEqual(SubmitOutcome{ .bad_seq = 2 }, sh.submit(&t3));
-    try testing.expectEqual(SubmitOutcome.ok, sh.submit(&t2));
+    var raw1: [registry.tx_bytes]u8 = undefined;
+    var raw2: [registry.tx_bytes]u8 = undefined;
+    t1.encode(&raw1);
+    t2.encode(&raw2);
+    _ = sh.admit(&raw1).accepted;
+    _ = sh.admit(&raw2).accepted;
     try testing.expectEqual(@as(u64, 3), sh.nextSeq(t1.source));
     try testing.expectEqual(@as(usize, 2), sh.n_pending);
 
@@ -477,17 +687,6 @@ test "shared: submit rules (seq, duplicate, queue) and prune after apply" {
     try testing.expectEqual(@as(usize, 1), sh.n_pending);
     try testing.expectEqual(@as(u64, 2), sh.pending[0].seq);
     try testing.expectEqual(@as(u64, 3), sh.nextSeq(t1.source));
-
-    // Queue full.
-    var full = testShared();
-    for (0..registry.max_pending) |i| {
-        var k: registry.Key = @splat(0);
-        std.mem.writeInt(u64, k[24..32], @intCast(i + 1), .big);
-        var tx = Tx.init(k, 1, .claim, "x", "", registry.zero_key).?; // unsigned: submit() does not verify
-        tx.sig = @splat(0);
-        try testing.expectEqual(SubmitOutcome.ok, full.submit(&tx));
-    }
-    try testing.expectEqual(SubmitOutcome.queue_full, full.submit(&t1));
 }
 
 // Non-vacuity: every verb and every `err` code in `handle` has a line here;
