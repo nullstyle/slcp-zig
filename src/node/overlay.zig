@@ -997,6 +997,12 @@ pub const Overlay = struct {
                 continue;
             };
             defer frame.deinit(gpa);
+            if (frame == .app_message and
+                conn.peer_feature_flags & wire.feature_app_messages == 0)
+            {
+                log.debug("overlay: dropping unnegotiated app_message from peer {d}", .{conn.id});
+                continue;
+            }
             if (isRequestFrame(frame)) switch (self.chargeRequest(conn)) {
                 .accept => {},
                 .drop => continue,
@@ -1329,6 +1335,7 @@ const Recorder = struct {
     pings: std.ArrayListUnmanaged(u64) = .empty,
     pongs: std.ArrayListUnmanaged(u64) = .empty,
     envelopes: std.ArrayListUnmanaged([]u8) = .empty,
+    app_messages: std.ArrayListUnmanaged([]u8) = .empty,
     /// If set, reply to every received ping with a matching pong.
     reply_pong: bool = false,
 
@@ -1351,6 +1358,13 @@ const Recorder = struct {
                     return;
                 };
                 self.envelopes.append(self.gpa, c) catch self.gpa.free(c);
+            },
+            .app_message => |b| {
+                const c = self.gpa.dupe(u8, b) catch {
+                    self.mu.unlock(self.io);
+                    return;
+                };
+                self.app_messages.append(self.gpa, c) catch self.gpa.free(c);
             },
             else => {},
         }
@@ -1387,6 +1401,26 @@ const Recorder = struct {
         return c;
     }
 
+    fn pingCount(self: *Recorder, want: u64) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var c: usize = 0;
+        for (self.pings.items) |v| {
+            if (v == want) c += 1;
+        }
+        return c;
+    }
+
+    fn appMessageCount(self: *Recorder, want: []const u8) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var c: usize = 0;
+        for (self.app_messages.items) |message| {
+            if (std.mem.eql(u8, message, want)) c += 1;
+        }
+        return c;
+    }
+
     fn envelopeCount(self: *Recorder, want: []const u8) usize {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -1403,7 +1437,9 @@ const Recorder = struct {
 
     fn deinit(self: *Recorder) void {
         for (self.envelopes.items) |e| self.gpa.free(e);
+        for (self.app_messages.items) |message| self.gpa.free(message);
         self.envelopes.deinit(self.gpa);
+        self.app_messages.deinit(self.gpa);
         self.up_ids.deinit(self.gpa);
         self.pings.deinit(self.gpa);
         self.pongs.deinit(self.gpa);
@@ -1579,6 +1615,45 @@ test "overlay negotiation: app messages reach only capable peers; ordinary frame
     defer legacy_ping.deinit(gpa);
     try testing.expect(legacy_ping == .ping);
     try testing.expectEqual(@as(u64, 0xACCE55), legacy_ping.ping);
+}
+
+test "overlay negotiation: an incapable peer cannot inject app messages but stays usable" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xAA), rec.callbacks());
+    rec.ov = &ov;
+    try ov.start();
+    defer ov.deinit();
+    defer ov.stop();
+
+    var addr = try net.IpAddress.parse("127.0.0.1", ov.boundPort());
+    const raw_peer = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer raw_peer.close(io);
+    var framer = framing.Framer.initWithOptions(gpa, framer_options);
+    defer framer.deinit();
+    var our_hello = try readTestFrame(gpa, io, raw_peer, &framer, 2_000);
+    our_hello.deinit(gpa);
+    try writeTestHello(gpa, io, raw_peer, 0, 0xE1);
+    try waitPeerCount(io, &ov, 1);
+
+    const app = try wire.encode(gpa, .{ .app_message = "must-be-dropped" });
+    defer gpa.free(app);
+    try writeAll(io, raw_peer.socket.handle, app);
+    const ping = try wire.encode(gpa, .{ .ping = 0x51A7E });
+    defer gpa.free(ping);
+    try writeAll(io, raw_peer.socket.handle, ping);
+
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        if (rec.pingCount(0x51A7E) == 1) break;
+        sleepMs(io, 10);
+    }
+    try testing.expectEqual(@as(usize, 1), rec.pingCount(0x51A7E));
+    try testing.expectEqual(@as(usize, 0), rec.appMessageCount("must-be-dropped"));
+    try testing.expectEqual(@as(usize, 1), ov.peerCount());
 }
 
 test "two overlays connect and exchange ping/pong" {
