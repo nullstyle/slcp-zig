@@ -57,9 +57,10 @@
 //!     frames are popped after every push, exceeding that means an oversized
 //!     frame — framing error, disconnect.
 //!   * Each conn's write queue is bounded (`max_write_queue_items` /
-//!     `max_write_queue_bytes`). A Hello-complete peer that stops draining
-//!     overflows it; the overflow fails the enqueue and force-disconnects the
-//!     conn (socket shutdown → its reader unblocks → normal teardown).
+//!     `max_write_queue_bytes`). Ordinary/consensus overflow force-disconnects
+//!     a peer that stopped draining. Opportunistic app frames have smaller
+//!     item/byte sub-caps and preserve an ordinary reserve; app pressure drops
+//!     only the app frame and keeps the connection usable.
 //!   * The handshake has a receive deadline (`handshake_timeout_s`): a peer
 //!     that connects but never sends its Hello cannot wedge a reader thread
 //!     forever. The deadline belongs to the Io OPERATION, not to the socket:
@@ -110,10 +111,22 @@ pub const max_outstanding_requests: usize = 64;
 /// §9.1: largest wire frame we accept (1 MiB). Enforced through the framer's
 /// buffered-bytes cap — see the implementation notes above.
 pub const max_frame_bytes: usize = 1 << 20;
-/// Per-conn write queue bounds. Overflow means the peer stopped draining:
-/// the enqueue fails and the conn is force-disconnected.
+/// Per-conn aggregate write queue bounds. Ordinary overflow means the peer
+/// stopped draining: the enqueue fails and the conn is force-disconnected.
 pub const max_write_queue_items: usize = 1024;
 pub const max_write_queue_bytes: usize = 16 * 1024 * 1024;
+/// Application traffic is opportunistic: it may consume at most this many
+/// queued frames, while ordinary/consensus traffic keeps a reserved tail.
+pub const max_app_write_queue_items: usize = 256;
+pub const reserved_write_queue_items: usize = 256;
+pub const max_app_write_queue_bytes: usize = 1024 * 1024;
+pub const reserved_write_queue_bytes: usize = 4 * 1024 * 1024;
+comptime {
+    if (max_app_write_queue_items > max_write_queue_items - reserved_write_queue_items)
+        @compileError("application write-queue item cap consumes the ordinary reserve");
+    if (max_app_write_queue_bytes > max_write_queue_bytes - reserved_write_queue_bytes)
+        @compileError("application write-queue byte cap consumes the ordinary reserve");
+}
 /// Maximum concurrently-live inbound connections; over-cap accepts are
 /// closed immediately, before any per-conn resources are allocated.
 pub const max_inbound_conns: usize = 128;
@@ -218,11 +231,15 @@ const Conn = struct {
 
     // Async write queue drained by the writer thread. Bounded by
     // `max_write_queue_items` / `max_write_queue_bytes` (`wq_bytes` tracks
-    // the queued payload bytes; zeroed when the writer takes the batch).
+    // the queued payload bytes). The app subset has its own counters so it
+    // cannot consume the ordinary reserve. All counters are zeroed when the
+    // writer takes the whole batch.
     wq_mu: std.Io.Mutex = .init,
     wq_cond: std.Io.Condition = .init,
     wq: std.ArrayListUnmanaged([]u8) = .empty,
     wq_bytes: usize = 0,
+    wq_app_items: usize = 0,
+    wq_app_bytes: usize = 0,
     wq_closed: bool = false,
     writer_started: bool = false,
     writer_thread: ?std.Thread = null,
@@ -295,6 +312,43 @@ const Conn = struct {
         return error.WriteQueueFull;
     }
 
+    /// Opportunistically enqueue an application frame. App pressure drops
+    /// the frame without closing the queue or socket; allocation/closed-queue
+    /// failures remain visible to the caller. Hello-complete connections
+    /// always have a writer, so a pre-writer call is simply not admissible.
+    fn enqueueApp(self: *Conn, bytes: []const u8) !bool {
+        if (!self.writer_started) return false;
+        self.wq_mu.lockUncancelable(self.io);
+        defer self.wq_mu.unlock(self.io);
+        if (self.wq_closed) return error.WriteClosed;
+
+        const app_total_item_limit = max_write_queue_items - reserved_write_queue_items;
+        const app_total_byte_limit = max_write_queue_bytes - reserved_write_queue_bytes;
+        if (self.wq_app_items >= max_app_write_queue_items or
+            self.wq.items.len >= app_total_item_limit or
+            bytes.len > max_app_write_queue_bytes or
+            self.wq_app_bytes > max_app_write_queue_bytes - bytes.len or
+            bytes.len > app_total_byte_limit or
+            self.wq_bytes > app_total_byte_limit - bytes.len)
+        {
+            log.debug("overlay: dropping app frame for peer {d}; app queue at {d} items/{d} B ({d} items/{d} B total)", .{
+                self.id, self.wq_app_items, self.wq_app_bytes, self.wq.items.len, self.wq_bytes,
+            });
+            return false;
+        }
+
+        const copy = try self.gpa.dupe(u8, bytes);
+        self.wq.append(self.gpa, copy) catch |err| {
+            self.gpa.free(copy);
+            return err;
+        };
+        self.wq_bytes += copy.len;
+        self.wq_app_items += 1;
+        self.wq_app_bytes += copy.len;
+        self.wq_cond.signal(self.io);
+        return true;
+    }
+
     fn startWriter(self: *Conn) !void {
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
@@ -316,6 +370,8 @@ const Conn = struct {
             var batch = self.wq;
             self.wq = .empty;
             self.wq_bytes = 0;
+            self.wq_app_items = 0;
+            self.wq_app_bytes = 0;
             self.wq_mu.unlock(io);
 
             var failed = false;
@@ -536,12 +592,20 @@ pub const Overlay = struct {
             }
             // Test-only partition simulation; a no-op in production.
             if (!linkAllowed(self.cfg.node_id, conn.peer_node_id)) continue;
-            // enqueue copies `bytes` and only touches the conn's queue lock
-            // (plus, on queue overflow, a non-blocking socket shutdown); it
-            // never blocks on I/O, so holding conns_mu is fine.
-            conn.enqueue(bytes) catch |err| {
-                log.debug("overlay: enqueue to peer {d} failed: {t}", .{ conn.id, err });
-            };
+            // Enqueue copies `bytes` and only touches the conn's queue lock.
+            // Ordinary overflow may also do a non-blocking socket shutdown;
+            // app pressure only drops that frame. Neither path blocks on I/O,
+            // so holding conns_mu is fine.
+            if (frame == .app_message) {
+                _ = conn.enqueueApp(bytes) catch |err| {
+                    log.debug("overlay: app enqueue to peer {d} failed: {t}", .{ conn.id, err });
+                    continue;
+                };
+            } else {
+                conn.enqueue(bytes) catch |err| {
+                    log.debug("overlay: enqueue to peer {d} failed: {t}", .{ conn.id, err });
+                };
+            }
         }
     }
 
@@ -2034,6 +2098,163 @@ test "write queue caps: overflow fails the enqueue and shuts the conn down" {
         try testing.expectError(error.WriteQueueFull, conn.enqueue("y"));
         try testing.expectError(error.WriteClosed, conn.enqueue("y"));
     }
+}
+
+test "app write queue: pressure drops app frames but preserves an ordinary slot" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{
+        .mode = .stream,
+        .reuse_address = true,
+    });
+    defer server.deinit(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", portOf(server.socket.address));
+    const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    const black_hole = try server.accept(io);
+    defer black_hole.close(io);
+
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{}, test_prefix, 0xAA), rec.callbacks());
+    defer ov.deinit();
+
+    const conn = try gpa.create(Conn);
+    conn.* = .{
+        .io = io,
+        .gpa = gpa,
+        .stream = client,
+        .read_buf = try gpa.alloc(u8, 64),
+        .id = 1,
+        .hello_done = true,
+        .peer_feature_flags = wire.feature_app_messages,
+        // Exercise the async queue without starting a writer: the peer is a
+        // deterministic black hole and nothing drains behind the test.
+        .writer_started = true,
+    };
+    try ov.conns.append(gpa, conn);
+    defer {
+        _ = ov.conns.pop();
+        conn.deinit();
+        gpa.destroy(conn);
+    }
+
+    var i: usize = 0;
+    while (i < max_write_queue_items) : (i += 1) {
+        ov.broadcast(.{ .app_message = "app-pressure" });
+    }
+    ov.broadcast(.{ .ping = 0xC0A5E });
+
+    conn.wq_mu.lockUncancelable(io);
+    defer conn.wq_mu.unlock(io);
+    try testing.expect(!conn.wq_closed);
+    try testing.expectEqual(@as(usize, 257), conn.wq.items.len);
+    var last = try wire.decode(gpa, conn.wq.items[conn.wq.items.len - 1]);
+    defer last.deinit(gpa);
+    try testing.expect(last == .ping);
+    try testing.expectEqual(@as(u64, 0xC0A5E), last.ping);
+}
+
+test "app write queue: byte pressure stops at 1 MiB and preserves 4 MiB for ordinary frames" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{ .mode = .stream, .reuse_address = true });
+    defer server.deinit(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", portOf(server.socket.address));
+    const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    const black_hole = try server.accept(io);
+    defer black_hole.close(io);
+
+    const conn = try gpa.create(Conn);
+    conn.* = .{
+        .io = io,
+        .gpa = gpa,
+        .stream = client,
+        .read_buf = try gpa.alloc(u8, 64),
+        .id = 1,
+        .writer_started = true,
+    };
+    defer {
+        conn.deinit();
+        gpa.destroy(conn);
+    }
+
+    const payload = try gpa.alloc(u8, wire.max_app_message_bytes);
+    defer gpa.free(payload);
+    @memset(payload, 0xA7);
+    const encoded_app = try wire.encode(gpa, .{ .app_message = payload });
+    defer gpa.free(encoded_app);
+    const app_byte_cap: usize = 1024 * 1024;
+    const fitting_apps = app_byte_cap / encoded_app.len;
+    var i: usize = 0;
+    while (i < fitting_apps) : (i += 1) {
+        try testing.expect(try conn.enqueueApp(encoded_app));
+    }
+    try testing.expect(!(try conn.enqueueApp(encoded_app)));
+
+    const ordinary = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(ordinary);
+    @memset(ordinary, 0x5C);
+    i = 0;
+    while (i < 4) : (i += 1) try conn.enqueue(ordinary);
+    try testing.expect(!conn.wq_closed);
+    try testing.expect(conn.wq_bytes >= 4 * 1024 * 1024);
+}
+
+test "app write queue: taking a batch restores app admission" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{ .mode = .stream, .reuse_address = true });
+    defer server.deinit(io);
+    var addr = try net.IpAddress.parse("127.0.0.1", portOf(server.socket.address));
+    const client = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    const peer = try server.accept(io);
+
+    const conn = try gpa.create(Conn);
+    conn.* = .{
+        .io = io,
+        .gpa = gpa,
+        .stream = client,
+        .read_buf = try gpa.alloc(u8, 64),
+        .id = 1,
+        // Queue a whole batch before starting the real writer.
+        .writer_started = true,
+    };
+    defer {
+        // Unblock a writer parked in the kernel send before joining it.
+        peer.close(io);
+        conn.deinit();
+        gpa.destroy(conn);
+    }
+
+    const payload = try gpa.alloc(u8, wire.max_app_message_bytes);
+    defer gpa.free(payload);
+    @memset(payload, 0xB8);
+    const encoded_app = try wire.encode(gpa, .{ .app_message = payload });
+    defer gpa.free(encoded_app);
+    const fitting_apps = max_app_write_queue_bytes / encoded_app.len;
+    var i: usize = 0;
+    while (i < fitting_apps) : (i += 1) {
+        try testing.expect(try conn.enqueueApp(encoded_app));
+    }
+
+    try conn.startWriter();
+    var batch_taken = false;
+    i = 0;
+    while (i < 300) : (i += 1) {
+        conn.wq_mu.lockUncancelable(io);
+        batch_taken = conn.wq.items.len == 0;
+        conn.wq_mu.unlock(io);
+        if (batch_taken) break;
+        sleepMs(io, 10);
+    }
+    try testing.expect(batch_taken);
+    try testing.expect(try conn.enqueueApp(encoded_app));
 }
 
 // Non-vacuity: dropping the bracket strip makes `[::1]` the host (red);
