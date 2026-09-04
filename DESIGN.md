@@ -31,7 +31,7 @@ The v1 profile is intentionally narrow:
 - small inline application values;
 - static peers and quorum configuration;
 - a TCP flood overlay with no transport authentication or confidentiality;
-- bounded recent history, not an archive or state-transfer protocol.
+- bounded recent-slot answering, not an archive or state-transfer protocol.
 
 Stellar Core is a behavioral oracle for the consensus state-machine shapes,
 not a protocol peer. SLCP has different wire bytes, signature preimages, and
@@ -123,11 +123,28 @@ network gate fails closed if allocating its envelope metadata fails, preserving
 that floor instead of retrying the same stale statement inside the Engine.
 Restart reconstructs two related floors before restoration: the admission
 floor closes every journaled slot through the durable high-water mark, while
-the older answer floor retains at most the last 16 slots of own statements for
-lagging peers. Own-log records below the answer floor are skipped, so an
-uncompacted disk tail cannot crowd current slots out of the Engine's bounded
-live set. Subsequent delivery advances both floors monotonically and never
-lowers an explicit `start_slot` boundary.
+the older answer floor retains at most the configured
+`answering_window_slots = W` slots of own statements for lagging peers. `W`
+defaults to 16 and is restricted to 1..62 so those retained slots, current
+consensus, and one far-ahead catch-up slot fit the Engine's 64-live-slot bound.
+Own-log records below the answer floor are skipped, so an uncompacted disk
+tail cannot crowd current slots out of the Engine's bounded live set.
+Subsequent delivery advances both floors monotonically and never lowers an
+explicit `start_slot` boundary.
+
+The answering window is node-local and is neither advertised nor negotiated.
+It controls both what this node keeps to answer peers and how far ahead a
+decided slot must be before this node gap-jumps. Peers may choose different
+windows: a larger local value cannot recover statements that enough reachable
+validators have already discarded, while a smaller local value can abandon a
+gap even when another peer retained more. Deployments that want predictable
+availability use a consistent policy and observe cached past-side
+own-statement coverage through the Experimental `Node.catchupStats()`
+snapshot. Its count and bounds cover slots at or below the ordered-delivery
+frontier, can include locally abandoned slots or holes, and do not prove
+quorum availability. After widening a previously compacted data directory,
+an emitting validator can grow that cache toward `W` only as it emits new
+statements; configuration never recreates deleted records.
 
 Inbound statements are gated by the delivery frontier. Eligible future
 statements inside the bounded hold window wait until prior application state
@@ -274,18 +291,24 @@ valid prefix. A structurally complete record with a bad checksum is corruption,
 not a partial write. A validator whose own-statement history is untrustworthy
 must not continue signing. Recovery replays the retained externalized journal
 tail to the application. It restores own statements only from the later of
-`start_slot` and the delivered frontier's 16-slot answer floor, while
+`start_slot` and the delivered frontier's W-slot answer floor, while
 independently rejecting inbound/Engine work below the later of `start_slot`
-and the journal high-water mark's successor. The bounded restore prevents up
-to ~80 pre-compaction slots from exhausting the Engine's 64-slot budget
-oldest-first; the stronger admission floor prevents a closed slot from being
-resurrected after restart.
+and the journal high-water mark's successor. In gap-free steady state with no
+already-journaled future externalizations, a successful compaction leaves at
+most a W-slot journal suffix and its span can reach `W + 63` before the next
+64-slot frontier boundary. Already-journaled future externalizations extend
+the upper end; failed compaction retains an older lower end until retry. In
+every case the bounded own-state restore prevents stale history from crowding
+the Engine: records below the W-slot answer floor are skipped, leaving at most
+W restored past-side answer slots and room for current consensus. The stronger
+admission floor prevents a closed slot from being resurrected after restart.
 
-The journal is a bounded answering window, not complete application state.
-Applications with delta-like commands must persist their own snapshot and
-reconstruct state from that snapshot plus the retained journal tail. Long-gap
-catch-up requires an application-level archive or a future state-transfer
-interface. The registry example demonstrates the application-level path: a
+The consensus journal supports a bounded answering window; it is not complete
+application state or an authenticated history-transfer format. Applications
+with delta-like commands must persist their own snapshot and reconstruct state
+from that snapshot plus the retained journal tail. Long-gap catch-up requires
+an application-level archive or a future state-transfer interface. The
+registry example demonstrates the application-level path: a
 quorum-certified history tip authenticates an exact head H; recovery loads the
 tip's Snapshot V3 anchor and strictly replays its immutable per-slot ledger
 records through H before Node starts at H + 1 with the exact value agreed at H

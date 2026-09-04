@@ -212,13 +212,16 @@ establish it.
 _Avoid_: Certified-adoption marker, application snapshot
 
 **Answering window**:
-The recent span of externalized slots for which a node can still answer a
-lagging peer from local history.
+The node-local slot horizon that controls both recent own-statement retention
+for lagging peers and when ordered delivery abandons a missing gap. Cached
+own-statement coverage at or below the ordered-delivery frontier may be
+shorter, contain locally abandoned slots, or contain holes.
 _Avoid_: History archive
 
 **Answer floor**:
-The oldest slot whose own statements a node retains for answering lagging
-peers. It may be older than the purge floor after restart.
+The oldest slot eligible to retain own statements for answering lagging peers.
+It may precede the cached past-side own-statement set and may be older than the
+purge floor.
 _Avoid_: Delivery frontier
 
 **Purge floor**:

@@ -55,8 +55,11 @@
 //!         the valid prefix's high-water mark, and the file is likewise
 //!         truncated to that prefix (a torn tail sets `torn_tail_repaired`).
 //!   * compact(keep_from_slot): atomically rewrite both logs keeping only
-//!     records with slot >= keep_from_slot (§10's 16-slot answering window).
-//!     Temp file + fsync + rename-over — crash-safe at every point.
+//!     records with slot >= keep_from_slot. Node computes that floor from its
+//!     configured answering window W (default 16, range 1..62); Store owns no
+//!     retention policy. Temp file + fsync + rename-over — crash-safe at every
+//!     point. The resulting logs are recent consensus/replay material, not an
+//!     application history archive or state-transfer format.
 //!   * deinitRecovery frees everything recover() allocated.
 //!   * Tests (use std.testing.tmpDir): round-trip append→recover; last-wins
 //!     dedup across two prepares for one slot; a hand-corrupted own.log tail

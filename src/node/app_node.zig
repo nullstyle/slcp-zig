@@ -613,17 +613,26 @@ const bad_composite_fmt = "{s}.combine returned a Command that its own validate 
 ///
 /// Restart (plan R17): `State` is NOT persisted by this module. After
 /// `create`, `state` = `initialState()` + `apply` over the replayed journal
-/// tail (compaction-bounded: the last ≥16 slots), so commands must be full
-/// VALUES ("count becomes 3"), never deltas. An app with delta semantics
+/// tail. In gap-free steady state with no already-journaled future
+/// externalizations, a successful compaction leaves at most W slots, growing
+/// to at most W+63 before the next frontier boundary (default W=16; valid
+/// 1..62). Future externalizations can extend the upper end; failed
+/// compaction can retain an older lower end until retry.
+/// Commands must therefore be full VALUES ("count becomes 3"), never deltas.
+/// An app with delta semantics
 /// persists State itself, keyed by the slot it was taken at (every
 /// `waitApplied` item carries one), and declares BOTH `initialState()` (the
 /// snapshot) and `pub fn initialSlot() u64` (that slot): `create` seeds its
 /// dedup floor from `initialSlot()` before the tail replays, so journaled
 /// slots at or below it are skipped, not re-applied (S8 D2). Ordinarily the
-/// retained tail must continue that slot, so persist at least every 16 applied
-/// slots. An application that independently verifies an external checkpoint
-/// through slot H also exposes `pub fn initialCommand() ?Command`, returning
-/// the exact consensus value at H, and sets `.start_slot` to H + 1. The value
+/// retained tail must continue that slot, so persist at least every W applied
+/// slots. Widening after compaction cannot recreate deleted records; inspect
+/// `raw().catchupStats()` for cached own-statement count and bounds at or below
+/// the ordered-delivery frontier while the new window warms; those bounds may
+/// contain abandoned slots and holes. An application that independently
+/// verifies an external checkpoint through slot H also exposes
+/// `pub fn initialCommand() ?Command`, returning the exact consensus value at
+/// H, and sets `.start_slot` to H + 1. The value
 /// seeds the same next-slot nomination schedule incumbents use when the local
 /// journal is absent or stale; a newer continuing journal supersedes it.
 /// Continuity failures and a missing checkpoint command when the journal

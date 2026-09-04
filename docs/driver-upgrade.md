@@ -107,17 +107,38 @@ apps remain valid.
   would reject (a silent stall). `.maybe_valid` is fine: a node behind on
   `State` cannot judge what it combines.
 - **State is not persisted by `AppNode`** (plan R17): after a restart
-  `State = initialState()` + `apply` over the replayed journal tail (the last
-  ≥ 16 slots). That is why commands must be full values. An app with delta
-  semantics persists `State` itself, keyed by the slot it was taken at (every
-  `waitApplied` item carries one), and declares **both** `initialState()`
-  (the snapshot) and `initialSlot()` (that slot): `create` seeds its
-  dedup floor from `initialSlot()` before the tail replays, so journaled
-  slots at or below it are skipped instead of being applied a second time on
-  top of the snapshot. Persist at least every 16 applied slots: ordinarily a
-  snapshot the retained tail cannot catch up — older than the tail's first
-  slot, ahead of its last, or with no journal at all — is refused at `create`
-  with `InitialSlotOutsideJournal` rather than started on a wrong `State`.
+  `State = initialState()` + `apply` over the replayed journal tail. In
+  gap-free steady state without journaled future externalizations, successful
+  compaction leaves its last `answering_window_slots = W` slots and the suffix
+  may grow by up to 63 slots before the next frontier boundary. Journaled
+  future externalizations can extend the upper end. `W` defaults to 16 and
+  accepts 1..62. A failed compaction is nonfatal and retries after later
+  delivery, so the on-disk tail can retain an older lower end.
+  That is why commands must be full values. An app with delta semantics
+  persists `State` itself, keyed by the slot it was taken at (every
+  `waitApplied` item carries one), and declares **both**
+  `initialState()` (the snapshot) and `initialSlot()` (that slot): `create`
+  seeds its dedup floor from `initialSlot()` before the tail replays, so
+  journaled slots at or below it are skipped instead of being applied a
+  second time on top of the snapshot. Persist snapshots no less often than
+  every W applied slots: ordinarily a snapshot the retained tail cannot catch
+  up — older than the tail's first slot, ahead of its last, or with no journal
+  at all — is refused at `create` with `InitialSlotOutsideJournal` rather than
+  started on a wrong `State`.
+
+  Widening W after the old policy compacted a data directory cannot restore
+  records already deleted. The journal builds a newer suffix as later slots
+  externalize. Separately, an emitting validator's cached own-statement
+  coverage at or below the ordered-delivery frontier can refill toward the new
+  W only as it emits new statements. Experimental `raw().catchupStats()`
+  reports that cached coverage—not the retained journal tail—and its bounds can
+  include locally abandoned slots or holes and do not establish quorum
+  availability. Likewise, W is only native recent-statement retention and a
+  local gap-abandonment horizon. It is not application snapshot transport or
+  authenticated history. A lag that reachable peers' cached statements cannot
+  cover with the required quorum still needs the external-checkpoint path
+  below (or another application-owned archive).
+
   There is one explicit external-checkpoint path: after the application has
   independently authenticated state through slot H, set `initialSlot()` to H
   and `.start_slot` to exactly H + 1, and expose

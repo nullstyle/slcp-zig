@@ -95,11 +95,12 @@ apply-time check is essential—enqueue-time admission can become stale while
 the item waits behind attacker-controlled traffic. On restart, the same floor
 is reconstructed as the successor of the journal high-water mark (or a later
 explicit `start_slot`) before any own statement is restored or network input
-is accepted. A separate answer floor retains only the last 16 own-statement
-slots; records below that older floor are skipped, so an uncompacted disk tail
-cannot consume the Engine slot budget with retired history. Retained answers
-below the admission floor can be sent to a lagging peer but cannot reactivate
-local consensus state.
+is accepted. A separate answer floor retains own statements for only the
+configured W recent slots behind the ordered-delivery cursor
+(`answering_window_slots`, default 16, range 1..62); records below that older
+floor are skipped, so an uncompacted disk tail cannot consume the Engine slot
+budget with retired history. Retained answers below the admission floor can be
+sent to a lagging peer but cannot reactivate local consensus state.
 
 The separate application-message inbox is lazy and global, not one allocation
 per connection. Until the application first calls `waitAppMessage`, received
@@ -277,6 +278,18 @@ Held statements are neither relayed nor answered, so a lagging node also
 stops propagating the next slot's statements until it catches up (a slower
 relay in sparse topologies; invisible on the full-mesh deployments).
 
+The separate native answering window is a **local availability policy**.
+`answering_window_slots = W` defaults to 16 and accepts 1..62; it is neither
+advertised nor negotiated. This node keeps up to W recent slots of its own
+statements for peers and abandons a delivery gap once a buffered decided slot
+is at least W beyond the missing frontier. The far-ahead decision still needs
+the normal v-blocking evidence above, so a lone Byzantine peer cannot force
+the jump. Heterogeneous W values do not weaken statement safety, but they do
+make recovery availability asymmetric: a large receiver W cannot recreate
+statements its reachable validators discarded, while a small receiver may
+jump before a better-retaining peer answers. A common W is therefore an
+operational convention, not a consensus parameter.
+
 **Relevance filter** (protocol §4 step 8): statements whose signer is outside
 the published transitive quorum graph of your configuration are `ignored`
 before any per-slot state is allocated. The graph is exact at checkpoints and
@@ -431,11 +444,20 @@ writes without stopping consensus.
   untrusted and the node runs as a **watcher for its lifetime** (v1
   as-built) — it can never emit a statement older than one it already
   broadcast, because it never emits.
-- **Uncompacted valid tail**: recovery derives the same 16-slot answer floor
-  used during live delivery (or the later explicit `start_slot`) and restores
-  only own statements at or above it. It separately closes Engine admission
-  through the journal high-water mark. The full retained externalized journal
-  tail is still replayed to the application for slot-level dedup.
+- **Uncompacted valid tail**: recovery derives the same configured W-slot
+  answer floor used during live delivery (or the later explicit `start_slot`)
+  and restores only own statements at or above it. It separately closes
+  Engine admission through the journal high-water mark. In gap-free steady
+  state with no already-journaled future externalizations, successful
+  compaction leaves at most a W-slot journal suffix and its span can reach
+  `W + 63` before the next frontier boundary. Future externalizations can
+  extend the upper end; failed compaction can retain an older lower end. The
+  full retained journal tail is still replayed to the application for slot-
+  level dedup, but at most W past-side answer slots enter the 64-live-slot
+  Engine. Widening an already compacted directory does not recreate its
+  deleted prefix; an emitting validator's cached own-statement coverage at or
+  below the ordered-delivery frontier can refill toward the new W only as it
+  emits later statements and can include abandoned slots or holes.
 - Cost: every own emission pays a disk sync (`fsync`, plus `F_FULLFSYNC` on
   macOS for the key file). On slow disks this throttles ballot rounds
   (design §16); acceptable at seconds-scale slots.
@@ -476,11 +498,12 @@ writes without stopping consensus.
 ## 8. Registry replayable history: application-owned trust
 
 The SLCP core has no archival/state-transfer protocol and does not authenticate
-application snapshots. Its native node answers only from the recent 16-slot
-window. `AppNode` performs a pre-live continuity check against recovered
-journal metadata. After an application has independently authenticated and
-reconstructed state through H, it may leave a stale or empty journal behind
-only by pairing `initialSlot() = H` with `.start_slot = H + 1` and the exact
+application snapshots. Its native node answers only from its recent configured
+window (`answering_window_slots`, default 16, range 1..62). `AppNode` performs
+a pre-live continuity check against recovered journal metadata. After an
+application has independently authenticated and reconstructed state through H,
+it may leave a stale or empty journal behind only by pairing
+`initialSlot() = H` with `.start_slot = H + 1` and the exact
 consensus value at H from `initialCommand()`; a later start is valid only when
 the journal supplies every intervening slot. Node recovery prefers a newer
 journal value and rejects a same-slot byte mismatch. The application still
@@ -668,10 +691,11 @@ startup materialization to at most `N-1` ledger applications, or 63 at N=64.
 This does not guarantee availability. A hostile archive can withhold a needed
 object; the importer may choose a lower replayable certified candidate still
 above its floor, but it cannot recover a candidate whose anchor or ledger is
-missing. An unrecoverable gap observed while the registry is already running
-still stops that process rather than applying a discontinuous ledger value.
-Immutable shared ledgers, anchors, and votes—and trusted per-slot
-signing/frontier evidence—grow until a separate retention policy exists.
+missing. A live-delivery gap the native node abandons under its local horizon
+still stops the registry process rather than applying a discontinuous ledger
+value; certified archive recovery may remain available after restart.
+Immutable shared ledgers, anchors, and votes—and trusted per-slot signing and
+frontier evidence—grow until a separate retention policy exists.
 
 ## 9. Out of scope
 
@@ -680,9 +704,10 @@ Not addressed by v1 and not claimed:
 - **Flow control and fairness** beyond the per-peer budgets in §3.
 - **Peer discovery** — you list peers explicitly; there is no gossip of
   addresses.
-- **Core history / archival** — the native answering window remains 16 slots;
-  the registry adapter in §8 provides its own bounded, replayable archive, but
-  SLCP still has no generic state transfer or configurable retained history.
+- **Core history / archival** — the native answering window is configurable
+  from 1 through 62 slots, but still carries only recent signed consensus
+  statements. The registry adapter in §8 provides its own bounded replay from
+  an application-owned archive; SLCP has no generic history or state transfer.
 - **DoS resistance beyond budgets** — a well-provisioned attacker on the
   port can degrade liveness of a small network (§2 is the mitigation).
 - **Driver nondeterminism** — a `validate` / `combine` / `apply` that gives

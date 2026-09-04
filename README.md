@@ -29,10 +29,11 @@ The library is two layers in one package:
   it byte for byte.
 - **`slcp`** — the native "omakase" node on top of the engine: a TCP flood
   overlay, a real-clock timer wheel, crash-safe write-ahead persistence, a
-  bounded best-effort quorum-set answering cache, an Ed25519 key file, quorum
-  linting at startup, and two app-facing APIs — the typed `slcp.AppNode(App)`
-  (a pure `validate` / `apply` state machine over an auto-derived canonical
-  encoding) and the bytes-level `slcp.Node`.
+  configurable bounded recent-slot answering window, a best-effort quorum-set
+  answering cache, an Ed25519 key file, quorum linting at startup, and two
+  app-facing APIs — the typed `slcp.AppNode(App)` (a pure `validate` / `apply`
+  state machine over an auto-derived canonical encoding) and the bytes-level
+  `slcp.Node`.
 
 The program every design decision is derived from is a replicated counter on
 three hobbyist machines: each proposes "the count becomes N+1", the network
@@ -291,10 +292,33 @@ this lower-level seam does not authenticate application state.
 | `.watcher` | `false` | No key, ephemeral node id, never signs, never proposes — a node that only follows. |
 | `.strict_canonical` | `true` | Reject statements whose bytes are not the canonical encoding (protocol §4.2). |
 | `.max_value_bytes` | `4096` | Largest value `propose` accepts, in `[1, 65536]`. |
+| `.answering_window_slots` | `16` | Recent slots behind the ordered-delivery cursor retained for bounded native peer answering, and the slot distance at which ordered delivery abandons a gap; valid range `[1, 62]`. This is a local availability policy, not an archive. |
 | `.start_slot` | `1` | First slot to nominate for; must be above the journal high-water mark of an existing data dir. |
 | `.driver` | `null` | Application driver vtable (`slcp.Driver`); `null` is the default driver described in `docs/driver-upgrade.md`. |
 | `.delivery` | `null` | Engine-thread delivery hook (`slcp.DeliveryHook`) instead of the `waitExternalized` queue; what `AppNode` installs for itself. |
 | `.diagnostic` | `null` | Where `create` writes its failure message (`*slcp.node.Diagnostic`). |
+
+`answering_window_slots = W` is configured independently on each node and is
+not negotiated on the wire. A node serves only the signed statements it still
+actually has; increasing `W` after an older, smaller policy compacted a data
+directory cannot recreate deleted slots. An emitting validator can refill its
+cached past-side coverage toward `W` only by emitting new statements. The
+Experimental `Node.catchupStats()` snapshot reports the configured window,
+the count and bounds of locally cached own statements at or below the ordered-
+delivery frontier, held and pending work, and gap-jump counters. The cached
+set can include locally abandoned slots or holes and does not prove that a
+quorum can supply a range. For predictable recovery availability, configure
+the validators expected to answer one another consistently and monitor their
+actual cached own-statement coverage—not just the configured number.
+
+A larger `W` retains O(W) recent consensus state, increases connection and
+periodic anti-entropy replay toward O(W) envelopes, and leaves a wider slot
+span in the consensus logs. The upper bound of 62 reserves two of the Engine's
+64 live slots: one for current consensus and one for far-ahead catch-up that
+can trigger a gap jump. This window transfers recent signed consensus
+statements only; an application that must reconstruct old state still needs
+snapshots and an authenticated application history such as the registry
+example.
 
 ## The `slcp` CLI
 
@@ -334,7 +358,7 @@ mise exec -- zig build test
 |---|---|
 | `zig build test` | The gate: engine unit tests, conformance-vector replay, framing vectors, engine end-to-end, node-layer tests, ABI conformance, sim smoke matrix, fuzz smoke, the wasm differential (when the artifact is present), CLI tests, the AppNode expected-fail compiles, the example's in-tree compile, and the docs gate below. |
 | `zig build docs-smoke` | The docs gate (part of `test`): README and `docs/` snippets byte-equal to the files they quote, recipe outputs byte-equal to the real CLI, every documented build step / recipe / CLI verb exists, enum arms and version pins match the source. Prints `[docs-smoke] checks=N failures=M`. |
-| `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
+| `zig build e2e` | The 4-node real-socket cluster: 200 slots, default-window kill/restart with a gap-jump, configured-window exact catch-up beyond 16 slots, post-recovery voting, partition/heal, one equivocator, and two nodes restarting together three times. About three minutes. |
 | `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
 | `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three skewed-clock registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, deterministic close-time agreement, ordinary restart, then exact peerless anchor-to-tip replay after one validator misses at least 201 slots and both certifying peers stop. The recovered validator must expose the same non-anchor slot/hash/time after replaying 17–63 immutable ledgers, then cast a necessary vote in the first later transaction-bearing ledger. It also proves the hard network epoch. Not part of `test` (which runs `registry-tests`, the example's own tests). |

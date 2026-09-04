@@ -57,12 +57,13 @@ comptime {
 
 /// One validated startup policy owns every past-window calculation. Keeping
 /// this separate from `HoldBuffer.window` is intentional: that fixed bound
-/// limits future inbound work, while this one retains recent delivered work.
+/// limits future inbound work, while this one bounds past-side answering and
+/// local gap abandonment.
 const AnsweringPolicy = struct {
     slots: u8,
 
-    /// Oldest retained slot for an inclusive delivered frontier. Zero means
-    /// the configured window has not filled yet.
+    /// Oldest eligible retained slot for an inclusive ordered-delivery
+    /// frontier. Zero means the configured window has not filled yet.
     fn floor(self: AnsweringPolicy, frontier: u64) u64 {
         const slots: u64 = self.slots;
         return if (frontier >= slots) frontier - (slots - 1) else 0;
@@ -354,9 +355,10 @@ pub const Options = struct {
     strict_canonical: bool = true,
     /// Largest value `propose` accepts; [1, 65536].
     max_value_bytes: u32 = 4096,
-    /// Recently delivered slots retained for native peer answering, and the
-    /// slot distance at which ordered delivery abandons a missing gap. Valid
-    /// range: 1..62. This is not archival history.
+    /// Recent slots behind the ordered-delivery cursor retained for native
+    /// peer answering, and the slot distance at which ordered delivery
+    /// abandons a missing gap. Valid range: 1..62. This is not archival
+    /// history.
     answering_window_slots: u8 = default_answering_window_slots,
     /// First slot to nominate proposals for (default 1). Must be above the
     /// journal high-water mark of an existing data_dir.
@@ -425,15 +427,17 @@ pub const StorageStats = struct {
 pub const CatchupStats = struct {
     /// Configured local horizon, fixed for this Node lifetime.
     answering_window_slots: u8,
-    /// Slot immediately before the next ordered application delivery. Before
-    /// the first delivery this is `start_slot - 1`.
+    /// Slot immediately before the next ordered-delivery cursor. This can
+    /// include a locally abandoned gap; before the first delivery it is
+    /// `start_slot - 1`.
     delivery_frontier: u64,
-    /// Delivered slots for which this node currently caches an own statement.
-    /// This set can contain holes and is not a quorum-availability promise.
+    /// Slots at or below `delivery_frontier` for which this node caches an own
+    /// statement. This set can include locally abandoned slots, contain holes,
+    /// and is not a quorum-availability promise.
     answerable_slots: usize,
-    /// Minimum slot in that cached delivered set, or null when it is empty.
+    /// Minimum slot in that cached past-side set, or null when it is empty.
     oldest_answerable_slot: ?u64,
-    /// Maximum slot in that cached delivered set, or null when it is empty.
+    /// Maximum slot in that cached past-side set, or null when it is empty.
     newest_answerable_slot: ?u64,
     /// First slot still admitted by the native host and Engine. This can be
     /// newer than `oldest_answerable_slot` after journal recovery.
@@ -1226,19 +1230,20 @@ pub const Node = struct {
     /// or early, once a v-blocking set has externalized their slot (S8 D1 /
     /// S8b).
     hold: HoldBuffer = .{},
-    /// Engine-thread-only: the delivered frontier at the last successful log
-    /// compaction. Compaction runs whenever the frontier enters a new
-    /// 64-slot bucket past this (§10 "every 64 delivered slots") — tracked
-    /// rather than tested with `frontier % 64 == 0`, because one drain can
-    /// step over a boundary when out-of-order catch-up slots are buffered.
+    /// Engine-thread-only: the ordered-delivery frontier at the last
+    /// successful log compaction. Compaction runs whenever the frontier enters
+    /// a new 64-slot-number bucket past this — tracked rather than tested with
+    /// `frontier % 64 == 0`, because one drain can step over a boundary when
+    /// out-of-order catch-up slots are buffered.
     last_compact_frontier: u64 = 0,
     /// The externalized.log tail found at `create` (first/last slot and the
     /// first slot of its maximal gap-free suffix; null when empty). Written
     /// once before go-live, then read-only: `AppNode` checks an app's
     /// `initialSlot()` against it (§8.5 delta-app recipe, S8 D2).
     journal_tail: ?JournalTail = null,
-    /// Oldest slot retained in `own_latest` and the durable logs for outbound
-    /// catch-up. Engine-thread-only after synchronous recovery.
+    /// Logical floor for `own_latest` restoration/retention and the next log
+    /// compaction. Durable logs may temporarily retain older records.
+    /// Engine-thread-only after synchronous recovery.
     answer_floor: u64 = 1,
     /// Immutable, validated policy shared by recovery, retention, compaction,
     /// and ordered-delivery gap handling.
@@ -1771,11 +1776,13 @@ pub const Node = struct {
         //   traffic can resurrect a pre-restart NOMINATE/CONFIRM slot even
         //   though the application state is already at the journal HWM.
         //
-        // Recovery can contain the configured window plus up to 63 newer
-        // slots just before the next 64-slot compaction, so answer_floor also
-        // keeps old restores within the Engine's 64-slot budget. An explicit
-        // start_slot remains a permanent inbound floor when it is newer than
-        // the journal.
+        // Durable logs can contain records below this logical floor between
+        // successful compactions, and the journal can already contain
+        // out-of-order externalizations above the ordered frontier. Applying
+        // the reconstructed answer floor during own-state restore prevents
+        // stale past-side records from crowding the Engine's 64-slot budget.
+        // An explicit start_slot remains a permanent inbound floor when it is
+        // newer than the journal.
         const restored_answer_floor = @max(opts.start_slot, self.answering.floor(self.next_deliver - 1));
         const admission_floor = if (rec.externalized_hwm) |hwm|
             @max(opts.start_slot, hwm +| 1)
@@ -2166,9 +2173,10 @@ pub const Node = struct {
     }
 
     /// Coherent bounded-catch-up snapshot. Experimental. Answerable coverage
-    /// counts cached own statements for delivered slots; it can contain holes
-    /// and does not prove that a quorum can supply any range. All values
-    /// describe this node only; peers may use other windows.
+    /// counts cached own statements at or below the ordered-delivery frontier;
+    /// it can include locally abandoned slots, contain holes, and does not
+    /// prove that a quorum can supply any range. All values describe this node
+    /// only; peers may use other windows.
     pub fn catchupStats(self: *Node) CatchupStats {
         self.stats_mu.lockUncancelable(self.io);
         defer self.stats_mu.unlock(self.io);
@@ -2193,8 +2201,8 @@ pub const Node = struct {
         self.own_mu.lockUncancelable(self.io);
         var answerable_it = self.own_latest.keyIterator();
         while (answerable_it.next()) |slot| {
-            // Current and transient far-ahead consensus slots are useful
-            // live state, but they are not retained delivered history.
+            // Current and transient far-ahead consensus slots are useful live
+            // state, but they are not past-side answering coverage.
             if (slot.* > delivery_frontier) continue;
             answerable_slots += 1;
             answerable_lowest = if (answerable_lowest) |lowest| @min(lowest, slot.*) else slot.*;
@@ -2637,8 +2645,9 @@ pub const Node = struct {
         }
         if (!delivered_any) return;
 
-        // GC (§10): keep the configured answering window behind the DELIVERED
-        // frontier (never purge a slot the app has not consumed).
+        // GC (§10): keep the configured answering window behind the ordered
+        // delivery cursor. Nothing at or above `next_deliver` is purged;
+        // locally abandoned gap slots below it are intentionally closed.
         const frontier = self.next_deliver - 1;
         const window_floor = self.answering.floor(frontier);
         if (window_floor != 0) {
@@ -2654,12 +2663,12 @@ pub const Node = struct {
             self.answer_floor = @max(self.answer_floor, window_floor);
             self.pruneOwnLatest(self.answer_floor);
             self.q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = engine_floor } }, .source_peer = null });
-            // §10 "and compacts": rewrite the logs occasionally so they do
-            // not grow without bound (every 64 delivered slots). A drain may
-            // deliver several buffered slots at once and land past a
-            // multiple of 64, so compare 64-slot buckets against the last
-            // compaction instead of testing the frontier itself; a failed
-            // compaction leaves the mark alone so the next drain retries.
+            // §10 "and compacts": rewrite the logs whenever the ordered-
+            // delivery frontier enters a new 64-slot-number bucket. A drain
+            // may deliver several buffered slots or jump a gap and step over
+            // a boundary, so compare buckets against the last compaction
+            // instead of testing the frontier itself; a failed compaction
+            // leaves the mark alone so the next drain retries.
             if (frontier / 64 > self.last_compact_frontier / 64) {
                 if (self.store.compact(self.answer_floor)) |_| {
                     self.last_compact_frontier = frontier;
@@ -4010,8 +4019,8 @@ test "recovery predecessor merges an external checkpoint with the durable journa
     try std.testing.expect(std.mem.indexOf(u8, diag.message(), "maximum slot") != null);
 }
 
-// A normal compaction at frontier 64 leaves slots 49..64, after which a
-// crash just before frontier 128 can leave slots 49..127 in both logs. The
+// A normal W=62 compaction at frontier 64 leaves slots 3..64, after which a
+// crash just before frontier 128 can leave slots 3..127 in both logs. The
 // restart must derive both floors from the durable high-water mark before
 // restoring own.log. This maximum-window case keeps the newest 62 historical
 // slots while inbound traffic through the journal HWM is already closed.
@@ -4446,8 +4455,8 @@ fn probeDrainCompaction(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8
 // (tested once per drain, after the loop) leaves arm B — a single drain
 // that steps 63 → 65 over the 64 boundary, the out-of-order catch-up case
 // `pending_ext` exists for — with all 62 pre-existing journal records
-// (min slot 1) instead of the 13 records >= 50 the §10 "every 64 delivered
-// slots" cadence promises; arm A (a drain ending exactly on 64) passes
+// (min slot 1) instead of the 13 records >= 50 the §10 64-slot frontier
+// bucket cadence promises; arm A (a drain ending exactly on 64) passes
 // either way and pins the steady-state cadence. Dropping the
 // `last_compact_frontier` update after a successful compaction would
 // compact on every later drain — not caught here, but harmless.

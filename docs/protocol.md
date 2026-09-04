@@ -931,8 +931,8 @@ or history must own it above this seam.
   means "latest externalized you have". Requests are never relayed.
 - **On connect** (after the Hello exchange): send own latest envelopes for
   all live slots to that peer, then `getSlotState(0)`. Externalized slots
-  keep answering with EXTERNALIZE statements for the 16-slot answering window
-  (§13).
+  keep answering with EXTERNALIZE statements for this node's configured
+  `answering_window_slots` (§13; default 16, valid range 1..62).
 - **Periodic anti-entropy** (`resync_interval_ms = 3_000`): every 3 s each
   node re-floods its own latest envelopes for live slots and broadcasts
   `getSlotState(0)`. The engine emits only on state change, so this is the
@@ -951,7 +951,7 @@ or history must own it above this seam.
 
 Source: `src/node/store.zig` (header + `Recovery`),
 `src/node/qset_disk_cache.zig`, `src/node/node.zig` (identity marker,
-`purge_window`, compaction), `src/node/keys.zig`.
+`AnsweringPolicy`, compaction), `src/node/keys.zig`.
 **No cross-language persistence vector yet** — until one is added,
 `store.zig` tests pin the logs (round-trip, last-wins dedup, torn tail, crc),
 and `qset_disk_cache.zig` tests pin answering-cache behavior.
@@ -1016,17 +1016,18 @@ the lock when the process exits or dies, so a leftover `lock` file after a
 crash is inert and a restart needs no cleanup. On a filesystem without lock
 support the node logs a warning and starts unguarded.
 
-**Restart order** (`Node.create`, M6 S3): (1) the delivery frontier comes
-from the journal high-water mark `F`; (2) before restoring Engine state, the
-host reconstructs an answer floor of `max(start_slot, F − 15)` when `F >= 16`
-(otherwise `start_slot`) and a stronger admission/purge floor of
-`max(start_slot, F + 1)`; (3) the complete retained journal tail is replayed
-to the app through the single delivery chokepoint in ascending slot order;
-(4) only `own.log` latest records at or above the answer floor are fed as
-`restore_own_envelope` inputs; (5) go live: listen, engine thread,
-anti-entropy thread. An explicit `start_slot` declares every lower slot out of
-scope even when the journal is empty. When no journal exists, both floors
-begin at `start_slot`.
+**Restart order** (`Node.create`, M6 S3): let
+`W = answering_window_slots` (default 16, valid range 1..62). (1) The delivery
+frontier comes from the journal high-water mark `F`; (2) before restoring
+Engine state, the host reconstructs an answer floor of
+`max(start_slot, F − (W − 1))` when `F >= W` (otherwise `start_slot`) and a
+stronger admission/purge floor of `max(start_slot, F + 1)`; (3) the complete
+retained journal tail is replayed to the app through the single delivery
+chokepoint in ascending slot order; (4) only `own.log` latest records at or
+above the answer floor are fed as `restore_own_envelope` inputs; (5) go live:
+listen, engine thread, anti-entropy thread. An explicit `start_slot` declares
+every lower slot out of scope even when the journal is empty. When no journal
+exists, both floors begin at `start_slot`.
 
 The Experimental recovery seam runs inside that startup boundary. After the
 store has recovered its high-water mark and gap-free journal suffix, but
@@ -1054,7 +1055,7 @@ exact consensus command at H from `initialCommand()`. A later start is
 accepted only when the journal supplies every intervening slot; a newer
 journal also supplies the nomination predecessor itself. This is an
 application trust seam only. It changes neither the signed consensus schema
-nor the Node's 16-slot answering window.
+nor the Node's configured answering window.
 
 **Write path**: `persist_own_envelope` → append + fsync `own.log` → only then
 the paired `broadcast_envelope`. A failed append latches the node **inert**
@@ -1062,21 +1063,30 @@ the paired `broadcast_envelope`. A failed append latches the node **inert**
 cannot persist must go silent. `externalized` → append + fsync
 `externalized.log` → deliver to the app.
 
-**GC / answering window**: `purge_window = 16`. When the delivered frontier
-`F >= 16`, the node advances its answer floor to `F − 15` and, each
-time `F` enters a new 64-slot bucket since the last compaction (so a
-multi-slot catch-up drain that steps over a multiple of 64 still counts),
-compacts both logs to `slot >= F − 15` (atomic temp-file + fsync +
-rename-over). So between compactions a log holds between 16 and ~80 slots,
-and a restart replays the whole retained **journal** tail to the application
-(dedup by slot in the app, design §8.5), while old `own.log` records below
-the reconstructed answer floor are skipped before Engine restoration. This
-prevents an uncompacted ~80-slot tail from filling the 64-slot Engine budget
-oldest-first and excluding current protocol state.
+**GC / answering window**: `Node.Options.answering_window_slots = W` defaults
+to 16 and accepts 1..62. The upper bound reserves one Engine slot for current
+consensus and one for far-ahead catch-up. Once the delivered frontier `F >= W`,
+the node advances its answer floor to at least `F − (W − 1)` (`F − W + 1`).
+Each time `F` enters a new 64-slot bucket since the last compaction (so a
+multi-slot catch-up drain that steps over a multiple of 64 still counts), it
+compacts both logs to `slot >= answer_floor` (atomic temp-file + fsync +
+rename-over).
+In gap-free steady state with no already-journaled future externalizations, a
+successful compaction leaves at most a W-slot journal suffix; before the next
+64-slot frontier boundary its span can reach `W + 63`. Already-journaled future
+externalizations extend the upper end. Compaction failure is nonfatal and is
+retried after later delivery, so the on-disk tail can retain an older lower
+end. A restart replays the whole retained **journal** tail to the application
+(dedup by slot in the app, design §8.5), but skips old
+`own.log` records below the reconstructed answer floor before Engine
+restoration. At most W answer slots are therefore restored, leaving two of the
+Engine's 64 live slots: one for current work and one for the far-ahead slot
+that can initiate catch-up. That is why W is capped at 62.
+
 A native node independently keeps the admission/purge floor at least as new
 as the durable journal's successor, and publishes the later of that floor and
-`F − 15` before it queues the priority Engine purge. Neither floor retreats,
-including when an explicit `start_slot` is later than the first
+`F − (W − 1)` before it queues the priority Engine purge. Neither floor
+retreats, including when an explicit `start_slot` is later than the first
 answering-window calculation.
 Late peer envelopes, entries already in the hold buffer, and local nominations
 that the purge overtook in the ordinary queue are all checked against the
@@ -1086,9 +1096,38 @@ producing fresh state for old history. Own EXTERNALIZE statements between the
 answer and admission floors remain restored Engine slots for answering a
 lagging peer, but the admission gate prevents them from accepting new peer or
 local work and from advancing old history.
-A catch-up gap wider than the window is declared unrecoverable and skipped
-loudly; held statements (§12) for the skipped range are dropped with it,
-and the new frontier slot's held statements are released.
+A gap is abandoned when the highest buffered externalization is at least W
+slots beyond `next_deliver` and the lowest buffered slot is also beyond that
+missing frontier. The node skips loudly to that lowest slot; held statements
+(§12) for the skipped range are dropped and the new frontier slot's held
+statements are released. This is the lagging node's bounded local policy, not
+proof that every peer discarded the gap.
+
+The window is not advertised or negotiated. Each node answers from its own
+actual retained statements and applies its own W when deciding to abandon a
+gap, so heterogeneous windows change availability: a larger receiver window
+cannot create data already discarded by the reachable validators, and a
+smaller receiver may jump before a larger peer's older answer arrives.
+Continuous catch-up still requires enough reachable validators under the
+receiver's quorum rules to retain every missing slot. Widening a data
+directory after compaction does not recreate deleted records; an emitting
+validator's cached own-statement coverage at or below the ordered-delivery
+frontier can refill toward W only as it emits later statements. Experimental
+`Node.catchupStats()` exposes configured W, the local count and bounds of that
+cached past-side set, pending and held work, drops, and gap-jump totals. The
+cached set can include locally abandoned slots or holes and is not evidence
+that a quorum can supply a range.
+
+The memory and anti-entropy work attributable to retained own statements is
+O(W) (up to a nomination and ballot envelope per slot). In gap-free steady
+state without already-journaled future externalizations, successful compaction
+leaves at most a W-slot suffix and its span can grow to `W + 63` before the
+next frontier boundary. Future externalizations can extend the upper end,
+while failed compaction can retain an older lower end until a retry succeeds.
+Byte cost also depends on how many own statements each slot emitted. These are
+signed consensus answers only. They neither carry an application snapshot nor
+authenticate or transfer old application state; recovery beyond available
+live statements belongs to an application-owned history/archive protocol.
 
 **Qset cache** (`qset_disk_cache.zig`):
 `qsets/<lower-case hex of qsetHash>.bin` holds framed `QuorumSet` message
