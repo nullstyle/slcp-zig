@@ -11,6 +11,24 @@ const app = @import("app.zig");
 const rpc = @import("rpc.zig");
 
 const default_rpc = "127.0.0.1:7412";
+const gossip_drain_per_tick: usize = 64;
+const gossip_reflood_ms: u64 = 1_000;
+
+/// Stack-lived adapter from registry admission to the node's Experimental
+/// application-message transport. A periodic reflood retries any best-effort
+/// send that cannot make progress now.
+const GossipPublisher = struct {
+    node: *slcp.Node,
+
+    fn publisher(self: *@This()) rpc.Publisher {
+        return .{ .ctx = self, .publishFn = publish };
+    }
+
+    fn publish(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.node.publishAppMessage(bytes) catch {};
+    }
+};
 
 const usage =
     \\registry — a replicated name registry on slcp (examples/registry)
@@ -265,6 +283,13 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         return 1;
     };
     defer node.deinit();
+
+    // The generic Node retains no application payloads until the application
+    // asks for one. Opt in before RPC admission or the cadence loop can race
+    // with an already-connected peer's first transaction flood.
+    if (node.raw().waitAppMessage(.{ .timeout_ms = 0 })) |message| {
+        node.raw().allocator().free(message);
+    }
     if (!restored) {
         if (node.raw().journal_tail) |tail| {
             if (tail.first > 1) {
@@ -278,7 +303,8 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         }
     }
 
-    var shared = rpc.Shared{ .io = io, .state = app.boot.state };
+    var publisher = GossipPublisher{ .node = node.raw() };
+    var shared = rpc.Shared{ .io = io, .state = app.boot.state, .publisher = publisher.publisher() };
     const server = rpc.Server.start(gpa, io, &shared, rpc_port) catch |err| {
         std.debug.print("registry node: cannot bind the rpc port 127.0.0.1:{d}: {t}\n", .{ rpc_port, err });
         return 1;
@@ -302,6 +328,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
     // hold window plus its 16-slot answering window) is not told so: the
     // statements it needs are dropped silently. Say something every minute.
     var next_stall_warn = nowMs(io) + stall_warn_ms;
+    var next_gossip_reflood = nowMs(io) + gossip_reflood_ms;
     while (true) {
         const item = node.waitApplied(.{ .timeout_ms = 100 }) catch |err| switch (err) {
             error.NodeHalted => {
@@ -341,12 +368,27 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             next_stall_warn = last_close + stall_warn_ms;
             proposed = false;
         }
-        if (nowMs(io) >= next_stall_warn) {
+
+        // Keep hostile or simply busy peers from starving application and
+        // consensus progress: each tick consumes at most 64 owned messages.
+        // Shared.admit is the same trust boundary used by localhost RPC.
+        for (0..gossip_drain_per_tick) |_| {
+            const message = node.raw().waitAppMessage(.{ .timeout_ms = 0 }) orelse break;
+            defer node.raw().allocator().free(message);
+            _ = shared.admit(message);
+        }
+
+        const now = nowMs(io);
+        if (now >= next_gossip_reflood) {
+            _ = shared.refloodPending();
+            next_gossip_reflood = now + gossip_reflood_ms;
+        }
+        if (now >= next_stall_warn) {
             std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum (the library says `consensus needs a quorum; waiting` every 60 s) or this node fell more than ~80 slots behind and cannot rejoin in E1 (roadmap §2.1); restart it from a fresh --data-dir only when the whole network starts over\n", .{(nowMs(io) -| last_close) / 1000});
-            next_stall_warn = nowMs(io) + stall_warn_ms;
+            next_stall_warn = now + stall_warn_ms;
         }
         if (!proposed) {
-            const since = nowMs(io) -| last_close;
+            const since = now -| last_close;
             var set: ?registry.TxSet = null;
             shared.lock();
             if ((shared.n_pending > 0 and since >= f.min_slot_ms) or since >= f.heartbeat_ms) {
