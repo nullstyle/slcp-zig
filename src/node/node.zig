@@ -225,6 +225,53 @@ pub const Externalized = struct {
 /// calls `on_failed` exactly once. `on_failed` also fires for every other
 /// latch (a failed write-ahead append, an engine fault), so the app can
 /// stop waiting.
+pub const RecoveryJournalTail = struct {
+    first: u64,
+    /// First slot of the maximal gap-free suffix ending at `last`.
+    contiguous_from: u64,
+    last: u64,
+};
+
+/// Read-only metadata from the recovered externalization journal. A recovery
+/// hook may inspect this before replay and before the node creates any worker
+/// or listener, allowing an application snapshot to fail closed against the
+/// journal it would otherwise consume.
+pub const RecoveryView = struct {
+    externalized_hwm: ?u64,
+    journal_tail: ?RecoveryJournalTail,
+};
+
+/// Experimental pre-live recovery check used by typed application adapters.
+/// It runs after durable recovery metadata is available but before replay,
+/// the timer wheel, listener bind, or worker startup.
+pub const RecoveryHook = struct {
+    ctx: *anyopaque,
+    on_recovered: *const fn (ctx: *anyopaque, view: RecoveryView) anyerror!void,
+};
+
+/// The last value covered by application state restored outside the Node's
+/// own journal. Nomination for `slot + 1` depends on these exact bytes, so a
+/// checkpoint importer supplies them alongside its recovered state. The
+/// bytes are borrowed only for the synchronous `createWithRecovery` call and
+/// may be larger than the current proposal limit, but never the frozen 64 KiB
+/// wire cap.
+pub const RecoveryValue = struct {
+    slot: u64,
+    bytes: []const u8,
+};
+
+/// Experimental startup inputs owned by an application recovery adapter.
+/// The hook validates snapshot/journal continuity; `previous_value` seeds
+/// next-slot nomination. The selected newest value must be the immediate
+/// predecessor of the slot where recovery resumes. If both sources cover the
+/// same slot, their bytes must agree. A newer journal value always wins.
+/// Raw `Node.create` with no supplied value may explicitly skip beyond its
+/// journal; in that legacy case the predecessor is unknown and stays empty.
+pub const RecoveryOptions = struct {
+    hook: ?RecoveryHook = null,
+    previous_value: ?RecoveryValue = null,
+};
+
 pub const DeliveryHook = struct {
     ctx: *anyopaque,
     on_externalized: *const fn (ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void,
@@ -1083,10 +1130,10 @@ pub const Node = struct {
     /// rather than tested with `frontier % 64 == 0`, because one drain can
     /// step over a boundary when out-of-order catch-up slots are buffered.
     last_compact_frontier: u64 = 0,
-    /// The externalized.log tail found at `create` (first and last slot;
-    /// null when the journal was empty). Written once before go-live, then
-    /// read-only: `AppNode` checks an app's `initialSlot()` against it
-    /// (§8.5 delta-app recipe, S8 D2).
+    /// The externalized.log tail found at `create` (first/last slot and the
+    /// first slot of its maximal gap-free suffix; null when empty). Written
+    /// once before go-live, then read-only: `AppNode` checks an app's
+    /// `initialSlot()` against it (§8.5 delta-app recipe, S8 D2).
     journal_tail: ?JournalTail = null,
     /// Slots below this are purged; the timer wheel drops stale fires for
     /// them (read on the wheel thread).
@@ -1140,8 +1187,15 @@ pub const Node = struct {
     /// `OutOfMemory` included, and a reused buffer never keeps a previous
     /// failure's text (it is cleared first; a success leaves it empty).
     pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
+        return createWithRecovery(gpa, io, options, .{});
+    }
+
+    /// Experimental creation seam for an application adapter that must
+    /// validate recovered journal metadata and/or restore the preceding
+    /// consensus value before replay or network startup.
+    pub fn createWithRecovery(gpa: std.mem.Allocator, io: std.Io, options: Options, recovery: RecoveryOptions) CreateError!*Node {
         if (options.diagnostic) |d| d.len = 0;
-        return createChecked(gpa, io, options) catch |e| switch (e) {
+        return createChecked(gpa, io, options, recovery) catch |e| switch (e) {
             // The one member no check site writes (every `try` allocation
             // can raise it): give it the paragraph here (review finding).
             error.OutOfMemory => fail(options.diagnostic, error.OutOfMemory, "out of memory while creating the node; nothing was started — free memory or raise the process limit and try again.", .{}),
@@ -1149,7 +1203,7 @@ pub const Node = struct {
         };
     }
 
-    fn createChecked(gpa: std.mem.Allocator, io: std.Io, options: Options) CreateError!*Node {
+    fn createChecked(gpa: std.mem.Allocator, io: std.Io, options: Options, recovery: RecoveryOptions) CreateError!*Node {
         const opts = options;
         const diag = opts.diagnostic;
 
@@ -1445,8 +1499,91 @@ pub const Node = struct {
         if (opts.start_slot > 1) {
             if (rec.externalized_hwm) |hwm| {
                 if (opts.start_slot <= hwm) {
-                    return fail(diag, error.StartSlotBehindJournal, ".start_slot {d} is at or below the journal high-water mark {d} in {s}; drop .start_slot (the node resumes at {d}) or use a fresh data_dir.", .{ opts.start_slot, hwm, opts.data_dir, hwm + 1 });
+                    const resume_slot = std.math.add(u64, hwm, 1) catch {
+                        return fail(diag, error.StartSlotBehindJournal, ".start_slot {d} is at or below the journal high-water mark {d} in {s}, which is the maximum slot and has no successor; this journal cannot resume.", .{ opts.start_slot, hwm, opts.data_dir });
+                    };
+                    return fail(diag, error.StartSlotBehindJournal, ".start_slot {d} is at or below the journal high-water mark {d} in {s}; drop .start_slot (the node resumes at {d}) or use a fresh data_dir.", .{ opts.start_slot, hwm, opts.data_dir, resume_slot });
                 }
+            }
+        }
+        if (rec.ext_tail.len > 0) {
+            const last = rec.ext_tail[rec.ext_tail.len - 1].slot;
+            var contiguous_from = last;
+            var i = rec.ext_tail.len - 1;
+            while (i > 0) {
+                const previous = rec.ext_tail[i - 1].slot;
+                if (contiguous_from == 0 or previous != contiguous_from - 1) break;
+                contiguous_from = previous;
+                i -= 1;
+            }
+            self.journal_tail = .{
+                .first = rec.ext_tail[0].slot,
+                .contiguous_from = contiguous_from,
+                .last = last,
+            };
+        }
+        if (recovery.hook) |hook| {
+            hook.on_recovered(hook.ctx, .{
+                .externalized_hwm = rec.externalized_hwm,
+                .journal_tail = self.journal_tail,
+            }) catch |e| {
+                return fail(diag, error.EngineFailed, "the recovery hook refused the journal in {s} before the node went live: {t}", .{ opts.data_dir, e });
+            };
+        }
+
+        // Nomination for the next slot is seeded from the value accepted in
+        // the preceding slot. Live externalization maintains this field in
+        // `onExternalized`; restart recovery must do the same before any
+        // timer, listener, or worker can nominate. Otherwise a restarted
+        // validator uses the empty sentinel even though its durable journal
+        // knows the actual predecessor value.
+        var previous_value: ?RecoveryValue = null;
+        if (rec.ext_tail.len > 0) {
+            const latest = rec.ext_tail[rec.ext_tail.len - 1];
+            previous_value = .{ .slot = latest.slot, .bytes = latest.value };
+        }
+        if (recovery.previous_value) |restored| {
+            if (restored.slot == 0) {
+                return fail(diag, error.EngineFailed, "the recovered previous value names slot 0, which has no preceding consensus value; omit it for genesis state.", .{});
+            }
+            if (restored.bytes.len == 0) {
+                return fail(diag, error.EngineFailed, "the recovered previous value for slot {d} is empty; checkpoint recovery must provide the exact non-empty bytes externalized in that slot.", .{restored.slot});
+            }
+            if (restored.bytes.len > core.limits.frozen_max_value_bytes_cap) {
+                return fail(diag, error.EngineFailed, "the recovered previous value for slot {d} is {d} bytes, above the frozen 65536-byte wire cap.", .{ restored.slot, restored.bytes.len });
+            }
+            // `ext_tail` is deduped and sorted, but its latest record can be
+            // newer than the checkpoint. Compare the whole retained overlap:
+            // looking only at the journal tip would let a conflicting value at
+            // H hide behind a matching/non-conflicting record at H + 1.
+            for (rec.ext_tail) |journaled| {
+                if (journaled.slot != restored.slot) continue;
+                if (!std.mem.eql(u8, restored.bytes, journaled.value)) {
+                    return fail(diag, error.EngineFailed, "the recovered application checkpoint and local journal disagree on the consensus value at slot {d}; refuse to nominate from ambiguous history.", .{restored.slot});
+                }
+                break;
+            }
+            if (previous_value) |journaled| {
+                if (restored.slot > journaled.slot) previous_value = restored;
+            } else {
+                previous_value = restored;
+            }
+        }
+        if (previous_value) |value| {
+            const successor = std.math.add(u64, value.slot, 1) catch {
+                return fail(diag, error.EngineFailed, "the selected recovered previous value names maximum slot {d}, which has no successor to start.", .{value.slot});
+            };
+            const journal_successor = if (rec.externalized_hwm) |hwm|
+                std.math.add(u64, hwm, 1) catch {
+                    return fail(diag, error.EngineFailed, "the journal high-water mark is maximum slot {d}, which has no successor to resume.", .{hwm});
+                }
+            else
+                opts.start_slot;
+            const effective_start = @max(opts.start_slot, journal_successor);
+            if (effective_start == successor) {
+                self.last_ext_value = try gpa.dupe(u8, value.bytes);
+            } else if (recovery.previous_value != null) {
+                return fail(diag, error.EngineFailed, "the selected recovered previous value is at slot {d}, so it can seed only start_slot {d}; effective recovery starts at slot {d}, and binding it there would skip a predecessor.", .{ value.slot, successor, effective_start });
             }
         }
 
@@ -1518,9 +1655,6 @@ pub const Node = struct {
         // -bounded) journal tail into the app stream — the app dedups by slot
         // (the §10 contract). Without this, journaled-but-unconsumed values
         // would be silently lost across a restart (review finding).
-        if (rec.ext_tail.len > 0) {
-            self.journal_tail = .{ .first = rec.ext_tail[0].slot, .last = rec.ext_tail[rec.ext_tail.len - 1].slot };
-        }
         for (rec.ext_tail) |r| {
             const v = try gpa.dupe(u8, r.value);
             self.deliverSlot(r.slot, v) catch |e| switch (e) {
@@ -1817,7 +1951,7 @@ pub const Node = struct {
     }
 
     /// Bounds of the journal tail replayed at `create` (ascending slots).
-    pub const JournalTail = struct { first: u64, last: u64 };
+    pub const JournalTail = RecoveryJournalTail;
 
     pub const WaitOptions = struct {
         /// null = block until the next externalization or shutdown.
@@ -3336,6 +3470,38 @@ const RecordingHook = struct {
     }
 };
 
+const RecoveryRejectingHook = struct {
+    seen: ?RecoveryView = null,
+    externalized_calls: usize = 0,
+
+    fn onRecovered(ctx: *anyopaque, view: RecoveryView) anyerror!void {
+        const self: *RecoveryRejectingHook = @ptrCast(@alignCast(ctx));
+        self.seen = view;
+        return error.RecoveryRejectedByTest;
+    }
+
+    fn onExternalized(ctx: *anyopaque, slot: u64, value: []const u8) anyerror!void {
+        _ = slot;
+        _ = value;
+        const self: *RecoveryRejectingHook = @ptrCast(@alignCast(ctx));
+        self.externalized_calls += 1;
+    }
+
+    fn onFailed(_: *anyopaque, _: anyerror) void {}
+
+    fn recoveryHook(self: *RecoveryRejectingHook) RecoveryHook {
+        return .{ .ctx = @ptrCast(self), .on_recovered = onRecovered };
+    }
+
+    fn deliveryHook(self: *RecoveryRejectingHook) DeliveryHook {
+        return .{
+            .ctx = @ptrCast(self),
+            .on_externalized = onExternalized,
+            .on_failed = onFailed,
+        };
+    }
+};
+
 /// A validly-signed, framed EXTERNALIZE envelope for `slot` by `seed` — what
 /// own.log holds for a slot this node externalized before a crash.
 fn buildSignedExternalize(gpa: std.mem.Allocator, seed: [32]u8, network_id: [32]u8, slot: u64, value: []const u8) ![]u8 {
@@ -3431,6 +3597,7 @@ test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascen
         try std.testing.expect(n.waitExternalized(.{ .timeout_ms = 50 }) == null);
         try std.testing.expect(hook.failed_with == null);
         try std.testing.expectEqual(@as(u64, 8), n.next_deliver);
+        try std.testing.expectEqualStrings("seven", n.last_ext_value);
     }
 
     // Queue path: the same dir yields 3, 5, 7 exactly once each.
@@ -3444,6 +3611,7 @@ test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascen
             try std.testing.expectEqualSlices(u8, w, e.value);
         }
         try std.testing.expect(n.waitExternalized(.{ .timeout_ms = 50 }) == null);
+        try std.testing.expectEqualStrings("seven", n.last_ext_value);
     }
 
     // A hook that refuses a journaled value refuses the whole start.
@@ -3458,6 +3626,195 @@ test "delivery hook: journal tail 3,5,7 (+ own EXTERNALIZE 5) is delivered ascen
         try std.testing.expectEqualSlices(u64, &[_]u64{3}, hook.slots.items); // stopped at the refusal
         try std.testing.expect(hook.failed_with == null); // create failed; no latch, no on_failed
     }
+}
+
+test "recovery hook: metadata is accepted before replay, listener bind, or worker startup" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    {
+        var st = try store_mod.Store.open(gpa, io, data_dir);
+        defer st.deinit();
+        try st.appendExternalized(3, "three");
+        try st.appendExternalized(5, "five");
+        try st.appendExternalized(7, "seven");
+    }
+
+    // A held port makes the ordering observable: a post-live recovery check
+    // reports ListenPortInUse. The recovery hook must reject first instead.
+    var server = try holdEphemeralPort(io);
+    defer server.deinit(io);
+    const port = portOfServer(&server);
+    const seed: [32]u8 = @splat(0x4f);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var hook: RecoveryRejectingHook = .{};
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.EngineFailed, Node.createWithRecovery(gpa, io, .{
+        .network = "pre-live recovery hook v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = port,
+        .data_dir = data_dir,
+        .delivery = hook.deliveryHook(),
+        .diagnostic = &diag,
+    }, .{ .hook = hook.recoveryHook() }));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "RecoveryRejectedByTest") != null);
+    try std.testing.expectEqual(@as(?u64, 7), hook.seen.?.externalized_hwm);
+    try std.testing.expectEqual(@as(u64, 3), hook.seen.?.journal_tail.?.first);
+    try std.testing.expectEqual(@as(u64, 7), hook.seen.?.journal_tail.?.contiguous_from);
+    try std.testing.expectEqual(@as(u64, 7), hook.seen.?.journal_tail.?.last);
+    try std.testing.expectEqual(@as(usize, 0), hook.externalized_calls);
+}
+
+test "recovery predecessor merges an external checkpoint with the durable journal" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "checkpoint");
+    try tmp.dir.createDirPath(io, "journal");
+    try tmp.dir.createDirPath(io, "max-slot");
+    var checkpoint_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var journal_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var max_slot_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const checkpoint_dir = checkpoint_buf[0..try tmp.dir.realPathFile(io, "checkpoint", &checkpoint_buf)];
+    const journal_dir = journal_buf[0..try tmp.dir.realPathFile(io, "journal", &journal_buf)];
+    const max_slot_dir = max_slot_buf[0..try tmp.dir.realPathFile(io, "max-slot", &max_slot_buf)];
+
+    const seed: [32]u8 = @splat(0x53);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+
+    // With no journal, an application-authenticated checkpoint supplies the
+    // predecessor bytes for the exact successor slot.
+    {
+        const n = try Node.createWithRecovery(gpa, io, .{
+            .network = "external recovery predecessor v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}),
+            .listen_port = 0,
+            .data_dir = checkpoint_dir,
+            .start_slot = 42,
+            // Historical predecessor bytes are not a proposal for the new
+            // slot; lowering the live limit must not erase their exact hash.
+            .max_value_bytes = 1,
+            .diagnostic = &diag,
+        }, .{ .previous_value = .{ .slot = 41, .bytes = "checkpoint" } });
+        defer n.deinit();
+        try std.testing.expectEqualStrings("checkpoint", n.last_ext_value);
+        try std.testing.expectEqual(@as(u64, 42), n.current_slot);
+    }
+
+    // A seed newer than the journal describes the slot immediately before
+    // the cutover; it cannot be paired with an unrelated start slot.
+    if (Node.createWithRecovery(gpa, io, .{
+        .network = "external recovery predecessor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = checkpoint_dir,
+        .start_slot = 43,
+        .diagnostic = &diag,
+    }, .{ .previous_value = .{ .slot = 41, .bytes = "checkpoint" } })) |unexpected| {
+        unexpected.deinit();
+        return error.ExpectedRecoveryCutoverRejection;
+    } else |err| {
+        try std.testing.expectEqual(error.EngineFailed, err);
+        try std.testing.expect(std.mem.indexOf(u8, diag.message(), "start_slot 42") != null);
+    }
+
+    {
+        var st = try store_mod.Store.open(gpa, io, journal_dir);
+        defer st.deinit();
+        try st.appendExternalized(7, "journal");
+    }
+
+    // A journal newer than the application snapshot is authoritative for
+    // the next nomination predecessor.
+    {
+        const n = try Node.createWithRecovery(gpa, io, .{
+            .network = "journal recovery predecessor v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}),
+            .listen_port = 0,
+            .data_dir = journal_dir,
+            .start_slot = 8,
+            .diagnostic = &diag,
+        }, .{ .previous_value = .{ .slot = 6, .bytes = "older-checkpoint" } });
+        defer n.deinit();
+        try std.testing.expectEqualStrings("journal", n.last_ext_value);
+    }
+
+    // A newer journal record must not hide a conflicting overlap at the
+    // checkpoint slot.
+    {
+        var st = try store_mod.Store.open(gpa, io, journal_dir);
+        defer st.deinit();
+        try st.appendExternalized(8, "newer-journal");
+    }
+    try std.testing.expectError(error.EngineFailed, Node.createWithRecovery(gpa, io, .{
+        .network = "journal recovery predecessor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = journal_dir,
+        .diagnostic = &diag,
+    }, .{ .previous_value = .{ .slot = 7, .bytes = "fork" } }));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "disagree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "slot 7") != null);
+
+    // Even an older supplied checkpoint cannot cause the journal's slot-8
+    // value to be hashed as slot 10's immediate predecessor.
+    try std.testing.expectError(error.EngineFailed, Node.createWithRecovery(gpa, io, .{
+        .network = "journal recovery predecessor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = journal_dir,
+        .start_slot = 10,
+        .diagnostic = &diag,
+    }, .{ .previous_value = .{ .slot = 6, .bytes = "older-checkpoint" } }));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "slot 9") != null);
+
+    // A raw Node may deliberately bootstrap past its journal without an
+    // application checkpoint. In that legacy case the previous value is
+    // unknown, so recovery retains the empty sentinel rather than misbinding
+    // slot 8's bytes to slot 10.
+    {
+        const n = try Node.create(gpa, io, .{
+            .network = "journal recovery predecessor v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}),
+            .listen_port = 0,
+            .data_dir = journal_dir,
+            .start_slot = 10,
+            .diagnostic = &diag,
+        });
+        defer n.deinit();
+        try std.testing.expectEqual(@as(usize, 0), n.last_ext_value.len);
+    }
+
+    // The explicit-start diagnostic must also be total at the u64 boundary;
+    // formatting the nonexistent H + 1 used to overflow in safety builds.
+    {
+        var st = try store_mod.Store.open(gpa, io, max_slot_dir);
+        defer st.deinit();
+        try st.appendExternalized(std.math.maxInt(u64), "terminal");
+    }
+    try std.testing.expectError(error.StartSlotBehindJournal, Node.create(gpa, io, .{
+        .network = "maximum journal slot recovery v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = max_slot_dir,
+        .start_slot = 2,
+        .diagnostic = &diag,
+    }));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "maximum slot") != null);
 }
 
 // A normal compaction at frontier 64 leaves slots 49..64, after which a

@@ -7,7 +7,7 @@
 //! imports it to check the table against the SOURCE: every `src` fragment
 //! must appear verbatim in app_node.zig, and the number of teaching-error
 //! sites there (`contract_site` + `codec_site` occurrences) must equal
-//! `cases.len`. Without the second half a 21st rule could land with no
+//! `cases.len`. Without the second half another rule could land with no
 //! expected-fail object and `zig build test` would stay green (S8 review).
 //!
 //! `needle` is the TAIL of the compile error's first line after the `<T>` /
@@ -42,6 +42,8 @@ pub const cases = [_]Case{
     .{ .stem = "err_bad_combine_signature", .needle = "): combine has the wrong signature.", .src = "combine has the wrong signature." },
     .{ .stem = "err_bad_initial_state_signature", .needle = "): initialState has the wrong signature.", .src = "initialState has the wrong signature." },
     .{ .stem = "err_bad_initial_slot_signature", .needle = "): initialSlot has the wrong signature.", .src = "initialSlot has the wrong signature." },
+    .{ .stem = "err_initial_command_without_slot", .needle = "): initialCommand requires initialSlot.", .src = "initialCommand requires initialSlot." },
+    .{ .stem = "err_bad_initial_command_signature", .needle = "): initialCommand has the wrong signature.", .src = "initialCommand has the wrong signature." },
     .{ .stem = "err_lone_encode", .needle = "): a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`.", .src = "a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." },
     .{ .stem = "err_bad_encode_signature", .needle = "): encode has the wrong signature.", .src = "encode has the wrong signature." },
     .{ .stem = "err_bad_decode_signature", .needle = "): decode has the wrong signature.", .src = "decode has the wrong signature." },

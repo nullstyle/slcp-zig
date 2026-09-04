@@ -36,6 +36,7 @@
 const std = @import("std");
 const core = @import("slcp-core");
 const node = @import("node.zig");
+const store_mod = @import("store.zig");
 
 pub const Validity = core.driver.Validity;
 pub const Driver = core.driver.Driver;
@@ -368,7 +369,15 @@ fn validateAppContract(comptime App: type) void {
                 "\n  want: fn () u64   (the slot your persisted initialState() already includes; 0 = none)" ++
                 "\n  got:  " ++ @typeName(@TypeOf(App.initialSlot)));
     }
-
+    if (@hasDecl(App, "initialCommand")) {
+        if (!@hasDecl(App, "initialSlot"))
+            contractError(App, "initialCommand requires initialSlot." ++
+                "\n  The command is the consensus value at initialSlot(); declare that slot so recovery can bind the two.");
+        if (@TypeOf(App.initialCommand) != fn () ?Command)
+            contractError(App, "initialCommand has the wrong signature." ++
+                "\n  want: fn () ?Command   (the exact value externalized at initialSlot(); null at genesis)" ++
+                "\n  got:  " ++ @typeName(@TypeOf(App.initialCommand)));
+    }
     if (hasCustomCodec(App)) {
         if (!@hasDecl(App, "encode") or !@hasDecl(App, "decode"))
             contractError(App, "a custom codec needs BOTH `pub fn encode(cmd: Command, buf: []u8) []u8` and `pub fn decode(bytes: []const u8) ?Command`." ++
@@ -516,18 +525,34 @@ fn fail(diag: ?*node.Diagnostic, err: anytype, comptime fmt: []const u8, args: a
 /// §8.5 delta-app recipe: can a `State` persisted at slot `s0` hand off to
 /// this Node? A snapshot at 0 claims nothing. Otherwise either the retained
 /// local journal must continue it, or an explicit start at its exact
-/// successor declares that the application verified an external checkpoint.
+/// successor declares that the application verified an external checkpoint;
+/// the separate recovery check also requires its final Command when the
+/// journal cannot supply a newer predecessor.
 fn initialSlotCanStart(s0: u64, tail: ?node.Node.JournalTail, start_slot: u64) bool {
-    if (s0 == 0) return true;
+    if (s0 == 0) {
+        if (start_slot != 1) return false;
+        const t = tail orelse return true;
+        return t.contiguous_from == 1;
+    }
     const successor = std.math.add(u64, s0, 1) catch return false;
-    if (start_slot == successor) return true;
+    if (start_slot == successor) {
+        const t = tail orelse return true;
+        return t.last <= s0 or t.contiguous_from <= successor;
+    }
     const t = tail orelse return false;
-    return t.first <= successor and s0 <= t.last;
+    if (t.contiguous_from > successor or s0 > t.last) return false;
+    // The default lets Node derive the successor from the journal. An
+    // explicit start after replay may name only the exact tail successor;
+    // anything farther would silently skip a slot after the recovered tail.
+    if (start_slot == 1) return true;
+    const tail_successor = std.math.add(u64, t.last, 1) catch return false;
+    return start_slot == tail_successor;
 }
 
 /// The teaching text for a journaled value the current `Command` cannot
 /// decode (design §8.5: command evolution is consensus surface).
 const undecodable_fmt = "slot {d}: journaled value ({d} bytes) does not decode as {s} — the Command type changed since this data_dir was written. Restore the old Command definition, or start a fresh data_dir under a NEW `network` passphrase (command evolution is consensus surface, §8.5).";
+const delivery_gap_fmt = "slot {d} arrived after applied slot {d}, but {s}.initialSlot() declares contiguous state transitions; the missing slot cannot be skipped, so the typed node is stopping before applying the out-of-order command.";
 
 /// The teaching text for a `combine` whose result does not self-validate
 /// (§8.5: the composite must be `.valid`, or `.maybe_valid` when this node is
@@ -554,13 +579,14 @@ const bad_composite_fmt = "{s}.combine returned a Command that its own validate 
 /// slots at or below it are skipped, not re-applied (S8 D2). Ordinarily the
 /// retained tail must continue that slot, so persist at least every 16 applied
 /// slots. An application that independently verifies an external checkpoint
-/// through slot H instead sets `initialSlot()` to H and `.start_slot` to the
-/// exact successor H + 1; that explicit handoff starts consensus and delivery
-/// after the checkpoint even when the local journal is absent or stale.
-/// Every other snapshot/journal mismatch is `InitialSlotOutsideJournal`.
-/// Without an external cutover, the first proposal after a restart is usually
-/// STALE (computed from `initialState()`): the network rejects it and the §0
-/// loop catches up from the applied stream.
+/// through slot H also exposes `pub fn initialCommand() ?Command`, returning
+/// the exact consensus value at H, and sets `.start_slot` to H + 1. The value
+/// seeds the same next-slot nomination schedule incumbents use when the local
+/// journal is absent or stale; a newer continuing journal supersedes it.
+/// Continuity failures and a missing checkpoint command when the journal
+/// cannot supply it are `InitialSlotOutsideJournal`. A supplied command that
+/// conflicts byte-for-byte with the same retained journal slot is rejected by
+/// the underlying Node as `EngineFailed`.
 pub fn AppNode(comptime App: type) type {
     comptime validateAppContract(App);
     return struct {
@@ -608,6 +634,16 @@ pub fn AppNode(comptime App: type) type {
         created: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// Recorded by the hook for `create`'s codec-mismatch diagnostic.
         undecodable: ?struct { slot: u64, len: usize } = null,
+        /// Set by the pre-live recovery hook so `create` can replace Node's
+        /// generic hook error with the app-level snapshot/journal diagnostic.
+        recovery_rejection: ?node.RecoveryView = null,
+        /// An external checkpoint newer than the journal must carry the exact
+        /// command agreed at its final slot; otherwise next-slot nomination
+        /// would start from the empty predecessor sentinel.
+        initial_command_present: bool = false,
+        initial_command_missing: bool = false,
+        /// The requested consensus start, captured before Node recovery.
+        start_slot: u64 = 1,
 
         // waitApplied queue (same shape as Node's externalized queue).
         mu: std.Io.Mutex = .init,
@@ -630,7 +666,7 @@ pub fn AppNode(comptime App: type) type {
         /// The slot `initialState()` already includes (§8.5 delta-app
         /// recipe); 0 when the app declares no `initialSlot()`. State loaded
         /// from an independently verified external checkpoint through H must
-        /// be paired with `.start_slot = H + 1`.
+        /// be paired with `.start_slot = H + 1` and `initialCommand()` at H.
         fn initialSlot() u64 {
             if (@hasDecl(App, "initialSlot")) return App.initialSlot();
             return 0;
@@ -646,15 +682,16 @@ pub fn AppNode(comptime App: type) type {
             return self;
         }
 
-        /// Start the typed node: forwards `opts` to `node.Node.create` with
-        /// the compiled driver and the delivery hook, replaying the journal
-        /// tail through `apply` before returning. `*Self` is the driver and
-        /// hook ctx (stable address). Adds two members to the bytes-level
+        /// Start the typed node: forwards `opts` to
+        /// `node.Node.createWithRecovery` with the compiled driver, pre-live
+        /// recovery check, and delivery hook, replaying the journal tail
+        /// through `apply` before returning. `*Self` is the driver and hook
+        /// ctx (stable address). Adds two members to the bytes-level
         /// `CreateError`: an auto-encoded Command larger than
         /// `max_value_bytes`, and a journaled value the Command cannot decode;
         /// a third for a persisted `State` whose `initialSlot()` is neither
         /// continued by the retained journal nor paired with an explicit
-        /// exact-successor checkpoint start.
+        /// exact-successor checkpoint start and its preceding Command.
         pub fn create(gpa: std.mem.Allocator, io: std.Io, opts: Options) CreateError!*Self {
             // Same contract as Node.create: a reused Diagnostic never keeps
             // a previous failure's text, and OutOfMemory gets a message too
@@ -677,6 +714,7 @@ pub fn AppNode(comptime App: type) type {
             }
 
             const self = try createDetached(gpa, io, opts.max_value_bytes);
+            self.start_slot = opts.start_slot;
             errdefer {
                 self.queue.deinit(gpa);
                 gpa.destroy(self);
@@ -694,7 +732,22 @@ pub fn AppNode(comptime App: type) type {
                 @field(nopts, name) = @field(opts, name);
             }
 
-            const n = node.Node.create(gpa, io, nopts) catch |e| {
+            var recovery: node.RecoveryOptions = .{ .hook = self.recoveryHook() };
+            var recovery_scratch: ?[]u8 = null;
+            defer if (recovery_scratch) |buf| gpa.free(buf);
+            if (comptime @hasDecl(App, "initialCommand")) {
+                if (App.initialCommand()) |cmd| {
+                    const scratch = try gpa.alloc(u8, max_encoded_bytes);
+                    recovery_scratch = scratch;
+                    self.initial_command_present = true;
+                    recovery.previous_value = .{
+                        .slot = self.applied_hwm,
+                        .bytes = codec.encode(cmd, scratch),
+                    };
+                }
+            }
+
+            const n = node.Node.createWithRecovery(gpa, io, nopts, recovery) catch |e| {
                 if (self.undecodable) |u| {
                     // The hook refused a journaled value during the tail
                     // replay: report OUR member with the teaching text
@@ -702,28 +755,23 @@ pub fn AppNode(comptime App: type) type {
                     // superseded).
                     return fail(diag, error.UndecodableExternalizedValue, undecodable_fmt, .{ u.slot, u.len, @typeName(Command) });
                 }
+                if (self.recovery_rejection) |view| {
+                    const s0 = self.applied_hwm;
+                    const successor: ?u64 = std.math.add(u64, s0, 1) catch null;
+                    if (successor == null) {
+                        return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} has no successor slot, so the node cannot start after that State; use a checkpoint below the maximum u64 slot.", .{s0});
+                    }
+                    if (view.journal_tail) |tail| {
+                        return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} retains slots {d}..{d} with a gap-free suffix only from slot {d}, and .start_slot is {d}; restore a State immediately before that suffix, or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly. The node did not go live.", .{ s0, opts.data_dir, tail.first, tail.last, tail.contiguous_from, self.start_slot, s0, successor.? });
+                    }
+                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} is empty and .start_slot is {d}; start from initialSlot() = 0 with .start_slot = 1, restore the local journal, or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly. The node did not go live.", .{ s0, opts.data_dir, self.start_slot, s0, successor.? });
+                }
+                if (self.initial_command_missing) {
+                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} is newer than the local journal, but initialCommand() did not provide the exact consensus value at that slot; retain that Command in the authenticated checkpoint so nomination for slot {d} uses the same predecessor as incumbent validators. The node did not go live.", .{ self.applied_hwm, self.start_slot });
+                }
                 return e;
             };
             self.n = n;
-            // §8.5 delta-app recipe: a persisted State is usable when the
-            // local journal continues it, or when the application explicitly
-            // starts at its exact successor after independently verifying an
-            // external checkpoint. Anything else would re-apply or skip a
-            // slot and silently produce the wrong State.
-            const s0 = initialSlot();
-            if (s0 != 0 and !initialSlotCanStart(s0, n.journal_tail, opts.start_slot)) {
-                const tail = n.journal_tail;
-                n.deinit();
-                self.n = null;
-                const successor: ?u64 = std.math.add(u64, s0, 1) catch null;
-                if (successor == null) {
-                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} has no successor slot, so the node cannot start after that State; use a checkpoint below the maximum u64 slot.", .{s0});
-                }
-                if (tail) |t| {
-                    return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} retains slots {d}..{d} and .start_slot is {d}; use a local State the retained tail can continue (persist it at least every 16 applied slots), or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly.", .{ s0, opts.data_dir, t.first, t.last, opts.start_slot, s0, successor.? });
-                }
-                return fail(diag, error.InitialSlotOutsideJournal, "initialSlot() = {d} but the journal in {s} is empty and .start_slot is {d}; start from initialSlot() = 0, restore the local journal, or independently verify an external checkpoint through slot {d} and set .start_slot = {d} exactly.", .{ s0, opts.data_dir, opts.start_slot, s0, successor.? });
-            }
             self.created.store(true, .release);
             return self;
         }
@@ -825,6 +873,25 @@ pub fn AppNode(comptime App: type) type {
             };
         }
 
+        fn recoveryHook(self: *Self) node.RecoveryHook {
+            return .{ .ctx = @ptrCast(self), .on_recovered = hookRecovered };
+        }
+
+        fn hookRecovered(ctx: *anyopaque, view: node.RecoveryView) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "initialSlot")) {
+                if (!initialSlotCanStart(self.applied_hwm, view.journal_tail, self.start_slot)) {
+                    self.recovery_rejection = view;
+                    return error.InitialSlotOutsideJournal;
+                }
+                const journal_hwm = view.externalized_hwm orelse 0;
+                if (self.applied_hwm > journal_hwm and !self.initial_command_present) {
+                    self.initial_command_missing = true;
+                    return error.InitialCommandMissing;
+                }
+            }
+        }
+
         // ---- driver vtable (engine thread) ----
 
         fn driverValidate(ctx: *anyopaque, slot: u64, value: []const u8, is_nomination: bool) Validity {
@@ -900,6 +967,16 @@ pub fn AppNode(comptime App: type) type {
                 return error.UndecodableExternalizedValue;
             };
             if (slot <= self.applied_hwm) return; // re-delivery: no-op
+            if (comptime @hasDecl(App, "initialSlot")) {
+                const expected = std.math.add(u64, self.applied_hwm, 1) catch {
+                    if (self.created.load(.acquire)) log.err(delivery_gap_fmt, .{ slot, self.applied_hwm, @typeName(App) });
+                    return error.AppliedSlotGap;
+                };
+                if (slot != expected) {
+                    if (self.created.load(.acquire)) log.err(delivery_gap_fmt, .{ slot, self.applied_hwm, @typeName(App) });
+                    return error.AppliedSlotGap;
+                }
+            }
             if (comptime apply_in_place) {
                 App.apply(&self.state, cmd);
             } else {
@@ -1765,6 +1842,7 @@ const DeltaNode = AppNode(Delta);
 /// taken at, rebuild it in `initialState()` and name that slot in
 /// `initialSlot()`. The "persisted" snapshot is a test global.
 var delta_snapshot: struct { state: Delta.State, slot: u64 } = .{ .state = .{}, .slot = 0 };
+var delta_previous: ?Delta.Command = null;
 const DeltaSnap = struct {
     pub const State = Delta.State;
     pub const Command = Delta.Command;
@@ -1776,8 +1854,31 @@ const DeltaSnap = struct {
     pub fn initialSlot() u64 {
         return delta_snapshot.slot;
     }
+    pub fn initialCommand() ?Command {
+        return delta_previous;
+    }
 };
 const DeltaSnapNode = AppNode(DeltaSnap);
+
+test "an initialSlot app refuses a live delivery gap before mutating state" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+    delta_snapshot = .{ .state = .{}, .slot = 0 };
+    const n = try DeltaSnapNode.createDetached(gpa, io, 4096);
+    defer n.deinit();
+    const ctx: *anyopaque = @ptrCast(n);
+    var buf: [DeltaSnapNode.codec.size]u8 = undefined;
+    const encoded = DeltaSnapNode.codec.encode(.{ .add = 1 }, &buf);
+
+    try DeltaSnapNode.hookExternalized(ctx, 1, encoded);
+    try testing.expectError(error.AppliedSlotGap, DeltaSnapNode.hookExternalized(ctx, 3, encoded));
+    try testing.expectEqual(@as(u64, 1), n.applied_hwm);
+    try testing.expectEqual(@as(i64, 1), n.state.sum);
+    const one = (try n.waitApplied(.{ .timeout_ms = 0 })).?;
+    try testing.expectEqual(@as(u64, 1), one.slot);
+    try testing.expect((try n.waitApplied(.{ .timeout_ms = 0 })) == null);
+}
 
 /// Pump the delta loop ("add 1" after every applied slot) on `peer` until
 /// `n` applies its next slot; returns that first applied item. `n` is
@@ -1913,8 +2014,8 @@ test "restart of a DELTA app from a persisted snapshot (2-of-2 loopback): initia
 // An application can verify a checkpoint independently of the Node's local
 // journal, reconstruct State through slot H, and declare H + 1 as the first
 // slot this process should participate in. The exact-successor relationship
-// is the handoff: the checkpoint accounts for every earlier slot, while the
-// Node owns every later one.
+// and exact final Command are the handoff: the checkpoint accounts for every
+// earlier slot and seeds nomination, while the Node owns every later one.
 test "AppNode starts from a verified external checkpoint at its exact successor" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1922,10 +2023,26 @@ test "AppNode starts from a verified external checkpoint at its exact successor"
     defer td.deinit();
 
     delta_snapshot = .{ .state = .{ .sum = 200 }, .slot = 200 };
-    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+    defer {
+        delta_snapshot = .{ .state = .{}, .slot = 0 };
+        delta_previous = null;
+    }
     const seed = seedOf(0x74);
     const me = try crypto.publicKeyFromSeed(seed);
     var diag: node.Diagnostic = .{};
+
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "external checkpoint exact successor v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = td.path(),
+        .start_slot = 201,
+        .diagnostic = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "initialCommand()") != null);
+
+    delta_previous = .{ .add = 1 };
 
     const n = try DeltaSnapNode.create(gpa, io, .{
         .network = "external checkpoint exact successor v1",
@@ -1939,6 +2056,8 @@ test "AppNode starts from a verified external checkpoint at its exact successor"
     defer n.deinit();
 
     try testing.expect(n.raw().journal_tail == null);
+    var previous_buf: [DeltaSnapNode.codec.size]u8 = undefined;
+    try testing.expectEqualSlices(u8, DeltaSnapNode.codec.encode(.{ .add = 1 }, &previous_buf), n.raw().last_ext_value);
     try n.propose(.{ .add = 1 });
     const applied = (try n.waitApplied(.{ .timeout_ms = 5_000 })) orelse return error.Timeout;
     try testing.expectEqual(@as(u64, 201), applied.slot);
@@ -1954,7 +2073,10 @@ test "external checkpoint ahead of a stale local journal starts without replayin
     const io = testing.io;
     var td = try TestDir.init();
     defer td.deinit();
-    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+    defer {
+        delta_snapshot = .{ .state = .{}, .slot = 0 };
+        delta_previous = null;
+    }
 
     const seed = seedOf(0x76);
     const me = try crypto.publicKeyFromSeed(seed);
@@ -1978,6 +2100,7 @@ test "external checkpoint ahead of a stale local journal starts without replayin
     }
 
     delta_snapshot = .{ .state = .{ .sum = 200 }, .slot = 200 };
+    delta_previous = .{ .add = 1 };
     const n = try DeltaSnapNode.create(gpa, io, .{
         .network = network,
         .secret_seed = seed,
@@ -2062,14 +2185,77 @@ test "external checkpoint start must be the checked exact successor" {
 // above pin the predicate's separate exact-successor arm.
 test "initialSlot handoff through the retained journal: within, at either edge, ahead, behind, no journal" {
     // tail 49..70: a snapshot at 48 (tail starts right after it) through 70.
-    try testing.expect(initialSlotCanStart(48, .{ .first = 49, .last = 70 }, 1));
-    try testing.expect(initialSlotCanStart(60, .{ .first = 49, .last = 70 }, 1));
-    try testing.expect(initialSlotCanStart(70, .{ .first = 49, .last = 70 }, 1));
-    try testing.expect(!initialSlotCanStart(71, .{ .first = 49, .last = 70 }, 1)); // ahead
-    try testing.expect(!initialSlotCanStart(47, .{ .first = 49, .last = 70 }, 1)); // behind: 48 lost
+    const contiguous: node.Node.JournalTail = .{ .first = 49, .contiguous_from = 49, .last = 70 };
+    try testing.expect(initialSlotCanStart(48, contiguous, 1));
+    try testing.expect(initialSlotCanStart(60, contiguous, 1));
+    try testing.expect(initialSlotCanStart(70, contiguous, 1));
+    try testing.expect(initialSlotCanStart(48, contiguous, 71)); // replay then exact tail successor
+    try testing.expect(!initialSlotCanStart(48, contiguous, 72)); // skips slot 71
+    try testing.expect(!initialSlotCanStart(71, contiguous, 1)); // ahead
+    try testing.expect(!initialSlotCanStart(47, contiguous, 1)); // behind: 48 lost
     try testing.expect(!initialSlotCanStart(1, null, 1)); // no journal
     try testing.expect(initialSlotCanStart(0, null, 1)); // the default: nothing claimed
-    try testing.expect(initialSlotCanStart(0, .{ .first = 49, .last = 70 }, 1));
+    try testing.expect(!initialSlotCanStart(0, contiguous, 1));
+
+    const gapped: node.Node.JournalTail = .{ .first = 3, .contiguous_from = 5, .last = 7 };
+    try testing.expect(!initialSlotCanStart(3, gapped, 1)); // slot 4 is absent
+    try testing.expect(initialSlotCanStart(4, gapped, 1)); // 5..7 is contiguous
+}
+
+test "delta snapshot recovery requires a gap-free journal continuation" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    defer delta_snapshot = .{ .state = .{}, .slot = 0 };
+    const seed = seedOf(0x7a);
+    const me = try core.crypto.publicKeyFromSeed(seed);
+    var diag: node.Diagnostic = .{};
+    var encoded_buf: [DeltaSnapNode.codec.size]u8 = undefined;
+    const encoded = DeltaSnapNode.codec.encode(.{ .add = 1 }, &encoded_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    delta_snapshot = .{ .state = .{ .sum = 3 }, .slot = 3 };
+    const gapped_dir = try td.sub(&path_buf, "gapped");
+    {
+        var store = try store_mod.Store.open(gpa, io, gapped_dir);
+        defer store.deinit();
+        try store.appendExternalized(3, encoded);
+        try store.appendExternalized(5, encoded);
+        try store.appendExternalized(7, encoded);
+    }
+    try testing.expectError(error.InitialSlotOutsideJournal, DeltaSnapNode.create(gpa, io, .{
+        .network = "delta gapped recovery v1",
+        .secret_seed = seed,
+        .quorum = core.quorum.Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = gapped_dir,
+        .diagnostic = &diag,
+    }));
+
+    const contiguous_dir = try td.sub(&path_buf, "contiguous");
+    {
+        var store = try store_mod.Store.open(gpa, io, contiguous_dir);
+        defer store.deinit();
+        try store.appendExternalized(3, encoded);
+        try store.appendExternalized(4, encoded);
+        try store.appendExternalized(5, encoded);
+    }
+    const recovered = try DeltaSnapNode.create(gpa, io, .{
+        .network = "delta contiguous recovery v1",
+        .secret_seed = seed,
+        .quorum = core.quorum.Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = contiguous_dir,
+        .diagnostic = &diag,
+    });
+    defer recovered.deinit();
+    const four = (try recovered.waitApplied(.{ .timeout_ms = 1000 })) orelse return error.TailNotReplayed;
+    const five = (try recovered.waitApplied(.{ .timeout_ms = 1000 })) orelse return error.TailNotReplayed;
+    try testing.expectEqual(@as(u64, 4), four.slot);
+    try testing.expectEqual(@as(i64, 4), four.state.sum);
+    try testing.expectEqual(@as(u64, 5), five.slot);
+    try testing.expectEqual(@as(i64, 5), five.state.sum);
 }
 
 // Non-vacuity: without the reset at the top of AppNode.create and the OOM

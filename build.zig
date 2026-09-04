@@ -638,7 +638,7 @@ pub fn build(b: *std.Build) void {
     // sites in app_node.zig against it — an unpinned 21st rule goes red
     // there, not here (S8 review: this loop only pins the rows it has).
     const appnode_error_cases = @import("tests/appnode_errors/cases.zig").cases;
-    comptime std.debug.assert(appnode_error_cases.len == 23);
+    comptime std.debug.assert(appnode_error_cases.len == 25);
     const appnode_errors_step = b.step("appnode-errors", "Expected-fail compile of every AppNode contract / auto-codec teaching error (part of `test`)");
     for (appnode_error_cases) |case| {
         const obj = b.addObject(.{
