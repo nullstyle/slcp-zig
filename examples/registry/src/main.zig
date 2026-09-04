@@ -391,7 +391,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             const since = now -| last_close;
             var set: ?registry.TxSet = null;
             shared.lock();
-            if ((shared.n_pending > 0 and since >= f.min_slot_ms) or since >= f.heartbeat_ms) {
+            if (registry.nominationDue(shared.n_pending > 0, since, f.min_slot_ms, f.heartbeat_ms)) {
                 set = registry.proposal(&shared.state, shared.pendingSlice());
             }
             shared.unlock();

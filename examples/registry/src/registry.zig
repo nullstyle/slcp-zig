@@ -45,6 +45,16 @@ pub const max_pending: usize = 256;
 pub const min_slot_ms: u64 = 1000;
 pub const heartbeat_ms: u64 = 3000;
 
+/// Whether the process should nominate after `elapsed_ms` since its last
+/// applied slot. Pending work observes the busy-slot minimum; the heartbeat
+/// is strictly the idle path and must never bypass that minimum.
+pub fn nominationDue(has_pending: bool, elapsed_ms: u64, busy_min_ms: u64, idle_heartbeat_ms: u64) bool {
+    return if (has_pending)
+        elapsed_ms >= busy_min_ms
+    else
+        elapsed_ms >= idle_heartbeat_ms;
+}
+
 pub const tag_net = "REGISTRY-NET-V1";
 pub const tag_tx = "REGISTRY-TX-V1";
 pub const tag_hdr = "REGISTRY-HDR-V1";
@@ -1195,6 +1205,17 @@ test "proposal: pending queue in arrival order becomes a sorted, contiguous set"
     try testing.expectEqual(Verdict.valid, validate(&s, &p));
     var buf: [max_set_bytes]u8 = undefined;
     try testing.expect(TxSet.decode(p.encode(&buf)) != null);
+}
+
+// The heartbeat is an idle liveness mechanism, not a second busy cadence.
+// If the pending branch were ORed with the heartbeat branch, the third case
+// would nominate 4.9 seconds before the configured busy minimum.
+test "nomination cadence: pending work observes the busy minimum while only idle work uses the heartbeat" {
+    try testing.expect(!nominationDue(true, 99, 100, 10));
+    try testing.expect(nominationDue(true, 100, 100, 10));
+    try testing.expect(!nominationDue(true, 100, 5_000, 100));
+    try testing.expect(!nominationDue(false, 99, 5_000, 100));
+    try testing.expect(nominationDue(false, 100, 5_000, 100));
 }
 
 // Non-vacuity: flipping any byte of the snapshot (checksum, an entry, the
