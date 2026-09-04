@@ -4,9 +4,9 @@ What a consumer of `slcp-zig` may rely on across releases, how that promise is
 enforced, and how a symbol gets promoted. This file is the review reference
 `zig build check-api` points at when it goes red.
 
-**Status: FROZEN for v0.1.0 (M6 stage S6).** The Stable list below is the
-contract the `0.1.x` line keeps. Changing a Stable line is a breaking change
-(see "Semver, pre-1.0").
+**Status: FROZEN through v0.2.0.** The Stable list below is the contract first
+published by v0.1.0 and carried forward byte-for-byte into v0.2.0. Changing a
+Stable line is a breaking change (see "Semver, pre-1.0").
 
 ## The two tiers, and how they are enforced
 
@@ -85,7 +85,7 @@ to `examples/counter/src/main.zig`) and walks `slcp.AppNode(Counter)` and
 `order` / `size` — are the frozen contract for every instantiation, since the
 generic body is the same code.
 
-## What is Stable (v0.1.0)
+## What is Stable (v0.2.0; unchanged from v0.1.0)
 
 Grouped by area. "prefix" means the type and all of its members/fields are
 frozen; "exact" means the one symbol only (its fields stay Experimental).
@@ -178,7 +178,7 @@ expect in the Stable list and that are deliberately **not**:
   sets by their hashes, and `Engine.init` hashes the local qset. None can
   carry an explicit set without a behaviour-changing error mapping, and a
   frozen `anyerror!T` line documents a contract nobody can `switch` on. They
-  stay Experimental until they have real sets (a v0.2 item); the rest of
+  stay Experimental until they have real sets (a future release item); the rest of
   the `Engine` surface and the `QuorumSetOwned` shape are frozen, and the
   Stable way to obtain a validated set is `Quorum.toOwned` + `Node.create`
   / `AppNode(App).create`, which validate internally and report through
@@ -191,6 +191,11 @@ expect in the Stable list and that are deliberately **not**:
 - `slcp.overlay`, `slcp.timers`, `slcp.store`, `slcp.wire`: the node's
   internals, public only as escape hatches. Their shapes follow the
   implementation.
+- `slcp.node.Node.storageStats` and `slcp.node.StorageStats`: best-effort
+  quorum-set answering-cache observability added in v0.2.0. Entry/byte counts,
+  the `qset_cache_evictions` removal count (policy evictions plus
+  invalidations), failures, and the sticky degraded flag may evolve with that
+  cache while the Stable consensus statistics stay separate.
 - `slcp.lint_report`: the CLI's rendering of lint findings. The lint
   **codes** are frozen by `schema/host.capnp` and `vectors/lint.json`, not
   by these Zig names.

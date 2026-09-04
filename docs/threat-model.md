@@ -102,7 +102,7 @@ envelope citing an unknown qset hash parks until the qset arrives —
 4`, FIFO eviction (each eviction is a `phase_event(parked_evicted)`).
 EXTERNALIZE statements never park.
 
-**Quorum-set cache** (`src/engine/qset_store.zig`): the configured
+**Engine quorum-set cache** (`src/engine/qset_store.zig`): the configured
 `max_cached_qsets` bound includes the mandatory local set and every distinct
 qset carried by a live stored remote NOMINATE, PREPARE, or CONFIRM statement.
 EXTERNALIZE uses a synthetic sender singleton, so its commit-qset hash is not a
@@ -119,12 +119,30 @@ that unreferenced response. `max_cached_qsets = 0` is a special local-only
 mode: rotation overflow is disabled, steady residency is exactly the local
 qset, and one fetched in-flight response can make the transient peak two.
 Native request correlation prevents unsolicited or malformed qset frames from
-reaching either the Engine or persistence. The on-disk `qsets/` cache has no
-pruning policy, however: a relevant signer can drive a serial stream of valid,
-requested qset rotations whose files accumulate for the lifetime of the data
-directory even though in-memory residency remains bounded. Writes are
-best-effort, so exhaustion is logged rather than consensus-fatal, but disk
-usage remains an operator-visible residual risk.
+reaching either the Engine or persistence.
+
+**Node qset answering cache** (`src/node/qset_disk_cache.zig`): the on-disk
+`qsets/` cache is independent of Engine residency and bounded to 1,024 managed
+entries including the pinned local set, 64 MiB of logical payload bytes, and 1
+MiB per entry. Runtime remote eviction is FIFO; restart keeps the newest
+`(mtime, hash)` entries under both budgets with O(cap) selection memory.
+Atomic rename avoids successful partial writes, and any write/cleanup failure
+disables later writes for that Node lifetime. Reads are length-capped and
+semantically revalidate the qset hash before serving. Failures become misses
+and sticky Experimental `Node.storageStats()` counters, never consensus-fatal
+state. Residual disk usage is filesystem allocation overhead, unrelated names
+the cache deliberately preserves, and at most one new owned temp after a live
+filesystem failure prevents both completion and cleanup; operators should
+still alert on degradation.
+
+Cache files and directory renames are not fsync'd. A crash or power loss can
+therefore lose or corrupt an entry or leave a temporary file. Startup cleanup
+and semantic verification reduce those outcomes to cache misses; the fsync'd
+consensus logs are separate and unaffected. Reconciliation memory is O(the
+1,024-entry cap), but its CPU and I/O scan every `qsets/` directory entry and
+cleanup may rescan after deletions. An old unbounded cache or operator-created
+names can therefore delay startup even though retained cache state is bounded;
+keep `data_dir` operator-owned and do not co-locate other files in `qsets/`.
 
 Statement identity remains exact: graph reachability is derived from the
 union of the exact qsets on all live non-EXTERNALIZE statements, not a
@@ -258,7 +276,11 @@ for interop debugging only; both modes are safe (`sim/byzantine.zig`
 match its hash, leaves the referencing envelope parked until eviction;
 nothing else is affected. Qset size and depth are bounded by the frozen
 wire limits, and `slcp_qset_hash` / the node only accept qsets that validate
-and normalize.
+and normalize. A Node also reparses and hashes a remote disk-cache entry before
+answering `getQset`; same-sized corruption is invalidated as a miss. A peer
+receiving any cached response independently performs the same validation, so
+cache corruption is an availability loss rather than a consensus-integrity
+path.
 
 **Signature forgery / wrong network.** `invalid_signature`, never processed
 (`sim/byzantine.zig` "sig forger").
@@ -347,7 +369,7 @@ proposes again after every applied slot for exactly this reason. A 1-of-1
 self quorum lints with a warning and does externalize (dev / smoke use), but
 a restart story needs at least two proposers.
 
-## 6. Persistence failure ⇒ inert
+## 6. Consensus-log persistence failure ⇒ inert
 
 The write-ahead discipline (design §10, `src/node/node.zig` `dispatch` /
 `markFailed`): `persist_own_envelope` appends and fsyncs `own.log` **before**
@@ -358,6 +380,11 @@ error), or the `externalized.log` journal append fails, the node latches
 `error.NodeHalted`; `haltError()` names the cause). A node that cannot
 persist must go silent — broadcasting an unpersisted statement is Byzantine
 after the next crash (it could re-emit an older, conflicting statement).
+
+The best-effort qset answering cache is deliberately outside this rule. Its
+local qset stays pinned in memory; remote read/write failures become misses,
+set `Node.storageStats().qset_cache_degraded`, and may disable later cache
+writes without stopping consensus.
 
 - **Torn tail** (the file ends mid-record): repaired on recovery by
   truncating to the valid prefix; the node stays a validator. Safe because a

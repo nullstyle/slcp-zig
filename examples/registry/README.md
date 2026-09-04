@@ -132,11 +132,11 @@ mesh — see *Security*). On every box:
    zig build -Doptimize=ReleaseSafe
    ```
 
-   Or copy `examples/registry/` anywhere and pin the release instead of the
-   path — delete the `.slcp = .{ .path = "../.." }` line from
+   After v0.2.0 is tagged, you can instead copy `examples/registry/` anywhere
+   and pin that release: delete the `.slcp = .{ .path = "../.." }` line from
    `build.zig.zon` and run
-   `zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.1.0.tar.gz`
-   (the example uses only the Stable API of that release). Either way you
+   `zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz`
+   (the example uses only the unchanged Stable API). Either way you
    get `zig-out/bin/registry` and `zig-out/bin/slcp`.
 
 3. **Mint this machine's node key** (an Ed25519 seed, mode 0600; never copy

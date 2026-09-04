@@ -100,8 +100,9 @@ checklist.
 ### Native Node module
 
 [`src/node/node.zig`](src/node/node.zig) is the native host. Its public
-interface hides the engine pump, TCP overlay, timer wheel, persistence,
-restart recovery, input serialization, slot-ordered delivery, and the bounded
+interface hides the engine pump, TCP overlay, timer wheel, consensus-log
+persistence, the bounded best-effort quorum-set answering cache, restart
+recovery, input serialization, slot-ordered delivery, and the bounded
 Engine-ingress and future-slot hold queues.
 
 One engine thread owns all engine state. Overlay readers, timers, and
@@ -193,12 +194,14 @@ Changes should preserve these system-level invariants:
    participate in admission.
 5. **Apply before next-slot validation.** Normal host delivery keeps
    state-dependent validation from judging a live slot against stale state.
-6. **Bound adversary-controlled memory.** Frames, input and effect queues,
+6. **Bound adversary-controlled retention.** Frames, input and effect queues,
    held statements, pending envelopes, stored statements, quorum sets, slots,
-   and value caches all have explicit limits and defined overflow behavior.
-7. **Failure becomes silence.** Durable-write failure, driver fault, or a
-   sticky engine failure makes the node inert instead of continuing with
-   ambiguous state.
+   value caches, and managed quorum-set files all have explicit memory or disk
+   limits and defined overflow behavior.
+7. **Consensus-critical failure becomes silence.** Consensus-log write
+   failure, driver fault, or a sticky engine failure makes the node inert
+   instead of continuing with ambiguous state. An answering-cache failure is
+   observable but nonfatal: it becomes a cache miss, never unsafe progress.
 8. **Externalization is immutable.** Intact nodes do not decide two different
    values for one slot.
 9. **Halting is preferable to guessing.** A node without the required quorum
@@ -212,14 +215,18 @@ arbitrary independently chosen quorum sets into a safe federation.
 
 ## Persistence and recovery
 
-[`src/node/store.zig`](src/node/store.zig) owns the durable host state:
+Durable and best-effort state have separate owners. [`src/node/store.zig`](src/node/store.zig)
+owns the safety-critical logs and process lock; `Node` owns the identity
+marker; [`src/node/qset_disk_cache.zig`](src/node/qset_disk_cache.zig) owns the
+bounded answering cache:
 
 - `own.log` records the latest own statements needed to avoid post-crash
   equivocation;
 - `externalized.log` is the recent application-visible journal;
-- `qsets/` caches verified quorum sets;
 - `identity` binds a data directory to its network and node identity;
-- `lock` prevents two live processes from sharing one data directory.
+- `lock` prevents two live processes from sharing one data directory;
+- `qsets/` caches the pinned local set and requested, validated remote sets
+  under a 1,024-entry / 64 MiB logical payload budget.
 
 Recovery treats an incomplete final record as a torn tail and truncates to the
 valid prefix. A structurally complete record with a bad checksum is corruption,
@@ -235,6 +242,15 @@ Applications with delta-like commands must persist their own snapshot and
 reconstruct state from that snapshot plus the retained journal tail. Long-gap
 catch-up requires an application-level archive or a future state-transfer
 interface.
+
+The qset cache is not write-ahead state. Remote entries use FIFO eviction;
+startup reconstructs a deterministic `(mtime, hash)` order, prunes owned
+overflow and stale temp files with memory proportional to the entry cap, and
+checks a remote file's semantic hash lazily before serving it. Atomic
+same-directory rename prevents a successful write from exposing a partial
+file, but cache writes are not fsync'd. Cache I/O or allocation failure latches
+Experimental degradation counters and may disable further cache writes while
+the local quorum set remains answerable from memory.
 
 ## Trust and operations
 

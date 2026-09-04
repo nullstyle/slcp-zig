@@ -26,6 +26,13 @@ comptime {
     }
 }
 
+fn testFilters(b: *std.Build, filter: ?[]const u8) []const []const u8 {
+    const value = filter orelse return &.{};
+    const owned = b.allocator.alloc([]const u8, 1) catch @panic("out of memory");
+    owned[0] = value;
+    return owned;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -81,8 +88,10 @@ pub fn build(b: *std.Build) void {
     // node-tests: the whole native node layer's unit tests (store byte
     // format + restart recovery, timer wheel, key file, overlay framing,
     // Node lifecycle). Runs under `zig build test`.
+    const node_filter = b.option([]const u8, "node-filter", "node-tests: run only the tests whose name contains this");
     const node_tests = b.addTest(.{
         .name = "slcp-node-tests",
+        .filters = testFilters(b, node_filter),
         .root_module = slcp_mod,
     });
     const run_node_tests = b.addRunArtifact(node_tests);
@@ -99,7 +108,7 @@ pub fn build(b: *std.Build) void {
     const liveness_filter = b.option([]const u8, "liveness-filter", "liveness-tests: run only the tests whose name contains this");
     const liveness_tests = b.addTest(.{
         .name = "slcp-liveness-tests",
-        .filters = if (liveness_filter) |f| &.{f} else &.{},
+        .filters = testFilters(b, liveness_filter),
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/liveness_test.zig"),
             .target = target,
@@ -554,7 +563,7 @@ pub fn build(b: *std.Build) void {
     const e2e_filter = b.option([]const u8, "e2e-filter", "e2e: run only tests whose name contains this");
     const e2e_node_tests = b.addTest(.{
         .name = "slcp-e2e",
-        .filters = if (e2e_filter) |f| &.{f} else &.{},
+        .filters = testFilters(b, e2e_filter),
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/e2e/cluster_test.zig"),
             .target = target,

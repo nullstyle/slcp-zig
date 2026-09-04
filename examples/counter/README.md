@@ -123,10 +123,12 @@ every box.
    ```
 
 3. **Pin slcp-zig** by release tag (immutable tarball; `zig fetch` records the
-   content hash in `build.zig.zon`):
+   content hash in `build.zig.zon`). The v0.2.0 command below becomes usable
+   after that candidate is tagged; until then, use a checkout and `.path`
+   dependency for candidate testing:
 
    ```sh
-   zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.1.0.tar.gz
+   zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz
    ```
 
 4. **Paste the program** above into `src/main.zig` (replace what `zig init`

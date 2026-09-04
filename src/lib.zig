@@ -1,7 +1,7 @@
 //! slcp — the native omakase layer (design §11.2). Wraps the sans-io engine
 //! (slcp-core) in a real node: TCP flood overlay, a real-clock timer wheel,
-//! crash-safe persistence, and a key file. The typed `AppNode(App)` layer
-//! (§8.5) landed M6 on top of this.
+//! crash-safe consensus-log persistence, and a key file. The typed
+//! `AppNode(App)` layer (§8.5) landed M6 on top of this.
 //!
 //! Escape hatches stay public: `core` is the whole sans-io engine, so a power
 //! user can drive `core.engine.Engine` with their own I/O and skip everything
@@ -19,7 +19,8 @@ pub const wire = @import("node/wire.zig");
 pub const overlay = @import("node/overlay.zig");
 /// Real-clock timer wheel: arm/cancel → timer_fired inputs (§5.4).
 pub const timers = @import("node/timers.zig");
-/// Crash-safe persistence: own.log, externalized.log, qsets/ (§10).
+/// Crash-safe consensus-log persistence: own.log + externalized.log (§10).
+/// Node owns the separate bounded, best-effort qsets/ answering cache.
 pub const store = @import("node/store.zig");
 /// Ed25519 key file: loadOrCreate (§11 keys UX).
 pub const keys = @import("node/keys.zig");

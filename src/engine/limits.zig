@@ -20,8 +20,9 @@ pub const Limits = struct {
     max_pending_envelopes: u32 = 1024,
     max_pending_bytes: u32 = 8 * 1024 * 1024,
     max_live_slots: u32 = 64,
-    // Direct Engine configs may use 0 for a local-only cache; Store reserves
-    // the one mandatory local entry. host.capnp 0 still decodes as default.
+    // Direct Engine configs may use 0 for a local-only cache;
+    // qset_store.Store reserves the one mandatory local entry. host.capnp 0
+    // still decodes as default.
     max_cached_qsets: u32 = 1024,
     timeout_cap_ms: u32 = frozen_timeout_cap_ms,
     max_stored_statement_bytes: u32 = 20 * 1024 * 1024,

@@ -13,6 +13,28 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-03
+
+**Candidate package hash placeholder** (replace with `just release-hash`
+before the tag; afterward it is what `zig fetch --save=slcp
+https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz`
+records):
+
+```
+slcp-0.2.0-PLACEHOLDER0000000000000000000000000000000000000000
+```
+
+### Breaking
+
+- The Experimental `slcp.store.Store.putQset` and `Store.getQset` methods
+  were removed. Quorum-set answering now belongs to Node's private bounded
+  cache instead of the safety-critical consensus-log Store.
+
+**Migration:** consumers that called those Experimental Store methods should
+use the native Node's normal `request_qset` / `getQset` exchange and inspect
+`Node.storageStats()`, or own a separate application cache if they drive the
+sans-I/O Engine directly. No Stable declaration changed.
+
 ### Added
 
 - **`examples/registry`** — the second example and step E1 of the examples
@@ -37,6 +59,13 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   node. Evidence: `[registry-smoke] nodes=3 txs=7 slots=N head=<hex16>`.
 - Experimental native-node ingress statistics, a bounded priority purge lane,
   and `-De2e-filter` for focused real-socket regression runs.
+- A bounded, restart-aware native quorum-set answering cache: 1,024 managed
+  entries including the pinned local set, 64 MiB logical payload bytes, 1 MiB
+  per entry, FIFO runtime eviction, deterministic restart reconciliation,
+  atomic replacement, capped reads, lazy semantic hash verification, and
+  fail-closed write degradation. Experimental `Node.storageStats()` reports
+  logical usage, removals, failures, and the sticky degraded state.
+- `-Dnode-filter` for focused native-node and cache regression runs.
 - Canonical `CONTEXT.md`, `DESIGN.md`, `STATUS.md`, and
   `docs/examples-roadmap.md` project-state documents.
 
@@ -53,6 +82,9 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 - Engine-derived node statistics publish only at complete input/effect-drain
   boundaries. Input-sequence fuzzing now generates diverse valid typed streams,
   and restart E2E evidence requires fresh post-restart participation.
+- Quorum-set disk persistence is separated from the consensus-log Store.
+  Only requested, validated, successfully queued remote responses are cached;
+  cache I/O failure becomes a miss and never makes consensus inert.
 
 ### Fixed
 
@@ -62,6 +94,13 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   previous valid statement or releases its qset reference.
 - Quorum-set responses are correlated to outstanding requests and remain
   retryable when native ingress is under pressure.
+- Node qset correlation now applies the same 1 MiB frame, nesting, and
+  traversal limits as Engine ingestion, so an oversized parseable response
+  cannot consume a request that the Engine would reject.
+- Qset-cache startup uses memory proportional to its entry cap even when
+  pruning an old unbounded directory. Same-sized corrupt/wrong-hash files,
+  mixed-case path aliases, symlinks, atomic-write failures, OOM, concurrent
+  access, churn, and restart are covered by regression tests.
 
 ## [0.1.0] - 2026-09-01
 
@@ -264,5 +303,6 @@ test; and a dozen documentation claims that disagreed with the code
   is sent but never used for dialing.
 - No license is granted.
 
-[Unreleased]: https://github.com/nullstyle/slcp-zig/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nullstyle/slcp-zig/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/nullstyle/slcp-zig/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nullstyle/slcp-zig/releases/tag/v0.1.0

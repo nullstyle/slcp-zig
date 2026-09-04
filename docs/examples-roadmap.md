@@ -4,9 +4,8 @@ This track grows one non-financial application toward the architectural
 complexity of Stellar Core. It is a direction-setting document, not a promise
 that a future Stable interface already exists.
 
-**Status as of 2026-09-03:** E1 is implemented on `main` at `cf3b84b`; E2 and
-E3 are designs only. E1 is after the `v0.1.0` tag and remains part of the
-unreleased repository state.
+**Status as of 2026-09-03:** E1 is implemented and included in the v0.2.0
+release candidate; E2 and E3 are designs only.
 
 ## Direction
 

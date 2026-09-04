@@ -10,7 +10,6 @@
 //!                        u32 crc32); fsync'd. The write-ahead record.
 //!     externalized.log   append-only: (u64 slot, u32 len, value, u32 crc32);
 //!                        fsync'd. App journal AND crash-fallback slot bound.
-//!     qsets/<hex64>.bin  verified foreign qset cache (best-effort, no fsync).
 //!
 //! Record framing (both logs): little-endian u64 slot, little-endian u32
 //! payload length, `len` payload bytes, little-endian u32 crc32 (IEEE, over
@@ -34,13 +33,11 @@
 //! `std.Io.Dir.cwd().createFile(io, path, .{})`, `readFileAlloc`, `access`,
 //! `makePath`). Discover the fsync call on the file handle (data-sync).
 //!
-//!   * open: makePath(data_dir), makePath(data_dir/qsets). Open/create both
-//!     logs for append. Keep the Dir + open file handles.
+//!   * open: makePath(data_dir). Open/create both logs for append. Keep the
+//!     Dir + open file handles.
 //!   * appendOwn / appendExternalized: encode one record, write, fsync. These
 //!     are on the write-ahead path — fsync MUST complete before return (§10:
 //!     persist strictly precedes broadcast; the Node relies on that).
-//!   * putQset: write qsets/<hex of hash>.bin (best-effort; swallow errors,
-//!     log). getQset: read it back if present (caller frees), else null.
 //!   * recover(): read both logs.
 //!       - own.log: parse records front-to-back. On the FIRST bad record,
 //!         stop and classify it: a torn tail (file ends mid-record) is safe
@@ -64,8 +61,8 @@
 //!   * Tests (use std.testing.tmpDir): round-trip append→recover; last-wins
 //!     dedup across two prepares for one slot; a hand-corrupted own.log tail
 //!     byte sets own_log_corrupt AND still yields externalized_hwm from the
-//!     intact externalized.log; qset put/get round-trip; crc rejects a
-//!     flipped payload byte. To build valid envelope bytes for tests, use
+//!     intact externalized.log; crc rejects a flipped payload byte. To build
+//!     valid envelope bytes for tests, use
 //!     core.emit or hand-build via core.gen.slcp (see src/engine/emit.zig).
 //! ========================================================================
 
@@ -87,10 +84,6 @@ const ext_log_name = "externalized.log";
 /// complete log, and the next compact truncates the scratch file.
 const own_tmp_name = "own.log.compact";
 const ext_tmp_name = "externalized.log.compact";
-const qsets_dir_name = "qsets";
-/// "qsets/" ++ 64 hex chars ++ ".bin".
-const qset_path_len = qsets_dir_name.len + 1 + 64 + 4;
-
 /// Record framing overhead: u64 slot + u32 len (header) + u32 crc (trailer).
 const rec_header_len = 8 + 4;
 const rec_crc_len = 4;
@@ -136,7 +129,7 @@ pub const Recovery = struct {
 pub const Store = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Handle to the data directory; qset files and log reads resolve against it.
+    /// Handle to the data directory; log reads resolve against it.
     dir: std.Io.Dir,
     /// `lock`, held exclusively for the Store's lifetime (released on close).
     lock_file: std.Io.File,
@@ -171,8 +164,6 @@ pub const Store = struct {
             else => return Error.IoFailed,
         };
         if (!locked) return Error.Busy;
-
-        try dir.createDirPath(io, qsets_dir_name);
 
         // truncate=false: preserve an existing log across a restart (recovery).
         // read=true: compact() re-reads each log through its open handle.
@@ -238,30 +229,6 @@ pub const Store = struct {
         w.interface.writeAll(rec) catch return Error.IoFailed;
         w.interface.flush() catch return Error.IoFailed;
         try fullSync(self.io, file);
-    }
-
-    /// Best-effort write of a verified foreign qset (no fsync).
-    pub fn putQset(self: *Store, hash: [32]u8, framed_qset: []const u8) void {
-        var path_buf: [qset_path_len]u8 = undefined;
-        const path = qsetPath(hash, &path_buf);
-        var file = self.dir.createFile(self.io, path, .{}) catch |err| {
-            std.log.warn("store: putQset create failed: {s}", .{@errorName(err)});
-            return;
-        };
-        defer file.close(self.io);
-        file.writeStreamingAll(self.io, framed_qset) catch |err|
-            std.log.warn("store: putQset write failed: {s}", .{@errorName(err)});
-    }
-
-    /// Read a cached qset by hash (caller frees), or null.
-    pub fn getQset(self: *Store, gpa: std.mem.Allocator, hash: [32]u8) !?[]u8 {
-        var path_buf: [qset_path_len]u8 = undefined;
-        const path = qsetPath(hash, &path_buf);
-        return self.dir.readFileAlloc(self.io, path, gpa, .unlimited) catch |err| switch (err) {
-            error.FileNotFound => null,
-            error.OutOfMemory => Error.OutOfMemory,
-            else => Error.IoFailed,
-        };
     }
 
     /// Read both logs and compute the restart plan (§10). Whenever a log's
@@ -559,20 +526,6 @@ fn classifyKind(gpa: std.mem.Allocator, framed_envelope: []const u8) !Kind {
         .prepare, .confirm, .externalize => .ballot,
         .unset => Error.BadRecord,
     };
-}
-
-/// Render "qsets/<hex64>.bin" for `hash` into `buf`, returning the full path.
-fn qsetPath(hash: [32]u8, buf: *[qset_path_len]u8) []const u8 {
-    const hex = "0123456789abcdef";
-    @memcpy(buf[0..qsets_dir_name.len], qsets_dir_name);
-    buf[qsets_dir_name.len] = '/';
-    const off = qsets_dir_name.len + 1;
-    for (hash, 0..) |b, i| {
-        buf[off + i * 2] = hex[b >> 4];
-        buf[off + i * 2 + 1] = hex[b & 0x0f];
-    }
-    @memcpy(buf[off + 64 ..][0..4], ".bin");
-    return buf[0..qset_path_len];
 }
 
 // ---------------------------------------------------------------------------
@@ -960,30 +913,6 @@ test "store: crc rejects a flipped payload byte" {
     try testing.expectEqual(@as(usize, 0), after.len);
 }
 
-test "store: qset put/get round-trips and absent returns null" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [128]u8 = undefined;
-    const data_dir = try tmpDataDir(&tmp, &path_buf);
-
-    var store = try Store.open(gpa, io, data_dir);
-    defer store.deinit();
-
-    const hash: [32]u8 = @splat(0x5c);
-    const payload = "framed-qset-bytes";
-    store.putQset(hash, payload);
-
-    const got = try store.getQset(gpa, hash);
-    try testing.expect(got != null);
-    defer gpa.free(got.?);
-    try testing.expectEqualSlices(u8, payload, got.?);
-
-    const absent: [32]u8 = @splat(0xff);
-    try testing.expectEqual(@as(?[]u8, null), try store.getQset(gpa, absent));
-}
-
 test "store: torn externalized.log tail is repaired and keeps prefix hwm" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1122,9 +1051,7 @@ test "store: compact keeps only slots >= keep_from_slot and stays appendable" {
     var store = try Store.open(gpa, io, data_dir);
     defer store.deinit();
 
-    // Records for slots 1..40 in both logs, plus a qset that must survive.
-    const qset_hash: [32]u8 = @splat(0x5c);
-    store.putQset(qset_hash, "framed-qset-bytes");
+    // Records for slots 1..40 in both logs.
     var slot: u64 = 1;
     while (slot <= 40) : (slot += 1) {
         const env = try buildTestEnvelope(gpa, slot, .prepare, @intCast(slot));
@@ -1161,12 +1088,6 @@ test "store: compact keeps only slots >= keep_from_slot and stays appendable" {
         // hwm preserved: the max-slot externalized record always survives.
         try testing.expectEqual(@as(?u64, 40), rec.externalized_hwm);
     }
-
-    // qsets/ dir untouched by compaction.
-    const qset = try store.getQset(gpa, qset_hash);
-    try testing.expect(qset != null);
-    defer gpa.free(qset.?);
-    try testing.expectEqualSlices(u8, "framed-qset-bytes", qset.?);
 
     // Appends still work on the swapped handles, and survive a reopen.
     const env41 = try buildTestEnvelope(gpa, 41, .prepare, 41);

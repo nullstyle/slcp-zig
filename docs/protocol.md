@@ -479,8 +479,9 @@ pub const Limits = struct {
     max_pending_envelopes: u32 = 1024,
     max_pending_bytes: u32 = 8 * 1024 * 1024,
     max_live_slots: u32 = 64,
-    // Direct Engine configs may use 0 for a local-only cache; Store reserves
-    // the one mandatory local entry. host.capnp 0 still decodes as default.
+    // Direct Engine configs may use 0 for a local-only cache;
+    // qset_store.Store reserves the one mandatory local entry. host.capnp 0
+    // still decodes as default.
     max_cached_qsets: u32 = 1024,
     timeout_cap_ms: u32 = frozen_timeout_cap_ms,
     max_stored_statement_bytes: u32 = 20 * 1024 * 1024,
@@ -861,15 +862,17 @@ pending state below a newly published purge floor.
   implemented.
 - `dontHave` is **ignored** (the flood covers the requester; parked envelopes
   expire by the parking caps).
-- `getQset` is answered from the persisted qset cache (§13) or with
+- `getQset` is answered from the bounded on-disk qset cache (§13) or with
   `dontHave{kind 0, id = hash}`. A native Node parses, validates, normalizes,
   and hashes an inbound qset before correlating it with an outstanding
   `request_qset`. Only a matching response that successfully enters the input
   queue consumes that request and is persisted; malformed, unsolicited,
   duplicate, or queue-rejected responses reach neither the Engine nor disk,
-  and queue pressure releases the claim for a later retry. The direct sans-I/O
-  Engine has no request ledger and accepts any valid `qset_received` input,
-  including deliberate cache pre-warming by its host.
+  and queue pressure releases the claim for a later retry. A cache miss or
+  read failure is also answered with `dontHave`; cache failure never halts consensus.
+  The direct sans-I/O Engine has no request ledger and accepts any
+  valid `qset_received` input, including deliberate cache pre-warming by its
+  host.
 - `getSlotState(s)` is answered with up to 64 of the node's **own** latest
   envelopes (ballot statements preferred) for the requested window; `0`
   means "latest externalized you have". Requests are never relayed.
@@ -889,10 +892,12 @@ pending state below a newly published purge floor.
 
 ## 13. Persistence
 
-Source: `src/node/store.zig` (header + `Recovery`), `src/node/node.zig`
-(identity marker, `purge_window`, compaction), `src/node/keys.zig`.
-**No cross-language vector yet** — until one is added, `store.zig`'s tests
-(round-trip, last-wins dedup, torn tail, crc) are the pin.
+Source: `src/node/store.zig` (header + `Recovery`),
+`src/node/qset_disk_cache.zig`, `src/node/node.zig` (identity marker,
+`purge_window`, compaction), `src/node/keys.zig`.
+**No cross-language persistence vector yet** — until one is added,
+`store.zig` tests pin the logs (round-trip, last-wins dedup, torn tail, crc),
+and `qset_disk_cache.zig` tests pin answering-cache behavior.
 
 **`data_dir` layout** (as built, M6):
 
@@ -903,7 +908,7 @@ slcp-data/
   own.log            # append-only: (u64 slot, u32 len, envelope bytes, u32 crc32); fsync'd
   externalized.log   # append-only: (u64 slot, u32 len, value, u32 crc32); fsync'd —
                      # the app-visible journal AND the crash-fallback slot bound
-  qsets/<hex64>.bin  # verified local/requested-remote qset cache (best-effort, no fsync)
+  qsets/<hex64>.bin  # bounded local/requested-remote qset cache (best-effort, no fsync)
   own.log.compact / externalized.log.compact   # compaction scratch (harmless leftovers)
 ```
 
@@ -994,14 +999,36 @@ A catch-up gap wider than the window is declared unrecoverable and skipped
 loudly; held statements (§12) for the skipped range are dropped with it,
 and the new frontier slot's held statements are released.
 
-**Qset cache**: `qsets/<lower-case hex of qsetHash>.bin` holds the framed
-`QuorumSet` message bytes; best-effort, no fsync, written for the local qset and
-for validated inbound hashes the node requested. These files are not currently
-pruned by log compaction or in-memory qset eviction. A long-lived node that
-resolves a continuing sequence of requested qset rotations can therefore grow
-`qsets/` without a built-in disk bound; native request correlation prevents
-unsolicited frames from doing so, but operators must still monitor the data
-directory.
+**Qset cache** (`qset_disk_cache.zig`):
+`qsets/<lower-case hex of qsetHash>.bin` holds framed `QuorumSet` message
+bytes. The cache manages at most **1,024 entries including the pinned local
+qset**, at most **64 MiB of logical payload bytes total**, and at most **1
+MiB per entry**. Filesystem allocation overhead and names that are not exact
+lowercase finals or cache temp names are outside that accounting. The local
+frame remains pinned in memory even when the directory is unavailable.
+
+Only the local qset and a validated inbound qset that matches an outstanding
+native request and successfully enters the Engine input queue are written.
+Remote entries use FIFO eviction during one run; reads and duplicate writes do
+not refresh them. A restart retains the newest entries under both budgets,
+ordered deterministically by `(mtime, hash)`, and rebuilds the live FIFO in
+that order. Selection memory is proportional to the 1,024-entry cap, not the
+number of legacy files. Startup removes excess exact finals and exact stale
+temps but preserves unrelated names and exact-looking directories. A
+mixed-case alias blocks canonical-path mutation, which matters on
+case-insensitive filesystems.
+
+Writes use an exclusive random temp in `qsets/` followed by same-directory
+rename; they are best-effort and are not fsync'd. After any atomic-write or
+cleanup failure, later cache writes are disabled for that Node lifetime, so a
+failing filesystem cannot accumulate one temp per request. Reads open without
+following symlinks, stat the opened handle, allocate only the recorded bounded
+length, require a complete read, then parse, normalize, and compare the
+semantic qset hash before serving. Invalid files become misses and are removed
+when safe; verification OOM is a miss but leaves a potentially valid file in
+place. `Node.storageStats()` exposes logical entries/bytes, removals,
+read/write failures, and a sticky degraded flag. None of these failures makes
+the consensus engine inert; `getQset` answers the miss with `dontHave`.
 
 **Key file** (`keys.zig` header): exactly **32 raw seed bytes** (not hex),
 mode `0600`, created atomically and durably (temp file → fsync, plus

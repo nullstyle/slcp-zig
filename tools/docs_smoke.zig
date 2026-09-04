@@ -76,6 +76,7 @@ pub const required_paths = active_docs ++ required_snippets ++ [_][]const u8{
     "src/engine/statement.zig",
     "src/engine/engine.zig",
     "src/engine/qset.zig",
+    "src/node/qset_disk_cache.zig",
     ci_workflow,
 };
 
@@ -104,6 +105,9 @@ pub const protocol_needles = [_][]const u8{
     "4096",
     "255",
     "60 s",
+    "1,024 entries including the pinned local",
+    "64 MiB of logical payload bytes total",
+    "cache failure never halts consensus",
     // §13 compaction trigger (S8 D2 finding): compaction is gated on a drain
     // ending with the frontier a multiple of 64, not on every drain.
     "a multiple of 64",
@@ -116,6 +120,8 @@ pub const threat_model_needles = [_][]const u8{
     "WireGuard",
     "quorum intersection",
     "Top-level threshold sanity",
+    "Node qset answering cache",
+    "never consensus-fatal",
 };
 /// Source strings the docs quote verbatim. Each needle must occur in BOTH
 /// the source file and the doc (whitespace-folded, so a quotation wrapped
@@ -145,6 +151,7 @@ pub const forbidden_needles = [_][]const u8{
     // Stale since fc351a5 (R20): the Experimental snapshot is strict on both
     // CI test legs, not only the ubuntu one.
     "staleness on Linux CI",
+    "without a built-in disk bound",
 };
 /// docs/stability.md AND the tool's module doc (tools/api_snapshot.zig) must
 /// state the tiering rule as it actually behaves: a new declaration under a
@@ -1146,7 +1153,7 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         const version = parseManifestVersion(zon) orelse "";
         rep.checkFmt(version.len > 0, "build.zig.zon", 0, ".version parses", .{}, "no `.version = \"…\"`", .{});
         const pin = try std.fmt.allocPrint(arena, "refs/tags/v{s}.tar.gz", .{version});
-        for ([_][]const u8{ "README.md", "examples/counter/README.md" }) |p| {
+        for ([_][]const u8{ "README.md", "examples/counter/README.md", "examples/registry/README.md" }) |p| {
             const text = for (docs) |d| (if (std.mem.eql(u8, d.path, p)) break d.text) else "";
             rep.checkFmt(std.mem.indexOf(u8, text, pin) != null, p, 0, "install pin `{s}` present", .{pin}, "the tarball pin must name build.zig.zon's .version", .{});
         }

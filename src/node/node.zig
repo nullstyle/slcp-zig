@@ -26,6 +26,7 @@ const wire = @import("wire.zig");
 const overlay_mod = @import("overlay.zig");
 const timers_mod = @import("timers.zig");
 const store_mod = @import("store.zig");
+const qset_disk_cache = @import("qset_disk_cache.zig");
 const keys_mod = @import("keys.zig");
 const lint_report = @import("lint_report.zig");
 
@@ -35,6 +36,11 @@ const qset = core.qset;
 const gen_slcp = core.gen.slcp;
 const canonical = core.canonical;
 const MessageBuilder = core.capnpc.message.MessageBuilder;
+const QsetDiskCache = qset_disk_cache.QsetDiskCache;
+
+test {
+    _ = qset_disk_cache;
+}
 
 const log = std.log.scoped(.slcp_node);
 
@@ -298,6 +304,20 @@ pub const IngressStats = struct {
     queued_items: usize,
     queued_bytes: usize,
     dropped_network_inputs: usize,
+};
+
+/// Best-effort host-storage health. Experimental: these fields describe the
+/// bounded quorum-set answering cache, not the safety-critical consensus logs.
+/// Entry and byte counts are logical managed payloads and include the pinned
+/// local quorum set; filesystem allocation overhead and unrelated files under
+/// `qsets/` are outside the accounting.
+pub const StorageStats = struct {
+    qset_cache_entries: usize,
+    qset_cache_bytes: usize,
+    qset_cache_evictions: u64,
+    qset_cache_read_failures: u64,
+    qset_cache_write_failures: u64,
+    qset_cache_degraded: bool,
 };
 
 /// Host-side per-slot hold buffer (S8 D1, the stellar-core Herder shape —
@@ -992,6 +1012,7 @@ pub const Node = struct {
     eng: engine.Engine,
     q: InputQueue,
     store: store_mod.Store,
+    qset_cache: QsetDiskCache,
     wheel: timers_mod.Wheel,
     ov: overlay_mod.Overlay,
 
@@ -1331,6 +1352,7 @@ pub const Node = struct {
             .q = .{ .gpa = gpa, .io = io },
             .qset_requests = try QsetRequests.init(gpa, io, limits.max_pending_envelopes),
             .store = undefined,
+            .qset_cache = undefined,
             .wheel = undefined,
             .ov = undefined,
             .current_slot = opts.start_slot,
@@ -1363,13 +1385,20 @@ pub const Node = struct {
         self.store = store_mod.Store.open(gpa, io, opts.data_dir) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Busy => return fail(diag, error.DataDirBusy, ".data_dir \"{s}\" is in use by another live slcp node (the lock file {s}/lock is held); one identity must never run twice — stop the other process, or point this node at its own data_dir.", .{ opts.data_dir, opts.data_dir }),
-            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\": a write-ahead log cannot be opened for writing (permission denied); fix the ownership/permissions of its files (own.log, externalized.log, qsets/) — a restart as a different user than the one that created them is the usual cause — or point .data_dir at a directory this user owns.", .{opts.data_dir}),
+            error.AccessDenied, error.PermissionDenied => return fail(diag, error.DataDirAccessDenied, ".data_dir \"{s}\": a write-ahead log cannot be opened for writing (permission denied); fix the ownership/permissions of own.log and externalized.log — a restart as a different user than the one that created them is the usual cause — or point .data_dir at a directory this user owns.", .{opts.data_dir}),
             else => return fail(diag, error.DataDirUnusable, ".data_dir \"{s}\" cannot be used: the write-ahead logs could not be opened ({t}); check the path, the filesystem (read-only?) and free space.", .{ opts.data_dir, e }),
         };
         errdefer self.store.deinit();
 
-        // Cache our own qset on disk so getQset can answer it after restart.
-        self.store.putQset(local_hash, framed_local);
+        // The answering cache is deliberately separate from Store's fatal
+        // write-ahead path. Reconcile it while Store's process lock is held and
+        // before Overlay.init can expose the listener. Filesystem failures
+        // degrade to memory-pinned local answers and Experimental counters.
+        self.qset_cache = try QsetDiskCache.open(gpa, io, opts.data_dir, .{
+            .hash = local_hash,
+            .framed = framed_local,
+        });
+        errdefer self.qset_cache.deinit();
 
         self.wheel = timers_mod.Wheel.init(gpa, io, onTimerFire, self);
         errdefer self.wheel.deinit(); // stop() is idempotent; frees the timer list
@@ -1703,6 +1732,7 @@ pub const Node = struct {
         for (self.peer_specs) |s| self.gpa.free(s);
         self.gpa.free(self.peer_specs);
 
+        self.qset_cache.deinit();
         self.store.deinit();
         self.eng.deinit();
         self.freeAppBuffers();
@@ -1816,10 +1846,24 @@ pub const Node = struct {
         return s;
     }
 
-    /// Native ingress pressure and drops. Experimental in v0.1.x; the
-    /// consensus Engine's Stable stats remain a separate snapshot.
+    /// Native ingress pressure and drops. Experimental; the consensus
+    /// Engine's Stable stats remain a separate snapshot.
     pub fn ingressStats(self: *Node) IngressStats {
         return self.q.snapshot();
+    }
+
+    /// Bounded quorum-set disk-cache accounting and failure counters.
+    /// Experimental in v0.x; consensus Engine stats remain separate.
+    pub fn storageStats(self: *Node) StorageStats {
+        const s = self.qset_cache.snapshot();
+        return .{
+            .qset_cache_entries = s.entries,
+            .qset_cache_bytes = s.bytes,
+            .qset_cache_evictions = s.evictions,
+            .qset_cache_read_failures = s.read_failures,
+            .qset_cache_write_failures = s.write_failures,
+            .qset_cache_degraded = s.degraded,
+        };
     }
 
     /// Engine-owner only (or the creating thread before `engine_thread`
@@ -2491,11 +2535,11 @@ pub const Node = struct {
             return;
         };
         self.qset_requests.commit(hash);
-        self.store.putQset(hash, framed_qset);
+        self.qset_cache.rememberRequested(hash, framed_qset);
     }
 
     fn answerGetQset(self: *Node, peer_id: usize, hash: [32]u8) void {
-        const framed = self.store.getQset(self.gpa, hash) catch null;
+        const framed = self.qset_cache.copy(self.gpa, hash);
         if (framed) |bytes| {
             defer self.gpa.free(bytes);
             self.ov.send(peer_id, .{ .qset = bytes });
@@ -2553,7 +2597,11 @@ pub const Node = struct {
 const Bucket = enum { nom, ballot };
 
 fn qsetHashOfFramed(gpa: std.mem.Allocator, framed_qset: []const u8) ![32]u8 {
-    var msg = try core.capnpc.message.Message.init(gpa, framed_qset, .{});
+    if (framed_qset.len > core.limits.frozen_max_frame_bytes) return error.FrameTooLarge;
+    var msg = try core.capnpc.message.Message.init(gpa, framed_qset, .{
+        .nesting_limit = 32,
+        .traversal_limit_words = core.limits.frozen_max_frame_bytes / 8,
+    });
     defer msg.deinit();
     const r = try gen_slcp.QuorumSet.Reader.init(&msg);
     var qs = try qset.fromReader(gpa, r);
@@ -2886,6 +2934,7 @@ test "qset ingress: only a requested frame enters the engine" {
         .diagnostic = &diag,
     });
     defer n.deinit();
+    try std.testing.expectEqual(@as(usize, 1), n.storageStats().qset_cache_entries);
 
     const remote = try crypto.publicKeyFromSeed(@splat(0x63));
     var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
@@ -2907,11 +2956,60 @@ test "qset ingress: only a requested frame enters the engine" {
     defer gpa.free(requested_framed);
     n.noteQsetRequested(requested_hash);
     n.onQsetFrame(requested_framed);
+    try std.testing.expectEqual(@as(usize, 2), n.storageStats().qset_cache_entries);
 
     n.q.close();
     if (n.engine_thread) |thread| thread.join();
     n.engine_thread = null;
     try std.testing.expectEqual(@as(usize, 2), n.stats().cached_qsets);
+}
+
+test "qset ingress: an oversized parseable response cannot consume its request" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x6c);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const n = try Node.create(gpa, io, .{
+        .network = "qset ingress parser limits v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+    });
+    defer n.deinit();
+
+    const remote = try crypto.publicKeyFromSeed(@splat(0x6d));
+    var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
+    defer remote_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &remote_qset);
+    const hash = try qset.hashNormalized(gpa, &remote_qset);
+    const framed = try ownedQsetToFramed(gpa, &remote_qset);
+    defer gpa.free(framed);
+
+    // Keep the valid root but enlarge its sole segment beyond the Engine's
+    // frame cap. A loose Cap'n Proto pre-parse accepts and ignores the unused
+    // trailing words, so this specifically pins parity with handleQset.
+    const oversized_len = core.limits.frozen_max_frame_bytes + 8;
+    const oversized = try gpa.alloc(u8, oversized_len);
+    defer gpa.free(oversized);
+    @memset(oversized, 0);
+    @memcpy(oversized[0..framed.len], framed);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, oversized[0..4], .little));
+    std.mem.writeInt(u32, oversized[4..8], @intCast((oversized.len - 8) / 8), .little);
+
+    n.noteQsetRequested(hash);
+    n.onQsetFrame(oversized);
+    try std.testing.expectEqual(@as(usize, 1), n.storageStats().qset_cache_entries);
+
+    // The rejected response left the claim available; a normal response can
+    // still enter the queue and the answering cache.
+    n.onQsetFrame(framed);
+    try std.testing.expectEqual(@as(usize, 2), n.storageStats().qset_cache_entries);
 }
 
 // Closing the queue is not successful admission. A requested qset which
@@ -2954,7 +3052,7 @@ test "qset ingress: closed queue releases the request and does not persist" {
     n.onQsetFrame(framed);
 
     try std.testing.expect(n.consumeQsetRequested(hash));
-    const persisted = try n.store.getQset(gpa, hash);
+    const persisted = n.qset_cache.copy(gpa, hash);
     defer if (persisted) |bytes| gpa.free(bytes);
     try std.testing.expectEqual(@as(?[]u8, null), persisted);
     try std.testing.expectEqual(@as(usize, 0), n.ingressStats().dropped_network_inputs);
@@ -3054,7 +3152,121 @@ test "qset ingress: queue pressure preserves the request for retry" {
 
     try std.testing.expectEqual(@as(usize, 1), n.ingressStats().dropped_network_inputs);
     try std.testing.expect(n.consumeQsetRequested(hash));
-    try std.testing.expectEqual(@as(?[]u8, null), try n.store.getQset(gpa, hash));
+    try std.testing.expectEqual(@as(?[]u8, null), n.qset_cache.copy(gpa, hash));
+}
+
+test "qset cache failure degrades storage without making consensus inert" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x72);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diag: Diagnostic = .{};
+    const n = try Node.create(gpa, io, .{
+        .network = "qset cache failure is nonfatal v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .diagnostic = &diag,
+    });
+    defer n.deinit();
+
+    const remote = try crypto.publicKeyFromSeed(@splat(0x73));
+    var remote_qset = try Quorum.of(1, &.{remote}).toOwned(gpa);
+    defer remote_qset.deinit(gpa);
+    try qset.validateAndNormalize(gpa, &remote_qset);
+    const hash = try qset.hashNormalized(gpa, &remote_qset);
+    const framed = try ownedQsetToFramed(gpa, &remote_qset);
+    defer gpa.free(framed);
+
+    const hash_hex = std.fmt.bytesToHex(hash, .lower);
+    var blocked_path_buf: ["qsets/".len + 64 + ".bin".len]u8 = undefined;
+    const blocked_path = try std.fmt.bufPrint(&blocked_path_buf, "qsets/{s}.bin", .{&hash_hex});
+    try tmp.dir.createDirPath(io, blocked_path);
+
+    n.noteQsetRequested(hash);
+    n.onQsetFrame(framed);
+    const storage = n.storageStats();
+    try std.testing.expectEqual(@as(usize, 1), storage.qset_cache_entries);
+    try std.testing.expectEqual(@as(u64, 1), storage.qset_cache_write_failures);
+    try std.testing.expect(storage.qset_cache_degraded);
+    try std.testing.expect(!n.stats().failed);
+
+    try n.propose("consensus survives cache failure");
+    const decided = n.waitExternalized(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
+    defer gpa.free(decided.value);
+    try std.testing.expectEqualSlices(u8, "consensus survives cache failure", decided.value);
+    try std.testing.expect(!n.stats().failed);
+}
+
+test "qset cache churn remains bounded across restart and consensus continues" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const seed: [32]u8 = @splat(0x74);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const opts: Options = .{
+        .network = "qset cache production bounds v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = data_dir,
+    };
+
+    const remote_count = 1027;
+    var newest_hash: [32]u8 = undefined;
+    {
+        const n = try Node.create(gpa, io, opts);
+        for (0..remote_count) |i| {
+            var remote_seed: [32]u8 = @splat(0xd0);
+            std.mem.writeInt(u64, remote_seed[0..8], @intCast(i + 1), .little);
+            const validator = try crypto.publicKeyFromSeed(remote_seed);
+            var remote_qset = try Quorum.of(1, &.{validator}).toOwned(gpa);
+            defer remote_qset.deinit(gpa);
+            try qset.validateAndNormalize(gpa, &remote_qset);
+            const hash = try qset.hashNormalized(gpa, &remote_qset);
+            newest_hash = hash;
+            const framed = try ownedQsetToFramed(gpa, &remote_qset);
+            defer gpa.free(framed);
+            n.qset_cache.rememberRequested(hash, framed);
+        }
+
+        const storage = n.storageStats();
+        try std.testing.expectEqual(@as(usize, 1024), storage.qset_cache_entries);
+        try std.testing.expect(storage.qset_cache_bytes <= 64 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, remote_count - 1023), storage.qset_cache_evictions);
+        try std.testing.expectEqual(@as(u64, 0), storage.qset_cache_write_failures);
+        try std.testing.expect(!storage.qset_cache_degraded);
+        try std.testing.expect(!n.stats().failed);
+        n.deinit();
+    }
+
+    const restarted = try Node.create(gpa, io, opts);
+    defer restarted.deinit();
+    const restored = restarted.storageStats();
+    try std.testing.expectEqual(@as(usize, 1024), restored.qset_cache_entries);
+    try std.testing.expect(restored.qset_cache_bytes <= 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), restored.qset_cache_write_failures);
+    try std.testing.expect(!restored.qset_cache_degraded);
+
+    const remote = restarted.qset_cache.copy(gpa, newest_hash) orelse return error.TestUnexpectedResult;
+    gpa.free(remote);
+    const local = restarted.qset_cache.copy(gpa, restarted.local_qset_hash) orelse return error.TestUnexpectedResult;
+    gpa.free(local);
+    try restarted.propose("consensus after cache restart");
+    const decided = restarted.waitExternalized(.{ .timeout_ms = 5_000 }) orelse return error.Timeout;
+    defer gpa.free(decided.value);
+    try std.testing.expectEqualSlices(u8, "consensus after cache restart", decided.value);
+    try std.testing.expect(!restarted.stats().failed);
 }
 
 // -- delivery hook + create() reorder (M6 S3) ---------------------------------

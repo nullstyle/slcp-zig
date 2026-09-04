@@ -28,10 +28,11 @@ The library is two layers in one package:
   vectors (`vectors/`), so a second implementation can be checked against
   it byte for byte.
 - **`slcp`** — the native "omakase" node on top of the engine: a TCP flood
-  overlay, a real-clock timer wheel, crash-safe write-ahead persistence, an
-  Ed25519 key file, quorum linting at startup, and two app-facing APIs — the
-  typed `slcp.AppNode(App)` (a pure `validate` / `apply` state machine over
-  an auto-derived canonical encoding) and the bytes-level `slcp.Node`.
+  overlay, a real-clock timer wheel, crash-safe write-ahead persistence, a
+  bounded best-effort quorum-set answering cache, an Ed25519 key file, quorum
+  linting at startup, and two app-facing APIs — the typed `slcp.AppNode(App)`
+  (a pure `validate` / `apply` state machine over an auto-derived canonical
+  encoding) and the bytes-level `slcp.Node`.
 
 The program every design decision is derived from is a replicated counter on
 three hobbyist machines: each proposes "the count becomes N+1", the network
@@ -41,7 +42,9 @@ halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
 
 ## Status
 
-- **v0.1.0 is tagged** — see the notice above. Nothing here is supported.
+- **This tree is the local v0.2.0 release candidate**; v0.1.0 remains the
+  latest tag until the exact candidate completes the release gates, is pushed,
+  and passes CI. Nothing here is supported.
 - The engine (`slcp-core`) has run a deterministic 1000-seed simulation
   matrix with Byzantine actors, a fuzz suite, a native-vs-wasm differential
   replay, and a real-socket 4-node end-to-end cluster with kill/restart and
@@ -336,19 +339,20 @@ drift.
 
 ## Using slcp-zig as a dependency
 
-Pin an **immutable release tag** by its tarball URL — never a branch or a
-bare commit — and let `zig fetch` record the content hash in your
-`build.zig.zon`:
+The pin below becomes usable after v0.2.0 is tagged. Until then, use a checkout
+and a `.path` dependency for candidate testing; v0.1.0 remains the latest
+immutable release. For releases, pin the tag tarball—never a branch or a bare
+commit—and let `zig fetch` record the content hash in `build.zig.zon`:
 
 ```sh
-zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz
 ```
 
-The hash `zig fetch` records for v0.1.0 is `slcp-0.1.0-p1Kf2iJtEwBe2gyU1SFRaJQ3tqSh-XMOTSwxmp4pxgKz`
-(computed from the tagged tree with `just release-hash`; the same value is in
-`CHANGELOG.md`, and `just verify-release-hash 0.1.0` re-checks it against the
-published tarball). If your `build.zig.zon` shows a different hash for that
-URL, you did not fetch this release.
+The candidate package hash is
+`slcp-0.2.0-PLACEHOLDER0000000000000000000000000000000000000000`. It must be
+replaced with the value from `just release-hash` before release; the same value
+must appear in `CHANGELOG.md`, and `just verify-release-hash 0.2.0` will check
+the published tarball after tagging.
 
 Keep the `--save`. On this Zig a bare `zig fetch <archive-url>` (no `--save`)
 prints the right hash but stores the archive double-nested in the global
@@ -376,8 +380,8 @@ and is fetched the same way.
 The public surface is split into two tiers, and a gate inside `zig build
 test` keeps the split honest:
 
-- **Stable** — `docs/api-snapshot.txt`, the frozen contract for the `0.1.x`
-  line: the typed `AppNode` / `Codec` layer (pinned through a reference
+- **Stable** — `docs/api-snapshot.txt`, the v0.1.0 contract carried
+  byte-for-byte into v0.2.0: the typed `AppNode` / `Codec` layer (pinned through a reference
   instantiation over the counter above), `Node` and its `Options` with every
   default, the `Quorum` spec and node-id helpers, the key-file entry points
   with explicit error sets, the `Driver` vtable, the sans-io engine's

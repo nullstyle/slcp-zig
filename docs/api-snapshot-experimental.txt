@@ -68,6 +68,7 @@ slcp.Node.prop_mu: field Io.Mutex = <default>
 slcp.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
 slcp.Node.purge_floor: field atomic.Value(u64) = <default>
 slcp.Node.q: field node.node.InputQueue
+slcp.Node.qset_cache: field node.qset_disk_cache.QsetDiskCache
 slcp.Node.qset_requests: field node.node.QsetRequests
 slcp.Node.resync_stop: field atomic.Value(bool) = <default>
 slcp.Node.resync_thread: field ?Thread = null
@@ -1258,14 +1259,23 @@ slcp.node.Node.prop_mu: field Io.Mutex = <default>
 slcp.node.Node.proposal_queue: field array_list.Aligned([]u8,null) = <default>
 slcp.node.Node.purge_floor: field atomic.Value(u64) = <default>
 slcp.node.Node.q: field node.node.InputQueue
+slcp.node.Node.qset_cache: field node.qset_disk_cache.QsetDiskCache
 slcp.node.Node.qset_requests: field node.node.QsetRequests
 slcp.node.Node.resync_stop: field atomic.Value(bool) = <default>
 slcp.node.Node.resync_thread: field ?Thread = null
 slcp.node.Node.stats_mu: field Io.Mutex = <default>
 slcp.node.Node.stats_snapshot: field engine.engine.Stats = <default>
+slcp.node.Node.storageStats: fn (*node.node.Node) node.node.StorageStats
 slcp.node.Node.store: field node.store.Store
 slcp.node.Node.watcher: field bool
 slcp.node.Node.wheel: field node.timers.Wheel
+slcp.node.StorageStats.qset_cache_bytes: field usize
+slcp.node.StorageStats.qset_cache_degraded: field bool
+slcp.node.StorageStats.qset_cache_entries: field usize
+slcp.node.StorageStats.qset_cache_evictions: field u64
+slcp.node.StorageStats.qset_cache_read_failures: field u64
+slcp.node.StorageStats.qset_cache_write_failures: field u64
+slcp.node.StorageStats: struct
 slcp.node.envelopeMeta: fn (mem.Allocator, [32]u8, []const u8) error{BadNodeIdLength,BadSignatureLength,BadStatementLength,EmptyMessage,FrameTooLarge,InvalidEnumValue,InvalidFarPointer,InvalidFlatBytes,InvalidInlineCompositePointer,InvalidMessageSize,InvalidPointer,InvalidRootPointer,InvalidSegmentCount,InvalidSegmentId,ListTooLarge,MessageTooLarge,NestingLimitExceeded,OutOfBounds,OutOfMemory,PointerDepthLimit,SegmentCountLimitExceeded,TraversalLimitExceeded,TruncatedMessage,UnsetPledges}!node.node.Meta
 slcp.node.msTimeout: fn (u64) Io.Timeout
 slcp.node: struct
@@ -1347,13 +1357,11 @@ slcp.store.Store.deinit: fn (*node.store.Store) void
 slcp.store.Store.deinitRecovery: fn (mem.Allocator, *node.store.Recovery) void
 slcp.store.Store.dir: field Io.Dir
 slcp.store.Store.ext_file: field Io.File
-slcp.store.Store.getQset: fn (*node.store.Store, mem.Allocator, [32]u8) error{BadRecord,Busy,IoFailed,OutOfMemory}!?[]u8
 slcp.store.Store.gpa: field mem.Allocator
 slcp.store.Store.io: field Io
 slcp.store.Store.lock_file: field Io.File
 slcp.store.Store.open: fn (mem.Allocator, Io, []const u8) error{AccessDenied,AntivirusInterference,BadPathName,BadRecord,Busy,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,IoFailed,IsDir,LinkQuotaExceeded,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,OutOfMemory,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,Streaming,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.store.Store
 slcp.store.Store.own_file: field Io.File
-slcp.store.Store.putQset: fn (*node.store.Store, [32]u8, []const u8) void
 slcp.store.Store.recover: fn (*node.store.Store, mem.Allocator) error{BadRecord,Busy,IoFailed,OutOfMemory}!node.store.Recovery
 slcp.store.Store: struct
 slcp.store: struct

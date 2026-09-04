@@ -36,8 +36,8 @@ git status --short          # must be empty
 ```
 
 - [ ] Tree clean, `main` up to date with `origin/main`.
-- [ ] `[Unreleased]` in `CHANGELOG.md` covers every commit since the last tag
-      (`git log --oneline <last-tag>..HEAD`).
+- [ ] `[Unreleased]` or the staged `X.Y.Z` section in `CHANGELOG.md` covers
+      every commit since the last tag (`git log --oneline <last-tag>..HEAD`).
 - [ ] The bump is classified per the table.
 
 ### 2. Version sweep
@@ -47,9 +47,10 @@ $EDITOR build.zig.zon        # .version = "X.Y.Z"
 zig build docs-smoke         # red until every pin follows
 ```
 
-A `.version` bump must update **README.md**, **examples/counter/README.md**
-(both carry the `refs/tags/vX.Y.Z.tar.gz` install pin — docs-smoke checks
-every tag pin in every active doc against the manifest) **and CHANGELOG.md**
+A `.version` bump must update **README.md**, **examples/counter/README.md**,
+**examples/registry/README.md** (all carry the `refs/tags/vX.Y.Z.tar.gz`
+install pin — docs-smoke checks every tag pin in every active doc against the
+manifest) **and CHANGELOG.md**
 (the dated section and the link footer; `release-tag-check` and `release.yml`
 both grep for them).
 
@@ -104,19 +105,23 @@ iterations, K/M/G suffixes).
 
 ### 4. Ablations — prove each gate can go red
 
-Once per release, each of the five: mutate → `git diff --stat` must be
-non-empty (a prior release audit caught two vacuous passes this way) → run
-the gate → quote the red line → `git checkout -- <file>`.
-Ablate committed code only: `git checkout -- <file>` reverts the whole file.
+Once per release, each of the five: start from a clean committed candidate →
+mutate → `git diff --stat` must be non-empty (a prior release audit caught
+two vacuous passes this way) → run the gate → quote the red line → restore the
+exact mutation. Do not stack ablations or run one over unrelated work.
 
 1. Flip one byte in `vectors/lint.json` → `zig build test` red (vectors).
 2. Delete one `pub const` from `src/lib.zig` → `zig build check-api` red.
 3. Change one character inside README's counter snippet → `zig build
    docs-smoke` red.
-4. Delete the float field from `tests/appnode_errors/err_float_command.zig`
-   → `zig build appnode-errors` red (the case no longer produces its error).
-5. Set one peer port wrong in `tools/example_smoke.zig`'s rewrite →
-   `zig build example-smoke` red by timeout.
+4. Change `price: f64` to `price: u64` in
+   `tests/appnode_errors/err_float_command.zig` → `zig build appnode-errors`
+   red (the case no longer produces its intended float error). Deleting the
+   field is not equivalent: it triggers the separate zero-size error.
+5. Add 100 to both generated peer destinations in
+   `tools/example_smoke.zig`'s rewrite → `zig build example-smoke` red by
+   timeout. One bad route is insufficient because the remaining 2-of-3 path
+   can relay traffic.
 
 ### 5. Record the package hash BEFORE the tag
 
@@ -178,13 +183,61 @@ just verify-release-hash X.Y.Z   # fetches the published tarball as a consumer
       tarball; the evidence (three `public key:` lines, the three five-line
       deployment blocks, 20 consecutive `slot N: count = N` lines per
       machine, the hash) goes into this version's run log, or “not yet run”
-      is written there explicitly. A failure ships as vX.Y.Z+1.
+      is written there explicitly. A failure ships as the next patch release.
 - [ ] Record-keeping sweep: update `CHANGELOG.md`, `STATUS.md`, canonical
       repository docs, and upstream drafts sent as messages (never issues).
 
 ---
 
 ## Run log
+
+### v0.2.0 — 2026-09-03 (local candidate; not tagged)
+
+Machine: Darwin 25.6.0 arm64, 18 logical cores; Zig
+`0.17.0-dev.1998+c04f47c61`; `capnp` 1.5.0; `just` 1.58.0.
+
+Lineage: released `v0.1.0` at `916907a`; `origin/main` at `cf3b84b`;
+committed hardening implementation `9d21b00` with proof record `87d7083`.
+The v0.2.0 candidate SHA is PENDING until the worktree is frozen.
+
+**Semver.** Minor. The Stable snapshot remains byte-for-byte unchanged at 290
+declarations. Experimental `Store.putQset` / `Store.getQset` were removed and
+Experimental storage diagnostics were added; `CHANGELOG.md` carries Breaking
+and Migration text.
+
+**Development evidence.** Before candidate freeze, `zig build test --summary
+all` passed 84/84 steps and 485/486 tests with one expected platform skip;
+node tests were 151 pass + 1 skip, including 21/21 focused qset-cache tests.
+Strict API verification passed at 290 Stable / 1,409 Experimental declarations,
+and docs-smoke passed 431 checks. These are development checks, not the cold
+release preflight.
+
+**Candidate freeze.** PENDING. Commit every intended source, manifest,
+snapshot, test, and documentation change, including the new qset-cache source,
+then record the exact SHA here. No file inside `.paths` may change after the
+package hash is fixed.
+
+**Cold preflight.** PENDING. Run `just preflight` alone on the clean candidate
+commit and record every evidence line plus the exact SHA and elapsed time.
+Earlier v0.1.0 and hardening-baseline runs are not v0.2.0 evidence.
+
+**Ablations.** PENDING. Run all five release ablations against the clean
+committed candidate, record each non-empty diff and intended red line, and
+restore the tree after each. The v0.1.0 ablations are historical evidence, not
+evidence for this release.
+
+**Hash.** PENDING. Replace the candidate placeholder in `README.md` and
+`CHANGELOG.md` with `just release-hash`, commit only hash-neutral documentation
+and evidence, and verify that the hash is unchanged afterward.
+
+**Land / CI / tag.** NOT DONE. The candidate has not been pushed, CI has not
+run on its final SHA, `release-tag-check 0.2.0` has not passed, and `v0.2.0`
+does not exist.
+
+**Advisory.** ReleaseFast and long fuzz: NOT RUN for this candidate.
+
+**Post-tag.** NOT RUN: published-tarball hash verification, GitHub Release,
+and external multi-machine acceptance remain post-tag work.
 
 ### v0.1.0 — 2026-09-01
 

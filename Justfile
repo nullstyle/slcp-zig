@@ -311,7 +311,7 @@ two-machine:
       7. zig build -Doptimize=ReleaseSafe run
     Evidence for the release's RELEASING.md run log: the three 'public key:' lines, the three five-line blocks,
     20 consecutive 'slot N: count = N' lines from each machine, and the tag hash
-    (just verify-release-hash ${ver}). A failure ships as v0.1.1.
+    (just verify-release-hash ${ver}). A failure ships as the next patch.
     EOF
 
 
