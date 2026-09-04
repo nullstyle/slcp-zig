@@ -194,7 +194,8 @@ just verify-release-hash X.Y.Z   # fetches the published tarball as a consumer
 ### v0.2.0 — 2026-09-03 (local candidate; not tagged)
 
 Machine: Darwin 25.6.0 arm64, 18 logical cores; Zig
-`0.17.0-dev.1998+c04f47c61`; `capnp` 1.5.0; `just` 1.58.0.
+`0.17.0-dev.1786+75044cb04` via mise; supplemental shell-toolchain runs used
+`0.17.0-dev.1999+b70499234`; `capnp` 1.5.0; `just` 1.58.0.
 
 Lineage: released `v0.1.0` at `916907a`; `origin/main` at `cf3b84b`;
 committed hardening implementation `9d21b00` with proof record `87d7083`;
@@ -214,7 +215,8 @@ and docs-smoke passed 432 checks. After the release ablation exposed the RPC
 race, the focused registry suite passed 20/20, then 20 consecutive repetitions;
 both the old list-length admission rule and the old stop condition were
 reintroduced independently and failed at their intended deterministic
-assertions. The post-fix ordinary graph passed 84/84 steps. These are
+assertions. The post-fix ordinary graph passed under the prescribed toolchain
+at 84/84 steps and 486/487 tests with one expected platform skip. These are
 development checks, not the final cold release preflight.
 
 **Candidate freeze.** `1b68041` freezes every intended file inside `.paths`,
@@ -224,26 +226,72 @@ and deterministic regression under `examples/`, outside `.paths`. No packaged
 file has changed since `1b68041`; changing one would restart the hash and
 release proof.
 
-**Cold preflight.** Run 1 at clean `e529dcc` was green in 832 s: 100/100 build
-steps, 496/497 tests with one expected skip, all matrices/differential tests,
+**Cold preflight, run 1 (superseded).** Clean `e529dcc` was green in 832 s
+under the newer shell Zig:
+100/100 build steps, 496/497 tests with one expected skip, all
+matrices/differential tests,
 consumer smokes, E2E, generation, lint, documentation, and package checks
 passed. The following vector ablation also surfaced a flaky registry allocator
 crash; a focused loop reproduced it and `0f39869` fixes it. That first run is
-therefore superseded. Final post-fix cold preflight: PENDING.
+therefore superseded.
 
-**Ablations.** PENDING. Run all five release ablations against the clean
-committed candidate, record each non-empty diff and intended red line, and
-restore the tree after each. The v0.1.0 ablations are historical evidence, not
-evidence for this release.
+**Cross-version cold preflight (supplemental).** Clean `472f0a2` (code tip
+`0f39869`) passed from a fresh cache under the newer shell Zig: `preflight:
+GREEN in 813 s`. Evidence: `Build Summary: 100/100
+steps succeeded; 497/498 tests passed (1 skipped)` with zero cached summary
+steps; `sim-matrix: 15000 cells green in 418372 ms`; `byz-matrix: 1000 seeds x
+2 actors green`; WASM differential replay reported 4 traces, 32 normative and
+9 observable effects, then 300 fuzz iterations / 4,277 inputs / 9,616 effects;
+counter smoke reported 3 nodes / 20 slots / count 21; registry smoke reported
+3 nodes / 7 transactions / 25 slots and an agreed `fd4549af656c99d4` head;
+docs-smoke passed 432 checks; Stable/Experimental API counts were 290/1,409.
+The real-socket E2E suite passed 7/7 in 2 minutes; node tests passed 151 + one
+expected privileged-port skip; registry tests passed 20/20. Formatting,
+actionlint, pinned generation (capnp 1.5.0), 7/7 package-hash checks, and the
+archive consumer build/smoke all passed. Package preflight reproduced the
+recorded hash. Because the command did not run through `mise exec`, this is
+useful cross-version evidence but not the release preflight required above.
+
+**Pinned cold preflight.** PENDING. Run `mise exec -- just preflight` alone
+from a clean committed candidate and record its uncached evidence.
+
+**Cross-version ablations (supplemental).** Each started at clean `472f0a2`,
+showed a one-file non-empty diff, failed under the newer shell Zig for the
+intended reason, and was restored before the next:
+
+1. `vectors/lint.json`, first finding threshold `1` → `9`: `zig build test`
+   failed both findings replay and ABI agreement with `expected 9, found 1`.
+2. `src/lib.zig`, removed `DeliveryHook` plus its doc comment: `zig build
+   check-api` failed its live Stable rule at `stable_rules:
+   slcp.DeliveryHook`.
+3. README counter snippet, port `7311` → `7312`: `zig build docs-smoke`
+   reported the first difference at example line 29 / doc line 103 and
+   `checks=432 failures=1`.
+4. `err_float_command.zig`, `price: f64` → `u64`: `zig build
+   appnode-errors` failed because the pinned “floats are NONDETERMINISTIC”
+   diagnostic was not found (`22/24` steps, the one intended failure).
+5. `tools/example_smoke.zig`, both generated peer destinations `+ 100`: all
+   three counts stayed zero through `deadline of 180 s expired`, followed by
+   `[example-smoke] FAILED: Deadline`.
+
+After restoration the tree was clean at `472f0a2`; docs-smoke and check-api
+were explicitly rerun green. Repeat all five through `mise exec` before this
+candidate is release-ready.
 
 **Hash.** `just release-hash` on clean source freeze `1b68041` produced
 `slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_`. README and
-CHANGELOG now carry it. Re-run after the hash-neutral documentation/evidence
-commits and record that it is unchanged.
+CHANGELOG carry it. Re-runs at clean `472f0a2`, after the registry and
+hash-neutral documentation commits, were unchanged. `git archive HEAD` fed to
+`just verify-release-hash 0.2.0 <archive>` produced the same hash and found it
+in both files. These checks used the newer shell Zig; repeat the hash and
+archive-consumer checks through `mise exec`.
 
-**Land / CI / tag.** NOT DONE. The candidate has not been pushed, CI has not
-run on its final SHA, `release-tag-check 0.2.0` has not passed, and `v0.2.0`
-does not exist.
+**Land / CI / tag.** NOT DONE. The candidate has not been pushed and `v0.2.0`
+does not exist. The local `release-tag-check 0.2.0` passed its clean-tree,
+version, changelog, hash, absent-tag, and 432-check documentation guards, then
+refused exactly at `HEAD is not on origin/main — push first and wait for CI`;
+that supplemental dry run also used the newer shell Zig. The prescribed-
+toolchain dry run remains pending.
 
 **Advisory.** ReleaseFast and long fuzz: NOT RUN for this candidate.
 
