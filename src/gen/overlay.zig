@@ -24,6 +24,7 @@ pub const Frame = struct {
         slotState = 7,
         ping = 8,
         pong = 9,
+        appMessage = 10,
     };
 
     pub const Reader = struct {
@@ -137,6 +138,17 @@ pub const Frame = struct {
             return self._reader.readU64(8);
         }
 
+        pub fn hasAppMessage(self: Reader) bool {
+            if (self._reader.readUnionDiscriminant(0) != 10) return false;
+            return !self._reader.isPointerNull(0);
+        }
+
+        pub fn getAppMessage(self: Reader) ![]const u8 {
+            if ((try self.which()) != .appMessage) return error.WrongUnionMember;
+            if (self._reader.isPointerNull(0)) return &[_]u8{};
+            return try self._reader.readData(0);
+        }
+
     };
 
     pub const Builder = struct {
@@ -163,7 +175,7 @@ pub const Frame = struct {
 
         pub fn initHello(self: *Builder) !Hello.Builder {
             self._builder.writeU16(0, 1);
-            const builder = try self._builder.initStruct(0, 2, 2);
+            const builder = try self._builder.initStruct(0, 3, 2);
             return Hello.Builder{ ._builder = builder };
         }
 
@@ -236,6 +248,16 @@ pub const Frame = struct {
             self._builder.writeU64(8, @bitCast(value));
         }
 
+        pub fn hasAppMessage(self: Builder) bool {
+            if (self._builder.readUnionDiscriminant(0) != 10) return false;
+            return !self._builder.isPointerNull(0);
+        }
+
+        pub fn setAppMessage(self: *Builder, value: []const u8) !void {
+            self._builder.writeU16(0, 10);
+            try self._builder.writeData(0, value);
+        }
+
     };
 };
 
@@ -282,13 +304,17 @@ pub const Hello = struct {
             return self._reader.readU16(4);
         }
 
+        pub fn getFeatureFlags(self: Reader) !u64 {
+            return self._reader.readU64(16);
+        }
+
     };
 
     pub const Builder = struct {
         _builder: message.StructBuilder,
 
         pub fn init(msg: *message.MessageBuilder) !Builder {
-            const builder = try msg.allocateStruct(2, 2);
+            const builder = try msg.allocateStruct(3, 2);
             return .{ ._builder = builder };
         }
 
@@ -322,6 +348,10 @@ pub const Hello = struct {
 
         pub fn setListenPort(self: *Builder, value: u16) !void {
             self._builder.writeU16(4, @bitCast(value));
+        }
+
+        pub fn setFeatureFlags(self: *Builder, value: u64) !void {
+            self._builder.writeU64(16, @bitCast(value));
         }
 
     };

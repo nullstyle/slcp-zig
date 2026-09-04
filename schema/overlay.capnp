@@ -17,6 +17,7 @@ struct Frame { union {
   slotState    @7 :SlotState;
   ping         @8 :UInt64;
   pong         @9 :UInt64;
+  appMessage   @10 :Data;             # opaque application payload; <= 64 KiB
 }}
 
 struct Hello {
@@ -26,6 +27,7 @@ struct Hello {
   nodeId          @2 :Data;           # advisory, UNAUTHENTICATED
   currentSlot     @3 :UInt64;         # advisory
   listenPort      @4 :UInt16;         # for reciprocal dialing
+  featureFlags    @5 :UInt64;         # advisory capability bits; unknown bits ignored
 }
 
 struct DontHave  { kind @0 :UInt8; id @1 :Data; }

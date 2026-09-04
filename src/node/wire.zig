@@ -32,19 +32,25 @@ const MessageBuilder = capnpc.message.MessageBuilder;
 
 /// §9.1 frame-shape limits (also enforced by the schema comments).
 pub const max_slot_state_envelopes = 64;
+pub const max_app_message_bytes: usize = 64 * 1024;
 pub const protocol_version: u32 = 1;
+/// Hello feature bit 0: the peer can send and receive `app_message` frames.
+pub const feature_app_messages: u64 = 1 << 0;
 
 pub const Error = error{
     MalformedFrame,
     UnsetUnion,
     InvalidEnumValue,
     TooManyEnvelopes,
+    AppMessageTooLarge,
     BadFieldLength,
     OutOfMemory,
 };
 
 pub const Hello = struct {
     protocol_version: u32,
+    /// Append-only capability bits. Unknown bits are preserved by the codec.
+    feature_flags: u64 = 0,
     network_id_prefix: [8]u8,
     node_id: [32]u8,
     current_slot: u64,
@@ -78,12 +84,15 @@ pub const OverlayFrame = union(enum) {
     slot_state: SlotState,
     ping: u64,
     pong: u64,
+    /// Opaque application payload. Owned on decode; borrowed on encode.
+    app_message: []const u8,
 
     pub fn deinit(self: *OverlayFrame, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .envelope => |b| gpa.free(b),
             .qset => |b| gpa.free(b),
             .dont_have => |dh| gpa.free(dh.id),
+            .app_message => |payload| gpa.free(payload),
             .slot_state => |ss| {
                 for (ss.envelopes) |e| gpa.free(e);
                 gpa.free(ss.envelopes);
@@ -109,6 +118,7 @@ pub fn encode(gpa: std.mem.Allocator, frame: OverlayFrame) Error![]u8 {
         .hello => |h| {
             var hb = fb.initHello() catch return error.OutOfMemory;
             hb.setProtocolVersion(h.protocol_version) catch return error.OutOfMemory;
+            hb.setFeatureFlags(h.feature_flags) catch return error.OutOfMemory;
             hb.setNetworkIdPrefix(&h.network_id_prefix) catch return error.OutOfMemory;
             hb.setNodeId(&h.node_id) catch return error.OutOfMemory;
             hb.setCurrentSlot(h.current_slot) catch return error.OutOfMemory;
@@ -141,6 +151,10 @@ pub fn encode(gpa: std.mem.Allocator, frame: OverlayFrame) Error![]u8 {
         },
         .ping => |n| fb.setPing(n) catch return error.OutOfMemory,
         .pong => |n| fb.setPong(n) catch return error.OutOfMemory,
+        .app_message => |payload| {
+            if (payload.len > max_app_message_bytes) return error.AppMessageTooLarge;
+            fb.setAppMessage(payload) catch return error.OutOfMemory;
+        },
     }
 
     return @constCast(mb.toBytes() catch return error.OutOfMemory);
@@ -224,6 +238,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!OverlayFrame {
             if (prefix.len != 8 or node_id.len != 32) return error.BadFieldLength;
             var out = Hello{
                 .protocol_version = h.getProtocolVersion() catch return error.MalformedFrame,
+                .feature_flags = h.getFeatureFlags() catch return error.MalformedFrame,
                 .network_id_prefix = undefined,
                 .node_id = undefined,
                 .current_slot = h.getCurrentSlot() catch return error.MalformedFrame,
@@ -276,6 +291,12 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!OverlayFrame {
         },
         .ping => return .{ .ping = fr.getPing() catch return error.MalformedFrame },
         .pong => return .{ .pong = fr.getPong() catch return error.MalformedFrame },
+        .appMessage => {
+            const payload = fr.getAppMessage() catch return error.MalformedFrame;
+            if (payload.len > max_app_message_bytes) return error.AppMessageTooLarge;
+            const owned = gpa.dupe(u8, payload) catch return error.OutOfMemory;
+            return .{ .app_message = owned };
+        },
     }
 }
 
@@ -333,6 +354,7 @@ test "wire: scalar frames round-trip" {
         .{ .get_qset = @splat(7) },
         .{ .hello = .{
             .protocol_version = 1,
+            .feature_flags = 0x8000_0000_0000_0001,
             .network_id_prefix = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
             .node_id = @splat(9),
             .current_slot = 77,
@@ -352,6 +374,7 @@ test "wire: scalar frames round-trip" {
             .get_qset => |h| try testing.expectEqualSlices(u8, &h, &got.get_qset),
             .hello => |h| {
                 try testing.expectEqual(h.protocol_version, got.hello.protocol_version);
+                try testing.expectEqual(h.feature_flags, got.hello.feature_flags);
                 try testing.expectEqualSlices(u8, &h.network_id_prefix, &got.hello.network_id_prefix);
                 try testing.expectEqualSlices(u8, &h.node_id, &got.hello.node_id);
                 try testing.expectEqual(h.current_slot, got.hello.current_slot);
@@ -371,6 +394,54 @@ test "wire: dont_have round-trips its id" {
     defer got.deinit(gpa);
     try testing.expectEqual(@as(u8, 3), got.dont_have.kind);
     try testing.expectEqualSlices(u8, &id, got.dont_have.id);
+}
+
+test "wire: app_message decode owns the opaque payload" {
+    const gpa = testing.allocator;
+    const encoded = try encode(gpa, .{ .app_message = "opaque-application-message" });
+    defer gpa.free(encoded);
+
+    var got = try decode(gpa, encoded);
+    defer got.deinit(gpa);
+    @memset(encoded, 0xA5);
+
+    try testing.expectEqualSlices(u8, "opaque-application-message", got.app_message);
+}
+
+test "wire: app_message encode accepts 64 KiB and rejects one byte more" {
+    const gpa = testing.allocator;
+    const at_cap = try gpa.alloc(u8, max_app_message_bytes);
+    defer gpa.free(at_cap);
+    @memset(at_cap, 0x3C);
+    const encoded = try encode(gpa, .{ .app_message = at_cap });
+    defer gpa.free(encoded);
+    var decoded = try decode(gpa, encoded);
+    defer decoded.deinit(gpa);
+    try testing.expectEqual(@as(usize, max_app_message_bytes), decoded.app_message.len);
+
+    const over_cap = try gpa.alloc(u8, max_app_message_bytes + 1);
+    defer gpa.free(over_cap);
+    try testing.expectError(error.AppMessageTooLarge, encode(gpa, .{ .app_message = over_cap }));
+}
+
+test "wire: app_message decode rejects a raw payload over 64 KiB" {
+    const gpa = testing.allocator;
+    const over_cap = try gpa.alloc(u8, max_app_message_bytes + 1);
+    defer gpa.free(over_cap);
+
+    var mb = MessageBuilder.init(gpa);
+    defer mb.deinit();
+    var fb = try gen_overlay.Frame.Builder.init(&mb);
+    try fb.setAppMessage(over_cap);
+    const raw = @constCast(try mb.toBytes());
+    defer gpa.free(raw);
+
+    var decoded = decode(gpa, raw) catch |err| {
+        try testing.expectEqual(error.AppMessageTooLarge, err);
+        return;
+    };
+    defer decoded.deinit(gpa);
+    return error.TestExpectedError;
 }
 
 test "wire: envelope frame preserves statement + signature bytes" {
