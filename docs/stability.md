@@ -166,6 +166,21 @@ frozen; "exact" means the one symbol only (its fields stay Experimental).
   spelling; a signature that never closes is a `check-api` error naming the
   file line and the declaration.
 
+## Accepted Stable extensions for the next minor release (unreleased)
+
+- `slcp.node.Options.answering_window_slots: u8 = 16`, mirrored by
+  `AppNode(App).Options`, configures how many recently delivered slots a
+  native node retains for bounded peer answering. Values 1 through 63 are
+  accepted; zero and values above 63 fail creation with the new
+  `AnsweringWindowSlotsOutOfRange` member of the Stable node and AppNode
+  creation error sets. This is a bounded live-peer catch-up policy, not an
+  archival history or application-state transfer promise.
+- The new error member necessarily changes the frozen renderings of
+  `CreateError` / `Error`, `Node.create`, `AppNode(App).create`, and the two
+  `explain` entry points. Those signature changes and the two mirrored option
+  fields are the reviewed Stable promotion represented by this snapshot
+  update; no catch-up telemetry type or method is promoted with them.
+
 ## Held out: entry points whose error set is `anyerror` today
 
 `experimental_overrides` in the tool names five paths that a reader would
@@ -188,6 +203,11 @@ expect in the Stable list and that are deliberately **not**:
 
 ## What is Experimental (and why)
 
+- `slcp.node.Node.catchupStats` and `slcp.node.CatchupStats`: a coherent
+  node-local snapshot of bounded answering coverage, queued catch-up work,
+  held-statement outcomes, and gap jumps. The operational field set may
+  evolve as catch-up policy is exercised; it is not a freshness oracle,
+  archival history, or Stable application-state interface.
 - `slcp.ValueContext` / `slcp.app_node.ValueContext`: optional deterministic
   slot and nomination/ballot phase input for the contextual typed
   `App.validate` signature. The legacy two-argument signature remains valid;

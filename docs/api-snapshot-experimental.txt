@@ -37,7 +37,9 @@ slcp.Driver.ctx: field *anyopaque
 slcp.Driver.extract_valid_value: field ?*const fn (*anyopaque, u64, []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!bool = null
 slcp.Driver.validate_value: field *const fn (*anyopaque, u64, []const u8, bool) driver.Validity
 slcp.Node.answer_floor: field u64 = 1
+slcp.Node.answering: field node.node.AnsweringPolicy
 slcp.Node.app_gossip: field node.app_gossip.State
+slcp.Node.catchup_stats_snapshot: field node.node.CatchupStats = <default>
 slcp.Node.cur_source: field ?usize = null
 slcp.Node.current_slot: field u64
 slcp.Node.delivery: field ?node.node.DeliveryHook
@@ -50,6 +52,8 @@ slcp.Node.ext_mu: field Io.Mutex = <default>
 slcp.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <default>
 slcp.Node.ext_waiters: field usize = 0
 slcp.Node.failed: field atomic.Value(bool) = <default>
+slcp.Node.gap_jumps: field u64 = 0
+slcp.Node.gap_slots_skipped: field u64 = 0
 slcp.Node.gpa: field mem.Allocator
 slcp.Node.hold: field node.node.HoldBuffer = <default>
 slcp.Node.io: field Io
@@ -84,6 +88,7 @@ slcp.Node.store: field node.store.Store
 slcp.Node.watcher: field bool
 slcp.Node.wheel: field node.timers.Wheel
 slcp.NodeOptions.allow_unsafe_quorum: field bool = false
+slcp.NodeOptions.answering_window_slots: field u8 = 16
 slcp.NodeOptions.data_dir: field []const u8
 slcp.NodeOptions.delivery: field ?node.node.DeliveryHook = null
 slcp.NodeOptions.diagnostic: field ?*node.node.Diagnostic = null
@@ -1190,6 +1195,24 @@ slcp.node.AppMessageStats.queued_bytes: field usize
 slcp.node.AppMessageStats.queued_items: field usize
 slcp.node.AppMessageStats.receiving: field bool
 slcp.node.AppMessageStats: struct
+slcp.node.CatchupStats.answerable_slots: field usize
+slcp.node.CatchupStats.answering_window_slots: field u8
+slcp.node.CatchupStats.delivery_frontier: field u64
+slcp.node.CatchupStats.dropped_behind_statements: field u64
+slcp.node.CatchupStats.dropped_far_statements: field u64
+slcp.node.CatchupStats.dropped_full_statements: field u64
+slcp.node.CatchupStats.gap_jumps: field u64
+slcp.node.CatchupStats.gap_slots_skipped: field u64
+slcp.node.CatchupStats.held_statements: field usize
+slcp.node.CatchupStats.newest_answerable_slot: field ?u64
+slcp.node.CatchupStats.oldest_answerable_slot: field ?u64
+slcp.node.CatchupStats.pending_externalizations: field usize
+slcp.node.CatchupStats.pending_highest_slot: field ?u64
+slcp.node.CatchupStats.pending_lowest_slot: field ?u64
+slcp.node.CatchupStats.purge_floor: field u64
+slcp.node.CatchupStats.released_at_frontier_statements: field u64
+slcp.node.CatchupStats.released_early_statements: field u64
+slcp.node.CatchupStats: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
 slcp.node.HoldBuffer.Admit.dropped_badsig: enumerant = 5
 slcp.node.HoldBuffer.Admit.dropped_far: enumerant = 3
@@ -1252,9 +1275,12 @@ slcp.node.Node.JournalTail.first: field u64
 slcp.node.Node.JournalTail.last: field u64
 slcp.node.Node.JournalTail: struct
 slcp.node.Node.answer_floor: field u64 = 1
+slcp.node.Node.answering: field node.node.AnsweringPolicy
 slcp.node.Node.appMessageStats: fn (*node.node.Node) node.app_gossip.Stats
 slcp.node.Node.app_gossip: field node.app_gossip.State
-slcp.node.Node.createWithRecovery: fn (mem.Allocator, Io, node.node.Options, node.node.RecoveryOptions) error{BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirBusy,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,KeyFileTooPermissive,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}!*node.node.Node
+slcp.node.Node.catchupStats: fn (*node.node.Node) node.node.CatchupStats
+slcp.node.Node.catchup_stats_snapshot: field node.node.CatchupStats = <default>
+slcp.node.Node.createWithRecovery: fn (mem.Allocator, Io, node.node.Options, node.node.RecoveryOptions) error{AnsweringWindowSlotsOutOfRange,BadPeerSpec,ConflictingIdentity,DataDirAccessDenied,DataDirBusy,DataDirEmpty,DataDirNotADirectory,DataDirOtherNetwork,DataDirOtherNode,DataDirUnusable,DuplicatePeer,EngineFailed,IdentityMismatch,KeyFileAccessDenied,KeyFileBad,KeyFileDirMissing,KeyFileIoFailed,KeyFileTooPermissive,ListenFailed,ListenPortInUse,ListenPortPrivileged,MaxValueBytesOutOfRange,NetworkPassphraseEmpty,NoIdentity,OutOfMemory,PeerIsSelf,QuorumDuplicateNode,QuorumEmpty,QuorumThresholdOutOfRange,QuorumTooDeep,QuorumTooManyValidators,StartSlotBehindJournal,StartSlotZero,ThreadSpawnFailed,UnsafeQuorum,WatcherHasIdentity}!*node.node.Node
 slcp.node.Node.cur_source: field ?usize = null
 slcp.node.Node.current_slot: field u64
 slcp.node.Node.delivery: field ?node.node.DeliveryHook
@@ -1267,6 +1293,8 @@ slcp.node.Node.ext_mu: field Io.Mutex = <default>
 slcp.node.Node.ext_queue: field array_list.Aligned(node.node.Externalized,null) = <default>
 slcp.node.Node.ext_waiters: field usize = 0
 slcp.node.Node.failed: field atomic.Value(bool) = <default>
+slcp.node.Node.gap_jumps: field u64 = 0
+slcp.node.Node.gap_slots_skipped: field u64 = 0
 slcp.node.Node.gpa: field mem.Allocator
 slcp.node.Node.hold: field node.node.HoldBuffer = <default>
 slcp.node.Node.ingressStats: fn (*node.node.Node) node.node.IngressStats
