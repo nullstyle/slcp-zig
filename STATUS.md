@@ -92,12 +92,12 @@ the migration is recorded in `CHANGELOG.md`.
 These fields intentionally describe the integrated candidate tree, not the
 v0.1.0 release run. Before the package freeze, the ordinary full graph was
 green at 84/84 steps and 485/486 tests, with one expected platform skip. A
-first clean cold preflight passed at `e529dcc`, but its following ablation run
-exposed a pre-existing registry RPC teardown race. A second clean cold run at
-`472f0a2` passed after the fix, but both cold runs used the shell's newer Zig
-rather than the version prescribed by `mise.toml`, so they are supplemental
-evidence rather than release proof. The post-fix ordinary graph passes under
-the prescribed Zig; its final cold preflight remains pending.
+first clean cold preflight passed at `e529dcc` under an unprescribed shell Zig,
+but its following ablation exposed a pre-existing registry RPC teardown race,
+so that run was superseded by the code fix. A post-fix cold run at `472f0a2`
+passed under another unprescribed shell Zig and remains supplemental evidence.
+The final cold preflight passed at clean `0f52660` under the Zig prescribed by
+`mise.toml`.
 
 | Gate | Current sprint result |
 |---|---|
@@ -109,16 +109,16 @@ the prescribed Zig; its final cold preflight remains pending.
 | Full node tests | PASS — 151 passed, 1 expected platform skip |
 | Fuzz smoke and saved-input replay | PASS — 8 smoke tests; all 3 saved streams replayed to exhaustion (14/8/13 inputs) |
 | Stable/Experimental API snapshot review | PASS — 290 Stable unchanged; 1,409 Experimental verified; API closure green |
-| Registry RPC lifecycle | PASS — included in the prescribed-toolchain full graph; 20/20 focused tests, 20 consecutive suite repetitions, and exact cap and stop-wait regressions were also exercised under the newer shell Zig |
-| Full strict test gate | DEVELOPMENT PASS / RELEASE PENDING — prescribed Zig passes 84/84 steps and 486/487 tests with 1 expected platform skip; the clean 100/100-step, 497/498-test cold run at `472f0a2` used the newer shell Zig and must be repeated through `mise exec` |
-| WASM build and native/WASM differential replay | SUPPLEMENTAL PASS — newer-Zig cold run: 4 traces / 32 normative / 9 observable effects; 300 fuzz iterations, 4,277 inputs, 9,616 effects; prescribed-toolchain cold run pending |
-| Deterministic and Byzantine matrices | SUPPLEMENTAL PASS — newer-Zig cold run: 15,000 simulation cells; 1,000 seeds × 2 Byzantine actors; prescribed-toolchain cold run pending |
-| Real-socket end-to-end cluster | SUPPLEMENTAL PASS — newer-Zig cold run: 7/7 in 2 minutes; prescribed-toolchain cold run pending |
-| Counter consumer smoke | SUPPLEMENTAL PASS — newer-Zig cold run: 3 nodes, 20 slots, count 21; prescribed-toolchain cold run pending |
-| Registry consumer smoke | SUPPLEMENTAL PASS — newer-Zig cold run: 3 nodes, 7 transactions, 25 slots, one agreed head; prescribed-toolchain cold run pending |
-| Release ablations | SUPPLEMENTAL PASS / RELEASE PENDING — all five intended reds were proved and restored under the newer shell Zig; repeat through `mise exec` |
+| Registry RPC lifecycle | PASS — 20/20 in the pinned cold graph and 20 consecutive focused repetitions; one-line cap and stop-wait ablations failed at their exact assertions before the pinned preflight |
+| Full strict test gate | PASS — clean pinned cold preflight at `0f52660`: 100/100 steps, 497/498 tests, 1 expected platform skip, zero cached summary steps; GREEN in 682 s |
+| WASM build and native/WASM differential replay | PASS — 4 traces / 32 normative / 9 observable effects; 300 fuzz iterations, 4,277 inputs, 9,616 effects |
+| Deterministic and Byzantine matrices | PASS — 15,000 simulation cells in 411,250 ms; 1,000 seeds × 2 Byzantine actors |
+| Real-socket end-to-end cluster | PASS — 7/7 in 2 minutes, including restart and gap recovery cases |
+| Counter consumer smoke | PASS — 3 nodes, 20 slots, count 20; fetched-package repeat also green |
+| Registry consumer smoke | PASS — 3 nodes, 7 transactions, 13 slots, kill/restart/catch-up, agreed head `706d31eb6eef28d3` |
+| Release ablations | PASS — all five prescribed one-file mutations produced their intended red under `mise exec` and were restored; docs-smoke and check-api then reran green |
 | Long fuzz run | NOT RUN for v0.2.0 — advisory |
-| Release/package preflight | RECORDED / RELEASE PENDING — newer-Zig hash self-tests and archive consumer checks agree on `slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_`; prescribed-toolchain ceremony pending |
+| Release/package preflight | PASS — pinned cold run passed 7/7 hash self-tests and archive consumer build/smoke; pinned release-hash and local Git-archive verification agree on `slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_` |
 | Candidate CI / tag | NOT RUN / NOT CUT — local work has not been pushed |
 | Three-machine deployment acceptance | NOT RUN — requires external machines |
 
@@ -146,8 +146,7 @@ the last detached handler was still closing and destroying its `Conn`.
 `active_conn_threads` is now the lifetime barrier and the admission bound. A
 test-only scheduler gate makes both old conditions deterministically red; the
 focused registry suite passed 20 consecutive repetitions before the
-supplemental newer-Zig cold run, and the integrated suite also passes under
-the prescribed Zig.
+post-fix cold runs, and the integrated suite passes under the prescribed Zig.
 
 ## Known boundaries after this sprint
 
