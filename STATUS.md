@@ -61,8 +61,17 @@ path.
 - API gates: Experimental snapshot grew by 37 lines; the 292 Stable
   declarations are byte-identical; closure and strict checks green.
 - Docs-smoke: **PASS** — 436 checks, 0 failures.
-- Real-socket E2E and the three-process smoke are rerun for this change
-  below.
+- Real-socket E2E: **PASS** — 8/8.
+- Full three-process registry smoke: **PASS** —
+  `[registry-smoke] nodes=3 txs=8 slots=216 head=61fb7ae59293aa26`.
+- Repository gate: **PASS** — 113/113 steps, 209/209 tests in the final
+  recorded run. One earlier same-day full-graph run failed the owned
+  snapshot-restart loopback test; a baseline worktree at the parent commit
+  reproduced the same failure under a machine load average of 6+ from
+  unrelated processes — a pre-existing contention flake of that single
+  2-of-2 scenario (one propose per node; a stalled nomination round has no
+  re-propose), not a regression. The final gate and both focused suites
+  passed end-to-end.
 
 ## Historical feature record: archive retention
 
