@@ -14,7 +14,8 @@ granted.
 | Released | `v0.1.0` at `916907a` (2026-09-01) | First engine, native node, typed application layer, CLI, examples/counter, protocol docs, conformance and release gates. |
 | Pre-sprint `main` baseline | `cf3b84b` (2026-09-02), two commits after the tag | Post-tag documentation corrections plus E1 of the examples track: `examples/registry`. |
 | Hardening baseline | local `main` at `87d7083` (2026-09-03) | Exact qset lifecycle, bounded native ingress, restart/purge hardening, stronger fuzz/E2E evidence, canonical project state, and its recorded proof. |
-| Local release candidate | package/source freeze `1b68041` (not pushed or tagged) | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
+| Package payload freeze | `1b68041` (not pushed or tagged) | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
+| Local repository candidate | code tip `0f39869` plus hash-neutral release records (not pushed or tagged) | Retains the frozen package payload and fixes the example registry's detached RPC-handler teardown race found during release ablation. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
@@ -67,6 +68,9 @@ The sprint scope is:
   targets;
 - strengthen input-sequence fuzz diversity and retain deterministic smoke
   coverage;
+- keep the example registry RPC server and its allocator alive until every
+  detached handler finishes teardown, while counting teardown-in-progress
+  handlers against the 64-connection cap;
 - replace external milestone/session notes with concise canonical repository
   context (`CONTEXT.md`, `DESIGN.md`, this file, and the examples roadmap).
 
@@ -86,21 +90,24 @@ the migration is recorded in `CHANGELOG.md`.
 ## Current verification ledger
 
 These fields intentionally describe the integrated candidate tree, not the
-v0.1.0 release run. Before the candidate commit, the ordinary full graph was
-green at 84/84 steps and 485/486 tests, with one expected platform skip. The
-v0.2.0 cold preflight, package hash, and ablations are recorded here only after
-they run against a clean committed candidate.
+v0.1.0 release run. Before the package freeze, the ordinary full graph was
+green at 84/84 steps and 485/486 tests, with one expected platform skip. A
+first clean cold preflight passed at `e529dcc`, but its following ablation run
+exposed a pre-existing registry RPC teardown race; that run is superseded,
+and the final post-fix cold preflight remains pending.
 
 | Gate | Current sprint result |
 |---|---|
-| Package/source freeze | PASS — `1b68041`; tree clean before hashing |
+| Package payload freeze | PASS — `1b68041`; tree clean before hashing |
+| Repository code candidate | PASS — `0f39869`; focused lifecycle fix committed separately from the cache sprint |
 | Formatting and whitespace (`zig fmt`, `git diff --check`) | PASS |
 | Focused engine tests | PASS — 162 core, 13 vector, 4 framing-vector, and 1 engine end-to-end test |
 | Focused qset-cache tests | PASS — 21/21, including capacity/byte churn, restart, corruption, allocation failure, case aliases, and root/final/temp symlinks |
 | Full node tests | PASS — 151 passed, 1 expected platform skip |
 | Fuzz smoke and saved-input replay | PASS — 8 smoke tests; all 3 saved streams replayed to exhaustion (14/8/13 inputs) |
 | Stable/Experimental API snapshot review | PASS — 290 Stable unchanged; 1,409 Experimental verified; API closure green |
-| Full strict test gate | PASS — ordinary graph 84/84 steps; 485/486 tests with 1 expected skip; cold v0.2.0 preflight pending |
+| Registry RPC lifecycle | PASS — 20/20 focused tests, 20 consecutive suite repetitions, exact cap and stop-wait regressions both deliberately red before restoration |
+| Full strict test gate | PASS — post-fix ordinary graph 84/84 steps; final cold v0.2.0 preflight pending |
 | WASM build and native/WASM differential replay | PENDING candidate cold preflight |
 | Deterministic and Byzantine matrices | PENDING candidate cold preflight |
 | Real-socket end-to-end cluster | PENDING candidate cold preflight |

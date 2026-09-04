@@ -197,8 +197,9 @@ Machine: Darwin 25.6.0 arm64, 18 logical cores; Zig
 `0.17.0-dev.1998+c04f47c61`; `capnp` 1.5.0; `just` 1.58.0.
 
 Lineage: released `v0.1.0` at `916907a`; `origin/main` at `cf3b84b`;
-committed hardening implementation `9d21b00` with proof record `87d7083`.
-The package/source tree was frozen at `1b68041`.
+committed hardening implementation `9d21b00` with proof record `87d7083`;
+package payload freeze `1b68041`; recorded-hash commit `e529dcc`; repository
+code candidate `0f39869`.
 
 **Semver.** Minor. The Stable snapshot remains byte-for-byte unchanged at 290
 declarations. Experimental `Store.putQset` / `Store.getQset` were removed and
@@ -209,17 +210,26 @@ and Migration text.
 all` passed 84/84 steps and 485/486 tests with one expected platform skip;
 node tests were 151 pass + 1 skip, including 21/21 focused qset-cache tests.
 Strict API verification passed at 290 Stable / 1,409 Experimental declarations,
-and docs-smoke passed 431 checks. These are development checks, not the cold
-release preflight.
+and docs-smoke passed 432 checks. After the release ablation exposed the RPC
+race, the focused registry suite passed 20/20, then 20 consecutive repetitions;
+both the old list-length admission rule and the old stop condition were
+reintroduced independently and failed at their intended deterministic
+assertions. The post-fix ordinary graph passed 84/84 steps. These are
+development checks, not the final cold release preflight.
 
-**Candidate freeze.** `1b68041` includes every intended source, manifest,
-snapshot, test, and documentation change, including the new qset-cache source.
-The tree was clean before hashing. No file inside `.paths` may change without
-restarting the hash and release proof.
+**Candidate freeze.** `1b68041` freezes every intended file inside `.paths`,
+including the new qset-cache source, manifest, snapshots, and packaged test.
+`0f39869` is the repository code tip: it adds the registry RPC lifecycle fix
+and deterministic regression under `examples/`, outside `.paths`. No packaged
+file has changed since `1b68041`; changing one would restart the hash and
+release proof.
 
-**Cold preflight.** PENDING. Run `just preflight` alone on the clean candidate
-commit and record every evidence line plus the exact SHA and elapsed time.
-Earlier v0.1.0 and hardening-baseline runs are not v0.2.0 evidence.
+**Cold preflight.** Run 1 at clean `e529dcc` was green in 832 s: 100/100 build
+steps, 496/497 tests with one expected skip, all matrices/differential tests,
+consumer smokes, E2E, generation, lint, documentation, and package checks
+passed. The following vector ablation also surfaced a flaky registry allocator
+crash; a focused loop reproduced it and `0f39869` fixes it. That first run is
+therefore superseded. Final post-fix cold preflight: PENDING.
 
 **Ablations.** PENDING. Run all five release ablations against the clean
 committed candidate, record each non-empty diff and intended red line, and

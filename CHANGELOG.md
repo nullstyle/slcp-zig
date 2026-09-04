@@ -88,6 +88,10 @@ sans-I/O Engine directly. No Stable declaration changed.
 
 ### Fixed
 
+- Registry RPC shutdown now waits for every detached connection thread to
+  finish socket close and allocator-owned teardown before freeing `Server`.
+  Admission also counts handlers still tearing down, so the 64-connection
+  bound remains exact under churn.
 - Prevented an overtaken local nomination, retained journal prefix, lowered
   explicit start floor, or metadata-decoding OOM from recreating retired slots.
 - Rejecting an incompatible newer peer ballot no longer destroys that peer's
