@@ -27,7 +27,44 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: archive retention
+## Current feature work: per-peer catch-up diagnosis
+
+A quiet node can now say WHICH kind of quiet it is
+([ADR 0006](docs/adr/0006-catchup-diagnosis.md)). Every established overlay
+connection carries atomic link evidence (frames and envelopes received,
+slot-state responses, catch-up asks received and envelopes answered,
+monotonic establishment and last-frame timestamps), and the Experimental
+`Node.catchupDiagnosis(silent_after_ns, buf)` combines that with the
+catch-up counters, the delivery-frontier age, and slice math over the live
+peers' advertised ids into `CatchupDiagnosis` — including one honestly
+labeled stall classification: `no_quorum` (self + live advertised ids do
+not contain a local quorum slice), `quorum_silent` (connectivity satisfies
+the slice but every live connection is silent past the caller's window), or
+`missing_statements` (traffic flows yet the frontier is stuck with held or
+pending work). Null is itself a claim: nothing looks wrong FROM THIS SEAT,
+never "the network is healthy". The registry's stall warning now prints the
+matching next action per label, and a `diag` RPC verb exposes the same line
+plus per-link counters. The classifier is a pure function with a pinned
+truth table; live socket tests prove `no_quorum` alone, a healthy pair's
+evidence counters (envelopes, asks, served answers, delivery age), and
+`quorum_silent` under a test link partition. The Node now retains a parsed
+read-only copy of its normalized quorum set for the slice math (the engine
+keeps its own); per-frame cost is two atomic increments on the receive
+path.
+
+### Current diagnosis verification
+
+- Native node suite: **PASS** — 210 pass + 1 expected platform skip out of
+  211 (four new tests: classifier truth table, nested-slice satisfaction,
+  the live healthy/no_quorum pair, and the link-partition silence class).
+- Registry suite: **PASS** — 105/105 (a `diag` RPC verb test).
+- API gates: Experimental snapshot grew by 37 lines; the 292 Stable
+  declarations are byte-identical; closure and strict checks green.
+- Docs-smoke: **PASS** — 436 checks, 0 failures.
+- Real-socket E2E and the three-process smoke are rerun for this change
+  below.
+
+## Historical feature record: archive retention
 
 Both sides of the registry's history are now garbage-collected
 ([ADR 0004](docs/adr/0004-registry-capacity-epoch.md) closed the state-growth

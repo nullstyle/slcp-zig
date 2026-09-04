@@ -9,6 +9,7 @@
 //! into proposals (main.zig).
 
 const std = @import("std");
+const slcp = @import("slcp");
 const registry = @import("registry.zig");
 const net = std.Io.net;
 const Tx = registry.Tx;
@@ -59,6 +60,9 @@ pub const Shared = struct {
     pending: [registry.max_pending]Tx = undefined,
     n_pending: usize = 0,
     publisher: ?Publisher = null,
+    /// The bytes-level node, for the Experimental catch-up diagnosis. Set
+    /// once by main before the server starts; read-only afterwards.
+    node: ?*slcp.Node = null,
 
     pub fn lock(self: *Shared) void {
         self.mu.lockUncancelable(self.io);
@@ -219,6 +223,41 @@ pub fn handle(shared: *Shared, line: []const u8, out: []u8) []const u8 {
         shared.lock();
         defer shared.unlock();
         return fmt(out, "account key={s} seq={d} next={d}", .{ &registry.hex32(key), shared.state.accountSeq(key), shared.nextSeq(key) });
+    }
+    if (std.mem.eql(u8, verb, "diag")) {
+        // Experimental one-line catch-up diagnosis (ADR 0006): the node's
+        // own connectivity evidence and its best LOCAL explanation of a
+        // delivery stall. Null stall prints `none` — nothing wrong from
+        // this seat, not a network-wide health claim.
+        const n = shared.node orelse return fmt(out, "err bad_request diag needs the node", .{});
+        var links: [8]slcp.overlay.Overlay.PeerLink = undefined;
+        const d = n.catchupDiagnosis(5 * std.time.ns_per_s, &links);
+        const stall_name = if (d.stall) |s| @tagName(s) else "none";
+        var pos: usize = 0;
+        pos += (std.fmt.bufPrint(out[pos..], "diag stall={s} live={d}/{d} quorum={} silent={d} frontier={d} held={d} pending={d} jumps={d} delivered_ms={?d}", .{
+            stall_name,
+            d.live_peers,
+            d.configured_peers,
+            d.quorum_reachable,
+            d.silent_peers,
+            d.delivery_frontier,
+            d.held_statements,
+            d.pending_externalizations,
+            d.gap_jumps,
+            if (d.last_delivery_age_ns) |age| @divTrunc(age, std.time.ns_per_ms) else null,
+        }) catch return fmt(out, "err bad_request diag line too long", .{})).len;
+        for (d.peers) |pl| {
+            const written = std.fmt.bufPrint(out[pos..], " {s}{s}env={d},ask={d},ans={d},age_ms={d}", .{
+                if (pl.outbound) "out" else "in",
+                if (pl.last_frame_age_ns == null) "quiet:" else "",
+                pl.envelopes_received,
+                pl.slot_state_asks_received,
+                pl.slot_state_envelopes_answered,
+                @min(@divTrunc(pl.last_frame_age_ns orelse pl.established_age_ns, std.time.ns_per_ms), std.math.maxInt(u32)),
+            }) catch break;
+            pos += written.len;
+        }
+        return out[0..pos];
     }
     if (std.mem.eql(u8, verb, "submit")) {
         const hex = it.next() orelse return fmt(out, "err bad_request submit <hex of {d} bytes>", .{registry.tx_bytes});
@@ -711,6 +750,47 @@ test "shared: prune drops applied pending transactions and retains later ones" {
 
 // Non-vacuity: every verb and every `err` code in `handle` has a line here;
 // the `field` helper must find the first `key=` token only.
+test "handle: diag names the stall and per-link evidence shape" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const genesis_close_time: u64 = 1_234_567_890;
+    const network_id = registry.networkId("rpc diag test", genesis_close_time);
+    var sh: Shared = .{
+        .io = io,
+        .state = try registry.State.genesis(network_id, genesis_close_time, gpa),
+    };
+    defer sh.deinit(gpa);
+    var out: [max_line]u8 = undefined;
+
+    // Without the node wired the verb refuses.
+    try testing.expect(std.mem.startsWith(u8, handle(&sh, "diag", &out), "err bad_request diag"));
+
+    // A 2-of-2 node with its peer absent: self alone cannot satisfy the
+    // slice, so the line reports no_quorum and the frontier view.
+    const seed: [32]u8 = @splat(0x7e);
+    const id = try registry.publicKeyOf(seed);
+    const other: [32]u8 = @splat(0x99);
+    const n = try slcp.Node.create(gpa, io, .{
+        .network = "rpc diag node v1",
+        .secret_seed = seed,
+        .quorum = slcp.Quorum.of(2, &.{ id, other }),
+        .listen_port = 0,
+        .data_dir = data_dir,
+    });
+    defer n.deinit();
+    sh.node = n;
+    const r = handle(&sh, "diag", &out);
+    try testing.expect(std.mem.startsWith(u8, r, "diag stall=no_quorum live=0/0 quorum=false"));
+    try testing.expect(std.mem.indexOf(u8, r, "frontier=") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "held=0 pending=0 jumps=0") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "delivered_ms=null") != null);
+}
+
 test "handle: head/get/account/submit lines and every error code" {
     const genesis_close_time: u64 = 1_234_567_890;
     const network_id = registry.networkId("rpc handle test", genesis_close_time);

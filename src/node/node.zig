@@ -458,6 +458,86 @@ pub const CatchupStats = struct {
     gap_slots_skipped: u64,
 };
 
+/// One best local explanation for an ordered-delivery stall, or null when
+/// nothing looks wrong from this node's seat. Each label is a statement
+/// about LOCAL evidence only — the classifier deliberately does not pretend
+/// to know why remote validators act as they do (ADR 0006).
+pub const StallKind = enum {
+    /// Self plus the live connections' advertised ids do not contain a local
+    /// quorum slice. Nothing that arrives can close slots until more of the
+    /// configured validators are reachable.
+    no_quorum,
+    /// Connectivity satisfies the local quorum slice, but no live connection
+    /// delivered any frame within the caller's silence window: a transport
+    /// stall or wedged peers, not a statement-retention problem.
+    quorum_silent,
+    /// Connectivity satisfies the slice and frames are arriving, yet the
+    /// frontier is not advancing while pending or held work waits: the
+    /// statements needed to close the gap are not coming from these peers
+    /// (their answering windows may have moved past it).
+    missing_statements,
+};
+
+/// Experimental catch-up diagnosis (ADR 0006): `CatchupStats`'s frontier
+/// view plus per-peer link evidence and one honest stall classification.
+/// `peers` is the filled prefix of the caller's buffer. The quorum check
+/// uses the peers' UNAUTHENTICATED Hello advertisements — connectivity
+/// evidence, not identity proof.
+pub const CatchupDiagnosis = struct {
+    /// Best local explanation, or null when nothing looks wrong.
+    stall: ?StallKind,
+    configured_peers: usize,
+    live_peers: usize,
+    quorum_reachable: bool,
+    /// Live connections with no frame inside `silent_after_ns`.
+    silent_peers: usize,
+    silent_after_ns: u64,
+    /// Per-link evidence (filled prefix of the caller's buffer).
+    peers: []overlay_mod.Overlay.PeerLink,
+    delivery_frontier: u64,
+    held_statements: usize,
+    pending_externalizations: usize,
+    pending_lowest_slot: ?u64,
+    pending_highest_slot: ?u64,
+    gap_jumps: u64,
+    /// Monotonic age of the last ordered delivery, or null before the first.
+    last_delivery_age_ns: ?u64,
+};
+
+/// The pure classifier, so the truth table is testable without sockets:
+/// reachable-but-silent beats nothing-wrong, unreachable beats everything,
+/// and "statements missing" requires live traffic plus waiting work.
+fn classifyStall(
+    quorum_reachable: bool,
+    live_peers: usize,
+    silent_peers: usize,
+    waiting_work: usize,
+) ?StallKind {
+    if (!quorum_reachable) return .no_quorum;
+    if (live_peers > 0 and silent_peers == live_peers) return .quorum_silent;
+    if (waiting_work > 0) return .missing_statements;
+    return null;
+}
+
+/// True when `ids` (which must include this node itself) contains a slice
+/// satisfying `qs`: at each level, present validators plus fully satisfied
+/// inner sets meet the threshold.
+fn quorumSliceSatisfiedBy(qs: *const qset.QuorumSetOwned, ids: []const [32]u8) bool {
+    var satisfied: usize = 0;
+    for (qs.validators) |v| {
+        for (ids) |id| {
+            if (std.mem.eql(u8, &v, &id)) {
+                satisfied += 1;
+                break;
+            }
+        }
+    }
+    for (qs.inner_sets) |*inner| {
+        if (quorumSliceSatisfiedBy(inner, ids)) satisfied += 1;
+    }
+    return satisfied >= qs.threshold;
+}
+
 /// Host-side per-slot hold buffer (S8 D1, the stellar-core Herder shape —
 /// `processSCPQueueUpToIndex(lcl + 1)` with `PendingEnvelopes` for later
 /// slots). Inbound statements — NOMINATE / PREPARE / CONFIRM **and
@@ -1145,6 +1225,11 @@ pub const Node = struct {
     network_id: [32]u8,
     node_id: [32]u8,
     local_qset_hash: [32]u8,
+    /// The normalized local quorum set, kept parsed for Experimental
+    /// diagnostics (the engine owns its own copy; this one is read-only).
+    local_qset: qset.QuorumSetOwned,
+    /// Monotonic ns of the last ordered delivery (diagnostics only).
+    last_delivery_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     watcher: bool,
 
     eng: engine.Engine,
@@ -1521,6 +1606,13 @@ pub const Node = struct {
         };
         const drv = opts.driver orelse core.driver.Driver.default();
 
+        // The diagnostics copy is owned by the Node; the engine keeps its
+        // own through cfg.quorum_set.
+        var local_diag = qset.clone(gpa, &owned) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        errdefer local_diag.deinit(gpa);
+
         const self = try gpa.create(Node);
         errdefer gpa.destroy(self);
 
@@ -1530,6 +1622,7 @@ pub const Node = struct {
             .network_id = cfg.network_id,
             .node_id = node_id,
             .local_qset_hash = local_hash,
+            .local_qset = local_diag,
             .watcher = opts.watcher or secret_seed == null,
             .eng = undefined,
             .q = .{ .gpa = gpa, .io = io },
@@ -2021,6 +2114,9 @@ pub const Node = struct {
         self.store.deinit();
         self.eng.deinit();
         self.freeAppBuffers();
+        // Last: the diagnostics qset is pure read-only state, freed only
+        // here because the next statement blanks the struct.
+        self.local_qset.deinit(self.gpa);
 
         const gpa = self.gpa;
         self.* = undefined;
@@ -2181,6 +2277,68 @@ pub const Node = struct {
         self.stats_mu.lockUncancelable(self.io);
         defer self.stats_mu.unlock(self.io);
         return self.catchup_stats_snapshot;
+    }
+
+    /// Experimental per-peer catch-up diagnosis (ADR 0006). `peers_buf`
+    /// receives up to its length of live link snapshots (the returned
+    /// `peers` slice is the filled prefix); `silent_after_ns` is the
+    /// caller's transport-silence threshold against the node's monotonic
+    /// clock. Everything here is node-local evidence: the quorum check uses
+    /// unauthenticated Hello ids, `stall` is the best local explanation and
+    /// null means "nothing looks wrong from here", not "the network is
+    /// healthy".
+    pub fn catchupDiagnosis(self: *Node, silent_after_ns: u64, peers_buf: []overlay_mod.Overlay.PeerLink) CatchupDiagnosis {
+        const now_ns: i96 = std.Io.Clock.now(.awake, self.io).nanoseconds;
+        const links = self.ov.peerLinks(now_ns, peers_buf);
+        self.stats_mu.lockUncancelable(self.io);
+        const stats_copy = self.catchup_stats_snapshot;
+        self.stats_mu.unlock(self.io);
+
+        // Self counts toward its own slice; every live advertisement joins
+        // it. Two connections advertising the same id are one member.
+        var ids_buf: [64][32]u8 = undefined;
+        var n_ids: usize = 0;
+        ids_buf[0] = self.node_id;
+        n_ids += 1;
+        for (links) |link| {
+            var dup = false;
+            for (ids_buf[0..n_ids]) |known| {
+                if (std.mem.eql(u8, &known, &link.peer_node_id)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and n_ids < ids_buf.len) {
+                ids_buf[n_ids] = link.peer_node_id;
+                n_ids += 1;
+            }
+        }
+        const quorum_reachable = quorumSliceSatisfiedBy(&self.local_qset, ids_buf[0..n_ids]);
+
+        var silent: usize = 0;
+        for (links) |link| {
+            const age = link.last_frame_age_ns orelse link.established_age_ns;
+            if (age >= silent_after_ns) silent += 1;
+        }
+        const last = self.last_delivery_ns.load(.acquire);
+        const waiting: usize = stats_copy.held_statements + stats_copy.pending_externalizations +
+            @as(usize, @intCast(@min(stats_copy.gap_jumps, 1)));
+        return .{
+            .stall = classifyStall(quorum_reachable, links.len, silent, waiting),
+            .configured_peers = self.peer_specs.len,
+            .live_peers = links.len,
+            .quorum_reachable = quorum_reachable,
+            .silent_peers = silent,
+            .silent_after_ns = silent_after_ns,
+            .peers = links,
+            .delivery_frontier = stats_copy.delivery_frontier,
+            .held_statements = stats_copy.held_statements,
+            .pending_externalizations = stats_copy.pending_externalizations,
+            .pending_lowest_slot = stats_copy.pending_lowest_slot,
+            .pending_highest_slot = stats_copy.pending_highest_slot,
+            .gap_jumps = stats_copy.gap_jumps,
+            .last_delivery_age_ns = if (last == 0) null else @intCast(@max(0, now_ns - @as(i96, @intCast(last)))),
+        };
     }
 
     /// Engine-owner only (or the creating thread before `engine_thread`
@@ -2685,7 +2843,15 @@ pub const Node = struct {
     /// Takes ownership of `val` on every path. Callers keep slots ascending
     /// (`next_deliver`); a hook error or a queue OOM is returned unchanged
     /// for the caller to turn into a create failure or an inert latch.
+    /// Diagnostics: record the ordered-delivery time. Read on user threads
+    /// through `catchupDiagnosis`; written only at delivery points, both on
+    /// the engine thread and the creating thread during journal replay.
+    fn noteDeliveryTime(self: *Node) void {
+        self.last_delivery_ns.store(@intCast(@max(0, std.Io.Clock.now(.awake, self.io).nanoseconds)), .release);
+    }
+
     fn deliverSlot(self: *Node, slot: u64, val: []u8) anyerror!void {
+        self.noteDeliveryTime();
         if (self.delivery) |h| {
             defer self.gpa.free(val);
             try h.on_externalized(h.ctx, slot, val);
@@ -2940,6 +3106,7 @@ pub const Node = struct {
         }
         // Send while holding own_mu so the borrowed env slices stay valid
         // through encode (overlay copies them).
+        self.ov.noteSlotStateAnswered(peer_id, list.items.len);
         self.ov.send(peer_id, .{ .slot_state = .{ .slot = highest, .envelopes = list.items } });
     }
 
@@ -3005,6 +3172,59 @@ fn writeOwnedQset(qb: *gen_slcp.QuorumSet.Builder, qs: *const qset.QuorumSetOwne
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// Non-vacuity (classifier truth table): unreachable quorum beats
+// everything; reachable-but-all-silent beats nothing-wrong; "statements
+// missing" needs live traffic AND waiting work; a self-satisfied slice with
+// no live peers and no work is deliberately null (a singleton network is
+// not stalled by silence).
+const testing = std.testing;
+
+test "catchup diagnosis: the classifier truth table" {
+    const T = struct {
+        fn check(reachable: bool, live: usize, silent: usize, work: usize, want: ?StallKind) !void {
+            try testing.expectEqual(want, classifyStall(reachable, live, silent, work));
+        }
+    };
+    try T.check(false, 0, 0, 0, .no_quorum);
+    try T.check(false, 3, 0, 5, .no_quorum);
+    try T.check(true, 0, 0, 0, null);
+    try T.check(true, 2, 2, 5, .quorum_silent);
+    try T.check(true, 2, 1, 5, .missing_statements);
+    try T.check(true, 2, 0, 0, null);
+    try T.check(true, 1, 1, 0, .quorum_silent);
+    try T.check(true, 1, 0, 1, .missing_statements);
+}
+
+test "catchup diagnosis: quorum slice satisfaction over nested sets" {
+    const gpa = testing.allocator;
+    const leaf1: [32]u8 = @splat(1);
+    const leaf2: [32]u8 = @splat(2);
+    const self_id: [32]u8 = @splat(9);
+
+    // Top: 2 of { 1-of-{leaf1}, 1-of-{leaf2} }. The nested set owns both
+    // inner slices; one deinit frees the tree.
+    const inners = try gpa.alloc(qset.QuorumSetOwned, 2);
+    inners[0] = .{ .threshold = 1, .validators = try gpa.dupe([32]u8, &.{leaf1}), .inner_sets = &.{} };
+    inners[1] = .{ .threshold = 1, .validators = try gpa.dupe([32]u8, &.{leaf2}), .inner_sets = &.{} };
+    var nested = qset.QuorumSetOwned{ .threshold = 2, .validators = &.{}, .inner_sets = inners };
+    defer nested.deinit(gpa);
+
+    // Only leaf1's member is present: one satisfied inner < threshold 2.
+    try testing.expect(!quorumSliceSatisfiedBy(&nested, &.{ self_id, leaf1 }));
+    const both = [_][32]u8{ self_id, leaf1, leaf2 };
+    try testing.expect(quorumSliceSatisfiedBy(&nested, &both));
+
+    // Flat: 2 of {self, leaf1, leaf2}.
+    var flat = qset.QuorumSetOwned{
+        .threshold = 2,
+        .validators = try gpa.dupe([32]u8, &.{ self_id, leaf1, leaf2 }),
+        .inner_sets = &.{},
+    };
+    defer flat.deinit(gpa);
+    try testing.expect(quorumSliceSatisfiedBy(&flat, &.{ self_id, leaf1 }));
+    try testing.expect(!quorumSliceSatisfiedBy(&flat, &.{self_id}));
+}
 
 test "node: every method compiles (forces body analysis without instantiation)" {
     // Taking the address of each method forces the compiler to analyze its
@@ -6048,4 +6268,199 @@ test "hold gate: a signer outside the quorum graph is fed straight to the engine
     // A member's statement for the same slot is held as usual.
     n.applyInput(try f.item(n, f.seed_a, 5, .{ .nominate = "x" }));
     try std.testing.expectEqual(@as(usize, 1), n.hold.held_now.load(.acquire));
+}
+
+// Non-vacuity: the diagnosis plumbing over real sockets. A 2-of-2 pair with
+// the peer down classifies `no_quorum` (self alone cannot satisfy a 2-of-2
+// slice) with zero live links; after connecting and exchanging traffic, the
+// slice is satisfied through the peer's advertised id, per-link evidence
+// counts envelopes from the peer and answers we served, and an idle pair
+// with no waiting work reports no stall.
+test "catchup diagnosis: no_quorum alone, healthy with a live peer, per-link evidence" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
+    const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
+
+    const seed_a: [32]u8 = @splat(0xd1);
+    const seed_b: [32]u8 = @splat(0xd2);
+    const ids = [2][32]u8{ try crypto.publicKeyFromSeed(seed_a), try crypto.publicKeyFromSeed(seed_b) };
+    var diag: Diagnostic = .{};
+
+    const a = try Node.create(gpa, io, .{
+        .network = "diagnosis v1",
+        .secret_seed = seed_a,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .data_dir = dir_a,
+        .diagnostic = &diag,
+    });
+    defer a.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{a.boundPort()});
+
+    // Alone: self cannot satisfy the 2-of-2 slice; nothing is waiting.
+    {
+        var links: [4]overlay_mod.Overlay.PeerLink = undefined;
+        const d = a.catchupDiagnosis(std.time.ns_per_s, &links);
+        try testing.expectEqual(@as(usize, 0), d.live_peers);
+        try testing.expectEqual(@as(usize, 0), d.peers.len);
+        try testing.expect(!d.quorum_reachable);
+        try testing.expectEqual(StallKind.no_quorum, d.stall.?);
+        // a only listens (b dials), so it configures no outbound peers.
+        try testing.expectEqual(@as(usize, 0), d.configured_peers);
+        try testing.expect(d.last_delivery_age_ns == null);
+    }
+
+    const b = try Node.create(gpa, io, .{
+        .network = "diagnosis v1",
+        .secret_seed = seed_b,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .peers = &.{spec},
+        .data_dir = dir_b,
+        .diagnostic = &diag,
+    });
+    defer b.deinit();
+
+    // Wait for the connection plus some traffic. A 2-of-2 pair needs BOTH
+    // nodes to nominate, so both propose: nomination envelopes flow, the
+    // pair externalizes slot 1, and every evidence counter moves.
+    try a.propose("diagnose");
+    try b.propose("diagnose");
+    var links: [4]overlay_mod.Overlay.PeerLink = undefined;
+    var waited: u64 = 0;
+    while (waited < 20_000) : (waited += 100) {
+        var probe: [4]overlay_mod.Overlay.PeerLink = undefined;
+        const d = b.catchupDiagnosis(std.time.ns_per_s, &probe);
+        if (d.live_peers >= 1 and d.peers[0].envelopes_received > 0) {
+            links = probe;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
+    }
+    const d = b.catchupDiagnosis(std.time.ns_per_s, &links);
+    try testing.expect(d.live_peers >= 1);
+    try testing.expect(d.quorum_reachable);
+    try testing.expectEqual(@as(usize, 0), d.silent_peers);
+    // With the slot applied there is no waiting work and traffic flows: no
+    // local stall is claimed.
+    var applied = b.catchupStats();
+    waited = 0;
+    while (applied.delivery_frontier < 1 and waited < 20_000) : (waited += 100) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
+        applied = b.catchupStats();
+    }
+    try testing.expect(applied.delivery_frontier >= 1);
+    try testing.expect(d.peers[0].envelopes_received > 0);
+    try testing.expect(d.peers[0].slot_state_asks_received >= 1); // we asked on peerup
+    try testing.expect(d.peers[0].frames_received >= d.peers[0].envelopes_received);
+    // a received b's peerup ask, and once a has own statements its answer
+    // to b's periodic re-ask carries them (the peerup answer may precede a's
+    // first nomination and legitimately carry none).
+    var links_a: [4]overlay_mod.Overlay.PeerLink = undefined;
+    var da = a.catchupDiagnosis(std.time.ns_per_s, &links_a);
+    try testing.expectEqual(@as(usize, 1), da.live_peers);
+    try testing.expect(da.quorum_reachable);
+    try testing.expect(da.peers[0].slot_state_asks_received >= 1);
+    waited = 0;
+    while (da.peers[0].slot_state_envelopes_answered < 1 and waited < 20_000) : (waited += 100) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
+        da = a.catchupDiagnosis(std.time.ns_per_s, &links_a);
+    }
+    try testing.expect(da.peers[0].slot_state_envelopes_answered >= 1);
+    // The delivery stamp moved with slot 1, and after delivery with no
+    // waiting work the healthy pair reports no local stall.
+    const fresh = b.catchupDiagnosis(std.time.ns_per_s, &links);
+    try testing.expect(fresh.last_delivery_age_ns != null);
+    if (fresh.held_statements == 0 and fresh.pending_externalizations == 0) {
+        try testing.expect(fresh.stall == null);
+    }
+}
+
+// Non-vacuity: connectivity that satisfies the slice while NO frame arrives
+// is a transport silence, not a retention problem. The test link filter
+// simulates the partition: after both nodes connect and exchange their
+// peerup traffic, the filter drops every frame between them and the
+// diagnosis must report quorum_silent once the silence window elapses.
+test "catchup diagnosis: a partitioned link classifies quorum_silent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var dir_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&dir_a_buf, "{s}/a", .{root});
+    const dir_b = try std.fmt.bufPrint(&dir_b_buf, "{s}/b", .{root});
+
+    const seed_a: [32]u8 = @splat(0xd3);
+    const seed_b: [32]u8 = @splat(0xd4);
+    const ids = [2][32]u8{ try crypto.publicKeyFromSeed(seed_a), try crypto.publicKeyFromSeed(seed_b) };
+    var diag: Diagnostic = .{};
+
+    const a = try Node.create(gpa, io, .{
+        .network = "diagnosis silence v1",
+        .secret_seed = seed_a,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .data_dir = dir_a,
+        .diagnostic = &diag,
+    });
+    defer a.deinit();
+    var spec_buf: [32]u8 = undefined;
+    const spec = try std.fmt.bufPrint(&spec_buf, "127.0.0.1:{d}", .{a.boundPort()});
+    const b = try Node.create(gpa, io, .{
+        .network = "diagnosis silence v1",
+        .secret_seed = seed_b,
+        .quorum = core.quorum.Quorum.of(2, &ids),
+        .listen_port = 0,
+        .peers = &.{spec},
+        .data_dir = dir_b,
+        .diagnostic = &diag,
+    });
+    defer b.deinit();
+
+    // Wait for the live link first.
+    var waited: u64 = 0;
+    while (waited < 20_000) : (waited += 100) {
+        var probe: [4]overlay_mod.Overlay.PeerLink = undefined;
+        if (b.catchupDiagnosis(1, &probe).live_peers >= 1) break;
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
+    }
+    {
+        var probe: [4]overlay_mod.Overlay.PeerLink = undefined;
+        try testing.expect(b.catchupDiagnosis(1, &probe).live_peers >= 1);
+    }
+
+    // Cut the link in both directions and wait out the silence window.
+    overlay_mod.setTestLinkFilter(struct {
+        fn cut(_: [32]u8, _: [32]u8) bool {
+            return false;
+        }
+    }.cut);
+    defer overlay_mod.setTestLinkFilter(null);
+
+    const window_ns: u64 = 700 * std.time.ns_per_ms;
+    var saw_silence = false;
+    waited = 0;
+    while (waited < 10_000) : (waited += 100) {
+        var probe: [4]overlay_mod.Overlay.PeerLink = undefined;
+        const d = b.catchupDiagnosis(window_ns, &probe);
+        if (d.live_peers >= 1 and d.silent_peers == d.live_peers) {
+            try testing.expect(d.quorum_reachable);
+            try testing.expectEqual(StallKind.quorum_silent, d.stall.?);
+            saw_silence = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
+    }
+    try testing.expect(saw_silence);
 }

@@ -296,7 +296,12 @@ and the genesis root moved.
 
 Remaining work:
 
-- richer per-peer visibility beyond the local `catchupStats` snapshot;
+- richer per-peer visibility beyond the local `catchupStats` snapshot is
+  delivered at the evidence level ([ADR 0006](adr/0006-catchup-diagnosis.md)):
+  per-link counters plus an honest three-label stall classification, consumed
+  by the registry's stall warning and a `diag` RPC verb. A peer-advertised
+  answer-window disclosure (sharpening "not supplying it" to "says it no
+  longer holds it") remains future work;
 - quota-style admission control, since state growth is now bounded by memory
   and disk rather than fixed caps (an E3 concern).
 

@@ -1238,7 +1238,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
         if (history_publisher) |publisher| publisher.deinit();
     }
     var publisher = GossipPublisher{ .node = node.raw() };
-    var shared = rpc.Shared{ .io = io, .state = ready_state, .publisher = publisher.publisher() };
+    var shared = rpc.Shared{ .io = io, .state = ready_state, .publisher = publisher.publisher(), .node = node.raw() };
     const server = rpc.Server.start(gpa, io, &shared, rpc_port) catch |err| {
         std.debug.print("registry node: cannot bind the rpc port 127.0.0.1:{d}: {t}\n", .{ rpc_port, err });
         return 1;
@@ -1366,10 +1366,27 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             next_gossip_reflood = now + gossip_reflood_ms;
         }
         if (now >= next_stall_warn) {
-            if (f.history_dir != null) {
-                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or needed retained statements are not arriving from reachable peers; in the latter case restart this process after a certified history tip covering the gap is available\n", .{(nowMs(io) -| last_close) / 1000});
+            // The Experimental node diagnosis names the best LOCAL
+            // explanation (ADR 0006): connectivity, silence, or statements
+            // that these peers cannot supply. It is evidence, not a
+            // network-wide claim.
+            var links: [8]slcp.overlay.Overlay.PeerLink = undefined;
+            const d = node.raw().catchupDiagnosis(5 * std.time.ns_per_s, &links);
+            const stalled_s = (nowMs(io) -| last_close) / 1000;
+            if (d.stall) |stall| {
+                switch (stall) {
+                    .no_quorum => std.debug.print("registry node: no slot applied for {d} s — live peers {d}/{d} and self do not contain a local quorum slice; progress needs more validators reachable\n", .{ stalled_s, d.live_peers, d.configured_peers }),
+                    .quorum_silent => std.debug.print("registry node: no slot applied for {d} s — quorum connectivity is present but all {d} live connection(s) are silent; a transport stall or wedged peers, not a retention problem\n", .{ stalled_s, d.live_peers }),
+                    .missing_statements => {
+                        if (f.history_dir != null) {
+                            std.debug.print("registry node: no slot applied for {d} s — traffic flows but the frontier is stuck at {d} with {d} held/{d} pending ({d} gap jumps): the needed retained statements are not arriving from these peers; restart after a certified history tip covering the gap is available\n", .{ stalled_s, d.delivery_frontier, d.held_statements, d.pending_externalizations, d.gap_jumps });
+                        } else {
+                            std.debug.print("registry node: no slot applied for {d} s — traffic flows but the frontier is stuck at {d} with {d} held/{d} pending ({d} gap jumps): the needed retained statements are not arriving from these peers; configure authenticated history for long-outage recovery, or restart the whole network with fresh data dirs\n", .{ stalled_s, d.delivery_frontier, d.held_statements, d.pending_externalizations, d.gap_jumps });
+                        }
+                    },
+                }
             } else {
-                std.debug.print("registry node: no slot applied for {d} s — either the network has no quorum, or needed retained statements are not arriving from reachable peers; configure authenticated history for long-outage recovery, or use a fresh --data-dir only when the whole network starts over\n", .{(nowMs(io) -| last_close) / 1000});
+                std.debug.print("registry node: no slot applied for {d} s — no local explanation: {d}/{d} peer(s) live, traffic flowing, no waiting work; the delay is remote or the quorum disagrees elsewhere\n", .{ stalled_s, d.live_peers, d.configured_peers });
             }
             next_stall_warn = now + stall_warn_ms;
         }

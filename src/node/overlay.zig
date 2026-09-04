@@ -250,6 +250,18 @@ const Conn = struct {
     win_reqs: usize = 0,
     strikes: u32 = 0,
 
+    // Per-peer link evidence (Experimental diagnostics): reader-thread
+    // writes, `Overlay.peerLinks` reads — atomics, no lock needed. Ages are
+    // monotonic-clock nanoseconds since connection establishment / the last
+    // post-handshake frame received.
+    established_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_frame_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    frames_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    envelopes_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slot_states_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slot_state_asks_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slot_state_envelopes_answered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     /// Blocking read into `read_buf`; 0 on EOF. The established-connection
     /// path — no deadline, straight through the Io vtable.
     fn read(self: *Conn) !usize {
@@ -533,6 +545,65 @@ pub const Overlay = struct {
             if (conn.hello_done) n += 1;
         }
         return n;
+    }
+
+    /// One live established connection's link evidence (Experimental
+    /// diagnostics). Ages are against the caller's `now_ns` (the same
+    /// monotonic clock `Overlay` uses); `last_frame_age_ns` is null when no
+    /// post-handshake frame has ever arrived. The peer id is the
+    /// UNAUTHENTICATED Hello advertisement — connectivity evidence for
+    /// diagnosis, never identity proof.
+    pub const PeerLink = struct {
+        conn_id: usize,
+        outbound: bool,
+        peer_node_id: [32]u8,
+        established_age_ns: u64,
+        last_frame_age_ns: ?u64,
+        frames_received: u64,
+        envelopes_received: u64,
+        slot_states_received: u64,
+        slot_state_asks_received: u64,
+        slot_state_envelopes_answered: u64,
+    };
+
+    /// Snapshot up to `buf.len` established connections into `buf`; the
+    /// returned slice says how many fit. New connections may appear while
+    /// this runs; each link's counters are atomic per connection.
+    pub fn peerLinks(self: *Overlay, now_ns: i96, buf: []PeerLink) []PeerLink {
+        self.conns_mu.lockUncancelable(self.io);
+        defer self.conns_mu.unlock(self.io);
+        var n: usize = 0;
+        for (self.conns.items) |conn| {
+            if (!conn.hello_done or n == buf.len) continue;
+            const last = conn.last_frame_ns.load(.acquire);
+            buf[n] = .{
+                .conn_id = conn.id,
+                .outbound = conn.outbound,
+                .peer_node_id = conn.peer_node_id,
+                .established_age_ns = @intCast(@max(0, now_ns - @as(i96, @intCast(conn.established_ns.load(.acquire))))),
+                .last_frame_age_ns = if (last == 0) null else @intCast(@max(0, now_ns - @as(i96, @intCast(last)))),
+                .frames_received = conn.frames_received.load(.acquire),
+                .envelopes_received = conn.envelopes_received.load(.acquire),
+                .slot_states_received = conn.slot_states_received.load(.acquire),
+                .slot_state_asks_received = conn.slot_state_asks_received.load(.acquire),
+                .slot_state_envelopes_answered = conn.slot_state_envelopes_answered.load(.acquire),
+            };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    /// Credit `n` envelopes sent to `peer_id` in slot-state answers (the
+    /// answering side of catch-up). No effect when the connection is gone.
+    pub fn noteSlotStateAnswered(self: *Overlay, peer_id: usize, n: usize) void {
+        self.conns_mu.lockUncancelable(self.io);
+        defer self.conns_mu.unlock(self.io);
+        for (self.conns.items) |conn| {
+            if (conn.hello_done and conn.id == peer_id) {
+                _ = conn.slot_state_envelopes_answered.fetchAdd(n, .monotonic);
+                return;
+            }
+        }
     }
 
     /// Stop accepting/dialing, close peers, join all threads. Idempotent.
@@ -986,6 +1057,7 @@ pub const Overlay = struct {
             conn.id = self.next_peer_id;
             self.next_peer_id += 1;
             conn.hello_done = true;
+            conn.established_ns.store(@intCast(@max(0, self.monoNs())), .release);
             self.conns_mu.unlock(self.io);
 
             self.cb.on_peer_up(self.cb.ctx, conn.id);
@@ -1072,6 +1144,14 @@ pub const Overlay = struct {
                 .drop => continue,
                 .disconnect => return,
             };
+            _ = conn.frames_received.fetchAdd(1, .monotonic);
+            conn.last_frame_ns.store(@intCast(@max(0, self.monoNs())), .release);
+            switch (frame) {
+                .envelope => _ = conn.envelopes_received.fetchAdd(1, .monotonic),
+                .slot_state => _ = conn.slot_states_received.fetchAdd(1, .monotonic),
+                .get_slot_state => _ = conn.slot_state_asks_received.fetchAdd(1, .monotonic),
+                else => {},
+            }
             self.cb.on_recv(self.cb.ctx, conn.id, &frame);
         }
     }

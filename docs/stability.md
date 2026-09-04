@@ -215,6 +215,13 @@ expect in the Stable list and that are deliberately **not**:
   (`AppInitFailed` …) may evolve while the by-value `AppNode(Counter)`
   contract stays frozen. A reference instantiation over a heap counter is
   walked into the Experimental snapshot so the surface stays reviewable.
+- `slcp.node.Node.catchupDiagnosis` with `CatchupDiagnosis`, `StallKind`, and
+  `overlay.Overlay.PeerLink` (ADR 0006): per-peer link evidence (frames,
+  envelopes, slot-state asks/answers, last-frame age against the caller's
+  window) plus one honestly-labeled local stall classification
+  (`no_quorum`, `quorum_silent`, `missing_statements`, or null = nothing
+  wrong from this seat). The quorum check uses unauthenticated Hello
+  advertisements; the field set and labels may evolve with catch-up policy.
 - `slcp.node.Node.catchupStats` and `slcp.node.CatchupStats`: a coherent
   node-local snapshot of cached own-statement count and bounds for slots at or
   below the ordered-delivery frontier, queued catch-up work, held-statement
