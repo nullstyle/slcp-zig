@@ -94,8 +94,12 @@ one. These calls are synchronous inside consensus processing.
 
 Driver purity is a consensus requirement. Results must not depend on clock,
 I/O, random data, address values, unordered iteration, or mutable process
-state. [`docs/determinism.md`](docs/determinism.md) is the operational
-checklist.
+state. The slot and nomination/ballot phase are deterministic inputs, not
+ambient state; the typed adapter exposes them as `ValueContext` when an
+application opts into the contextual `validate` signature. The per-slot
+validation cache includes that phase in its key, so arrival order cannot reuse
+a nomination verdict for a ballot check or vice versa.
+[`docs/determinism.md`](docs/determinism.md) is the operational checklist.
 
 ### Native Node module
 
@@ -116,12 +120,14 @@ watermark. Because the purge can overtake ordinary work, admission is checked
 again when an item is applied: peer and held envelopes, plus already-queued
 local nominations, cannot recreate a slot below the host's purge floor. The
 network gate fails closed if allocating its envelope metadata fails, preserving
-that floor instead of retrying the same stale statement inside the Engine. The
-floor is reconstructed from the journal frontier and explicit `start_slot`
-before restart restoration, and retired own-log records below it are skipped;
-an uncompacted disk tail therefore cannot crowd current slots out of the
-Engine's bounded live set. Subsequent delivery advances this floor
-monotonically and never lowers an explicit `start_slot` boundary.
+that floor instead of retrying the same stale statement inside the Engine.
+Restart reconstructs two related floors before restoration: the admission
+floor closes every journaled slot through the durable high-water mark, while
+the older answer floor retains at most the last 16 slots of own statements for
+lagging peers. Own-log records below the answer floor are skipped, so an
+uncompacted disk tail cannot crowd current slots out of the Engine's bounded
+live set. Subsequent delivery advances both floors monotonically and never
+lowers an explicit `start_slot` boundary.
 
 Inbound statements are gated by the delivery frontier. Eligible future
 statements inside the bounded hold window wait until prior application state
@@ -157,7 +163,9 @@ amplification path inside `Node` or consuming the writer's consensus reserve.
 `State`, `Command`, `validate`, and `apply` into a `Node` driver and delivery
 hook. `Codec(Command)` provides a deterministic encoding for supported plain
 data, while an application may supply a custom strict codec and combination
-rule.
+rule. `validate` may take either `(State, Command)` or
+`(State, Command, ValueContext)`; the latter receives the checked slot and
+nomination/ballot phase without exposing ambient time or I/O.
 
 `apply` runs in the engine's serialized flow after the externalized journal
 append and before the next input. This gives validation and application one
@@ -265,10 +273,13 @@ Recovery treats an incomplete final record as a torn tail and truncates to the
 valid prefix. A structurally complete record with a bad checksum is corruption,
 not a partial write. A validator whose own-statement history is untrustworthy
 must not continue signing. Recovery replays the retained externalized journal
-tail to the application, but restores protocol state only from own statements
-at or above the later of `start_slot` and the delivered frontier's 16-slot
-answering-window floor. This prevents up to ~80 pre-compaction slots from
-exhausting the Engine's 64-slot budget oldest-first.
+tail to the application. It restores own statements only from the later of
+`start_slot` and the delivered frontier's 16-slot answer floor, while
+independently rejecting inbound/Engine work below the later of `start_slot`
+and the journal high-water mark's successor. The bounded restore prevents up
+to ~80 pre-compaction slots from exhausting the Engine's 64-slot budget
+oldest-first; the stronger admission floor prevents a closed slot from being
+resurrected after restart.
 
 The journal is a bounded answering window, not complete application state.
 Applications with delta-like commands must persist their own snapshot and
@@ -322,7 +333,7 @@ points live in [`docs/quorum-recipes.md`](docs/quorum-recipes.md).
 | [`tests/`](tests/) | Cross-module, ABI, fuzz, liveness, and real-socket tests. |
 | [`vectors/`](vectors/) | Frozen conformance cases and trace inputs. |
 | [`tools/`](tools/) | Generation, snapshots, documentation checks, release checks, and smoke harnesses. |
-| [`examples/`](examples/) | Consumer-shaped applications over the stable interface. |
+| [`examples/`](examples/) | Consumer-shaped applications over the public typed/native interfaces. |
 
 ## Verification model
 

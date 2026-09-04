@@ -12,7 +12,8 @@ pub const tag_qset: *const [12]u8 = "SLCP-QSET-V1";
 pub const tag_gi: *const [12]u8 = "SLCP-GI-V1\x00\x00";
 pub const tag_network: *const [12]u8 = "SLCP-NET-V1\x00";
 
-/// networkId = SHA-256("SLCP-NET-V1\x00" ‖ passphraseUtf8). Pure configuration;
+/// networkId = SHA-256("SLCP-NET-V1\x00" ‖ networkBytes). Conventionally a
+/// UTF-8 passphrase, but the exact configuration bytes are accepted unchanged;
 /// mixed into every statement preimage, never transmitted (§4.2).
 pub fn networkIdFromPassphrase(passphrase: []const u8) [32]u8 {
     var h = Sha256.init(.{});

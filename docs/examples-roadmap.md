@@ -4,14 +4,15 @@ This track grows one non-financial application toward the architectural
 complexity of Stellar Core. It is a direction-setting document, not a promise
 that a future Stable interface already exists.
 
-**Status as of 2026-09-03:** E1, E2a transaction flooding, and E2b
-authenticated checkpoint catch-up are implemented. Heap state, complete
-replayable history, close time, and E3 remain designs only.
+**Status as of 2026-09-04:** E1, E2a transaction flooding, E2b authenticated
+checkpoint catch-up, and E2c deterministic ledger close time are implemented.
+Heap state, complete replayable history, and E3 remain designs only.
 
 ## Direction
 
 The application is a replicated name registry. Principals hold Ed25519 keys,
-sign sequenced transactions, and agree on transaction sets one slot at a time.
+sign sequenced transactions, and agree on ledger values containing close time
+and a transaction set one slot at a time.
 The domain contains ownership, updates, transfers, and releases, but no money,
 assets, fees, or smart contracts.
 
@@ -20,7 +21,8 @@ assets, fees, or smart contracts.
 | E1: registry | Signed transactions, sequence numbers, transaction-set consensus values, header hash chain, snapshots, local RPC and CLI | Records limitations without changing the library interface. |
 | E2a: transaction flooding | Authenticated registry transactions propagate before nomination and survive loss of their submission node once another validator has admitted them | Experimental app-message transport with bounded opt-in retention and application-owned trust, relay, and retry policy. |
 | E2b: checkpoint catch-up | A validator absent for hundreds of slots authenticates recent state and rejoins voting | Application-owned quorum attestations plus the typed node's checked state/previous-value recovery seam. |
-| E2 remainder: history and state | Heap state, complete replayable history, close time | Configurable retained history, a heap-state application path, and slot/time context. |
+| E2c: deterministic close time | Every agreed ledger carries a bounded logical timestamp and recovery preserves its exact temporal context | Optional typed `ValueContext`, a coordinated application network/storage epoch, and an explicit proposal-clock boundary. |
+| E2 remainder: history and state | Heap state and complete replayable history | Configurable retained history and a heap-state application path. |
 | E3: upgrades and operations | Voted upgrades, quotas, atomic operation sets, invariants, close metadata, watchers, HTTP | Richer typed-driver hooks, watcher delivery, and operational statistics. |
 
 ## E1 — Registry (implemented)
@@ -34,7 +36,7 @@ The shipped shape includes:
 
 - client-signed transactions with per-account sequence numbers;
 - `claim`, `set`, `transfer`, and `release` operations;
-- a canonical transaction set as each consensus value;
+- a canonical ledger value containing close time and a transaction set;
 - deterministic candidate union through a custom codec and `combine`;
 - a ledger-style header hash chain and deterministic state root;
 - an atomically written application snapshot after each applied slot;
@@ -58,8 +60,8 @@ semantics while keeping transport and operational complexity understandable.
    messages, so a transaction waited for its submission node to influence a
    nomination. E2a resolves this gap for the registry with bounded,
    best-effort transaction flooding.
-4. Typed validation does not receive the slot number. Close-time policy would
-   need it, or would need to use the raw driver.
+4. E2c resolves the typed-context gap: validation may opt into
+   `slcp.ValueContext` for the slot and nomination/ballot phase.
 5. Catch-up and missing-quorum stalls need richer operator visibility.
 
 Historical acceptance evidence for E1 is recorded in
@@ -112,9 +114,11 @@ archive. The shared archive is treated as hostile; malformed objects,
 signature/path mismatches, wrong-network data, torn files, and non-quorum
 candidates cannot become boot state. A separate trusted per-node signing fence
 rejects same-slot equivocation and signing rollback before publication.
-Snapshot V2 retains the exact transaction set externalized at the checkpoint
+Snapshot V3 retains the exact `LedgerValue` externalized at the checkpoint
 slot as authenticated context; it remains outside the replicated state root
-but is bound to the header's transaction-set hash.
+but its close time and transaction-set hash are bound to the header. E2c
+superseded the original E2b snapshot/checkpoint domains rather than
+reinterpreting them.
 
 `AppNode` gained the narrow library seam this needs without becoming a history
 system. Ordinarily `initialSlot()` must still be continued by a gap-free suffix
@@ -153,11 +157,10 @@ avoids a userspace shutdown wait, although the OS may still delay final reaping
 of a kernel-stuck call. Ordinary cleanup stops the node before joining the
 worker.
 
-At slot 0, Snapshot V2 accepts only canonical empty genesis and no history vote
-is valid. Non-genesis Snapshot V1 remains readable only as a local,
-journal-backed restart format. The external history importer requires V2 so
-the selected state always includes the exact final transaction set and can be
-installed without a trapping migration.
+At slot 0, Snapshot V3 accepts only the canonical real genesis header and no
+history vote is valid. Snapshot V3 is the sole readable format: pre-E2c V1/V2
+objects do not contain the versioned timed predecessor value and are rejected
+for both local and external recovery.
 
 Startup reads one latest pointer for each locally configured validator and
 accepts at most 16 distinct valid candidate assertions. More candidates fail
@@ -178,25 +181,71 @@ The strengthened smoke keeps one validator absent while the survivors
 externalize at least 201 new durable slots. It then kills node0, lets buffered
 work drain, freezes node1's exact head H, and recomputes the newest checkpoint
 both survivors signed no more than 15 slots behind H. The restored validator
-boots explicitly from that Snapshot V2, catches the sole remaining peer's
-exact H/hash, and is necessary to externalize transaction 8 in exactly H+1;
-the third validator then restarts and all three agree. The earlier E1 and E2a
-source-death assertions remain in the same run.
+boots explicitly from that Snapshot V3, catches the sole remaining peer's
+exact H/hash/time, and is necessary to externalize transaction 8 in the first
+later transaction-bearing ledger; any intervening ledgers must be identical,
+empty, and contiguous on both validators. The third validator then restarts
+and all three agree. The earlier E1 and E2a source-death assertions remain in
+the same run.
+
+## E2c — Deterministic ledger close time (implemented)
+
+The consensus value is now `LedgerValue { close_time, txs }`, encoded as
+`"REGISTRY-VALUE-V1\n" || close_time:u64be || TxSet`. For a local head
+`(H,T)`, validation of target slot `S` uses `d = S - H` and accepts time only
+inside `[T+d, T+60d]`; `S <= H` or an unrepresentable lower bound is invalid,
+while the upper bound saturates at `u64` maximum. The
+immediate successor must also have a transaction set valid on current state.
+A structurally sound later value is only `.maybe_valid`, because intervening
+state is not known yet. This is implemented through the optional typed
+`ValueContext` rather than a registry-specific raw driver. The engine caches
+the same value independently in nomination and ballot, so phase-sensitive
+policy does not depend on envelope arrival order.
+
+Only proposal construction reads the local Unix/POSIX clock. It clamps that
+sample to `[T+1,T+60]`; the pure driver reads no clock. Candidate combination
+chooses the minimum proposed close time and the deterministic bounded
+transaction union. The implementation proves invariance over the complete
+n-ary candidate set under permutation and duplicate candidates; it does not
+claim recursive pairwise associativity for a bounded merge pool. Application
+accepts only an immediate successor whose agreed time advances by 1..60.
+
+The operator supplies a shared genesis close time `G`. The descriptor
+`"REGISTRY-NET-V2" || G:u64be || passphrase` is both hashed for registry
+transactions and passed as the raw SLCP network configuration, so changing G
+changes the network even when the human passphrase is unchanged. Genesis is a
+real network-bound header committing to G and the empty state root. Header V2
+also commits to network id and close time; Snapshot V3 stores the exact final
+LedgerValue; checkpoint assertions use their V2 domain. These formats form a
+hard epoch: old snapshots and bare-TxSet journals are not migrated, and nodes
+must use fresh private data/signing state. Boot selection checks both local and
+authenticated heads against G's cumulative interval before installation. See
+[`ADR 0001`](adr/0001-registry-close-time-network-epoch.md).
+
+The guarantee is deliberately narrow. Consensus agrees on a monotonic logical
+time with 1..60 seconds per sequential ledger, and therefore slot `S` remains
+inside `[G+S,G+60S]`. It does not prove truthful UTC: validator proposal clocks
+are untrusted, the minimum combine biases toward the earliest legal proposal,
+and a Byzantine quorum can choose any legal chain.
+
+The integrated smoke runs validators with -30/0/+30-second proposal offsets,
+requires RPC and durable logs to agree on every observed close time, checks a
+complete contiguous time chain across the long outage and checkpoint restore,
+and proves same-passphrase/different-G startup is rejected as
+`DataDirOtherNetwork`. Focused coverage is 80 registry tests plus 18 smoke-tool
+tests.
 
 ## E2 remainder — History and state (planned)
 
-E2b is checkpoint state transfer, not a complete ledger archive: it stores no
-intermediate transaction sets or header sequence and still needs a live peer
+E2b/E2c checkpoint state transfer is not a complete ledger archive: it stores
+no intermediate ledger values or header sequence and still needs a live peer
 for the short post-checkpoint tail. Remaining work includes:
 
 - heap-sized account and name state;
-- complete replayable history containing headers and transaction sets;
+- complete replayable history containing headers and ledger values;
 - configurable Node answering history;
-- close time in the consensus value, with deterministic combination and a
-  carefully defined local-clock policy;
 - either a heap-aware typed application interface or a first-class raw-driver
   recipe;
-- opt-in slot context for typed validation;
 - explicit visibility into dropped far-ahead statements and peer state.
 
 ## E3 — Upgrades and operations (planned)

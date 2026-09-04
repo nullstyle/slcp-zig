@@ -1,5 +1,5 @@
 //! app.zig — the `slcp.AppNode` adapter for the registry
-//! (docs/examples-roadmap.md E1–E2b).
+//! (docs/examples-roadmap.md E1–E2c).
 //!
 //! The pure state machine lives in `registry.zig`; this file is the glue the
 //! typed layer needs: the `App` contract (`State`, `Command`, contextual `validate`,
@@ -33,7 +33,8 @@ pub const Registry = struct {
         };
     }
 
-    /// The large-state shape: the ~20 KB State is updated in place.
+    /// The large-state shape: the ~27 KB State (including its last
+    /// LedgerValue) is updated in place.
     pub fn apply(state: *State, cmd: Command) void {
         registry.apply(state, &cmd);
     }

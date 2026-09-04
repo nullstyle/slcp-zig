@@ -32,19 +32,21 @@ for the state machines, not a peer.
 ## 1. networkId
 
 Source: `src/crypto.zig` (`networkIdFromPassphrase`, `tag_network`).
-Vector: `vectors/crypto.json` → `networkIds` (3 cases; e.g. passphrase
+Vector: `vectors/crypto.json` → `networkIds` (3 cases; e.g. configuration
 `"my-counter-app v1"` → `ba521500e3f3a00474d967e35089ee77e3ea0c1a628d25e1952a72f7e864a9dd`).
 
 ```
-networkId = SHA-256("SLCP-NET-V1\x00" ‖ passphraseUtf8)
+networkId = SHA-256("SLCP-NET-V1\x00" ‖ networkBytes)
 ```
 
-- The passphrase is pure configuration (`Node.Options.network`). The 32-byte
-  networkId is mixed into every statement digest (§4) and **never
-  transmitted**.
+- `Node.Options.network` is an exact byte string: conventionally a human
+  passphrase, but an application may use a canonical binary descriptor that
+  also binds its schema or genesis configuration. No Unicode normalization or
+  other transformation occurs. The 32-byte networkId is mixed into every
+  statement digest (§4) and **never transmitted**.
 - `Hello.networkIdPrefix` carries only the **first 8 bytes** (§12) — a fast
   wrong-network disconnect, not a secret and not authentication.
-- The empty passphrase is legal at this layer (vector case 3); `Node.create`
+- Empty network bytes are legal at this layer (vector case 3); `Node.create`
   refuses it (`NetworkPassphraseEmpty`) because it is never what a user means.
 
 ## 2. Domain-tag registry
@@ -866,7 +868,9 @@ or history must own it above this seam.
 §9.2's request_qset bullet):
 
 - `broadcast_envelope` → send to **all** connected peers.
-- Inbound `envelope` → **gated by the delivery frontier** (M6 S8b,
+- Inbound `envelope` → first gated by the monotonic admission/purge floor:
+  a slot below it is consumed without entering the Engine. At or above that
+  floor it is **gated by the delivery frontier** (M6 S8b,
   `node.zig` `HoldBuffer.admit` / `releaseHeld` / `releaseSlot` — the
   stellar-core Herder shape, `processSCPQueueUpToIndex(lcl + 1)`): a
   statement of **any kind, EXTERNALIZE included,** for a slot above
@@ -899,8 +903,8 @@ or history must own it above this seam.
   and this node's vote on it can never be needed: judging it against a
   stale state is harmless. A lone signer's EXTERNALIZE — the case that
   halted a 3-of-4 network in the S8b review — is never v-blocking and waits
-  like everything else. Statements for the frontier slot and anything
-  behind it are always fed.
+  like everything else. Statements for the frontier slot and anything behind
+  it are fed only while they remain at or above the admission floor.
 - Fed `envelope` → `envelope_received` input → the engine emits
   `forward_envelope` iff the envelope advanced per-node freshness (§10) →
   relay to all peers **except the source**. Engine freshness *is* the dedup;
@@ -1013,15 +1017,16 @@ crash is inert and a restart needs no cleanup. On a filesystem without lock
 support the node logs a warning and starts unguarded.
 
 **Restart order** (`Node.create`, M6 S3): (1) the delivery frontier comes
-from the journal high-water mark; (2) before restoring Engine state, the host
-reconstructs its monotonic purge floor as
-`max(start_slot, F − 15)` when the delivered frontier `F >= 16` (otherwise
-`start_slot`); (3) the complete retained journal tail is replayed to the app
-through the single delivery chokepoint in ascending slot order; (4) only
-`own.log` latest records at or above that floor are fed as
+from the journal high-water mark `F`; (2) before restoring Engine state, the
+host reconstructs an answer floor of `max(start_slot, F − 15)` when `F >= 16`
+(otherwise `start_slot`) and a stronger admission/purge floor of
+`max(start_slot, F + 1)`; (3) the complete retained journal tail is replayed
+to the app through the single delivery chokepoint in ascending slot order;
+(4) only `own.log` latest records at or above the answer floor are fed as
 `restore_own_envelope` inputs; (5) go live: listen, engine thread,
 anti-entropy thread. An explicit `start_slot` declares every lower slot out of
-scope even when the journal is empty.
+scope even when the journal is empty. When no journal exists, both floors
+begin at `start_slot`.
 
 The Experimental recovery seam runs inside that startup boundary. After the
 store has recovered its high-water mark and gap-free journal suffix, but
@@ -1058,24 +1063,29 @@ cannot persist must go silent. `externalized` → append + fsync
 `externalized.log` → deliver to the app.
 
 **GC / answering window**: `purge_window = 16`. When the delivered frontier
-`F >= 16`, the node issues `purge_slots(F − 15)` on every delivery and, each
+`F >= 16`, the node advances its answer floor to `F − 15` and, each
 time `F` enters a new 64-slot bucket since the last compaction (so a
 multi-slot catch-up drain that steps over a multiple of 64 still counts),
 compacts both logs to `slot >= F − 15` (atomic temp-file + fsync +
 rename-over). So between compactions a log holds between 16 and ~80 slots,
 and a restart replays the whole retained **journal** tail to the application
 (dedup by slot in the app, design §8.5), while old `own.log` records below
-the reconstructed startup floor are skipped before Engine restoration. This
+the reconstructed answer floor are skipped before Engine restoration. This
 prevents an uncompacted ~80-slot tail from filling the 64-slot Engine budget
 oldest-first and excluding current protocol state.
-A native node publishes the later of its current floor and `F − 15` before
-it queues the priority Engine purge. The floor never retreats, including when
-an explicit `start_slot` is later than the first answering-window calculation.
+A native node independently keeps the admission/purge floor at least as new
+as the durable journal's successor, and publishes the later of that floor and
+`F − 15` before it queues the priority Engine purge. Neither floor retreats,
+including when an explicit `start_slot` is later than the first
+answering-window calculation.
 Late peer envelopes, entries already in the hold buffer, and local nominations
-that the purge overtook in the ordinary queue are all checked against that
-floor at apply time and consumed when their slot is lower. This prevents stale
-work from recreating a just-purged slot and producing fresh state for old
-history.
+that the purge overtook in the ordinary queue are all checked against the
+admission floor at apply time and consumed when their slot is lower. This
+prevents stale work from recreating a journal-confirmed or just-purged slot and
+producing fresh state for old history. Own EXTERNALIZE statements between the
+answer and admission floors remain restored Engine slots for answering a
+lagging peer, but the admission gate prevents them from accepting new peer or
+local work and from advancing old history.
 A catch-up gap wider than the window is declared unrecoverable and skipped
 loudly; held statements (§12) for the skipped range are dropped with it,
 and the new frontier slot's held statements are released.

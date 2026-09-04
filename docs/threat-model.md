@@ -89,14 +89,17 @@ visible through `Node.ingressStats()`. Admission fails closed under host
 allocation pressure, including hold-gate metadata decoding, so an old envelope
 cannot bypass the floor through a second parse attempt. A coalesced purge
 watermark lives outside those budgets and overtakes the FIFO. The host therefore rechecks its
-monotonic purge floor when applying queued work: late peer or held envelopes
+monotonic admission/purge floor when applying queued work: late peer or held envelopes
 and an overtaken local nomination cannot recreate a retired slot. This
 apply-time check is essential—enqueue-time admission can become stale while
 the item waits behind attacker-controlled traffic. On restart, the same floor
-is reconstructed from the journal high-water mark and explicit `start_slot`
-before any own statement is restored or network input is accepted. Own-log
-records below it are skipped, so an uncompacted disk tail cannot consume the
-Engine slot budget with retired history.
+is reconstructed as the successor of the journal high-water mark (or a later
+explicit `start_slot`) before any own statement is restored or network input
+is accepted. A separate answer floor retains only the last 16 own-statement
+slots; records below that older floor are skipped, so an uncompacted disk tail
+cannot consume the Engine slot budget with retired history. Retained answers
+below the admission floor can be sent to a lagging peer but cannot reactivate
+local consensus state.
 
 The separate application-message inbox is lazy and global, not one allocation
 per connection. Until the application first calls `waitAppMessage`, received
@@ -428,10 +431,11 @@ writes without stopping consensus.
   untrusted and the node runs as a **watcher for its lifetime** (v1
   as-built) — it can never emit a statement older than one it already
   broadcast, because it never emits.
-- **Uncompacted valid tail**: recovery derives the same 16-slot answering
-  floor used during live delivery (or the later explicit `start_slot`) and
-  restores only own statements at or above it. The full retained externalized
-  journal tail is still replayed to the application for slot-level dedup.
+- **Uncompacted valid tail**: recovery derives the same 16-slot answer floor
+  used during live delivery (or the later explicit `start_slot`) and restores
+  only own statements at or above it. It separately closes Engine admission
+  through the journal high-water mark. The full retained externalized journal
+  tail is still replayed to the application for slot-level dedup.
 - Cost: every own emission pays a disk sync (`fsync`, plus `F_FULLFSYNC` on
   macOS for the key file). On slow disks this throttles ballot rounds
   (design §16); acceptable at seconds-scale slots.
@@ -492,15 +496,38 @@ importing process's normalized local quorum set. No threshold or quorum set
 stored in the archive is trusted. A validator must itself be a member of that
 local set before it may publish.
 
-At every non-genesis slot, Registry Snapshot V2 carries the exact transaction
-set at the checkpoint slot. The set is not part of the replicated state root,
-but import decodes it canonically and binds its hash to the signed ledger header
-before `AppNode` uses it as the next nomination's previous value. Slot 0 is
-only canonical empty genesis (all-zero header, no set) and is never a history
-checkpoint. Non-genesis V1 snapshots remain readable for ordinary local
-journal-backed restart, but the history importer rejects them: an externally
-selected state must carry its own exact predecessor value and be directly
-installable as V2.
+At every non-genesis slot, Registry Snapshot V3 carries the exact
+`LedgerValue`—close time plus transaction set—at the checkpoint slot. The
+value is not part of the replicated state root, but import decodes it
+canonically and binds both its time and transaction-set hash to the signed
+ledger header before `AppNode` uses it as the next nomination's previous
+value. Slot 0 is a real network-bound header committing to configured genesis
+time G and the empty state root, with zero previous/transaction hashes; it has
+no predecessor value and is never a history checkpoint. Snapshot V3 is the
+sole accepted format. Pre-E2c V1/V2 snapshots cannot preserve this timed
+context and are rejected for local and external recovery. Checkpoint votes use
+the `REGISTRY-CKPT-V2` domain. Boot selection independently checks both local
+and authenticated heads against configured G's cumulative time interval before
+either can be installed.
+
+Close time is authenticated agreement, not trustworthy UTC. For every
+sequential ledger it must advance by 1..60 seconds. Contextual validation
+directly bounds target S relative to local head `(H,T)` by
+`[T+(S-H),T+60(S-H)]`; induction from accepted genesis yields the cumulative
+reachable interval `[G+S,G+60S]` whenever its lower endpoint is representable.
+Only construction of a validator's own proposal samples its Unix clock, then
+clamps it to the legal successor range; driver validation, combination,
+application, and replay do not read ambient time. Proposal clocks are
+untrusted, minimum-time combination favors the earliest legal candidate, and
+a Byzantine quorum can choose any legal chain. Consumers must not treat the
+field as a secure timestamp oracle.
+
+The `(passphrase, G)` pair and all E2c encoding domains form a hard application
+epoch. Changing G creates a different raw SLCP and registry network, even with
+the same human passphrase. Legacy journals, snapshots, checkpoint votes, and
+private signing-fence state are not eligible for this epoch; validators use a
+fresh private data directory. Reusing a shared archive root only selects a new
+network-id namespace and provides no state migration.
 
 The adapter divides storage into two custody classes:
 
@@ -573,11 +600,11 @@ will not certify conflicting registry histories.
 
 Finally, these are state checkpoints, not full history. A recovered checkpoint
 must be no more than 15 slots behind a live peer, which supplies and agrees the
-short successor tail. There is no archive of every header and transaction set,
+short successor tail. There is no archive of every header and ledger value,
 no independent ancestry replay, and no guarantee of recovery when the archive
 withholds data or no suitable live peer remains. An unrecoverable gap observed
 while the registry is already running still stops that process rather than
-applying a discontinuous transaction set.
+applying a discontinuous ledger value.
 
 ## 9. Out of scope
 

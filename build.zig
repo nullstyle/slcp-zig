@@ -735,14 +735,14 @@ pub fn build(b: *std.Build) void {
     example_smoke_tests_step.dependOn(&run_example_smoke_tests.step);
     test_step.dependOn(&run_example_smoke_tests.step);
 
-    // ===== E1-E2b:registry =====
-    // Examples-track stage anchor (registry through authenticated checkpoint
-    // recovery; docs/examples-roadmap.md acceptance gates):
+    // ===== E1-E2c:registry =====
+    // Examples-track stage anchor (registry through deterministic close time
+    // and authenticated recovery; docs/examples-roadmap.md acceptance gates):
     // registry-intree compile, registry-tests, the registry_smoke tool and
     // its run steps. Insert under this anchor only; never above it.
     // Keep the blank line between anchors so parallel stages merge cleanly.
 
-    // registry-intree: the E1-E2b program (examples/registry/src/main.zig)
+    // registry-intree: the E1-E2c program (examples/registry/src/main.zig)
     // compiled against the in-tree `slcp` module. NOT installed and never
     // run here (it listens, dials its peers and serves an RPC): `zig build
     // test` proves the published program still compiles.

@@ -1,5 +1,5 @@
 //! registry-smoke — examples/registry run for real
-//! (docs/examples-roadmap.md "E1 — Registry" acceptance gates).
+//! (docs/examples-roadmap.md E1–E2c acceptance gates).
 //!
 //! Builds `examples/registry` ONCE as a consumer package — a nested
 //! `zig build -Doptimize=ReleaseSafe` of a scratch copy with this repo as a
@@ -13,12 +13,13 @@
 //! submitted to the restarted node lands everywhere. It is then killed for
 //! at least 201 slots, restored from a quorum-certified history checkpoint inside
 //! the 16-slot answering window, and shown to be a necessary voter for the
-//! exact next transaction-bearing slot. The validators deliberately propose
+//! first later transaction-bearing slot (with any intervening ledgers proved
+//! empty and identical). The validators deliberately propose
 //! from wall clocks skewed by -30/0/+30 seconds; every RPC and durable slot log
 //! must agree on close time, and every observed adjacent ledger must advance it
-//! by 1..60 seconds. Checkpoint boot, exact-H catch-up, and H+1 are all pinned
-//! to that same temporal chain. Before the first crash the
-//! nodes form the deliberate line node2→node1→node0. One transaction is
+//! by 1..60 seconds. Checkpoint boot, exact-H catch-up, and the complete post-H
+//! continuation are all pinned to that same temporal chain. Before the first
+//! crash the nodes form the deliberate line node2→node1→node0. One transaction is
 //! submitted only to nomination-disabled node2; `head pending=1` proves it
 //! crossed one and two overlay hops while both survivors remain at slot S,
 //! then their `slot S+1: txs=1` lines prove it survived node2's SIGKILL and
@@ -89,8 +90,8 @@ const survivor_heartbeat_ms = "500";
 /// `(pending && busy_min) || heartbeat` bug advances during this interval.
 const pending_cadence_guard_ms: u64 = 1000;
 /// The history-rejoining node must co-vote with the sole survivor through the
-/// short retained tail, but a one-second heartbeat leaves a deterministic
-/// window in which the harness can observe H and submit tx8 for exactly H+1.
+/// short retained tail. A one-second heartbeat keeps the post-H transaction
+/// close while the harness permits and proves any already-due empty ledgers.
 const rejoin_heartbeat_ms = "1000";
 const disabled_cadence_ms = "18446744073709551615";
 const checkpoint_every = "8";

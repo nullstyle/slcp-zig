@@ -1153,10 +1153,27 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
         const version = parseManifestVersion(zon) orelse "";
         rep.checkFmt(version.len > 0, "build.zig.zon", 0, ".version parses", .{}, "no `.version = \"…\"`", .{});
         const pin = try std.fmt.allocPrint(arena, "refs/tags/v{s}.tar.gz", .{version});
-        for ([_][]const u8{ "README.md", "examples/counter/README.md", "examples/registry/README.md" }) |p| {
+        // Only released/package-compatible guides promise a tag install. The
+        // registry guide tracks current feature work and deliberately builds
+        // from this checkout until a release contains its Experimental APIs.
+        for ([_][]const u8{ "README.md", "examples/counter/README.md" }) |p| {
             const text = for (docs) |d| (if (std.mem.eql(u8, d.path, p)) break d.text) else "";
             rep.checkFmt(std.mem.indexOf(u8, text, pin) != null, p, 0, "install pin `{s}` present", .{pin}, "the tarball pin must name build.zig.zon's .version", .{});
         }
+        const registry_text = for (docs) |d| (if (std.mem.eql(u8, d.path, "examples/registry/README.md")) break d.text) else "";
+        const registry_unreleased_warning = try std.fmt.allocPrint(
+            arena,
+            "future revision that contains E2c rather than the v{s} package",
+            .{version},
+        );
+        rep.check(
+            std.mem.indexOf(u8, registry_text, pin) != null or
+                std.mem.indexOf(u8, registry_text, registry_unreleased_warning) != null,
+            "examples/registry/README.md",
+            0,
+            "current tag pin or unreleased E2c install warning present",
+            "pin the manifest version once it contains E2c; until then, say that its package lacks the example's Experimental APIs",
+        );
         for (docs) |doc| {
             const hits = try scanTagPins(arena, doc.text);
             for (hits) |h| rep.checkFmt(std.mem.eql(u8, h.version, version), doc.path, h.line, "tag pin v{s} is current", .{h.version}, "build.zig.zon says {s}", .{version});

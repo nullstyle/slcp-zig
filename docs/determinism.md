@@ -26,8 +26,12 @@ driver, this checklist, the double-call check, and the sim harness.
 For `validate`, `apply`, `combine`, a custom `encode` / `decode`, and any raw
 `Driver` function:
 
-1. **No clock, no time.** Not `std.time`, not a slot-to-wallclock mapping,
-   not "reject if older than an hour". Slots are your only clock.
+1. **No local clock reads inside the driver.** Deterministic time carried in
+   state or a consensus value is ordinary integer data, and the checked slot
+   may be read from `slcp.ValueContext`. A process may sample its wall clock
+   outside the driver to construct its own proposal; `validate`, `combine`,
+   and `apply` must judge that proposal only from replicated state, value, and
+   context. Never derive a supposedly shared timestamp from a local clock.
 2. **No floats.** The auto-codec rejects float fields at compile time
    (`src/node/app_node.zig`: "floats are NONDETERMINISTIC across nodes (NaN
    payloads, ±0, platform math differences)"). Do not compute with them
@@ -40,12 +44,14 @@ For `validate`, `apply`, `combine`, a custom `encode` / `decode`, and any raw
 5. **No pointer-value logic.** Never compare, hash, or order by address; do
    not let allocation success or failure change a verdict.
 6. **No global mutable state.** A verdict must depend only on `(state,
-   value)` — not on how many times you were called, what the previous slot
-   was, or a cache warmed by another thread. (Memoization is fine only if it
-   cannot change an answer.)
-7. **Total functions.** `combine` must succeed on **any** candidate set and
-   return something that validates `.valid`. `validate` must return a
-   verdict for **any** byte string of legal length — `.invalid` for
+   value, context)` — not on how many times you were called or a cache warmed
+   by another thread. `ValueContext.slot` and `.phase` are supplied by the
+   host and are deterministic inputs. (Memoization is fine only if it cannot
+   change an answer.)
+7. **Total functions.** `combine` must succeed on **any** non-empty candidate
+   set and return something its own validator does not judge `.invalid`;
+   `.maybe_valid` is permitted when local state is behind. `validate` must
+   return a verdict for **any** byte string of legal length — `.invalid` for
    garbage, never a panic or a fault.
 8. **Same binary on every node.** Compiler version, target, optimization
    mode and `Command` declaration all shape the bytes; a mixed fleet is a
@@ -61,10 +67,11 @@ For `validate`, `apply`, `combine`, a custom `encode` / `decode`, and any raw
   the `externalized.log` append and before any later input reaches the
   driver (`src/node/app_node.zig`, `src/node/node.zig` `deliverSlot`).
   While it runs, no envelope is processed and no timer fires. Keep it small.
-- `validate` runs on the engine thread **once per distinct value per slot**
-  — the engine caches verdicts by `SHA-256(value)` (`src/engine/values.zig`)
-  — inside envelope processing. A slow `validate` slows every peer's
-  statement you receive.
+- `validate` runs on the engine thread **once per distinct value, protocol
+  phase, and slot while its verdict is cached** — the engine keys verdicts by
+  `SHA-256(protocol-phase byte || value)` (`src/engine/values.zig`) —
+  inside envelope processing. A slow `validate` slows every peer's statement
+  you receive.
 - `combine` runs on the engine thread each time the candidate set grows
   (`src/engine/nomination.zig`, the `new_candidates` branch), over the
   sorted-unique candidates (≤ 64). An empty or oversized result is a fatal
@@ -101,7 +108,7 @@ externalized value. The simulator constructs each engine with
 through the scenarios, change that one argument to your vtable and re-run
 `zig build sim-matrix` (or a single cell with `zig build sim -- --seed=N
 --nodes=N --scenario=name`). A driver that depends on anything outside
-`(state, value)` breaks the byte-identical replay.
+`(state, value, context)` breaks the byte-identical replay.
 
 **(b) `slcp.core.driver.Checked`** (`src/driver.zig`, design §7.3 (b)
 as-built): a wrapper that forwards every `validate_value` and
@@ -148,6 +155,12 @@ Ship one artifact and follow `docs/driver-upgrade.md` §5.
 | Node goes **inert** with `EngineFailed` / `DriverFault` | `combine` not total, or `DriverFault` returned for a mere invalid value (rule 7); under `AppNode`, also a `combine` whose result its own `validate` judges `.invalid` — the log line names the App (`... combine returned a Command that its own validate judges .invalid`) |
 | Network **stalls on the first slot**, no halt, no error log, `insane` rising in every node's `stats()` | a bytes-level `combine` whose composite peers reject as invalid (rule 7): each node ballots a value nobody accepts. `AppNode` turns this into `DriverFault` (row above); a hand-written driver must validate its own composite |
 | `AppNode.create` fails with `UndecodableExternalizedValue` | `Command` layout changed under an existing `data_dir` (`docs/driver-upgrade.md` §5) |
-| Verdicts flip when a peer reconnects or after a long idle | verdict depends on call history or a cache (rule 6); note the engine only asks once per value per slot, so a "second" call is a different slot |
+| Verdicts flip when a peer reconnects or after a long idle | verdict depends on call history or a cache (rule 6); while cached, the engine asks once per value, protocol phase, and slot, so a "second" call is for a different phase or slot |
 | Slot rate collapses after adding a feature to `apply` | hot-path work that belongs on the user thread (§3) |
-| Everything agrees in `zig build sim-matrix` and forks on real hardware | wall clock, hostname, env, or a platform-dependent library call (rules 1, 4) — the simulator has no clock to disagree about |
+| Everything agrees in `zig build sim-matrix` and forks on real hardware | a driver-local wall clock, hostname, env, or a platform-dependent library call (rules 1, 4) — the simulator has no ambient clock to disagree about |
+
+The registry example is the worked time-bearing case. Its process samples
+Unix time only while constructing a proposal. The pure driver validates the
+proposed close time against a slot-derived interval rooted in the replicated
+previous close time, combines candidates by choosing their minimum time, and
+applies the agreed integer without consulting the machine clock.

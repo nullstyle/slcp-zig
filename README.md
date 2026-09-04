@@ -121,9 +121,10 @@ pub fn main(init: std.process.Init) !void {
 What the program relies on:
 
 - **`AppNode(App)` checks the contract at compile time.** `App` declares a
-  `State`, a `Command`, a pure `validate(state, cmd) slcp.Validity` and a
+  `State`, a `Command`, a pure `validate(state, cmd) slcp.Validity` (or the
+  contextual `validate(state, cmd, context: slcp.ValueContext)` shape) and a
   pure `apply(state, cmd) State` (optionally `combine`, `initialState`,
-  `initialSlot`, and
+  `initialSlot`, `initialCommand`, and
   an `encode`/`decode` pair). Every violation is a teaching compile error
   with the wanted signature, not a vtable type mismatch.
 - **`slcp.Codec(Command)` derives the wire encoding**: fields in declaration
@@ -335,7 +336,7 @@ mise exec -- zig build test
 | `zig build e2e` | The 4-node real-socket cluster: 200 slots, kill/restart (with a gap-jump and a rejoin-voting check), partition/heal, one equivocator, and two nodes restarting together three times. About two and a half minutes. |
 | `zig build liveness-tests` | Part of `test`: real engines through the real `AppNode` driver on a deterministic bus, with the node's hold gate in front of each — the double-crash schedules that halt without the gate and converge with it. |
 | `zig build example-smoke` | Builds `examples/counter` three times as a consumer package and runs the three counters over loopback with a `SIGKILL` + restart. Not part of `test`. |
-| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, ordinary restart, then quorum-authenticated checkpoint recovery after one validator misses at least 201 slots and its necessary vote in the exact next transaction slot. Not part of `test` (which runs `registry-tests`, the example's own tests). |
+| `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three skewed-clock registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, deterministic close-time agreement, ordinary restart, then quorum-authenticated checkpoint recovery after one validator misses at least 201 slots and its necessary vote in the first later transaction-bearing ledger. It also proves the timed ledger chain and hard network epoch. Not part of `test` (which runs `registry-tests`, the example's own tests). |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
 | `zig build sim-matrix` / `zig build byz-matrix` | The full 1000-seed simulation and Byzantine matrices (long). |
@@ -418,7 +419,8 @@ in [`docs/stability.md`](docs/stability.md).
   unreleased, and current worktree state, including the verification ledger.
 - [`docs/examples-roadmap.md`](docs/examples-roadmap.md) — E1's registry,
   E2a's bounded transaction flooding, E2b's authenticated checkpoint catch-up,
-  and the remaining E2/E3 path toward state, upgrades, and operations.
+  E2c's deterministic ledger close time, and the remaining E2/E3 path toward
+  state, history, upgrades, and operations.
 - `docs/protocol.md` — the normative byte-level definition of SLCP v1 as a
   citation index: domain tags, canonical form, quorum sets, leader election,
   frozen limits, statement sanity, the engine boundary, overlay and
@@ -438,8 +440,9 @@ in [`docs/stability.md`](docs/stability.md).
 - `examples/counter/README.md` — the three-VPS deployment walkthrough.
 - `examples/registry/README.md` — the second example: signed sequenced
   transactions, bounded pre-nomination flooding that survives source death
-  once propagated, transaction sets as the value, a ledger header hash chain,
-  snapshots, localhost RPC, and CLI.
+  once propagated, close-time-plus-transaction-set ledger values, a timed
+  header hash chain, authenticated checkpoint recovery, localhost RPC, and
+  CLI.
 - `vectors/` — the cross-implementation conformance vectors; when prose and
   vectors disagree, the vectors win.
 
@@ -463,7 +466,8 @@ tests/                     vector replay, framing vectors, engine e2e, fuzz, ABI
 tools/                     vector generator, API snapshot, example-smoke, registry-smoke, docs-smoke
 vectors/                   conformance vectors (the definition; prose is commentary)
 examples/                  counter/ (the §0 program as a consumer package), bytes_node.zig,
-                           registry/ (signed transactions, tx sets, a header chain; a consumer package)
+                           registry/ (signed transactions, timed ledger values, a header chain;
+                           a consumer package)
 docs/                      the documents listed above + the API snapshots
 ```
 

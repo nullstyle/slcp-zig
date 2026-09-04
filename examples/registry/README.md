@@ -1,15 +1,15 @@
-# registry — signed transactions, transaction sets and a header chain on slcp
+# registry — signed transactions, timed ledger values and a header chain on slcp
 
-The second example, now covering E1, E2a transaction flooding, and E2b
-authenticated checkpoint catch-up from the examples roadmap: a **replicated
-name registry** with the shape of
-stellar-core and none of the money. Principals hold Ed25519 keys and sign
-transactions that carry a per-account sequence number; accepted transactions
-flood between validators before nomination; each slot's value is a
-**transaction set**; a node applies the agreed set to a bounded, sorted state
-and advances a ledger **header hash chain**; the state is snapshotted after
-every slot; a localhost **RPC** takes transactions from a small CLI. Three
-nodes, three processes, one binary.
+The second example covers E1, E2a transaction flooding, E2b authenticated
+checkpoint catch-up, and E2c deterministic close time from the examples
+roadmap: a **replicated name registry** with the shape of stellar-core and none
+of the money. Principals hold Ed25519 keys and sign transactions that carry a
+per-account sequence number; accepted transactions flood between validators
+before nomination; each slot's **ledger value** contains an agreed close time
+and transaction set; a node applies it to a bounded, sorted state and advances
+a timed ledger **header hash chain**; the state is snapshotted after every
+slot; a localhost **RPC** takes transactions from a small CLI. Three nodes,
+three processes, one binary.
 
 Where `examples/counter` is the 40-line program, this one is five files:
 
@@ -26,8 +26,8 @@ limits are printed at startup; the transport/gossip bounds are fixed in code:
 
 | Limit | Value |
 |---|---|
-| transactions per set | 32 (a full set is 7521 bytes; the node raises `max_value_bytes` to 8192) |
-| accounts / names | 64 / 128 (bounded plain-data state, about 20 KB) |
+| transactions per set | 32 (a full set is 7521 bytes; a full tagged ledger value is 7547 bytes; the node raises `max_value_bytes` to 8192) |
+| accounts / names | 64 / 128 (about 19 KB serialized state-root payload; about 27 KB in-memory State including its last LedgerValue) |
 | name / value | `[a-z0-9-]`, 1..32 bytes / any bytes, 0..64 |
 | pending queue | 256 |
 | application-message payload / inbox | 64 KiB / 1024 messages or 16 MiB (lazy opt-in, best effort) |
@@ -42,29 +42,43 @@ limits are printed at startup; the transport/gossip bounds are fixed in code:
 `seq` (u64, 1 to 2⁶⁴−2), `op` (claim · set · transfer · release), a name, a value,
 a `to` key, and a 64-byte signature over
 `SHA-256("REGISTRY-TX-V1" ‖ network_id ‖ the 171 unsigned bytes)` where
-`network_id = SHA-256("REGISTRY-NET-V1" ‖ the --network passphrase)`. That
-digest is the transaction id. A transaction signed for one passphrase is
-invalid on every other network. Every field has exactly one canonical
-spelling (zero padding, per-op rules), so a set decodes to null or to the
-one transaction its bytes mean.
+`network_id = SHA-256("REGISTRY-NET-V2" ‖ G:u64be ‖ the --network
+passphrase)` and `G` is `--genesis-close-time`. That digest is the transaction
+id. A transaction signed for one `(passphrase, G)` pair is invalid on every
+other registry network. Every field has exactly one canonical spelling (zero
+padding, per-op rules), so a set decodes to null or to the one transaction its
+bytes mean.
 
-**Transaction sets.** The value the network agrees on: a count byte and up
-to 32 transactions, strictly ascending by (source, seq). The empty set is
-the single byte `00`, a legal value, so idle slots close. This is a custom
-codec (`encode` / `decode` on the app) because the auto-codec cannot encode
+**Ledger values and transaction sets.** A `TxSet` is a count byte and up to
+32 transactions, strictly ascending by (source, seq); its canonical empty
+form is the single byte `00`. The consensus value is
+`LedgerValue { close_time, txs }`, encoded exactly as
+`"REGISTRY-VALUE-V1\n" ‖ close_time:u64be ‖ TxSet`. The disjoint tag prevents
+old bare-TxSet bytes from acquiring a new meaning. This is a custom codec
+(`encode` / `decode` on the app) because the auto-codec cannot encode
 variable-length data.
 
-**`validate`.** Every signature verifies; per source the sequence numbers
-form a contiguous run starting at the account's `seq + 1` (a run that starts
-*ahead* is `.maybe_valid` — this node may be behind — never `.invalid`; a
-replay or a gap inside a run is `.invalid`); a new source when the account
-table is full is `.invalid`.
+**`validate`.** Let the local head be slot/time `(H,T)`, the checked slot be
+`S`, and `d = S-H`. `S <= H` is invalid. The proposed close time must lie in
+`[T+d,T+60d]`; an unrepresentable lower bound is invalid and the upper bound
+saturates at `u64` maximum. Every signature verifies; per source the sequence
+numbers form a contiguous run starting at the account's `seq + 1` (a replay
+or gap inside a run is invalid), and a new source when the account table is
+full is invalid. For the immediate successor, a run starting ahead is invalid
+because it cannot apply now. A structurally sound value for a later slot is
+`.maybe_valid` because this node does not yet know the intervening state.
+`App.validate` receives `S` through `slcp.ValueContext`; it reads no clock.
 
-**`combine`.** The union of every candidate set, deduplicated by (source,
-seq), sorted, filtered to what applies cleanly on this state, capped at 32.
-Two nodes proposing different transactions for one slot get both applied.
+**`combine`.** The minimum candidate close time plus the union of every
+candidate set, deduplicated by (source, seq), sorted, filtered to what applies
+cleanly on this state, capped at 32. Two nodes proposing different
+transactions for one slot get both applied. The result is invariant under
+permutation and duplicate candidates as one n-ary operation; the bounded pool
+does not promise recursive pairwise associativity.
 
-**`apply`.** In set order: the account's `seq` becomes the transaction's,
+**`apply`.** Only a clean immediate successor whose close time is in
+`(T,T+60]` changes state. In set order: the account's `seq` becomes the
+transaction's,
 **even when the operation fails** (stellar-core's rule; it is what keeps
 `validate` and `apply` in agreement), then the operation runs — `claim` a
 free name, `set` its value or `transfer` it or `release` it as its owner —
@@ -72,29 +86,32 @@ and its result (`ok`, `name_taken`, `not_owner`, `no_such_name`,
 `registry_full`) is recorded. Then the header advances:
 `slot += 1`, `prev_hash = hash`, `txset_hash = SHA-256(set)`,
 `state_root = SHA-256(the sorted accounts and names)`,
-`hash = SHA-256("REGISTRY-HDR-V1" ‖ slot ‖ prev_hash ‖ txset_hash ‖ state_root)`.
+`hash = SHA-256("REGISTRY-HDR-V2" ‖ network_id ‖ slot ‖ close_time ‖
+prev_hash ‖ txset_hash ‖ state_root)`.
 Three nodes that applied the same history print the same `head`.
 
 **Snapshots, checkpoints, and restart.** After every applied slot the node
 writes `<data-dir>/snapshot` with a random temporary file → write → `fsync`
 and successful `F_FULLFSYNC` on macOS → atomic replace → data-directory
-`fsync`. At every non-genesis slot, Snapshot V2 contains the header, state,
-exact transaction set agreed at that slot, and checksum; the set is outside
-`state_root` but bound to `txset_hash`. Slot 0 accepts only canonical empty
-genesis with an all-zero header and no set. On an ordinary restart it reads
-that snapshot into
-`initialState()`, names its slot in `initialSlot()`, exposes the set through
-`initialCommand()`, and the library replays only newer journal slots. A node
-that returns within the library's 16-slot answering window catches up from
-peers in the usual way. Non-genesis Snapshot V1 remains readable only for local
-journal-backed restart; external history accepts V2 only, because the imported
-state must carry its own exact final transaction set. Slot 0 is never a history
-checkpoint.
+`fsync`. Snapshot V3 contains the header, state, exact `LedgerValue` agreed at
+that slot, and checksum; the value is outside `state_root`, while its time and
+transaction-set hash are bound to the header. Slot 0 has no predecessor value
+but does have a real header: it commits to the network id, `G`, and empty state
+root with zero previous/transaction hashes. On an ordinary restart the node
+reads that snapshot into `initialState()`, names its slot in `initialSlot()`,
+exposes the exact ledger value through `initialCommand()`, and the library
+replays only newer journal slots. A node that returns within the library's
+16-slot answering window catches up from peers in the usual way. Snapshot V3
+is the sole accepted format; pre-E2c V1/V2 snapshots lack the timed predecessor
+value and are rejected. Before selecting either a local or authenticated boot
+state, the process also requires slot zero to equal configured G exactly and a
+later head to remain inside the cumulative `[G+slot,G+60·slot]` interval.
+Slot 0 is never a history checkpoint.
 
 `--history-dir <dir>` adds long-outage recovery without trusting that shared
 directory. At each `--checkpoint-every N` boundary (default 8, allowed 1..16)
 a validator signs
-`SHA-256("REGISTRY-CKPT-V1" || network_id || slot || head_hash || snapshot_hash)`.
+`SHA-256("REGISTRY-CKPT-V2" || network_id || slot || head_hash || snapshot_hash)`.
 Snapshots, immutable votes, and mutable per-validator latest pointers live in
 the network-scoped shared archive. On import, malformed or torn objects are
 ignored and unique valid signers must satisfy this process's current local
@@ -117,13 +134,13 @@ delay final reaping of a thread stuck inside a kernel syscall.
 Startup searches at or above `max(local snapshot slot, --history-min-slot)`.
 A newer certified checkpoint through H replaces the local snapshot only after
 `AppNode.create` accepts the checked handoff `.start_slot = H + 1` and seeds
-nomination with the exact set externalized at H. A newer local journal value
-supersedes that seed; a same-slot mismatch fails startup. Live peers then
-supply H+1 through the current frontier, so H must still be within their
-16-slot answering window; keeping the checkpoint cadence at most 16 provides
-that bridge while a quorum is publishing normally. The explicit minimum is
-the anti-rollback control: signatures prove who attested state, not that an
-untrusted archive showed you its newest state.
+nomination with the exact ledger value externalized at H. A newer local
+journal value supersedes that seed; a same-slot mismatch fails startup. Live
+peers then supply H+1 through the current frontier, so H must still be within
+their 16-slot answering window; keeping the checkpoint cadence at most 16
+provides that bridge while a quorum is publishing normally. The explicit
+minimum is the anti-rollback control: signatures prove who attested state,
+not that an untrusted archive showed you its newest state.
 
 Candidate discovery reads the derived latest pointer for each validator in
 the local quorum instead of scanning the archive. Startup accepts at most 16
@@ -140,21 +157,28 @@ assertions at one slot fail closed. Separately, if the selected authenticated
 checkpoint is at the eligible local snapshot's slot, their heads must agree.
 Those checks are not an arbitrary or continuous runtime fork detector: a
 withheld object or a validator's newer latest pointer can hide an older
-alternative. Complete header/transaction-set history is needed to prove every
+alternative. Complete header/ledger-value history is needed to prove every
 intervening link.
 
 A process that encounters an unrecoverable gap while running still exits with
-code 3 rather than apply a discontinuous transaction set. Restart it after a
+code 3 rather than apply a discontinuous ledger value. Restart it after a
 recent certificate exists. This archive stores checkpoint state, not every
-intermediate transaction set or header, so it is not standalone ledger replay
+intermediate ledger value or header, so it is not standalone ledger replay
 and cannot recover without a live peer holding the short post-checkpoint tail.
 A node stopped before its first slot still restarts from genesis; a compacted
 journal without either a usable local snapshot or configured certified
 history is refused.
 
-**Cadence and flooding.** After each applied slot a node proposes exactly once
-for the next: right away when it has pending transactions (after
-`--min-slot-ms`), otherwise at the idle heartbeat. A transaction accepted from
+**Cadence, time, and flooding.** After each applied slot a node proposes
+exactly once for the next: right away when it has pending transactions (after
+`--min-slot-ms`), otherwise at the idle heartbeat. Proposal construction alone
+samples Unix/POSIX whole seconds (leap seconds ignored), applies the optional
+`--proposal-clock-offset-s`, and clamps the result to `[T+1,T+60]`. Received
+values, combination, application, replay, and checkpoint recovery never read
+local time. The minimum-time combination rule makes honest skew converge, but
+the result is an agreed bounded logical time—not an authenticated UTC oracle.
+A Byzantine quorum can choose any chain that advances 1..60 seconds per slot.
+A transaction accepted from
 RPC or gossip is immediately published to every capable connected peer. Each
 peer runs the same canonical/signature/sequence/cap admission before adding it
 to its pending queue and explicitly publishing it onward; rejected bytes are
@@ -166,7 +190,7 @@ proposed in the next eligible slot even if the submission node then dies.
 **RPC.** One request line, one response line, on 127.0.0.1 only:
 
 ```
-head                → head slot=<n> hash=<hex64> accounts=<n> names=<n> pending=<n> network=<hex64>
+head                → head slot=<n> close_time=<unix-seconds> hash=<hex64> accounts=<n> names=<n> pending=<n> network=<hex64>
 get <name>          → entry name=<name> owner=<hex64> value=<hex>   |   none
 account <hex64>     → account key=<hex64> seq=<n> next=<n>
 submit <hex470>     → ok txid=<hex64>   |   err <code> <text>
@@ -175,7 +199,9 @@ submit <hex470>     → ok txid=<hex64>   |   err <code> <text>
 `submit` decodes the exact canonical 235-byte transaction, verifies its
 network-bound signature, requires `seq == next`, and refuses duplicates or a
 full queue (`bad_request`, `bad_tx`, `bad_sig`, `bad_seq`, `queue_full`,
-`duplicate`). Gossip input uses that same admission function. Acceptance adds
+`duplicate`). Clients do not provide a close time; extra request tokens are
+rejected, and validators construct that field only when proposing a ledger.
+Gossip input uses that same admission function. Acceptance adds
 the transaction locally and immediately floods the canonical bytes after the
 shared-state lock is released. The CLI's `submit` verb does the whole dance:
 it asks the node for `head` (the network id) and `account` (the next seq),
@@ -202,12 +228,10 @@ mesh — see *Security*). On every box:
    zig build -Doptimize=ReleaseSafe
    ```
 
-   After v0.2.0 is tagged, you can instead copy `examples/registry/` anywhere
-   and pin that release: delete the `.slcp = .{ .path = "../.." }` line from
-   `build.zig.zon` and run
-   `zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz`
-   (the example uses only the unchanged Stable API). Either way you
-   get `zig-out/bin/registry` and `zig-out/bin/slcp`.
+   This E2c example uses post-v0.2 Experimental `ValueContext`, application
+   messaging, and recovery seams. If you move it out of the repository, pin a
+   future revision that contains E2c rather than the v0.2.0 package. The build
+   produces `zig-out/bin/registry` and `zig-out/bin/slcp`.
 
 3. **Mint this machine's node key** (an Ed25519 seed, mode 0600; never copy
    it between machines, never commit it):
@@ -235,21 +259,27 @@ mesh — see *Security*). On every box:
    other two):
 
    ```sh
-   ./zig-out/bin/registry node --network "my registry v1" --key node.key --data-dir data \
+   ./zig-out/bin/registry node --network "my registry e2c" \
+       --genesis-close-time 1788480000 --key node.key --data-dir data \
        --quorum quorum.json --listen 7411 --rpc 7412 \
        --peer b.example.com:7411 --peer c.example.com:7411
    ```
 
-   `--network` must be identical everywhere (it is hashed into two network
-   ids, the library's and the registry's; neither is ever sent). The first
-   lines:
+   Choose `--genesis-close-time` once, near network birth, as a Unix/POSIX
+   whole-second value below `u64` maximum; leap seconds are ignored. Both it
+   and the nonempty `--network` string must be identical everywhere and must
+   be preserved on every restart. Their canonical binary descriptor is hashed
+   into the raw SLCP identity and the registry transaction identity; neither
+   full id is sent. `--proposal-clock-offset-s` defaults to zero and exists for
+   clock-skew testing/operations, not as shared configuration. The first
+   lines look like:
 
    ```
-   registry: node d4f7315f…985e58 listening on port 7411; 2 peer(s); data in data; starting from genesis at slot 0
+   registry: node d4f7315f…985e58 listening on port 7411; 2 peer(s); data in data; starting from genesis at slot 0 close_time=1788480000
    registry: limits: 32 txs per set, 64 accounts, 128 names, 256 pending; busy slots every >= 1000 ms, idle heartbeat every 3000 ms
    registry: rpc listening on 127.0.0.1:7412
-   slot 1: txs=0 ok=0 head=bc04bd8fd3648822
-   slot 2: txs=0 ok=0 head=eb61ccf8f5344ee1
+   slot 1: close_time=1788480060 txs=0 ok=0 head=<hash16>
+   slot 2: close_time=1788480120 txs=0 ok=0 head=<hash16>
    ```
 
    The `peer … unreachable` warnings while the other boxes start, the
@@ -258,8 +288,20 @@ mesh — see *Security*). On every box:
    README. `head=` is the first 16 hex characters of the header hash: the
    same on every machine at the same slot, or something is wrong.
 
-   To enable E2b, provision a durable shared or correctly mirrored filesystem
-   whose contents are visible to all three validators and append:
+   **E2c is a hard epoch, not an in-place upgrade.** The coordinated
+   `REGISTRY-NET-V2`, `REGISTRY-VALUE-V1`, `REGISTRY-HDR-V2`, Snapshot V3,
+   and checkpoint V2 formats do not reinterpret pre-E2c storage. Use a fresh
+   `--data-dir` for every validator, which also creates fresh SLCP logs and
+   history-signing state. An existing physical `--history-dir` may be reused
+   only as a container: the new network id selects a distinct namespace and
+   old checkpoints are not imported. If the identity guard were bypassed, an
+   old bare-TxSet journal would fail decoding rather than be wrapped silently.
+   Carrying application state across this boundary requires an explicit
+   migration that this example does not implement.
+
+   To enable checkpoint recovery, provision a durable shared or correctly
+   mirrored filesystem whose contents are visible to all three validators and
+   append:
 
    ```sh
    --history-dir /mnt/registry-history --checkpoint-every 8
@@ -301,18 +343,18 @@ mesh — see *Security*). On every box:
    alice` from another key is accepted at submit, applied with the result
    `name_taken`, and consumes that account's sequence number — exactly like
    a failed Stellar transaction. `registry head` shows the slot, the header
-   hash and the pending count; `registry account <hex64>` the applied `seq`
-   and the `next` one to use.
+   close time, hash, and pending count; `registry account <hex64>` the applied
+   `seq` and the `next` one to use.
 
 7. **Kill one and restart it.** Ctrl-C (or `kill -9`) **c**; **a** and **b**
    carry on (2-of-3). Start **c** again with the same command:
 
    ```
-   registry: node 84a5a57d…dcfff2 listening on port 7411; 2 peer(s); data in data; starting from the snapshot at slot 19
-   slot 20: txs=1 ok=1 head=e4bfe24da8622d9e
-   slot 21: txs=0 ok=0 head=abb082fa9a8e87bd
+   registry: node 84a5a57d…dcfff2 listening on port 7411; 2 peer(s); data in data; starting from the snapshot at slot 19 close_time=1788481140
+   slot 20: close_time=1788481200 txs=1 ok=1 head=<hash16>
+   slot 21: close_time=1788481260 txs=0 ok=0 head=<hash16>
    …
-   slot 24: txs=0 ok=0 head=8a5b103ab7569f8d
+   slot 24: close_time=1788481440 txs=0 ok=0 head=<hash16>
    ```
 
    It came back from its snapshot, was handed the slots it missed by its
@@ -323,13 +365,14 @@ mesh — see *Security*). On every box:
    to rejoin. With history enabled, restart it with the same archive; optionally
    add `--history-min-slot <known-good-slot>` to refuse any older view. It
    authenticates the newest eligible checkpoint, restores its exact final
-   transaction set as nomination context, starts at its successor, and catches
-   the remaining short tail from a live peer.
+   LedgerValue (time plus transaction set) as nomination context, starts at
+   its successor, and catches the remaining short tail from a live peer.
 
 ## Limits — what E2 still does not do
 
-Transaction flooding and authenticated checkpoint catch-up close two gaps
-recorded by E1. These remaining limits are deliberate:
+Transaction flooding, authenticated checkpoint catch-up, and deterministic
+close time close three gaps recorded by E1. These remaining limits are
+deliberate:
 
 - **Flooding is best-effort, not history.** Pending queues and the generic
   Node inbox are memory-only. Immediate publication plus a 1 s reflood heals
@@ -337,7 +380,7 @@ recorded by E1. These remaining limits are deliberate:
   loss of the submission node does not lose it. If the source dies before any
   peer admits the bytes, or every holder restarts before application, resubmit.
 - **Checkpoints are not replayable history.** The archive contains certified
-  snapshots, not all headers and transaction sets. Recovery still needs a
+  snapshots, not all headers and ledger values. Recovery still needs a
   checkpoint no more than 15 slots behind a live peer and that peer must help
   agree the short tail. An untrusted archive can hide or withhold valid data;
   `--history-min-slot` prevents accepting an older view but cannot make a
@@ -350,8 +393,10 @@ recorded by E1. These remaining limits are deliberate:
   typed layer copies the state after every applied slot and `initialState()`
   cannot read a file, which is why the state is plain data and the snapshot
   is loaded through a global before the node starts.
-- **No close time, no upgrades, no quotas, no watcher nodes, no HTTP.**
-  The remainder of E2 and E3.
+- **No complete history, heap state, upgrades, quotas, watcher nodes, or
+  HTTP.** The remainder of E2 and E3. Node's answering window is still fixed
+  at 16 slots, and far-ahead drops/peer catch-up state have limited operator
+  visibility.
 
 ## Security
 
@@ -430,18 +475,26 @@ lines to report `slot S+1: txs=1`, proving propagation before consensus and
 survival of the source's death. Node2 subsequently restarts and participates
 in the remaining ordinary registry operations.
 
-For E2b, the harness records a durable outage origin, stops node2 again, and
+For E2b/E2c, the three validators retain proposal-clock offsets of -30/0/+30
+seconds. The harness records a durable outage origin, stops node2 again, and
 requires node0 and node1 to externalize at least 201 new transaction-free
 slots. It then kills node0, lets buffered work drain, freezes node1's exact
 head H, and recomputes the newest checkpoint both survivors signed no more
 than 15 slots behind H (at least one must have observed it certified). Node2
-restarts with that Snapshot V2 as its minimum, finite nomination cadence, and
+restarts with that Snapshot V3 as its minimum, finite nomination cadence, and
 node1 as its sole live peer. It must explicitly report a history-checkpoint
-boot, restore the exact checkpoint transaction set as nomination context,
-catch node1's exact H/hash through a tail shorter than 16 slots, and then be a
-necessary voter with node1 for transaction 8 in exactly H+1. Finally node0
-rejoins and all three must agree on the transaction state and head. Evidence
-line on stdout:
+boot, restore the exact checkpoint LedgerValue as nomination context, and
+catch node1's exact H/hash/time through a tail shorter than 16 slots. Node2 is
+then a necessary voter with node1 for transaction 8 in the first later
+transaction-bearing ledger; every optional intervening ledger must appear on
+both logs, be empty, and extend one complete temporal chain.
+
+Across the run, each RPC head and durable slot line for the same ledger must
+agree on close time, every adjacent time step is 1..60 seconds, and every
+observed slot lies in the cumulative interval anchored at G. Finally node0
+rejoins, all three agree on transaction state/head/time, and a process-level
+probe proves that the same human passphrase with `G+1` is refused against the
+old data directory as `DataDirOtherNetwork`. Evidence line on stdout:
 
 ```
 [registry-smoke] nodes=3 txs=8 slots=N head=<hex16>
@@ -452,10 +505,12 @@ the scratch under `.zig-cache/registry-smoke/`. Neither is part of
 `zig build test` — that runs `registry-tests` (the pure module, the RPC, and
 a live 2-of-2 pair with restart) and compiles the program (`registry-intree`).
 Inside this directory, `zig build test` runs the same tests as a consumer.
-The current 66-test root also covers history and boot selection, snapshot and
-directory durability, publisher failure policy, quorum evaluation, tampering,
-rollback, torn objects, hostile namespaces, special files, candidate bounds,
-and fork discovery.
+The current 80-test registry root covers history and boot selection, timed
+value/header/snapshot invariants, directory durability, publisher failure
+policy, quorum evaluation, tampering, rollback, torn objects, hostile
+namespaces, special files, candidate bounds, and fork discovery. A separate
+18-test `registry-smoke-tests` target pins the harness predicates and argument
+rewrites.
 
 ## Files
 

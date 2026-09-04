@@ -54,17 +54,26 @@ const App = struct {
     pub const Command = ...;  // the value type the network agrees on
 
     pub fn validate(state: State, cmd: Command) slcp.Validity;  // pure, deterministic
+    // alternate shape when validation needs protocol context:
+    // pub fn validate(state: State, cmd: Command, context: slcp.ValueContext) slcp.Validity;
     pub fn apply(state: State, cmd: Command) State;             // pure — no I/O, no clock;
                               // large-state shape: fn (state: *State, cmd: Command) void
     // optional:
     pub fn combine(state: State, cmds: []const Command) Command;  // deterministic, total;
-                              // result must self-validate .valid; may synthesize
+                              // result must not self-validate .invalid; may synthesize
     pub fn initialState() State;                                  // default: State{}
     pub fn initialSlot() u64;                                     // default: 0 (the slot initialState() already includes)
+    pub fn initialCommand() ?Command;                              // exact value at initialSlot, for external recovery
     pub fn encode(cmd: Command, buf: []u8) []u8;                  // codec override (both or neither)
     pub fn decode(bytes: []const u8) ?Command;
 };
 ```
+
+`ValueContext` contains `slot: u64` and `phase`, whose values are
+`.nomination` and `.ballot`. The adapter constructs it from the same Engine
+call metadata exposed by the raw driver. It is deterministic input: use it for
+slot-relative policy, never as a route to local time or I/O. Legacy two-argument
+apps remain valid.
 
 - `.maybe_valid` means **"I cannot judge from my state"** — the §0 counter
   returns it for `cmd.next > state.count + 1` because *this node may be
@@ -90,8 +99,10 @@ const App = struct {
   `[N]T` arrays, nested structs. Floats, pointers/slices, optionals, unions,
   non-exhaustive enums and wider ints are compile errors that name the rule
   and the workaround.
-- **`combine` is checked**: `AppNode` runs `validate(state, result)` on
-  every composite. `.invalid` is a `DriverFault` — the node logs the App name
+- **`combine` is checked**: `AppNode` runs `validate(state, result, context)`
+  on every composite, using the candidate slot and `.ballot` phase. A
+  two-argument validator simply ignores that context. `.invalid` is a
+  `DriverFault` — the node logs the App name
   at error level and latches inert instead of balloting a value every peer
   would reject (a silent stall). `.maybe_valid` is fine: a node behind on
   `State` cannot judge what it combines.
@@ -135,9 +146,11 @@ const App = struct {
 
 ## 4. Step 2: the raw `Driver` vtable
 
-When you need the `slot`, `is_nomination`, `extract_valid_value`, or an
-encoding shared with a non-Zig peer, implement the vtable directly and pass
-it as `Node.Options.driver`. Copied from `src/driver.zig`:
+When you need `extract_valid_value`, a bytes-first policy, or a vtable shared
+with a non-Zig host, implement the raw interface and pass it as
+`Node.Options.driver`. Typed applications can observe slot and phase through
+`slcp.ValueContext`; the raw interface exposes that phase as the
+`is_nomination` bit. Copied from `src/driver.zig`:
 
 ```zig
 pub const Validity = enum(u2) { invalid = 0, maybe_valid = 1, valid = 2 };
@@ -158,17 +171,19 @@ The contract (design §8.1–§8.2, §7.3), identical in every host language:
 
 - **Synchronous, pure, deterministic.** SCP calls the driver *inside*
   envelope processing; the state machine cannot suspend mid-transition.
-- `validate_value` is called **at most once per distinct value per slot**
-  (the engine caches verdicts by `SHA-256(value)`, `src/engine/values.zig`).
-  `is_nomination` tells you whether the value is a nomination candidate
-  (may be a composite you will later be asked to combine) or a ballot value.
+- `validate_value` is called **at most once per distinct value, protocol
+  phase, and slot while its verdict is cached** (the engine keys verdicts by
+  `SHA-256(protocol-phase byte || value)`, `src/engine/values.zig`).
+  `is_nomination` tells you whether the value is a nomination candidate (may
+  be a composite you will later be asked to combine) or a ballot value.
   Values of length 0 or above `max_value_bytes` never reach you.
 - `combine_candidates` receives the **sorted-unique** candidate slice (own
   sets capped at the frozen 64 entries), is called each time the candidate
   set grows (`src/engine/nomination.zig`), and must be **total**: succeed on
-  any candidate set, and its result must itself validate `.valid` and stay
-  within `max_value_bytes`. Append the result to `out`; an empty or
-  oversized result is treated as a `DriverFault` (fatal, below).
+  any non-empty candidate set, and its result must not self-validate
+  `.invalid` and must stay within `max_value_bytes`. A `.maybe_valid` result
+  is permitted when local state is behind. Append the result to `out`; an
+  empty or oversized result is treated as a `DriverFault` (fatal, below).
 - `extract_valid_value` is optional: given an invalid value, return `true`
   and a valid replacement in `out`, or `false` to drop it (stellar-core
   default, mirrored by the `null` slot). Consulted in the leader-value pick
@@ -212,6 +227,13 @@ Worked example: `Command = struct { next: u64 }` becomes
 `null` (`.invalid`); new nodes decode 8-byte values as `null`. Under
 `"...v2"` neither ever sees the other's statements, and the v2 network
 starts at slot 1 with `.{ .next = last_v1_count + 1, .author = me }`.
+
+The registry's E2c transition uses this hard-epoch pattern more completely:
+its canonical network descriptor includes the configured genesis close time,
+and its LedgerValue, header, snapshot, and checkpoint domains were versioned
+together. Old data directories, snapshots, signing fences, and archive
+namespaces are intentionally not migrated or reinterpreted under the new
+network identity.
 
 ### Option B: explicit version tag via a custom codec
 
@@ -306,8 +328,10 @@ the payload is available locally — never block inside the driver.
 - [ ] `validate_value` / `combine` / `apply` are pure: no clock, no floats,
       no map-iteration order, no I/O, no RNG, no global mutable state —
       every item in `docs/determinism.md` §2.
-- [ ] `combine` is total and its result self-validates `.valid` within
-      `max_value_bytes`.
+- [ ] A contextual validator uses only `ValueContext.slot` / `.phase` plus
+      state and value; proposal-time wall-clock sampling stays outside it.
+- [ ] `combine` is total and its result does not self-validate `.invalid`; it
+      stays within `max_value_bytes`.
 - [ ] Every node runs the **same binary**; command evolution follows §5.
 - [ ] `.maybe_valid`, not `.invalid`, for "I cannot tell yet".
 - [ ] `DriverFault` is reserved for genuine faults.

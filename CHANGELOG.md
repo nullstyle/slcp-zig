@@ -35,10 +35,19 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   shared archive, with per-node durable signing fences against rollback and
   equivocation. Recovery evaluates unique signers against the importing
   node's current quorum and supports an explicit anti-rollback floor. Snapshot
-  V2 also retains the exact consensus set at the checkpoint slot, and archive
+  V3 retains the exact timed LedgerValue at the checkpoint slot, and archive
   publication runs on a coalescing worker so storage stalls do not stall the
-  consensus cadence loop. Legacy V1 snapshots remain readable for local
-  journal-backed restart but are never accepted as external history.
+  consensus cadence loop. Pre-E2c V1/V2 snapshots are rejected because they
+  cannot preserve the versioned timed predecessor value.
+- Experimental `slcp.ValueContext`, allowing a typed application's
+  deterministic `validate` function to opt into the checked slot and
+  nomination/ballot phase without moving to the raw driver.
+- Registry deterministic close time. Consensus values now carry a canonical
+  close time plus transaction set; contextual validation enforces
+  slot-derived bounds, combination chooses the minimum candidate time, and
+  application advances only by 1..60 seconds. Genesis time is required
+  configuration and is bound into the registry and raw SLCP network identity,
+  real genesis header, Header V2, Snapshot V3, and checkpoint V2 epoch.
 - Experimental `slcp.node.Node.createWithRecovery`, `RecoveryOptions`,
   `RecoveryHook`, `RecoveryView`, `RecoveryJournalTail`, and `RecoveryValue`,
   used by `AppNode` for a pre-live continuity check and nomination-predecessor
@@ -64,9 +73,29 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   transaction in the next slot, S+1. It then keeps that validator absent for
   at least 201 slots, requires a certified checkpoint inside the live 16-slot window,
   restores it from history, and proves its vote is necessary for a transaction
-  in exactly the next slot.
+  in the first later transaction-bearing ledger; any intervening ledgers must
+  be identical, empty, and contiguous on both validators.
 - Registry busy cadence now remains governed by `--min-slot-ms` whenever a
   transaction is pending; `--heartbeat-ms` applies only to idle slots.
+- Restart recovery now separates the 16-slot own-statement answer floor from
+  the stronger admission/Engine purge floor at the journal successor. Lagging
+  peers can still receive retained EXTERNALIZE answers, while traffic for a
+  journal-confirmed slot cannot recreate local consensus state.
+- The registry smoke runs -30/0/+30-second proposal clocks, verifies every
+  observed close-time step and the complete long-outage time chain, restores
+  the exact timed checkpoint value, and proves that changing genesis time
+  under the same passphrase is a hard network-identity mismatch.
+
+### Fixed
+
+- Driver validation verdicts are cached per nomination/ballot phase as well
+  as value and slot. A phase-sensitive application can no longer inherit the
+  verdict of whichever protocol phase happened to see the bytes first; the
+  deterministic 4,096-entry per-slot bound is unchanged.
+- Registry boot now independently checks checksum-valid local snapshots and
+  authenticated checkpoints against the cumulative interval rooted at the
+  configured genesis close time before using their slot or installing state.
+  The CLI also rejects an empty human network passphrase.
 
 ### Security
 
@@ -86,6 +115,11 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
   fail-stop custody error. The archive may neither overlap the private data
   tree nor contain the validator key's pinned parent; Node also binds its
   later key-file read to the identity already used for history signing.
+- Registry close time is agreed bounded logical metadata, not an authenticated
+  UTC oracle. Only proposal construction reads local time; a Byzantine quorum
+  can choose any legal 1..60-second progression. E2c is a hard storage/network
+  epoch and intentionally provides no silent migration from old journals,
+  snapshots, checkpoints, or signing fences.
 
 ## [0.2.0] - 2026-09-03
 

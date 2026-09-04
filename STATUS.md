@@ -1,6 +1,6 @@
 # Project Status
 
-**Snapshot date:** 2026-09-03
+**Snapshot date:** 2026-09-04
 
 This file distinguishes released code, the prior v0.2.0 candidate, and current
 feature work. It is a snapshot, not a guarantee of fitness: this remains an
@@ -18,13 +18,33 @@ granted.
 | Local repository candidate | code tip `0f39869` plus hash-neutral release records (not pushed or tagged) | Retains the frozen package payload and fixes the example registry's detached RPC-handler teardown race found during release ablation. |
 | E2a implementation and proof | `50456f7` through `0932a83` (including smoke `6899855`, legacy-Hello test `2051f5b`, and waiter/FIFO hardening `0932a83`) | Adds negotiated, bounded Experimental application-message transport, registry-controlled flooding, deterministic source-death proof, outbound isolation, and race-safe inbox teardown. |
 | E2b implementation and proof | `c66b450` through `35ad39b` (registry feature `f77e01c`, exact-current smoke `35ad39b`) | Adds application-owned quorum-authenticated registry checkpoints, durable local signing fences, hostile-archive handling, exact-successor `AppNode` recovery, CLI integration, and a proved long-outage rejoin. |
+| E2c implementation and proof | `77ac9b1` through `83d66f7` | Adds typed `ValueContext`, phase-separated validation caching, deterministic registry close time, G-anchored restored-state checks, a hard network/storage epoch, exact timed checkpoint recovery, closed-slot restart rejection, and a strengthened long-outage temporal-chain smoke. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: E2b authenticated checkpoint catch-up
+## Current feature work: E2c deterministic ledger close time
+
+E2c makes each registry consensus value a canonical
+`LedgerValue { close_time, txs }`. For local head `(H,T)` and checked slot S,
+typed validation receives `slcp.ValueContext`, derives `d = S-H`, and permits
+time only in `[T+d,T+60d]`; the immediate successor must also be fully valid
+on current transaction state. Proposal construction is the sole wall-clock
+boundary and clamps Unix time to `[T+1,T+60]`. Combination chooses the minimum
+candidate time plus deterministic transaction union, and application accepts
+only an exact successor advancing 1..60 seconds. Consensus therefore agrees
+on bounded logical time, not truthful UTC.
+
+The operator-supplied genesis close time G joins the human passphrase in the
+canonical binary Node/registry network descriptor. Genesis is a real hashed
+header committing to G and empty state. Header V2 binds network id and close
+time; Snapshot V3 stores the exact final timed value; checkpoint assertions
+use their V2 domain. This is a hard epoch with no silent migration of old
+snapshots, bare-TxSet journals, checkpoints, or signing fences. Changing G
+under the same passphrase produces a different Node identity and requires a
+fresh private data directory.
 
 E2b builds on the delivered E2a transport slice. E2a added append-only
 application-message negotiation, bounded Experimental native Node send/receive
@@ -44,9 +64,9 @@ shared archive is hostile input: paths are accessed through pinned no-follow
 directory handles, objects must be regular files, and every name, network,
 signature, head, and snapshot relationship is revalidated. The trusted signing
 tree must remain private, and the shared archive is rejected when it aliases,
-contains, or sits inside the entire private data root. Snapshot V2 authenticates
-the exact consensus set at the checkpoint slot so recovered nomination uses
-the same previous value as incumbents. Post-start archive I/O runs on a
+contains, or sits inside the entire private data root. Snapshot V3 authenticates
+the exact timed ledger value at the checkpoint slot so recovered nomination
+uses the same previous value as incumbents. Post-start archive I/O runs on a
 dedicated worker with a one-slot newest-wins pending mailbox in addition to
 the in-flight checkpoint; availability stalls retry or are superseded without
 blocking the cadence loop. The archive also may not contain the
@@ -56,10 +76,9 @@ Trusted-fence I/O is fail-stop even when the same low-level shared-archive
 failure would be retryable. Cleanup stops the node before joining the worker,
 and post-start fatal paths drain RPC, stop Node, and hard-exit without that
 join. This avoids a userspace wait with a live validator, although the OS may
-still delay final reaping of a kernel-stuck call. At slot 0, V2 accepts only
-canonical empty genesis and no history vote is valid. Non-genesis Snapshot V1
-is retained for local journal-backed restart only; external history requires
-V2.
+still delay final reaping of a kernel-stuck call. At slot 0, V3 accepts only
+the canonical network/time-bound genesis header and no history vote is valid.
+Snapshot V3 is the sole accepted format in this epoch.
 The immediate parents of `--history-dir` and `--data-dir` must pre-exist on
 durable storage; the registry creates or opens the final components and
 synchronizes those parent entries. Linux and macOS are the supported
@@ -79,28 +98,32 @@ assumption as live consensus.
 For an App declaring `initialSlot()`, `AppNode` checks recovered continuity
 before going live and rejects a later non-successor delivery before `apply`.
 An external-checkpoint handoff through H may start at H+1 only when it also
-supplies the exact command at H through `initialCommand()`; a newer journal
+supplies the exact ledger value at H through `initialCommand()`; a newer journal
 value supersedes it and a same-slot mismatch fails startup. The registry
 installs the authenticated snapshot before serving RPC, then needs a live peer
 to supply a tail of at most 15 slots. This is state checkpoint recovery, not
-complete header/transaction-set replay.
+complete header/ledger-value replay.
 
-A focused history implementation run passed the in-tree registry suite at
-66/66 tests, including flat and nested quorum evaluation,
-duplicate/non-member votes, wrong-network and self-consistent snapshot
-tampering, torn objects, rollback/equivocation fences, hostile namespaces and
-special files, directory-durability ablations, the 16-candidate bound, and
-simultaneously discoverable certified forks. The exact-current integrated
-smoke passed in 241,489 ms at `35ad39b`: the outage began at durable S=14;
-survivors certified C=208; the restored node booted from B=208; and the sole
-live incumbent was frozen at H=215. Thus H-S=201 and H-C=7. With the third
-validator still absent, the recovered validator was required for quorum and
-transaction 8 externalized in exactly H+1=216. The third validator then
-rejoined, and all three converged at slot 221 with head
-`3b9eab74b1176856`.
+The historical E2b checkpoint proof is pinned at `35ad39b` (66 focused tests
+and its exact-successor smoke). At final E2c code tip `83d66f7`, the focused
+suites passed 163/163 core tests, 187 native-node tests with one platform
+skip, 80/80 registry tests, and 18/18 smoke-tool tests. The strict full test
+graph passed all 87 build steps; its API gate verified 290 Stable and 1,469
+Experimental declarations, and docs-smoke passed 432 checks plus 17 tests.
 
-No Stable declaration changed. The registry-specific archive is not exported
-by the library; `slcp.node.Node.createWithRecovery`, `RecoveryOptions`,
+The strengthened integrated smoke then passed in 291,323 ms against that code
+tip: G=1788510951; outage S=11; certified and selected checkpoint C=B=208;
+stable sole-survivor head H=212; H-S=201 and H-C=4. The recovered validator
+caught the exact H/hash/time, was necessary for quorum, and transaction 8
+appeared in the first later transaction-bearing ledger at slot 213. Every
+intermediate and outage ledger formed one contiguous 1..60-second time chain,
+the third validator rejoined, and all three converged at slot 233 with head
+`e76ea6d8b56536c9`. A process-level probe changed only G to 1788510952 and
+proved the existing data directory fails closed as `DataDirOtherNetwork`.
+
+No Stable declaration changed. `slcp.ValueContext` and the registry-specific
+archive are Experimental; the archive is not exported by the library.
+`slcp.node.Node.createWithRecovery`, `RecoveryOptions`,
 `RecoveryHook`, `RecoveryView`, `RecoveryJournalTail`, and `RecoveryValue` are
 new Experimental recovery surface. The signed consensus schema and sans-I/O
 Engine remain unchanged.
@@ -231,7 +254,7 @@ test-only scheduler gate makes both old conditions deterministically red; the
 focused registry suite passed 20 consecutive repetitions before the
 post-fix cold runs, and the integrated suite passes under the prescribed Zig.
 
-## Known boundaries after E2b
+## Known boundaries after E2c
 
 - Transport remains unauthenticated and unencrypted; deploy behind a private
   network or authenticated tunnel.
@@ -264,9 +287,10 @@ post-fix cold runs, and the integrated suite passes under the prescribed Zig.
   run without competing copies, especially on macOS.
 - One identity must never run on two machines; local locking cannot detect a
   copied key or data directory.
-- E2a transaction flooding and E2b application checkpoint recovery are
-  delivered through committed proof `35ad39b`. Complete history/ancestry replay,
-  heap-sized state, and close time remain future work; E3 remains planned.
+- E2a transaction flooding, E2b application checkpoint recovery, and E2c
+  deterministic close time are delivered. Complete history/ancestry replay,
+  heap-sized state, configurable answering history, and richer peer/catch-up
+  visibility remain future work; E3 remains planned.
 - Licensing remains an explicit owner decision; this repository grants none.
 
 ## Reading order

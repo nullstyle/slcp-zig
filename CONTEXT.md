@@ -177,8 +177,28 @@ The recent span of externalized slots for which a node can still answer a
 lagging peer from local history.
 _Avoid_: History archive
 
-**Purge floor**:
-The first slot retained by the native host and engine after garbage
-collection. Inputs for lower slots are stale and must not recreate consensus
-state.
+**Answer floor**:
+The oldest slot whose own statements a node retains for answering lagging
+peers. It may be older than the purge floor after restart.
 _Avoid_: Delivery frontier
+
+**Purge floor**:
+The first slot the native host and engine admit for consensus processing.
+Inputs for lower slots are closed and must not recreate consensus state, even
+when their own statements remain inside the answering window.
+_Avoid_: Delivery frontier
+
+**Value context**:
+Deterministic metadata about one value check, currently its slot and protocol
+phase, supplied by the host to an application driver.
+_Avoid_: Local clock, application state
+
+**Close time**:
+The registry's agreed logical timestamp for a ledger. It advances within
+deterministic bounds but is not proof of truthful wall-clock time.
+_Avoid_: Block time, trusted timestamp
+
+**Genesis close time**:
+The operator-chosen close-time anchor for registry slot zero. It is part of
+the registry network identity and must be identical at every node.
+_Avoid_: Node start time

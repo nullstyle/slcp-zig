@@ -28,7 +28,7 @@ refresh chore.
 | Tier | File | Gate |
 |---|---|---|
 | **Stable** — the frozen contract | `docs/api-snapshot.txt` | `zig build check-api` (inside `zig build test`) is RED on any drift, on every OS. |
-| **Experimental** — may change at any 0.x bump | `docs/api-snapshot-experimental.txt` | Refreshed in place by `check-api`; CI's `test` job runs `-Dstrict-experimental=true` on both ubuntu and macOS, which is RED when the committed file is stale. |
+| **Experimental** — may change at any 0.x bump | `docs/api-snapshot-experimental.txt` | Refreshed by `zig build api-snapshot`; CI's `test` job runs `check-api -Dstrict-experimental=true` on both ubuntu and macOS, which is RED when the committed file is stale. |
 
 A third, implicit tier is **Internal**: anything not `pub`, plus test-only
 code. It never appears in either file.
@@ -188,6 +188,10 @@ expect in the Stable list and that are deliberately **not**:
 
 ## What is Experimental (and why)
 
+- `slcp.ValueContext` / `slcp.app_node.ValueContext`: optional deterministic
+  slot and nomination/ballot phase input for the contextual typed
+  `App.validate` signature. The legacy two-argument signature remains valid;
+  this new context shape may evolve before promotion.
 - `slcp.overlay`, `slcp.timers`, `slcp.store`, `slcp.wire`: the node's
   internals, public only as escape hatches. Their shapes follow the
   implementation.
