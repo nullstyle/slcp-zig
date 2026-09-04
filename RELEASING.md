@@ -198,7 +198,7 @@ Machine: Darwin 25.6.0 arm64, 18 logical cores; Zig
 
 Lineage: released `v0.1.0` at `916907a`; `origin/main` at `cf3b84b`;
 committed hardening implementation `9d21b00` with proof record `87d7083`.
-The v0.2.0 candidate SHA is PENDING until the worktree is frozen.
+The package/source tree was frozen at `1b68041`.
 
 **Semver.** Minor. The Stable snapshot remains byte-for-byte unchanged at 290
 declarations. Experimental `Store.putQset` / `Store.getQset` were removed and
@@ -212,10 +212,10 @@ Strict API verification passed at 290 Stable / 1,409 Experimental declarations,
 and docs-smoke passed 431 checks. These are development checks, not the cold
 release preflight.
 
-**Candidate freeze.** PENDING. Commit every intended source, manifest,
-snapshot, test, and documentation change, including the new qset-cache source,
-then record the exact SHA here. No file inside `.paths` may change after the
-package hash is fixed.
+**Candidate freeze.** `1b68041` includes every intended source, manifest,
+snapshot, test, and documentation change, including the new qset-cache source.
+The tree was clean before hashing. No file inside `.paths` may change without
+restarting the hash and release proof.
 
 **Cold preflight.** PENDING. Run `just preflight` alone on the clean candidate
 commit and record every evidence line plus the exact SHA and elapsed time.
@@ -226,9 +226,10 @@ committed candidate, record each non-empty diff and intended red line, and
 restore the tree after each. The v0.1.0 ablations are historical evidence, not
 evidence for this release.
 
-**Hash.** PENDING. Replace the candidate placeholder in `README.md` and
-`CHANGELOG.md` with `just release-hash`, commit only hash-neutral documentation
-and evidence, and verify that the hash is unchanged afterward.
+**Hash.** `just release-hash` on clean source freeze `1b68041` produced
+`slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_`. README and
+CHANGELOG now carry it. Re-run after the hash-neutral documentation/evidence
+commits and record that it is unchanged.
 
 **Land / CI / tag.** NOT DONE. The candidate has not been pushed, CI has not
 run on its final SHA, `release-tag-check 0.2.0` has not passed, and `v0.2.0`

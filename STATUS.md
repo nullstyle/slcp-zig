@@ -14,7 +14,7 @@ granted.
 | Released | `v0.1.0` at `916907a` (2026-09-01) | First engine, native node, typed application layer, CLI, examples/counter, protocol docs, conformance and release gates. |
 | Pre-sprint `main` baseline | `cf3b84b` (2026-09-02), two commits after the tag | Post-tag documentation corrections plus E1 of the examples track: `examples/registry`. |
 | Hardening baseline | local `main` at `87d7083` (2026-09-03) | Exact qset lifecycle, bounded native ingress, restart/purge hardening, stronger fuzz/E2E evidence, canonical project state, and its recorded proof. |
-| Local release candidate | v0.2.0 candidate, not pushed or tagged | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
+| Local release candidate | package/source freeze `1b68041` (not pushed or tagged) | Adds the bounded best-effort on-disk qset answering cache and its Experimental diagnostics on top of the hardening baseline. |
 | Package manifest | version `0.2.0` | `v0.1.0` remains the latest release until the candidate is pushed, passes CI on its exact commit, and is tagged. |
 
 The v0.1.0 evidence and limitations are recorded in
@@ -93,7 +93,7 @@ they run against a clean committed candidate.
 
 | Gate | Current sprint result |
 |---|---|
-| Source freeze / candidate SHA | PENDING candidate commit |
+| Package/source freeze | PASS — `1b68041`; tree clean before hashing |
 | Formatting and whitespace (`zig fmt`, `git diff --check`) | PASS |
 | Focused engine tests | PASS — 162 core, 13 vector, 4 framing-vector, and 1 engine end-to-end test |
 | Focused qset-cache tests | PASS — 21/21, including capacity/byte churn, restart, corruption, allocation failure, case aliases, and root/final/temp symlinks |
@@ -107,7 +107,7 @@ they run against a clean committed candidate.
 | Counter consumer smoke | PENDING candidate cold preflight |
 | Registry consumer smoke | PENDING candidate cold preflight |
 | Long fuzz run | NOT RUN for v0.2.0 — advisory |
-| Release/package preflight | PENDING clean candidate commit and package hash |
+| Release/package preflight | Package hash recorded as `slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_`; cold package preflight pending |
 | Candidate CI / tag | NOT RUN / NOT CUT — local work has not been pushed |
 | Three-machine deployment acceptance | NOT RUN — requires external machines |
 

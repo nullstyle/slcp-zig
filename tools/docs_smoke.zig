@@ -1174,6 +1174,9 @@ pub fn runGate(gpa: std.mem.Allocator, io: std.Io, cli_path: []const u8, rep: *R
             while (end < readme_text.len and (std.ascii.isAlphanumeric(readme_text[end]) or readme_text[end] == '_' or readme_text[end] == '-')) end += 1;
             const hash = readme_text[at..end];
             rep.checkFmt(hash.len >= hash_prefix.len + 20, "README.md", 0, "package hash `{s}` is a full hash", .{hash}, "truncated or placeholder", .{});
+            const is_placeholder = std.mem.indexOf(u8, hash, "PLACEHOLDER") != null or
+                std.mem.indexOf(u8, hash, "TBD") != null;
+            rep.checkFmt(!is_placeholder, "README.md", 0, "package hash is not a placeholder", .{}, "replace it with `just release-hash`", .{});
             const changelog = readFile(arena, io, "CHANGELOG.md") catch "";
             rep.checkFmt(std.mem.indexOf(u8, changelog, hash) != null, "CHANGELOG.md", 0, "carries README's package hash `{s}`", .{hash}, "README.md and CHANGELOG.md must record the same hash", .{});
         }

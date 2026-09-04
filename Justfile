@@ -234,8 +234,9 @@ release-hash:
 
 # Everything `release-tag` refuses on, as a dry run (no tag, no push): clean
 # tree; `.version` == VERSION; the dated CHANGELOG section + link footer; the
-# package hash recorded in README.md AND CHANGELOG.md; the tag does not exist
-# yet; docs-smoke green; HEAD on origin/main with EVERY CI run for it green
+# package hash recorded in README.md AND CHANGELOG.md and equal to the package
+# hash of HEAD; the tag does not exist yet; docs-smoke green; HEAD on
+# origin/main with EVERY CI run for it green
 # ("tag only on green CI" — the preventive half; release.yml is the
 # detective half).
 release-tag-check VERSION:
@@ -249,6 +250,8 @@ release-tag-check VERSION:
     hash=$(grep -oE 'slcp-{{VERSION}}-[A-Za-z0-9_-]{20,}' README.md | head -n 1 || true)
     [ -n "$hash" ] || { echo "ERROR: README.md does not record the slcp-{{VERSION}}-<hash> package hash (just release-hash)"; exit 1; }
     grep -qF "$hash" CHANGELOG.md || { echo "ERROR: CHANGELOG.md does not carry README's hash $hash"; exit 1; }
+    actual_hash=$(just release-hash | grep -E '^slcp-{{VERSION}}-[A-Za-z0-9_-]{20,}$' | tail -n 1)
+    [ "$hash" = "$actual_hash" ] || { echo "ERROR: recorded package hash $hash does not match HEAD's $actual_hash"; exit 1; }
     ! git rev-parse -q --verify "refs/tags/v{{VERSION}}" >/dev/null || { echo "ERROR: tag v{{VERSION}} already exists"; exit 1; }
     zig build docs-smoke
     git fetch -q origin main

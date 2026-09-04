@@ -15,13 +15,13 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ## [0.2.0] - 2026-09-03
 
-**Candidate package hash placeholder** (replace with `just release-hash`
-before the tag; afterward it is what `zig fetch --save=slcp
+**Candidate package hash** (computed from the frozen package tree with
+`just release-hash`; after the tag it is what `zig fetch --save=slcp
 https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0.2.0.tar.gz`
 records):
 
 ```
-slcp-0.2.0-PLACEHOLDER0000000000000000000000000000000000000000
+slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_
 ```
 
 ### Breaking

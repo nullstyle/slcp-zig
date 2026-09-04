@@ -349,10 +349,10 @@ zig fetch --save=slcp https://github.com/nullstyle/slcp-zig/archive/refs/tags/v0
 ```
 
 The candidate package hash is
-`slcp-0.2.0-PLACEHOLDER0000000000000000000000000000000000000000`. It must be
-replaced with the value from `just release-hash` before release; the same value
-must appear in `CHANGELOG.md`, and `just verify-release-hash 0.2.0` will check
-the published tarball after tagging.
+`slcp-0.2.0-p1Kf2gxUFgBmvfCp_MHA1hyQKEsMH9lovB-4R4TKoR-_`, computed from the
+frozen package tree with `just release-hash`. The same value appears in
+`CHANGELOG.md`; `just verify-release-hash 0.2.0` will check it against the
+published tarball after tagging.
 
 Keep the `--save`. On this Zig a bare `zig fetch <archive-url>` (no `--save`)
 prints the right hash but stores the archive double-nested in the global
