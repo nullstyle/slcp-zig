@@ -1637,6 +1637,54 @@ test "Options parity: AppNode.Options is node.Options minus driver/delivery, sam
     try testing.expect(@hasField(CounterNode.Options, "allow_unsafe_quorum"));
 }
 
+// Non-vacuity: the focused default assertion catches a changed or lost
+// mirror default even if the generic parity test is weakened; observing the
+// configured value through the raw Node catches AppNode.create forgetting to
+// forward a newly mirrored option into node.Options.
+test "answering window: AppNode mirrors the default and forwards an explicit configuration" {
+    const src = @typeInfo(node.Options).@"struct";
+    const dst = @typeInfo(CounterNode.Options).@"struct";
+    const src_idx = comptime std.meta.fieldIndex(node.Options, "answering_window_slots").?;
+    const dst_idx = comptime std.meta.fieldIndex(CounterNode.Options, "answering_window_slots").?;
+    try testing.expectEqual(@as(u8, 16), src.field_attrs[src_idx].defaultValue(u8).?);
+    try testing.expectEqual(@as(u8, 16), dst.field_attrs[dst_idx].defaultValue(u8).?);
+
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var td = try TestDir.init();
+    defer td.deinit();
+    var diag: node.Diagnostic = .{};
+
+    const default_seed = seedOf(0x4a);
+    const default_id = try crypto.publicKeyFromSeed(default_seed);
+    var default_dir: [std.fs.max_path_bytes]u8 = undefined;
+    const default_node = try CounterNode.create(gpa, io, .{
+        .network = "appnode-answering-window v1",
+        .secret_seed = default_seed,
+        .quorum = Quorum.of(1, &.{default_id}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&default_dir, "default"),
+        .diagnostic = &diag,
+    });
+    defer default_node.deinit();
+    try testing.expectEqual(@as(u8, 16), default_node.raw().catchupStats().answering_window_slots);
+
+    const configured_seed = seedOf(0x4b);
+    const configured_id = try crypto.publicKeyFromSeed(configured_seed);
+    var configured_dir: [std.fs.max_path_bytes]u8 = undefined;
+    const configured_node = try CounterNode.create(gpa, io, .{
+        .network = "appnode-answering-window v1",
+        .secret_seed = configured_seed,
+        .quorum = Quorum.of(1, &.{configured_id}),
+        .listen_port = 0,
+        .data_dir = try td.sub(&configured_dir, "configured"),
+        .answering_window_slots = 31,
+        .diagnostic = &diag,
+    });
+    defer configured_node.deinit();
+    try testing.expectEqual(@as(u8, 31), configured_node.raw().catchupStats().answering_window_slots);
+}
+
 // Non-vacuity: dropping the `codec.size > max_value_bytes` pre-check lets
 // the 8-byte Command start under max_value_bytes = 4 (and every propose then
 // fails with ValueTooLarge); forwarding a watcher's propose to the Node

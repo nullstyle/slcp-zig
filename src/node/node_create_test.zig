@@ -259,6 +259,70 @@ test "limits: max_value_bytes 0 / 65537, start_slot 0, start_slot behind the jou
     n.deinit();
 }
 
+test "answering window: zero is rejected before the data directory is created" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var opts = g.options();
+    opts.data_dir = try g.sub(&path_buf, "bad-answering-window");
+    opts.answering_window_slots = 0;
+
+    try g.expectFail(opts, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots 0");
+    try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window", .{}));
+}
+
+test "answering window: 64 is rejected before identity, data, or listener side effects" {
+    const io = testing.io;
+    const net = std.Io.net;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    const bind: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind, io, .{ .mode = .stream, .reuse_address = false });
+    defer server.deinit(io);
+    const occupied_port: u16 = switch (server.socket.address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var data_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var opts = g.options();
+    opts.secret_seed = null;
+    opts.key_file = try g.sub(&key_buf, "bad-answering-window.key");
+    opts.data_dir = try g.sub(&data_buf, "bad-answering-window-64");
+    opts.listen_port = occupied_port;
+    opts.answering_window_slots = 64;
+
+    try g.expectFail(opts, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots 64");
+    try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window.key", .{}));
+    try testing.expectError(error.FileNotFound, g.tmp.dir.access(io, "bad-answering-window-64", .{}));
+}
+
+test "answering window: boundary values 1 and 63 create and report exactly" {
+    const io = testing.io;
+    var g = try Golden.init();
+    defer g.deinit();
+
+    var one_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var one_opts = g.options();
+    one_opts.data_dir = try g.sub(&one_buf, "answering-window-1");
+    one_opts.answering_window_slots = 1;
+    const one = try Node.create(testing.allocator, io, one_opts);
+    defer one.deinit();
+    try testing.expectEqual(@as(u8, 1), one.catchupStats().answering_window_slots);
+
+    var max_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var max_opts = g.options();
+    max_opts.data_dir = try g.sub(&max_buf, "answering-window-63");
+    max_opts.answering_window_slots = 63;
+    const max = try Node.create(testing.allocator, io, max_opts);
+    defer max.deinit();
+    try testing.expectEqual(@as(u8, 63), max.catchupStats().answering_window_slots);
+}
+
 // Non-vacuity: each bad spec exercises one `validatePeerSpec` arm — wiring
 // create to a permissive parser starts the node instead; removing the
 // duplicate scan or the loopback+port test drops those members.

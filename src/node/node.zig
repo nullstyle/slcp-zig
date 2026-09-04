@@ -46,13 +46,51 @@ test {
 
 const log = std.log.scoped(.slcp_node);
 
-/// GC window: keep 16 externalized slots answerable to laggards (§10).
-const purge_window: u64 = 16;
+const default_answering_window_slots: u8 = 16;
+const max_answering_window_slots: u8 = @intCast(@min(
+    (core.limits.Limits{}).max_live_slots,
+    wire.max_slot_state_envelopes,
+) - 1);
 
-/// First slot in the retained answering window for a delivered frontier.
-/// Zero means no slot has aged out yet.
-fn purgeFloorForFrontier(frontier: u64) u64 {
-    return if (frontier >= purge_window) frontier - (purge_window - 1) else 0;
+/// One validated startup policy owns every past-window calculation. Keeping
+/// this separate from `HoldBuffer.window` is intentional: that fixed bound
+/// limits future inbound work, while this one retains recent delivered work.
+const AnsweringPolicy = struct {
+    slots: u8,
+
+    /// Oldest retained slot for an inclusive delivered frontier. Zero means
+    /// the configured window has not filled yet.
+    fn floor(self: AnsweringPolicy, frontier: u64) u64 {
+        const slots: u64 = self.slots;
+        return if (frontier >= slots) frontier - (slots - 1) else 0;
+    }
+
+    /// Whether `highest` is a full answering window beyond the missing next
+    /// delivery slot. Subtraction after ordering avoids overflow at u64 max.
+    fn gapExhausted(self: AnsweringPolicy, next: u64, highest: u64) bool {
+        return highest >= next and highest - next >= self.slots;
+    }
+};
+
+test "answering policy: floor and gap boundary follow the configured window without overflow" {
+    const policy = AnsweringPolicy{ .slots = 32 };
+
+    try std.testing.expectEqual(@as(u64, 0), policy.floor(31));
+    try std.testing.expectEqual(@as(u64, 1), policy.floor(32));
+    try std.testing.expectEqual(@as(u64, 69), policy.floor(100));
+    try std.testing.expect(!policy.gapExhausted(100, 131));
+    try std.testing.expect(policy.gapExhausted(100, 132));
+    try std.testing.expect(!policy.gapExhausted(std.math.maxInt(u64) - 31, std.math.maxInt(u64)));
+
+    const one = AnsweringPolicy{ .slots = 1 };
+    try std.testing.expectEqual(@as(u64, 7), one.floor(7));
+    try std.testing.expect(one.gapExhausted(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
+
+    const max = AnsweringPolicy{ .slots = max_answering_window_slots };
+    try std.testing.expectEqual(@as(u64, 1), max.floor(max_answering_window_slots));
+    try std.testing.expect(!max.gapExhausted(100, 162));
+    try std.testing.expect(max.gapExhausted(100, 163));
+    try std.testing.expect(max.gapExhausted(std.math.maxInt(u64) - 63, std.math.maxInt(u64)));
 }
 
 /// Anti-entropy period (§9.2 host policy; see the resync_thread field).
@@ -84,6 +122,7 @@ pub const CreateError = error{
     KeyFileIoFailed,
     KeyFileTooPermissive,
     MaxValueBytesOutOfRange,
+    AnsweringWindowSlotsOutOfRange,
     StartSlotZero,
     StartSlotBehindJournal,
     BadPeerSpec,
@@ -136,6 +175,7 @@ fn explainCreateError(err: CreateError) []const u8 {
         error.KeyFileIoFailed => ".key_file could not be read or created (I/O error); check the path and the filesystem.",
         error.KeyFileTooPermissive => ".key_file is readable by group or other (mode 0644, say) but the seed must be owner-only like ssh keys; run `chmod 600 <file>` and start again.",
         error.MaxValueBytesOutOfRange => ".max_value_bytes is outside [1, 65536]; pick the largest value your app will ever propose.",
+        error.AnsweringWindowSlotsOutOfRange => ".answering_window_slots is outside [1, 63]; use the default 16 or choose a bounded recent-slot catch-up horizon.",
         error.StartSlotZero => ".start_slot is 0 but slots start at 1; drop it (default 1).",
         error.StartSlotBehindJournal => ".start_slot is at or below the journal high-water mark in .data_dir; drop it (the node resumes after the journal) or use a fresh data_dir.",
         error.BadPeerSpec => "a .peers entry is not host:port (IPv4/IPv6 literal or hostname, port 1..65535).",
@@ -311,6 +351,9 @@ pub const Options = struct {
     strict_canonical: bool = true,
     /// Largest value `propose` accepts; [1, 65536].
     max_value_bytes: u32 = 4096,
+    /// Recently delivered slots retained for native peer answering and
+    /// bounded catch-up. Valid range: 1..63. This is not archival history.
+    answering_window_slots: u8 = default_answering_window_slots,
     /// First slot to nominate proposals for (default 1). Must be above the
     /// journal high-water mark of an existing data_dir.
     start_slot: u64 = 1,
@@ -369,6 +412,34 @@ pub const StorageStats = struct {
     qset_cache_read_failures: u64,
     qset_cache_write_failures: u64,
     qset_cache_degraded: bool,
+};
+
+/// Local facts about bounded native peer catch-up. Experimental: this is an
+/// operational snapshot, not a network-freshness oracle or history archive.
+/// Gauges are coherent at one completed Engine input/effect boundary;
+/// counters are monotonic and saturating for the Node lifetime.
+pub const CatchupStats = struct {
+    answering_window_slots: u8,
+    /// Slot immediately before the next ordered application delivery. Before
+    /// the first delivery this is `start_slot - 1`.
+    delivery_frontier: u64,
+    /// Actual local statement coverage, which can be shorter than the
+    /// configured window after widening a previously compacted data dir.
+    answerable_slots: usize,
+    oldest_answerable_slot: ?u64,
+    newest_answerable_slot: ?u64,
+    purge_floor: u64,
+    held_statements: usize,
+    pending_externalizations: usize,
+    pending_lowest_slot: ?u64,
+    pending_highest_slot: ?u64,
+    released_at_frontier_statements: u64,
+    released_early_statements: u64,
+    dropped_far_statements: u64,
+    dropped_full_statements: u64,
+    dropped_behind_statements: u64,
+    gap_jumps: u64,
+    gap_slots_skipped: u64,
 };
 
 /// Host-side per-slot hold buffer (S8 D1, the stellar-core Herder shape —
@@ -1070,9 +1141,9 @@ pub const Node = struct {
 
     engine_thread: ?std.Thread = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Last Engine stats observed at a completed input/drain boundary. The
-    /// engine thread publishes it; callers read only this copy, never the
-    /// live Engine containers owned by that thread.
+    /// Last observability snapshots at a completed input/drain boundary. The
+    /// engine thread publishes them; callers read only these copies, never
+    /// the live containers owned by that thread.
     stats_mu: std.Io.Mutex = .init,
     stats_snapshot: engine.Stats = .{
         .live_slots = 0,
@@ -1081,6 +1152,25 @@ pub const Node = struct {
         .effects_queued = 0,
         .stored_statement_bytes = 0,
         .failed = false,
+    },
+    catchup_stats_snapshot: CatchupStats = .{
+        .answering_window_slots = default_answering_window_slots,
+        .delivery_frontier = 0,
+        .answerable_slots = 0,
+        .oldest_answerable_slot = null,
+        .newest_answerable_slot = null,
+        .purge_floor = 0,
+        .held_statements = 0,
+        .pending_externalizations = 0,
+        .pending_lowest_slot = null,
+        .pending_highest_slot = null,
+        .released_at_frontier_statements = 0,
+        .released_early_statements = 0,
+        .dropped_far_statements = 0,
+        .dropped_full_statements = 0,
+        .dropped_behind_statements = 0,
+        .gap_jumps = 0,
+        .gap_slots_skipped = 0,
     },
     /// False during synchronous restart replay (before the overlay binds);
     /// true once the node is serving the network. Effect dispatch suppresses
@@ -1138,6 +1228,13 @@ pub const Node = struct {
     /// Oldest slot retained in `own_latest` and the durable logs for outbound
     /// catch-up. Engine-thread-only after synchronous recovery.
     answer_floor: u64 = 1,
+    /// Immutable, validated policy shared by recovery, retention, compaction,
+    /// and ordered-delivery gap handling.
+    answering: AnsweringPolicy,
+    /// Engine-thread-only monotonic outcomes, published through
+    /// `catchupStats` at complete input/drain boundaries.
+    gap_jumps: u64 = 0,
+    gap_slots_skipped: u64 = 0,
     /// Inbound and Engine slots below this are closed/purged; the timer wheel
     /// drops stale fires for them (read on the wheel thread). This may be
     /// newer than `answer_floor` after journal recovery.
@@ -1216,6 +1313,12 @@ pub const Node = struct {
             return fail(diag, error.NetworkPassphraseEmpty, ".network is empty; set it to a passphrase unique to your application, e.g. \"my-counter-app v1\" (it becomes the networkId, which partitions your network from every other slcp network).", .{});
         }
         const network_id = crypto.networkIdFromPassphrase(opts.network);
+
+        // Validate the answering policy before identity loading or any
+        // filesystem, listener, or thread side effect.
+        if (opts.answering_window_slots < 1 or opts.answering_window_slots > max_answering_window_slots) {
+            return fail(diag, error.AnsweringWindowSlotsOutOfRange, ".answering_window_slots {d} is outside [1, 63]; use the default 16 or choose at most 63 so the bounded Engine retains room for current consensus work.", .{opts.answering_window_slots});
+        }
 
         // ---- identity ----
         var node_id: [32]u8 = undefined;
@@ -1421,6 +1524,7 @@ pub const Node = struct {
             .app_gossip = app_gossip.State.init(gpa, io),
             .current_slot = opts.start_slot,
             .next_deliver = opts.start_slot,
+            .answering = .{ .slots = opts.answering_window_slots },
             .last_ext_value = &.{},
             .delivery = opts.delivery,
             .max_value_bytes = opts.max_value_bytes,
@@ -1648,18 +1752,19 @@ pub const Node = struct {
         }
         // Two recovery floors have deliberately different jobs:
         //
-        // * answer_floor retains the last 16 own statements so this node can
-        //   send them to a lagging peer;
+        // * answer_floor retains the configured answering window of own
+        //   statements so this node can send them to a lagging peer;
         // * admission_floor rejects inbound protocol traffic for every slot
         //   the externalized journal already proves closed. Re-admitting such
         //   traffic can resurrect a pre-restart NOMINATE/CONFIRM slot even
         //   though the application state is already at the journal HWM.
         //
-        // Recovery can contain up to 79 slots just before the next 64-slot
-        // compaction, so answer_floor also keeps old restores within the
-        // Engine's 64-slot budget. An explicit start_slot remains a permanent
-        // inbound floor when it is newer than the journal.
-        const restored_answer_floor = @max(opts.start_slot, purgeFloorForFrontier(self.next_deliver - 1));
+        // Recovery can contain the configured window plus up to 63 newer
+        // slots just before the next 64-slot compaction, so answer_floor also
+        // keeps old restores within the Engine's 64-slot budget. An explicit
+        // start_slot remains a permanent inbound floor when it is newer than
+        // the journal.
+        const restored_answer_floor = @max(opts.start_slot, self.answering.floor(self.next_deliver - 1));
         const admission_floor = if (rec.externalized_hwm) |hwm|
             @max(opts.start_slot, hwm +| 1)
         else
@@ -2048,12 +2153,57 @@ pub const Node = struct {
         };
     }
 
-    /// Engine-owner only (or the creating thread before `engine_thread`
-    /// starts): take the live Engine snapshot, then publish the POD copy.
-    fn publishStats(self: *Node) void {
-        const s = self.eng.stats();
+    /// Coherent bounded-catch-up snapshot. Experimental. Values describe
+    /// this node's local policy and state only; peers may use other windows.
+    pub fn catchupStats(self: *Node) CatchupStats {
         self.stats_mu.lockUncancelable(self.io);
-        self.stats_snapshot = s;
+        defer self.stats_mu.unlock(self.io);
+        return self.catchup_stats_snapshot;
+    }
+
+    /// Engine-owner only (or the creating thread before `engine_thread`
+    /// starts): take the live snapshots, then publish the POD copies.
+    fn publishStats(self: *Node) void {
+        const engine_stats = self.eng.stats();
+        var pending_lowest: ?u64 = null;
+        var pending_highest: ?u64 = null;
+        var pending_it = self.pending_ext.keyIterator();
+        while (pending_it.next()) |slot| {
+            pending_lowest = if (pending_lowest) |lowest| @min(lowest, slot.*) else slot.*;
+            pending_highest = if (pending_highest) |highest| @max(highest, slot.*) else slot.*;
+        }
+        var answerable_lowest: ?u64 = null;
+        var answerable_highest: ?u64 = null;
+        self.own_mu.lockUncancelable(self.io);
+        var answerable_it = self.own_latest.keyIterator();
+        while (answerable_it.next()) |slot| {
+            answerable_lowest = if (answerable_lowest) |lowest| @min(lowest, slot.*) else slot.*;
+            answerable_highest = if (answerable_highest) |highest| @max(highest, slot.*) else slot.*;
+        }
+        const answerable_slots = self.own_latest.count();
+        self.own_mu.unlock(self.io);
+        const catchup_stats = CatchupStats{
+            .answering_window_slots = self.answering.slots,
+            .delivery_frontier = self.next_deliver - 1,
+            .answerable_slots = answerable_slots,
+            .oldest_answerable_slot = answerable_lowest,
+            .newest_answerable_slot = answerable_highest,
+            .purge_floor = self.purge_floor.load(.acquire),
+            .held_statements = self.hold.count,
+            .pending_externalizations = self.pending_ext.count(),
+            .pending_lowest_slot = pending_lowest,
+            .pending_highest_slot = pending_highest,
+            .released_at_frontier_statements = self.hold.released.load(.acquire),
+            .released_early_statements = self.hold.released_early.load(.acquire),
+            .dropped_far_statements = self.hold.dropped_far.load(.acquire),
+            .dropped_full_statements = self.hold.dropped_full.load(.acquire),
+            .dropped_behind_statements = self.hold.dropped_behind.load(.acquire),
+            .gap_jumps = self.gap_jumps,
+            .gap_slots_skipped = self.gap_slots_skipped,
+        };
+        self.stats_mu.lockUncancelable(self.io);
+        self.stats_snapshot = engine_stats;
+        self.catchup_stats_snapshot = catchup_stats;
         self.stats_mu.unlock(self.io);
     }
 
@@ -2401,9 +2551,8 @@ pub const Node = struct {
         // App delivery is IN SLOT ORDER (§11.2's stream semantics): buffer
         // out-of-order externalizations (catch-up delivers slots in arbitrary
         // peer order) and drain the contiguous frontier. If the buffer
-        // outgrows the answering window, the gap is unrecoverable (peers only
-        // answer 16 slots back) — jump the frontier to the lowest buffered
-        // slot with a loud log.
+        // outgrows this node's answering window, its bounded wait is over —
+        // jump the frontier to the lowest buffered slot with a loud log.
         const copy = self.gpa.dupe(u8, value) catch {
             // A journaled slot the app can never see = silent divergence;
             // going inert is the honest failure (review finding).
@@ -2427,10 +2576,11 @@ pub const Node = struct {
         gop.value_ptr.* = copy;
 
         // Gap-jump on UNANSWERABILITY: once any buffered slot sits a full
-        // answering window past the frontier, the gap slot is older than
-        // window-16 on every peer — no protocol can ever fill it. (A count
-        // threshold is unreachable: peers can supply at most `purge_window`
-        // old slots — review finding.)
+        // answering window past the frontier, the gap slot is older than the
+        // configured local horizon. Peers may retain different horizons, so
+        // this is bounded local policy rather than a claim about the network.
+        // (A count threshold is unreachable: peers can supply at most one
+        // answering window of old slots — review finding.)
         var highest: u64 = 0;
         var lowest: u64 = std.math.maxInt(u64);
         var it = self.pending_ext.keyIterator();
@@ -2438,8 +2588,10 @@ pub const Node = struct {
             highest = @max(highest, k.*);
             lowest = @min(lowest, k.*);
         }
-        if (self.pending_ext.count() > 0 and highest >= self.next_deliver + purge_window and lowest > self.next_deliver) {
-            log.warn("externalized gap: slots {d}..{d} unrecoverable; resuming delivery at {d}", .{ self.next_deliver, lowest - 1, lowest });
+        if (self.pending_ext.count() > 0 and self.answering.gapExhausted(self.next_deliver, highest) and lowest > self.next_deliver) {
+            log.warn("externalized gap: slots {d}..{d} fell outside this node's answering window; resuming delivery at {d}", .{ self.next_deliver, lowest - 1, lowest });
+            self.gap_jumps = self.gap_jumps +| 1;
+            self.gap_slots_skipped = self.gap_slots_skipped +| (lowest - self.next_deliver);
             self.next_deliver = lowest;
         }
         self.drainDeliverable();
@@ -2465,13 +2617,13 @@ pub const Node = struct {
         }
         if (!delivered_any) return;
 
-        // GC (§10): keep a 16-slot answering window behind the DELIVERED
+        // GC (§10): keep the configured answering window behind the DELIVERED
         // frontier (never purge a slot the app has not consumed).
         const frontier = self.next_deliver - 1;
-        const window_floor = purgeFloorForFrontier(frontier);
+        const window_floor = self.answering.floor(frontier);
         if (window_floor != 0) {
             // `start_slot` may establish a later permanent floor than the
-            // ordinary 16-slot calculation. GC can advance that declaration,
+            // ordinary answering-window calculation. GC can advance it,
             // never lower it after the first delivery.
             const engine_floor = @max(self.purge_floor.load(.acquire), window_floor);
             self.purge_floor.store(engine_floor, .release);
@@ -3861,14 +4013,15 @@ test "restart recovery separates the closed admission floor from the retained ow
     const peer_a = try crypto.publicKeyFromSeed(peer_seed);
     const peer_b: [32]u8 = @splat(0x78);
     const network_id = crypto.networkIdFromPassphrase(passphrase);
+    const answering_window_slots: u8 = 32;
 
     // This is exactly the record range left by the 64-slot compaction cadence
-    // immediately before its next boundary: 16 retained slots plus 63 newer
+    // immediately before its next boundary: 32 retained slots plus 63 newer
     // ones. Keep one latest own EXTERNALIZE per slot.
     {
         var st = try store_mod.Store.open(gpa, io, data_dir);
         defer st.deinit();
-        var slot: u64 = 49;
+        var slot: u64 = 33;
         while (slot <= 127) : (slot += 1) {
             var value_buf: [16]u8 = undefined;
             const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{slot});
@@ -3886,15 +4039,16 @@ test "restart recovery separates the closed admission floor from the retained ow
         .quorum = Quorum.twoThirdsOf(&.{ me, peer_a, peer_b }),
         .listen_port = 0,
         .data_dir = data_dir,
+        .answering_window_slots = answering_window_slots,
         .diagnostic = &diag,
     });
     defer n.deinit();
 
-    const expected_answer_floor: u64 = 127 - (purge_window - 1);
+    const expected_answer_floor: u64 = 127 - (answering_window_slots - 1);
     try std.testing.expectEqual(@as(u64, 128), n.next_deliver);
     try std.testing.expectEqual(expected_answer_floor, n.answer_floor);
     try std.testing.expectEqual(@as(u64, 128), n.purge_floor.load(.acquire));
-    try std.testing.expectEqual(@as(usize, purge_window), n.stats().live_slots);
+    try std.testing.expectEqual(@as(usize, answering_window_slots), n.stats().live_slots);
     {
         n.own_mu.lockUncancelable(io);
         defer n.own_mu.unlock(io);
@@ -3920,7 +4074,7 @@ test "restart recovery separates the closed admission floor from the retained ow
     try n.propose("fresh-after-restart");
     try pollUntil(io, 2_000, n, struct {
         fn admitted(node: *Node) bool {
-            return node.stats().live_slots == @as(usize, purge_window + 1);
+            return node.stats().live_slots == 33; // 32 restored + current
         }
     }.admitted);
 }
@@ -5470,6 +5624,12 @@ test "hold gate: released at the frontier inside the same applyInput, ascending;
     try std.testing.expectEqual(@as(usize, 0), n.hold.held_now.load(.acquire));
     try std.testing.expect(n.eng.slots.get(3) == null); // CONFIRM(3) never opened a slot
     try std.testing.expect(n.eng.slots.get(20).?.latestFor(id_b, true) != null);
+    const catchup = n.catchupStats();
+    try std.testing.expectEqual(@as(u8, 16), catchup.answering_window_slots);
+    try std.testing.expectEqual(@as(u64, 19), catchup.delivery_frontier);
+    try std.testing.expectEqual(@as(u64, 1), catchup.gap_jumps);
+    try std.testing.expectEqual(@as(u64, 17), catchup.gap_slots_skipped);
+    try std.testing.expectEqual(@as(usize, 0), catchup.pending_externalizations);
 }
 
 // Non-vacuity: dropping the window check holds NOM(next_deliver + 65)
