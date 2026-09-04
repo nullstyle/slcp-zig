@@ -391,7 +391,7 @@ pub fn OwnedAppNode(comptime App: type) type {
         /// pre-live recovery check, and delivery hook, replaying the journal
         /// tail through `apply` before returning; each replayed slot's
         /// observation queues for `waitApplied` exactly like a live one.
-        /// Adds three members to the bytes-level `CreateError`:
+        /// Adds four members to the bytes-level `CreateError`:
         /// `AppInitFailed` (initState failed — diagnostic names the app
         /// error), plus AppNode's `CommandExceedsMaxValueBytes` /
         /// `InitialSlotOutsideJournal` / `UndecodableExternalizedValue` with
