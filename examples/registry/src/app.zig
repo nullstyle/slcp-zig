@@ -1,21 +1,22 @@
 //! app.zig — the `slcp.AppNode` adapter for the registry
-//! (docs/examples-roadmap.md "E1 — Registry").
+//! (docs/examples-roadmap.md E1–E2b).
 //!
 //! The pure state machine lives in `registry.zig`; this file is the glue the
 //! typed layer needs: the `App` contract (`State`, `Command`, `validate`,
-//! `apply`, `combine`, the custom codec, `initialState` / `initialSlot`) and
-//! the process-wide `boot` snapshot the two initial* functions read.
+//! `apply`, `combine`, the custom codec, `initialState` / `initialSlot` /
+//! `initialCommand`) and the process-wide `boot` snapshot those recovery
+//! functions read.
 //!
 //! `boot` is a global because `initialState()` is `fn () State` — it can
 //! take no `io` and no argument (the roadmap's first "Gaps recorded by E1"
-//! item). `main.zig` sets it
-//! from the snapshot file (or genesis) BEFORE `Node.create`.
+//! item). `main.zig` sets it from the snapshot file (or genesis) BEFORE
+//! `AppNode.create`, which performs the bytes-level recovery internally.
 
 const std = @import("std");
 const slcp = @import("slcp");
 pub const registry = @import("registry.zig");
 
-/// What `initialState()` / `initialSlot()` return. Set once before `create`.
+/// What the three recovery declarations return. Set once before `create`.
 pub var boot: struct { state: registry.State, slot: u64 } = .{ .state = .{}, .slot = 0 };
 
 /// The §8.5 App. `validate` and `apply` run on the engine thread; both are
@@ -49,6 +50,10 @@ pub const Registry = struct {
         return boot.slot;
     }
 
+    pub fn initialCommand() ?Command {
+        return boot.state.last_set;
+    }
+
     // The custom codec (variable-length sets; the auto-codec cannot).
     pub fn encode(cmd: Command, buf: []u8) []u8 {
         return cmd.encode(buf);
@@ -76,6 +81,7 @@ comptime {
 test {
     _ = registry;
     _ = @import("rpc.zig");
+    _ = @import("history.zig");
 }
 
 const testing = std.testing;

@@ -735,14 +735,14 @@ pub fn build(b: *std.Build) void {
     example_smoke_tests_step.dependOn(&run_example_smoke_tests.step);
     test_step.dependOn(&run_example_smoke_tests.step);
 
-    // ===== E1:registry =====
-    // Examples-track stage anchor (registry; docs/examples-roadmap.md
-    // "E1 — Registry" acceptance gates):
+    // ===== E1-E2b:registry =====
+    // Examples-track stage anchor (registry through authenticated checkpoint
+    // recovery; docs/examples-roadmap.md acceptance gates):
     // registry-intree compile, registry-tests, the registry_smoke tool and
     // its run steps. Insert under this anchor only; never above it.
     // Keep the blank line between anchors so parallel stages merge cleanly.
 
-    // registry-intree: the E1 program (examples/registry/src/main.zig)
+    // registry-intree: the E1-E2b program (examples/registry/src/main.zig)
     // compiled against the in-tree `slcp` module. NOT installed and never
     // run here (it listens, dials its peers and serves an RPC): `zig build
     // test` proves the published program still compiles.
@@ -757,14 +757,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&registry_intree.step);
 
-    // registry-tests: the example's own tests, rooted at app.zig — the pure
-    // state machine (registry.zig) and the in-process 2-of-2 AppNode restart
-    // test. They write scratch data dirs and read undeclared files: cwd
-    // pinned + side effects. Part of `test`.
+    // registry-tests: the example's own tests, rooted at main.zig so the CLI
+    // boot/history policy is covered alongside the pure state machine, RPC,
+    // checkpoint archive and in-process 2-of-2 AppNode restart test. They
+    // write scratch data dirs and read undeclared files: cwd pinned + side
+    // effects. Part of `test`.
     const registry_tests = b.addTest(.{
         .name = "slcp-registry-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/registry/src/app.zig"),
+            .root_source_file = b.path("examples/registry/src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
@@ -773,7 +774,7 @@ pub fn build(b: *std.Build) void {
     const run_registry_tests = b.addRunArtifact(registry_tests);
     run_registry_tests.setCwd(b.path("."));
     run_registry_tests.has_side_effects = true;
-    const registry_tests_step = b.step("registry-tests", "Run examples/registry's own tests: the pure state machine + the in-process 2-of-2 restart test (part of `test`)");
+    const registry_tests_step = b.step("registry-tests", "Run examples/registry's state, RPC, history, CLI-policy, and in-process restart tests (part of `test`)");
     registry_tests_step.dependOn(&run_registry_tests.step);
     test_step.dependOn(&run_registry_tests.step);
 

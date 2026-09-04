@@ -14,9 +14,10 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(exe);
     run.addPassthruArgs();
     b.step("run", "Run registry with the arguments after `--`").dependOn(&run.step);
-    // `zig build test`: the pure state machine, the RPC, and a live 2-of-2 pair.
+    // `zig build test`: state machine, RPC, history/boot policy, and a live
+    // 2-of-2 pair. Root at main so its CLI-policy tests are not orphaned.
     const tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/app.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "slcp", .module = slcp_dep.module("slcp") }},

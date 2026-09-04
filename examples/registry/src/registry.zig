@@ -58,11 +58,13 @@ pub fn nominationDue(has_pending: bool, elapsed_ms: u64, busy_min_ms: u64, idle_
 pub const tag_net = "REGISTRY-NET-V1";
 pub const tag_tx = "REGISTRY-TX-V1";
 pub const tag_hdr = "REGISTRY-HDR-V1";
-pub const snap_magic = "REGISTRY-SNAP-V1\n";
+pub const snap_magic_v1 = "REGISTRY-SNAP-V1\n";
+pub const snap_magic = "REGISTRY-SNAP-V2\n";
 
 comptime {
     std.debug.assert(max_set_bytes <= max_value_bytes);
     std.debug.assert(max_txs <= 255 and max_accounts <= 255 and max_names <= 255);
+    std.debug.assert(snap_magic_v1.len == snap_magic.len);
 }
 
 pub const Key = [32]u8;
@@ -345,6 +347,9 @@ pub const State = struct {
     /// The results of the last applied set, in set order.
     last_count: u8 = 0,
     last_results: [max_txs]Result = @splat(.ok),
+    /// The exact consensus value that advanced `head` to its current slot.
+    /// This is checkpoint context, not part of the replicated state root.
+    last_set: ?TxSet = null,
 
     pub fn accountsSlice(self: *const State) []const Account {
         return self.accounts[0..self.n_accounts];
@@ -505,7 +510,7 @@ pub const State = struct {
     }
 
     /// SHA-256 of `serialize`: excludes the header, the network id and the
-    /// last results.
+    /// last results or last consensus set.
     pub fn stateRoot(self: *const State) [32]u8 {
         var buf: [state_bytes_max]u8 = undefined;
         return sha256(self.serialize(&buf));
@@ -674,6 +679,7 @@ pub fn apply(state: *State, set: *const TxSet) void {
     }
     state.last_count = @intCast(txs.len);
     for (state.last_results[txs.len..]) |*r| r.* = .ok;
+    state.last_set = set.*;
 
     const h = &state.head;
     h.slot += 1;
@@ -737,9 +743,10 @@ pub fn headerHash(h: *const Header) [32]u8 {
 // Snapshot (roadmap §3.8)
 // ---------------------------------------------------------------------------
 
-/// magic ‖ network_id ‖ slot ‖ hash ‖ prev_hash ‖ txset_hash ‖ state_root ‖
-/// state bytes ‖ SHA-256 of everything before it.
-pub const snapshot_max_bytes: usize = snap_magic.len + 32 + 8 + 4 * 32 + state_bytes_max + 32;
+/// V2: magic ‖ network_id ‖ slot ‖ hash ‖ prev_hash ‖ txset_hash ‖
+/// state_root ‖ last-set length ‖ last-set bytes ‖ state bytes ‖ SHA-256
+/// of everything before it. A zero last-set length is reserved for genesis.
+pub const snapshot_max_bytes: usize = snap_magic.len + 32 + 8 + 4 * 32 + 2 + max_set_bytes + state_bytes_max + 32;
 const snapshot_fixed_prefix: usize = snap_magic.len + 32 + 8 + 4 * 32;
 
 /// `buf.len >= snapshot_max_bytes`.
@@ -756,6 +763,20 @@ pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
         @memcpy(buf[off..][0..32], f);
         off += 32;
     }
+    if (state.last_set) |*set| {
+        std.debug.assert(state.head.slot > 0);
+        std.debug.assert(std.mem.eql(u8, &state.head.txset_hash, &set.hash()));
+        var set_buf: [max_set_bytes]u8 = undefined;
+        const encoded = set.encode(&set_buf);
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(encoded.len), .big);
+        off += 2;
+        @memcpy(buf[off..][0..encoded.len], encoded);
+        off += encoded.len;
+    } else {
+        std.debug.assert(state.head.slot == 0);
+        std.mem.writeInt(u16, buf[off..][0..2], 0, .big);
+        off += 2;
+    }
     const body = state.serialize(buf[off..]);
     off += body.len;
     const sum = sha256(buf[0..off]);
@@ -764,27 +785,65 @@ pub fn writeSnapshot(state: *const State, buf: []u8) []u8 {
     return buf[0..off];
 }
 
-/// Strict: magic, checksum, canonical state bytes, and the header's
-/// `state_root` must equal the root of the state read back. Results are
-/// zeroed (they are not persisted).
+/// Strict: checksum, canonical state bytes, and the header's `state_root`
+/// must equal the root of the state read back. V2 also requires the exact
+/// canonical last consensus set at every non-genesis slot and binds its hash
+/// to `head.txset_hash`. V1 remains readable with `last_set = null`. Results
+/// are zeroed (they are not persisted).
 pub fn readSnapshot(bytes: []const u8) ?State {
     if (bytes.len < snapshot_fixed_prefix + 2 + 32) return null;
-    if (!std.mem.eql(u8, bytes[0..snap_magic.len], snap_magic)) return null;
+    const is_v2 = std.mem.eql(u8, bytes[0..snap_magic.len], snap_magic);
+    const is_v1 = std.mem.eql(u8, bytes[0..snap_magic_v1.len], snap_magic_v1);
+    if (!is_v2 and !is_v1) return null;
     const body_end = bytes.len - 32;
     const sum = sha256(bytes[0..body_end]);
     if (!std.mem.eql(u8, &sum, bytes[body_end..])) return null;
     var off: usize = snap_magic.len;
-    var state = State.deserialize(bytes[snapshot_fixed_prefix..body_end]) orelse return null;
-    state.network_id = bytes[off..][0..32].*;
+    const network_id = bytes[off..][0..32].*;
     off += 32;
-    state.head.slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
+    var head: Header = .{};
+    head.slot = std.mem.readInt(u64, bytes[off..][0..8], .big);
     off += 8;
-    state.head.hash = bytes[off..][0..32].*;
-    state.head.prev_hash = bytes[off + 32 ..][0..32].*;
-    state.head.txset_hash = bytes[off + 64 ..][0..32].*;
-    state.head.state_root = bytes[off + 96 ..][0..32].*;
-    if (!std.mem.eql(u8, &state.head.state_root, &state.stateRoot())) return null;
-    if (!std.mem.eql(u8, &state.head.hash, &headerHash(&state.head))) return null;
+    head.hash = bytes[off..][0..32].*;
+    head.prev_hash = bytes[off + 32 ..][0..32].*;
+    head.txset_hash = bytes[off + 64 ..][0..32].*;
+    head.state_root = bytes[off + 96 ..][0..32].*;
+    off = snapshot_fixed_prefix;
+
+    var last_set: ?TxSet = null;
+    if (is_v2) {
+        if (body_end < off + 2 + 2) return null;
+        const set_len: usize = std.mem.readInt(u16, bytes[off..][0..2], .big);
+        off += 2;
+        if (set_len > max_set_bytes or body_end < off + set_len + 2) return null;
+        if (head.slot == 0) {
+            if (set_len != 0) return null;
+        } else {
+            if (set_len == 0) return null;
+            const set = TxSet.decode(bytes[off..][0..set_len]) orelse return null;
+            if (!std.mem.eql(u8, &head.txset_hash, &set.hash())) return null;
+            last_set = set;
+        }
+        off += set_len;
+    }
+
+    var state = State.deserialize(bytes[off..body_end]) orelse return null;
+    state.network_id = network_id;
+    state.head = head;
+    state.last_set = last_set;
+    if (state.head.slot == 0) {
+        // Genesis has no ledger header yet: apply(slot 1) must continue from
+        // the all-zero hash used by every fresh State. Accept only that exact
+        // empty form rather than inventing a slot-zero header hash/root.
+        if (state.n_accounts != 0 or state.n_names != 0 or
+            !isZero(&state.head.hash) or
+            !isZero(&state.head.prev_hash) or
+            !isZero(&state.head.txset_hash) or
+            !isZero(&state.head.state_root)) return null;
+    } else {
+        if (!std.mem.eql(u8, &state.head.state_root, &state.stateRoot())) return null;
+        if (!std.mem.eql(u8, &state.head.hash, &headerHash(&state.head))) return null;
+    }
     return state;
 }
 
@@ -1115,6 +1174,27 @@ test "apply: operations, results, sequence numbers consumed on failure, header c
     try testing.expectEqual(@as(u8, max_names), full.n_names);
 }
 
+test "apply: records the exact last consensus set, including an empty set" {
+    const t = TestNet.init();
+    var s = t.genesis();
+    const set1 = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
+
+    apply(&s, &set1);
+    var expected_buf: [max_set_bytes]u8 = undefined;
+    var actual_buf: [max_set_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, set1.encode(&expected_buf), s.last_set.?.encode(&actual_buf));
+
+    apply(&s, &TxSet.empty);
+    try testing.expectEqual(@as(u8, 0), s.last_set.?.count);
+
+    var without_context = s;
+    without_context.last_set = null;
+    var with_buf: [state_bytes_max]u8 = undefined;
+    var without_buf: [state_bytes_max]u8 = undefined;
+    try testing.expectEqualSlices(u8, s.serialize(&with_buf), without_context.serialize(&without_buf));
+    try testing.expectEqualSlices(u8, &s.stateRoot(), &without_context.stateRoot());
+}
+
 // Non-vacuity: two states fed the same sets must serialize identically and
 // carry the same head; a different set in the middle must not.
 test "determinism: identical histories give identical roots and header hashes" {
@@ -1228,6 +1308,7 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     try testing.expectEqual(@as(u8, 2), s.last_count);
     var buf: [snapshot_max_bytes]u8 = undefined;
     const snap = writeSnapshot(&s, &buf);
+    try testing.expectEqualStrings(snap_magic, snap[0..snap_magic.len]);
     const back = readSnapshot(snap).?;
     try testing.expectEqual(s.head.slot, back.head.slot);
     try testing.expectEqualSlices(u8, &s.head.hash, &back.head.hash);
@@ -1235,6 +1316,9 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     try testing.expectEqualStrings("v", back.findName("alice").?.valueSlice());
     try testing.expectEqual(@as(u64, 3), back.accountSeq(t.keys[0]));
     try testing.expectEqual(@as(u8, 0), back.last_count);
+    var expected_set_buf: [max_set_bytes]u8 = undefined;
+    var actual_set_buf: [max_set_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, s.last_set.?.encode(&expected_set_buf), back.last_set.?.encode(&actual_set_buf));
     var bx: [state_bytes_max]u8 = undefined;
     var by: [state_bytes_max]u8 = undefined;
     try testing.expectEqualSlices(u8, s.serialize(&bx), back.serialize(&by));
@@ -1245,7 +1329,9 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     try testing.expect(readSnapshot(snap[0 .. snap.len - 1]) == null); // short
     // Tamper with an entry AND fix the checksum: the recorded root disagrees.
     var tampered = buf;
-    tampered[snapshot_fixed_prefix + 1 + 40 + 1 + 66] ^= 1; // first name's first value byte
+    const last_set_len: usize = std.mem.readInt(u16, snap[snapshot_fixed_prefix..][0..2], .big);
+    const state_offset = snapshot_fixed_prefix + 2 + last_set_len;
+    tampered[state_offset + 1 + 40 + 1 + 66] ^= 1; // first name's first value byte
     const fixed = sha256(tampered[0 .. snap.len - 32]);
     @memcpy(tampered[snap.len - 32 ..][0..32], &fixed);
     try testing.expect(readSnapshot(tampered[0..snap.len]) == null);
@@ -1255,6 +1341,74 @@ test "snapshot: round-trip; checksum, tampering and a wrong root are refused; re
     const fixed2 = sha256(wrong_head[0 .. snap.len - 32]);
     @memcpy(wrong_head[snap.len - 32 ..][0..32], &fixed2);
     try testing.expect(readSnapshot(wrong_head[0..snap.len]) == null);
+}
+
+test "snapshot V2: replacing the canonical last set is refused even with a repaired checksum" {
+    const t = TestNet.init();
+    var s = t.genesis();
+    const original = TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)});
+    apply(&s, &original);
+
+    var snapshot_buf: [snapshot_max_bytes]u8 = undefined;
+    const snapshot = writeSnapshot(&s, &snapshot_buf);
+    const set_len: usize = std.mem.readInt(u16, snapshot[snapshot_fixed_prefix..][0..2], .big);
+    try testing.expectEqual(@as(usize, 1 + tx_bytes), set_len);
+
+    const replacement = TestNet.set(&.{t.tx(0, 1, .claim, "mallory", "", zero_key)});
+    var replacement_buf: [max_set_bytes]u8 = undefined;
+    const replacement_bytes = replacement.encode(&replacement_buf);
+    try testing.expectEqual(set_len, replacement_bytes.len);
+
+    var tampered = snapshot_buf;
+    @memcpy(tampered[snapshot_fixed_prefix + 2 ..][0..set_len], replacement_bytes);
+    const repaired = sha256(tampered[0 .. snapshot.len - 32]);
+    @memcpy(tampered[snapshot.len - 32 ..][0..32], &repaired);
+    try testing.expect(readSnapshot(tampered[0..snapshot.len]) == null);
+}
+
+test "snapshot V1: legacy snapshots remain readable without prior consensus context" {
+    const t = TestNet.init();
+    var s = t.genesis();
+    apply(&s, &TestNet.set(&.{t.tx(0, 1, .claim, "alice", "", zero_key)}));
+
+    var v2_buf: [snapshot_max_bytes]u8 = undefined;
+    const v2 = writeSnapshot(&s, &v2_buf);
+    const set_len: usize = std.mem.readInt(u16, v2[snapshot_fixed_prefix..][0..2], .big);
+    const state_offset = snapshot_fixed_prefix + 2 + set_len;
+
+    var v1_buf: [snapshot_max_bytes]u8 = undefined;
+    @memcpy(v1_buf[0..snap_magic_v1.len], snap_magic_v1);
+    @memcpy(v1_buf[snap_magic_v1.len..snapshot_fixed_prefix], v2[snap_magic.len..snapshot_fixed_prefix]);
+    const state_len = v2.len - 32 - state_offset;
+    @memcpy(v1_buf[snapshot_fixed_prefix..][0..state_len], v2[state_offset..][0..state_len]);
+    const body_end = snapshot_fixed_prefix + state_len;
+    const checksum = sha256(v1_buf[0..body_end]);
+    @memcpy(v1_buf[body_end..][0..32], &checksum);
+
+    const restored = readSnapshot(v1_buf[0 .. body_end + 32]).?;
+    try testing.expectEqual(s.head.slot, restored.head.slot);
+    try testing.expectEqualSlices(u8, &s.head.hash, &restored.head.hash);
+    try testing.expectEqualStrings("alice", restored.findName("alice").?.nameSlice());
+    try testing.expect(restored.last_set == null);
+}
+
+test "snapshot V2: canonical genesis round-trips without inventing a slot-zero header" {
+    const network_id = networkId("snapshot genesis");
+    const genesis: State = .{ .network_id = network_id };
+    var buf: [snapshot_max_bytes]u8 = undefined;
+    const encoded = writeSnapshot(&genesis, &buf);
+    const restored = readSnapshot(encoded).?;
+    try testing.expectEqual(@as(u64, 0), restored.head.slot);
+    try testing.expectEqualSlices(u8, &network_id, &restored.network_id);
+    try testing.expect(isZero(&restored.head.hash));
+    try testing.expectEqual(@as(u8, 0), restored.n_accounts);
+    try testing.expectEqual(@as(u8, 0), restored.n_names);
+    try testing.expect(restored.last_set == null);
+
+    var invalid = genesis;
+    invalid.head.prev_hash = @splat(0x01);
+    const bad = writeSnapshot(&invalid, &buf);
+    try testing.expect(readSnapshot(bad) == null);
 }
 
 // Non-vacuity: the golden bytes pin the header format (tag, field order,
