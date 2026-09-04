@@ -1,4 +1,4 @@
-//! main.zig — the `registry` process (docs/examples-roadmap.md E1–E2b:
+//! main.zig — the `registry` process (docs/examples-roadmap.md E1–E2c:
 //! persistence, flooding, authenticated checkpoint recovery, cadence, and
 //! CLI). `registry node …` runs one validator: the typed node from
 //! app.zig, the RPC server from rpc.zig, the snapshot file, and the cadence
@@ -130,7 +130,7 @@ const Flags = struct {
     }
 };
 
-const FlagError = error{ UnknownFlag, MissingValue, BadPort, BadMillis, BadGenesisCloseTime, BadClockOffset, BadCheckpointInterval, BadSlot } || std.mem.Allocator.Error;
+const FlagError = error{ UnknownFlag, MissingValue, EmptyNetwork, BadPort, BadMillis, BadGenesisCloseTime, BadClockOffset, BadCheckpointInterval, BadSlot } || std.mem.Allocator.Error;
 
 fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool) FlagError!Flags {
     var f: Flags = .{};
@@ -147,6 +147,7 @@ fn parseFlags(gpa: std.mem.Allocator, args: []const []const u8, node_mode: bool)
         i += 1;
         const value = args[i];
         if (eql(name, "network")) {
+            if (value.len == 0) return error.EmptyNetwork;
             f.network = value;
         } else if (eql(name, "genesis-close-time")) {
             f.genesis_close_time = std.fmt.parseInt(u64, value, 10) catch return error.BadGenesisCloseTime;
@@ -198,6 +199,7 @@ fn flagsOrUsage(gpa: std.mem.Allocator, args: []const []const u8, node_mode: boo
         _ = usageError(switch (err) {
             error.UnknownFlag => "unknown flag",
             error.MissingValue => "a flag is missing its value",
+            error.EmptyNetwork => "--network must be a non-empty passphrase unique to this registry network",
             error.BadPort => "a port must be a number in 1..65535",
             error.BadMillis => "--min-slot-ms / --heartbeat-ms take milliseconds (heartbeat > 0)",
             error.BadGenesisCloseTime => "--genesis-close-time must be a Unix-seconds integer below 18446744073709551615",
@@ -329,7 +331,9 @@ const BootSelection = struct {
 
 const BootSelectionError = error{
     SnapshotWrongNetwork,
+    SnapshotWrongGenesisCloseTime,
     HistoryCheckpointWrongNetwork,
+    HistoryCheckpointWrongGenesisCloseTime,
     HistoryCheckpointConflict,
     HistoryCheckpointAtMaxSlot,
     HistoryFloorUnavailable,
@@ -348,9 +352,13 @@ fn selectBootState(
 ) BootSelectionError!BootSelection {
     if (local) |state| {
         if (!std.mem.eql(u8, &state.network_id, &network_id)) return error.SnapshotWrongNetwork;
+        if (!registry.closeTimeAtSlotOk(genesis_close_time, state.head.slot, state.head.close_time))
+            return error.SnapshotWrongGenesisCloseTime;
     }
     if (authenticated) |state| {
         if (!std.mem.eql(u8, &state.network_id, &network_id)) return error.HistoryCheckpointWrongNetwork;
+        if (!registry.closeTimeAtSlotOk(genesis_close_time, state.head.slot, state.head.close_time))
+            return error.HistoryCheckpointWrongGenesisCloseTime;
         if (state.head.slot < min_slot) return error.HistoryFloorUnavailable;
     }
 
@@ -685,6 +693,12 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             std.debug.print("registry node: {s}/snapshot belongs to another --network; use a fresh --data-dir\n", .{data_dir});
             return 1;
         }
+        // Validate G before this local slot is used as the archive lookup
+        // floor. `selectBootState` repeats the check at the install boundary.
+        if (!registry.closeTimeAtSlotOk(genesis_close_time, snap.head.slot, snap.head.close_time)) {
+            std.debug.print("registry node: the local snapshot's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped and restore a snapshot from this network epoch\n", .{genesis_close_time});
+            return 1;
+        }
     }
 
     var history_archive: ?history.Archive = null;
@@ -719,6 +733,8 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
 
     const selected = selectBootState(nid, genesis_close_time, local_snapshot, authenticated, f.history_min_slot) catch |err| {
         switch (err) {
+            error.SnapshotWrongGenesisCloseTime => std.debug.print("registry node: the local snapshot's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped and restore a snapshot from this network epoch\n", .{genesis_close_time}),
+            error.HistoryCheckpointWrongGenesisCloseTime => std.debug.print("registry node: the authenticated history checkpoint's slot/close_time is outside the interval anchored by --genesis-close-time {d}; keep this node stopped\n", .{genesis_close_time}),
             error.HistoryCheckpointConflict => std.debug.print("registry node: the authenticated history checkpoint and local snapshot claim different heads at the same slot; keep this node stopped\n", .{}),
             error.HistoryFloorUnavailable => std.debug.print("registry node: no local snapshot or authenticated history checkpoint reaches --history-min-slot {d}; refusing an anti-rollback downgrade\n", .{f.history_min_slot}),
             else => std.debug.print("registry node: cannot select boot state: {t}\n", .{err}),
@@ -1100,6 +1116,7 @@ test "registry main: history flags parse and checkpoint cadence is bounded by th
     try testing.expectError(error.BadSlot, parseFlags(testing.allocator, &.{ "--history-min-slot", "not-a-slot" }, true));
     try testing.expectError(error.BadGenesisCloseTime, parseFlags(testing.allocator, &.{ "--genesis-close-time", "18446744073709551615" }, true));
     try testing.expectError(error.BadClockOffset, parseFlags(testing.allocator, &.{ "--proposal-clock-offset-s", "fast" }, true));
+    try testing.expectError(error.EmptyNetwork, parseFlags(testing.allocator, &.{ "--network", "" }, true));
 }
 
 test "registry main: proposal clock offsets saturate without affecting cadence time" {
@@ -1112,9 +1129,11 @@ test "registry main: boot selection prefers authenticated history and treats its
     const nid = testNetworkId("registry main history selection");
     var local: registry.State = .{ .network_id = nid };
     local.head.slot = 10;
+    local.head.close_time = test_genesis_close_time + 10;
     local.head.hash = @splat(0x10);
     var checkpoint = local;
     checkpoint.head.slot = 11;
+    checkpoint.head.close_time = test_genesis_close_time + 11;
     checkpoint.head.hash = @splat(0x11);
 
     const newer = try selectBootState(nid, test_genesis_close_time, local, checkpoint, 0);
@@ -1133,6 +1152,26 @@ test "registry main: boot selection prefers authenticated history and treats its
     fork.head.hash = @splat(0xff);
     try testing.expectError(error.HistoryCheckpointConflict, selectBootState(nid, test_genesis_close_time, checkpoint, fork, 0));
     try testing.expectError(error.HistoryFloorUnavailable, selectBootState(nid, test_genesis_close_time, local, null, 11));
+}
+
+test "registry main: boot selection rejects a local genesis from a different close-time epoch" {
+    const nid = testNetworkId("registry main local genesis epoch");
+    const wrong_genesis = registry.State.genesis(nid, test_genesis_close_time + 1);
+    try testing.expectError(
+        error.SnapshotWrongGenesisCloseTime,
+        selectBootState(nid, test_genesis_close_time, wrong_genesis, null, 0),
+    );
+}
+
+test "registry main: boot selection rejects history outside the cumulative close-time epoch" {
+    const nid = testNetworkId("registry main history close-time epoch");
+    var checkpoint = registry.State.genesis(nid, test_genesis_close_time);
+    checkpoint.head.slot = 2;
+    checkpoint.head.close_time = test_genesis_close_time + 1;
+    try testing.expectError(
+        error.HistoryCheckpointWrongGenesisCloseTime,
+        selectBootState(nid, test_genesis_close_time, null, checkpoint, 0),
+    );
 }
 
 test "registry main: a history-free empty boot preserves genesis behavior" {

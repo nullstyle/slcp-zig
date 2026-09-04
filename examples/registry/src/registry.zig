@@ -42,10 +42,9 @@ pub const max_value_bytes: u32 = 8192;
 pub const max_pending: usize = 256;
 /// Cadence defaults (`--min-slot-ms`, `--heartbeat-ms`): close no faster
 /// than `min_slot_ms` when transactions are pending; when idle, close every
-/// `heartbeat_ms`. A transaction submitted to one node lands in the first
-/// slot whose round-1 leader is that node (E1 has no transaction flooding),
-/// so the expected wait is about three heartbeats; the library's 16-slot
-/// answering window is 16 heartbeats of idle time.
+/// `heartbeat_ms`. E2a floods admitted transactions before nomination, so a
+/// transaction can land in the first eligible slot after network admission;
+/// the library's 16-slot answering window is 16 heartbeats of idle time.
 pub const min_slot_ms: u64 = 1000;
 pub const heartbeat_ms: u64 = 3000;
 
@@ -60,6 +59,16 @@ pub fn nominationDue(has_pending: bool, elapsed_ms: u64, busy_min_ms: u64, idle_
 }
 
 pub const max_close_time_step: u64 = 60;
+
+/// Whether `close_time` can be reached at `slot` from the configured genesis
+/// anchor using one deterministic 1..60-second step per ledger. Slot zero is
+/// therefore exact equality with `genesis_close_time`; if even the lower
+/// endpoint is not representable, no continuation exists.
+pub fn closeTimeAtSlotOk(genesis_close_time: u64, slot: u64, close_time: u64) bool {
+    const lower = std.math.add(u64, genesis_close_time, slot) catch return false;
+    const upper = genesis_close_time +| (slot *| max_close_time_step);
+    return close_time >= lower and close_time <= upper;
+}
 
 pub const tag_net = "REGISTRY-NET-V2";
 pub const tag_tx = "REGISTRY-TX-V1";
@@ -386,7 +395,8 @@ pub const Entry = struct {
 pub const state_bytes_max: usize = 1 + max_accounts * 40 + 1 + max_names * 130;
 
 pub const State = struct {
-    /// Set at genesis from the passphrase; identical on every node.
+    /// Set at genesis from the passphrase plus genesis close time; identical
+    /// on every node.
     network_id: [32]u8 = @splat(0),
     head: Header = .{},
     n_accounts: u8 = 0,
@@ -571,8 +581,8 @@ pub const State = struct {
         return s;
     }
 
-    /// SHA-256 of `serialize`: excludes the header, the network id and the
-    /// last results or last consensus set.
+    /// SHA-256 of `serialize`: excludes the header, the network id, the last
+    /// results, and the last consensus ledger value.
     pub fn stateRoot(self: *const State) [32]u8 {
         var buf: [state_bytes_max]u8 = undefined;
         return sha256(self.serialize(&buf));
@@ -1632,6 +1642,20 @@ test "E2c contextual validation enforces the exact slot-derived close-time inter
     var at_end = state;
     at_end.head.close_time = std.math.maxInt(u64);
     try testing.expectEqual(Verdict.invalid, validate(&at_end, &.{ .close_time = std.math.maxInt(u64), .txs = clean }, 11));
+}
+
+test "E2c restored heads remain inside the representable genesis-anchored interval" {
+    const genesis: u64 = 1_000;
+    try testing.expect(closeTimeAtSlotOk(genesis, 0, 1_000));
+    try testing.expect(!closeTimeAtSlotOk(genesis, 0, 1_001));
+    try testing.expect(closeTimeAtSlotOk(genesis, 2, 1_002));
+    try testing.expect(closeTimeAtSlotOk(genesis, 2, 1_120));
+    try testing.expect(!closeTimeAtSlotOk(genesis, 2, 1_001));
+    try testing.expect(!closeTimeAtSlotOk(genesis, 2, 1_121));
+
+    const near_max = std.math.maxInt(u64) - 1;
+    try testing.expect(closeTimeAtSlotOk(near_max, 1, std.math.maxInt(u64)));
+    try testing.expect(!closeTimeAtSlotOk(near_max, 2, std.math.maxInt(u64)));
 }
 
 test "E2c proposal clamps wall time and combination chooses the minimum candidate time" {
