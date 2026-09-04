@@ -58,8 +58,13 @@ process hit).
 
 - Registry suite: **PASS** — 104/104 (four new retention tests), zero leaks.
 - Docs-smoke: **PASS** — 436 checks, 0 failures.
-- The three-process registry smoke and the full repository gate are rerun
-  for this change below.
+- Full three-process registry smoke: **PASS** (4 min) — the ReleaseSafe
+  consumer build compiles the startup prune path, and the live line's
+  flooding, close-time chain, restart, ≥201-slot outage with peerless
+  anchor-to-certified-tip replay, and hard-epoch probe all pass with
+  retention active.
+- Repository gate: **PASS** — 113/113 steps, 208/208 tests; strict API gate
+  green (no library surface changed this sprint).
 
 ## Historical feature record: registry heap-state migration (capacity epoch)
 
