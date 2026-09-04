@@ -165,6 +165,64 @@ apps remain valid.
   };
   ```
 
+### Heap-sized state: `slcp.OwnedAppNode` (Experimental)
+
+`AppNode` copies `State` into every applied notification, `initialState()`
+takes no argument, and nothing is ever freed — fine for the counter, wrong
+for a state that is really a heap of accounts. `slcp.OwnedAppNode(App)`
+(`src/node/owned_app_node.zig`, [ADR 0003](adr/0003-owned-application-state.md))
+is the opt-in sibling that owns the state's whole lifecycle. The contract
+differs in exactly the places ownership bites:
+
+```zig
+const App = struct {
+    pub const State = ...;     // may own heap memory; the node owns its lifetime
+    pub const Command = ...;   // same codec rules as AppNode
+    pub const Obs = ...;       // the per-slot observation waitApplied hands out
+    pub const Context = ...;   // what initState receives (void when unused)
+    pub const InitError = error{ OutOfMemory, ... };  // explicit, like slcp.keys
+
+    pub fn initState(context: Context, gpa: std.mem.Allocator) InitError!State;
+    pub fn deinitState(state: *State, gpa: std.mem.Allocator) void;
+    pub fn validate(state: *const State, cmd: Command, context: slcp.ValueContext) slcp.Validity;
+    pub fn apply(state: *State, cmd: Command, gpa: std.mem.Allocator) std.mem.Allocator.Error!void;
+    pub fn observe(state: *const State, gpa: std.mem.Allocator) std.mem.Allocator.Error!Obs;
+    // optional, same meanings as AppNode (but read from the loaded state):
+    pub fn initialSlot(state: *const State) u64;
+    pub fn initialCommand(state: *const State) ?Command;
+    pub fn combine(state: *const State, cmds: []const Command) Command;
+    // required iff Obs contains a pointer; rejected when Obs is plain data:
+    pub fn deinitObs(obs: *Obs, gpa: std.mem.Allocator) void;
+};
+```
+
+and the node becomes `slcp.OwnedAppNode(App).create(gpa, io, opts, context)`
+— the `context` argument is how a durable snapshot reaches `initState`
+without a process global. Four rules carry the ownership model:
+
+- **Apply may allocate; only OutOfMemory can fail it** (the signature forbids
+  the rest). An OOM halts this node — the value was decided before `apply`
+  ran, so a halt cannot fork anything — and the partially applied state is
+  never consulted again. Do not try to roll back: a rollback can fail under
+  the same pressure.
+- **Observations never alias State.** `observe` runs on the engine thread
+  right after each `apply`; what it returns is everything the user thread
+  sees. An `Obs` with a pointer owns that memory: every item taken from
+  `waitApplied` goes back through `node.release(applied)` (copying an owned
+  `Obs` out and releasing both paths is a double free). `deinit` frees
+  observations nobody took.
+- **A durable snapshot is written from an observation** (user thread) and
+  **loaded through the context** (creating thread), which keeps the
+  `initialSlot`/`initialCommand` continuity rules above working unchanged —
+  the journal tail still replays or skips against the loaded state.
+- **validate/combine take `*const State` and no allocator**: verdicts cannot
+  depend on available memory.
+
+The adapter's own tests (`src/node/owned_app_node.zig`) are the worked
+recipe, including a 2-of-2 restart whose snapshot travels through the
+context and a proof that the notification path allocates nothing per slot
+over a 100,000-entry state.
+
 ## 4. Step 2: the raw `Driver` vtable
 
 When you need `extract_valid_value`, a bytes-first policy, or a vtable shared
