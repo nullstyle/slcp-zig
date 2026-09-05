@@ -27,7 +27,31 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: per-peer catch-up diagnosis
+## Current feature work: durable application watermark
+
+Experimental `RecoveryOptions.retain_until_durable` protects local replay for
+applications that publish state asynchronously. The trusted checkpoint's exact
+`previous_value` initializes the durable watermark; `Node.acknowledgeDurable`
+admits coalesced progress and `durableApplicationSlot` observes engine-applied
+progress. Journal cleanup preserves that replay suffix without changing the
+Stable answering-window, Engine/cache, or gap policy. See
+[ADR 0007](docs/adr/0007-durable-application-watermark.md) and
+[application durability](docs/application-durability.md).
+
+Focused verification passes **8/8** tests, including five new cases for the
+slot-64 retention boundary, monotonic acknowledgements and compaction cadence,
+trusted bootstrap, callback races, and allocation-free control admission with
+a saturated ordinary FIFO. Docs smoke passes **436 checks / 0 failures** plus
+**18/18** tests. Strict API verification preserves all **292 Stable**
+declarations and verifies **1,625 Experimental** declarations. The coordinated
+full gate passes **113/113 build steps, 437/438 tests (one platform skip)**. The
+skip is the existing privileged-port negative check: this macOS host permits an
+unprivileged bind to port 1. All **8/8 real-socket E2E tests** pass in ReleaseSafe,
+including the 200-slot cluster, restart/catch-up/voting, configured answering
+window, repeated double restart, partition/heal, and equivocation scenarios.
+No release or push was performed.
+
+## Previous feature work: per-peer catch-up diagnosis
 
 A quiet node can now say WHICH kind of quiet it is
 ([ADR 0006](docs/adr/0006-catchup-diagnosis.md)). Every established overlay

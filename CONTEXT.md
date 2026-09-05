@@ -154,6 +154,12 @@ A durable encoding of application state at one delivery frontier. Its local
 integrity does not establish that another node should trust its contents.
 _Avoid_: History checkpoint
 
+**Durable application watermark**:
+The highest delivered slot whose complete application state and exact previous
+value are durably recoverable. It is a local application assertion, not evidence
+of validator agreement.
+_Avoid_: Delivery frontier, history tip, answering window
+
 **Snapshot anchor**:
 An application snapshot chosen as the starting state for a bounded replay of
 later ledger records. It anchors application state, not validator agreement.

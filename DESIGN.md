@@ -314,7 +314,8 @@ must not continue signing. Recovery replays the retained externalized journal
 tail to the application. It restores own statements only from the later of
 `start_slot` and the delivered frontier's W-slot answer floor, while
 independently rejecting inbound/Engine work below the later of `start_slot`
-and the journal high-water mark's successor. In gap-free steady state with no
+and the journal high-water mark's successor. With default journal retention,
+in gap-free steady state with no
 already-journaled future externalizations, a successful compaction leaves at
 most a W-slot journal suffix and its span can reach `W + 63` before the next
 64-slot frontier boundary. Already-journaled future externalizations extend
@@ -323,6 +324,13 @@ every case the bounded own-state restore prevents stale history from crowding
 the Engine: records below the W-slot answer floor are skipped, leaving at most
 W restored past-side answer slots and room for current consensus. The stronger
 admission floor prevents a closed slot from being resurrected after restart.
+
+Experimental `RecoveryOptions.retain_until_durable` additionally pins local
+journal replay after an application's trusted durable checkpoint. Coalesced
+acknowledgements release that pin only after engine-thread validation, without
+changing peer answering, Engine/cache retention, or gap abandonment. A stalled
+publisher can retain a longer journal suffix; the application must bound its
+unpublished work. See [application durability](docs/application-durability.md).
 
 The consensus journal supports a bounded answering window; it is not complete
 application state or an authenticated history-transfer format. Applications

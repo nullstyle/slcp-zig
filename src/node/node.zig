@@ -314,7 +314,14 @@ pub const RecoveryValue = struct {
 pub const RecoveryOptions = struct {
     hook: ?RecoveryHook = null,
     previous_value: ?RecoveryValue = null,
+    /// Experimental: keep local replay records after the application's durable
+    /// checkpoint until explicitly acknowledged. Seeds from previous_value's
+    /// slot, or zero for genesis; does not enlarge the peer answering window.
+    retain_until_durable: bool = false,
 };
+
+/// Experimental local publication-control errors; no consensus input changes.
+pub const DurabilityError = error{ DurabilityDisabled, DurabilityRegression, AheadOfDelivery, NodeClosed, NodeFailed };
 
 pub const DeliveryHook = struct {
     ctx: *anyopaque,
@@ -393,7 +400,8 @@ pub const InputItem = struct {
 
 /// Native host ingress pressure. Experimental: queue budgets may be tuned in
 /// later 0.x releases. `queued_items` includes the optional coalesced purge
-/// barrier in addition to the bounded ordinary FIFO; `queued_bytes` covers
+/// barrier and application-durable acknowledgement in addition to the bounded
+/// ordinary FIFO; `queued_bytes` covers
 /// payload bytes in that FIFO. Queue size is one coherent lock snapshot; the
 /// drop counter is an independent monotonic atomic total. A network drop is a
 /// transport-accepted envelope or a valid, requested qset response lost to
@@ -878,6 +886,7 @@ pub fn envelopeMeta(gpa: std.mem.Allocator, network_id: [32]u8, framed_env: []co
 /// (cancellation is a no-op on our raw std.Thread workers, so the
 /// *Uncancelable variants are used to avoid the error union).
 const InputQueue = struct {
+    const Event = union(enum) { engine: InputItem, durable: u64 };
     const max_items: usize = 1024;
     /// The ordinary FIFO may retain at most one additional cap-sized consumed
     /// prefix. Compacting only at that threshold makes the copies amortized
@@ -900,6 +909,8 @@ const InputQueue = struct {
     /// are monotonic, so one maximum watermark represents any number of
     /// pending purge inputs without losing work.
     pending_purge: ?u64 = null,
+    pending_durable: ?u64 = null,
+    requested_durable: u64 = 0,
     dropped_network: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     closed: bool = false,
 
@@ -942,6 +953,20 @@ const InputQueue = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.pending_purge = if (self.pending_purge) |old| @max(old, max_slot) else max_slot;
+        self.cond.signal(self.io);
+    }
+
+    /// A single non-allocating, monotonic control slot is independent of the
+    /// ordinary FIFO budget. Acknowledgements cannot displace network work.
+    fn pushDurable(self: *InputQueue, slot: u64, delivered: u64) DurabilityError!void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.closed) return error.NodeClosed;
+        if (slot < self.requested_durable) return error.DurabilityRegression;
+        if (slot > delivered) return error.AheadOfDelivery;
+        if (slot == self.requested_durable) return;
+        self.requested_durable = slot;
+        self.pending_durable = slot;
         self.cond.signal(self.io);
     }
 
@@ -1007,15 +1032,19 @@ const InputQueue = struct {
     }
 
     /// Block for the next item; null once closed and drained.
-    fn pop(self: *InputQueue) ?InputItem {
+    fn pop(self: *InputQueue) ?Event {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        while (self.head >= self.items.items.len and self.pending_purge == null and !self.closed) {
+        while (self.head >= self.items.items.len and self.pending_purge == null and self.pending_durable == null and !self.closed) {
             self.cond.waitUncancelable(self.io, &self.mu);
         }
         if (self.pending_purge) |max_slot| {
             self.pending_purge = null;
-            return .{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null };
+            return .{ .engine = .{ .input = .{ .purge_slots = .{ .max_slot = max_slot } }, .source_peer = null } };
+        }
+        if (self.pending_durable) |slot| {
+            self.pending_durable = null;
+            return .{ .durable = slot };
         }
         if (self.head >= self.items.items.len) return null;
         const it = self.items.items[self.head];
@@ -1025,7 +1054,7 @@ const InputQueue = struct {
             self.items.clearRetainingCapacity();
             self.head = 0;
         }
-        return it;
+        return .{ .engine = it };
     }
 
     /// Discard the already-consumed prefix without touching ownership of the
@@ -1050,7 +1079,7 @@ const InputQueue = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         return .{
-            .queued_items = self.items.items.len - self.head + @intFromBool(self.pending_purge != null),
+            .queued_items = self.items.items.len - self.head + @intFromBool(self.pending_purge != null) + @intFromBool(self.pending_durable != null),
             .queued_bytes = self.bytes,
             .dropped_network_inputs = self.dropped_network.load(.acquire),
         };
@@ -1321,6 +1350,13 @@ pub const Node = struct {
     /// `frontier % 64 == 0`, because one drain can step over a boundary when
     /// out-of-order catch-up slots are buffered.
     last_compact_frontier: u64 = 0,
+    retain_until_durable: bool = false,
+    application_durable: std.atomic.Value(u64) = .init(0),
+    application_delivered: std.atomic.Value(u64) = .init(0),
+    last_compact_keep_from: u64 = 0,
+    /// Latest ordinary cadence target. Acks release only its deferred suffix,
+    /// rather than rewriting the logs once per newly durable delivery slot.
+    compact_target_floor: u64 = 0,
     /// The externalized.log tail found at `create` (first/last slot and the
     /// first slot of its maximal gap-free suffix; null when empty). Written
     /// once before go-live, then read-only: `AppNode` checks an app's
@@ -1377,6 +1413,23 @@ pub const Node = struct {
 
     pub fn allocator(self: *Node) std.mem.Allocator {
         return self.gpa;
+    }
+
+    /// Experimental and thread-safe. The application asserts that its complete
+    /// state and exact previous value through slot are already durable. Success
+    /// admits a coalesced control update; durableApplicationSlot reports when
+    /// the engine applies it. AheadOfDelivery is retryable when a publisher
+    /// finishes before its delivery callback has returned successfully.
+    pub fn acknowledgeDurable(self: *Node, slot: u64) DurabilityError!void {
+        if (!self.retain_until_durable) return error.DurabilityDisabled;
+        if (self.failed.load(.acquire)) return error.NodeFailed;
+        try self.q.pushDurable(slot, self.application_delivered.load(.acquire));
+    }
+
+    /// Last engine-applied durable acknowledgement, or null when not opted in.
+    /// This is an application assertion, not a certificate or a consensus value.
+    pub fn durableApplicationSlot(self: *const Node) ?u64 {
+        return if (self.retain_until_durable) self.application_durable.load(.acquire) else null;
     }
 
     // -------------------------------------------------------------------
@@ -1475,6 +1528,9 @@ pub const Node = struct {
         }
         if (opts.start_slot == 0) {
             return fail(diag, error.StartSlotZero, ".start_slot is 0 but slots start at 1; drop .start_slot (default 1) or set it to the first slot this node should nominate.", .{});
+        }
+        if (recovery.retain_until_durable and opts.start_slot > 1 and recovery.previous_value == null) {
+            return fail(diag, error.EngineFailed, ".retain_until_durable with start_slot {d} requires a trusted application checkpoint and its exact previous_value; an explicit start slot alone does not establish durable application state.", .{opts.start_slot});
         }
 
         // ---- peer specs ----
@@ -1625,7 +1681,7 @@ pub const Node = struct {
             .local_qset = local_diag,
             .watcher = opts.watcher or secret_seed == null,
             .eng = undefined,
-            .q = .{ .gpa = gpa, .io = io },
+            .q = .{ .gpa = gpa, .io = io, .requested_durable = if (recovery.previous_value) |value| value.slot else 0 },
             .qset_requests = try QsetRequests.init(gpa, io, limits.max_pending_envelopes),
             .store = undefined,
             .qset_cache = undefined,
@@ -1635,6 +1691,9 @@ pub const Node = struct {
             .current_slot = opts.start_slot,
             .next_deliver = opts.start_slot,
             .answering = .{ .slots = opts.answering_window_slots },
+            .retain_until_durable = recovery.retain_until_durable,
+            .application_durable = .init(if (recovery.previous_value) |value| value.slot else 0),
+            .application_delivered = .init(if (recovery.previous_value) |value| value.slot else 0),
             .last_ext_value = &.{},
             .delivery = opts.delivery,
             .max_value_bytes = opts.max_value_bytes,
@@ -2421,9 +2480,23 @@ pub const Node = struct {
     }
 
     fn engineLoop(self: *Node) void {
-        while (self.q.pop()) |item| {
-            self.applyInput(item);
+        while (self.q.pop()) |event| {
+            switch (event) {
+                .engine => |item| self.applyInput(item),
+                .durable => |slot| self.applyDurable(slot),
+            }
         }
+    }
+
+    fn applyDurable(self: *Node, slot: u64) void {
+        if (self.failed.load(.acquire) or !self.retain_until_durable) return;
+        const previous = self.application_durable.load(.acquire);
+        if (slot < previous or slot > self.application_delivered.load(.acquire)) {
+            log.warn("rejected application durable slot {d} outside delivered monotonic frontier", .{slot});
+            return;
+        }
+        self.application_durable.store(slot, .release);
+        self.compactJournal(true);
     }
 
     /// Anti-entropy loop (own thread): re-flood our latest own envelopes for
@@ -2827,13 +2900,26 @@ pub const Node = struct {
             // a boundary, so compare buckets against the last compaction
             // instead of testing the frontier itself; a failed compaction
             // leaves the mark alone so the next drain retries.
-            if (frontier / 64 > self.last_compact_frontier / 64) {
-                if (self.store.compact(self.answer_floor)) |_| {
-                    self.last_compact_frontier = frontier;
-                } else |e| {
-                    log.warn("log compaction failed (will retry later): {s}", .{@errorName(e)});
-                }
-            }
+            self.compactJournal(false);
+        }
+    }
+
+    fn compactJournal(self: *Node, acknowledgement: bool) void {
+        const frontier = self.next_deliver - 1;
+        const cadence_due = frontier / 64 > self.last_compact_frontier / 64;
+        if (cadence_due) self.compact_target_floor = self.answer_floor;
+        const target = if (acknowledgement) self.compact_target_floor else self.answer_floor;
+        const keep_from = if (self.retain_until_durable)
+            @min(target, self.application_durable.load(.acquire) +| 1)
+        else
+            target;
+        const acknowledgement_due = acknowledgement and frontier >= 64 and keep_from > self.last_compact_keep_from;
+        if (!cadence_due and !acknowledgement_due) return;
+        if (self.store.compact(keep_from)) |_| {
+            self.last_compact_frontier = frontier;
+            self.last_compact_keep_from = keep_from;
+        } else |err| {
+            log.warn("log compaction failed (will retry later): {s}", .{@errorName(err)});
         }
     }
 
@@ -2855,6 +2941,7 @@ pub const Node = struct {
         if (self.delivery) |h| {
             defer self.gpa.free(val);
             try h.on_externalized(h.ctx, slot, val);
+            _ = self.application_delivered.fetchMax(slot, .release);
             return;
         }
         self.ext_mu.lockUncancelable(self.io);
@@ -2864,6 +2951,7 @@ pub const Node = struct {
             return e;
         };
         self.ext_cond.signal(self.io);
+        _ = self.application_delivered.fetchMax(slot, .release);
     }
 
     /// If idle and a proposal is queued, nominate the head for current_slot.
@@ -3259,9 +3347,9 @@ test "InputQueue: push, pop, and close over std.Io primitives" {
     q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 5 } }, .source_peer = null });
     q.push(.{ .input = .{ .purge_slots = .{ .max_slot = 6 } }, .source_peer = null });
 
-    const a = q.pop().?;
+    const a = q.pop().?.engine;
     try std.testing.expectEqual(@as(u64, 5), a.input.purge_slots.max_slot);
-    const b = q.pop().?;
+    const b = q.pop().?.engine;
     try std.testing.expectEqual(@as(u64, 6), b.input.purge_slots.max_slot);
 
     q.close();
@@ -3286,7 +3374,7 @@ test "InputQueue: push, pop, and close over std.Io primitives" {
     // purge while draining the items that were already queued. That barrier
     // must run before `pop` finally reports the closed queue empty.
     q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 7 } }, .source_peer = null });
-    const closing_purge = q.pop() orelse return error.MissingClosingPurge;
+    const closing_purge = (q.pop() orelse return error.MissingClosingPurge).engine;
     try std.testing.expectEqual(@as(u64, 7), closing_purge.input.purge_slots.max_slot);
     try std.testing.expect(q.pop() == null); // closed + drained
 }
@@ -3394,7 +3482,7 @@ test "InputQueue: sustained non-empty churn bounds live and backing item storage
     }
     var observed_backing_items = q.items.items.len;
     for (0..InputQueue.max_items * 4) |_| {
-        var consumed = q.pop().?;
+        var consumed = q.pop().?.engine;
         core.host_codec.freeInput(gpa, &consumed.input);
         const bytes = try gpa.dupe(u8, "x");
         q.push(.{ .input = .{ .envelope_received = .{ .bytes = bytes } }, .source_peer = 1 });
@@ -3433,7 +3521,7 @@ test "InputQueue: purge work is coalesced outside a full ordinary backlog and ov
     q.pushPriority(.{ .input = .{ .purge_slots = .{ .max_slot = 11 } }, .source_peer = null });
     try std.testing.expectEqual(InputQueue.max_items + 1, q.snapshot().queued_items);
 
-    var first = q.pop().?;
+    var first = q.pop().?.engine;
     defer core.host_codec.freeInput(gpa, &first.input);
     try std.testing.expect(first.input == .purge_slots);
     try std.testing.expectEqual(@as(u64, 11), first.input.purge_slots.max_slot);
@@ -6463,4 +6551,235 @@ test "catchup diagnosis: a partitioned link classifies quorum_silent" {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return error.TestSleepCanceled;
     }
     try testing.expect(saw_silence);
+}
+
+test "application durability: a checkpoint pins replay beyond the answering window" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const seed: [32]u8 = @splat(0x72);
+    const me = try crypto.publicKeyFromSeed(seed);
+    inline for (.{ false, true }) |retained| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+        {
+            var store = try store_mod.Store.open(gpa, io, path);
+            defer store.deinit();
+            for (1..64) |slot| try store.appendExternalized(slot, "value");
+        }
+        {
+            const node = try Node.createWithRecovery(gpa, io, .{
+                .network = "durable application journal v1",
+                .secret_seed = seed,
+                .quorum = Quorum.of(1, &.{me}),
+                .listen_port = 0,
+                .data_dir = path,
+            }, .{
+                .previous_value = .{ .slot = 7, .bytes = "value" },
+                .retain_until_durable = retained,
+            });
+            defer node.deinit();
+            try testing.expectEqual(@as(?u64, if (retained) 7 else null), node.durableApplicationSlot());
+            if (!retained) try testing.expectError(error.DurabilityDisabled, node.acknowledgeDurable(7));
+            for (1..64) |slot| {
+                const item = node.waitExternalized(.{ .timeout_ms = 1000 }) orelse return error.ReplayMissing;
+                defer gpa.free(item.value);
+                try testing.expectEqual(@as(u64, slot), item.slot);
+            }
+            try node.propose("slot64");
+            const item = node.waitExternalized(.{ .timeout_ms = 3000 }) orelse return error.ProposalNotDelivered;
+            defer gpa.free(item.value);
+            try testing.expectEqual(@as(u64, 64), item.slot);
+            // The public answering policy remains at its original sixteen
+            // slots even when the local journal retains a longer replay suffix.
+            try testing.expectEqual(@as(u8, 16), node.catchupStats().answering_window_slots);
+        }
+        var store = try store_mod.Store.open(gpa, io, path);
+        defer store.deinit();
+        var recovered = try store.recover(gpa);
+        defer store_mod.Store.deinitRecovery(gpa, &recovered);
+        try testing.expectEqual(@as(u64, if (retained) 8 else 49), recovered.ext_tail[0].slot);
+        try testing.expectEqual(@as(usize, if (retained) 57 else 16), recovered.ext_tail.len);
+    }
+}
+
+test "application durability: acknowledgements are monotonic and release replay on the engine thread" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    {
+        var store = try store_mod.Store.open(gpa, io, path);
+        defer store.deinit();
+        for (1..65) |slot| try store.appendExternalized(slot, "value");
+    }
+    const seed: [32]u8 = @splat(0x73);
+    const me = try crypto.publicKeyFromSeed(seed);
+    {
+        const node = try Node.createWithRecovery(gpa, io, .{
+            .network = "durable application ack v1",
+            .secret_seed = seed,
+            .quorum = Quorum.of(1, &.{me}),
+            .listen_port = 0,
+            .data_dir = path,
+        }, .{ .previous_value = .{ .slot = 7, .bytes = "value" }, .retain_until_durable = true });
+        defer node.deinit();
+        for (1..65) |_| {
+            const item = node.waitExternalized(.{ .timeout_ms = 1000 }) orelse return error.ReplayMissing;
+            gpa.free(item.value);
+        }
+        try testing.expectEqual(@as(?u64, 7), node.durableApplicationSlot());
+        try testing.expectError(error.AheadOfDelivery, node.acknowledgeDurable(65));
+        try testing.expectError(error.DurabilityRegression, node.acknowledgeDurable(6));
+        try node.acknowledgeDurable(64);
+        try node.acknowledgeDurable(64);
+        try testing.expectError(error.DurabilityRegression, node.acknowledgeDurable(63));
+        var attempts: usize = 0;
+        while (node.durableApplicationSlot() != 64 and attempts < 100) : (attempts += 1)
+            try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+        try testing.expectEqual(@as(?u64, 64), node.durableApplicationSlot());
+        try testing.expectEqual(@as(u8, 16), node.catchupStats().answering_window_slots);
+        try node.propose("value65");
+        const item = node.waitExternalized(.{ .timeout_ms = 3000 }) orelse return error.ProposalNotDelivered;
+        defer gpa.free(item.value);
+        try testing.expectEqual(@as(u64, 65), item.slot);
+        try node.acknowledgeDurable(65);
+        attempts = 0;
+        while (node.durableApplicationSlot() != 65 and attempts < 100) : (attempts += 1)
+            try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+        try testing.expectEqual(@as(?u64, 65), node.durableApplicationSlot());
+    }
+    var store = try store_mod.Store.open(gpa, io, path);
+    defer store.deinit();
+    var recovered = try store.recover(gpa);
+    defer store_mod.Store.deinitRecovery(gpa, &recovered);
+    try testing.expectEqual(@as(u64, 49), recovered.ext_tail[0].slot);
+    // Releasing a previously clamped floor must not turn the ordinary
+    // sixty-four-slot compaction cadence into a rewrite on every new ack.
+    try testing.expectEqual(@as(usize, 17), recovered.ext_tail.len);
+}
+
+test "application durability: skipped startup requires a trusted application checkpoint" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const seed: [32]u8 = @splat(0x74);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var diagnostic: Diagnostic = .{};
+    const options: Options = .{
+        .network = "durable application bootstrap v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = path,
+        .start_slot = 9,
+        .diagnostic = &diagnostic,
+    };
+    if (Node.createWithRecovery(gpa, io, options, .{ .retain_until_durable = true })) |node| {
+        node.deinit();
+        return error.ExpectedUntrustedBootstrapRejection;
+    } else |err| try testing.expectEqual(error.EngineFailed, err);
+    try testing.expect(std.mem.indexOf(u8, diagnostic.message(), "previous_value") != null);
+    const node = try Node.createWithRecovery(gpa, io, options, .{
+        .retain_until_durable = true,
+        .previous_value = .{ .slot = 8, .bytes = "checkpoint-eight" },
+    });
+    defer node.deinit();
+    try testing.expectEqual(@as(?u64, 8), node.durableApplicationSlot());
+    try node.acknowledgeDurable(8);
+    try testing.expectError(error.AheadOfDelivery, node.acknowledgeDurable(9));
+    node.q.close();
+    try testing.expectError(error.NodeClosed, node.acknowledgeDurable(8));
+    node.failed.store(true, .release);
+    try testing.expectError(error.NodeFailed, node.acknowledgeDurable(8));
+    try testing.expectEqual(@as(?u64, 8), node.durableApplicationSlot());
+}
+
+test "application durability: callback races retry and acknowledgements coalesce without advancing early" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const Gate = struct {
+        entered: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        fn delivered(ctx: *anyopaque, slot: u64, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (slot == 65) {
+                self.entered.set(testing.io);
+                self.proceed.waitUncancelable(testing.io);
+            }
+        }
+        fn failed(_: *anyopaque, _: anyerror) void {}
+    };
+    var gate: Gate = .{};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    {
+        var store = try store_mod.Store.open(gpa, io, path);
+        defer store.deinit();
+        for (1..65) |slot| try store.appendExternalized(slot, "value");
+    }
+    const seed: [32]u8 = @splat(0x75);
+    const me = try crypto.publicKeyFromSeed(seed);
+    const node = try Node.createWithRecovery(gpa, io, .{
+        .network = "durable application coalescing v1",
+        .secret_seed = seed,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = path,
+        .delivery = .{ .ctx = &gate, .on_externalized = Gate.delivered, .on_failed = Gate.failed },
+    }, .{ .previous_value = .{ .slot = 7, .bytes = "value" }, .retain_until_durable = true });
+    defer node.deinit();
+    defer gate.proceed.set(io);
+    try node.propose("value65");
+    try gate.entered.waitTimeout(io, msTimeout(3000));
+    try testing.expectError(error.AheadOfDelivery, node.acknowledgeDurable(65));
+    for (8..65) |slot| try node.acknowledgeDurable(slot);
+    try testing.expectEqual(@as(?u64, 7), node.durableApplicationSlot());
+    // Leave room for ordinary timer inputs. An uncoalesced control FIFO would
+    // retain all fifty-seven acknowledgements while the callback is blocked.
+    try testing.expect(node.ingressStats().queued_items <= 8);
+    try testing.expectEqual(@as(usize, 0), node.ingressStats().queued_bytes);
+    gate.proceed.set(io);
+    var attempts: usize = 0;
+    while (node.durableApplicationSlot() != 64 and attempts < 100) : (attempts += 1)
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    try testing.expectEqual(@as(?u64, 64), node.durableApplicationSlot());
+    try node.acknowledgeDurable(65);
+    attempts = 0;
+    while (node.durableApplicationSlot() != 65 and attempts < 100) : (attempts += 1)
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    try testing.expectEqual(@as(?u64, 65), node.durableApplicationSlot());
+}
+
+test "application durability: the control lane survives a saturated FIFO without allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var queue: InputQueue = .{ .gpa = failing.allocator(), .io = testing.io };
+    defer queue.deinit();
+    for (0..InputQueue.max_items) |i| try queue.tryPush(.{
+        .input = .{ .purge_slots = .{ .max_slot = i } },
+        .source_peer = null,
+    });
+    failing.fail_index = failing.alloc_index;
+    for (1..1001) |slot| try queue.pushDurable(slot, 1000);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(usize, InputQueue.max_items + 1), queue.snapshot().queued_items);
+    try testing.expectEqual(@as(u64, 1000), queue.pop().?.durable);
+    try testing.expectError(error.AheadOfDelivery, queue.pushDurable(1001, 1000));
+    try testing.expectError(error.DurabilityRegression, queue.pushDurable(999, 1000));
+    queue.close();
+    try testing.expectError(error.NodeClosed, queue.pushDurable(1000, 1000));
+    for (0..InputQueue.max_items) |i| {
+        const item = queue.pop().?.engine;
+        try testing.expectEqual(@as(u64, i), item.input.purge_slots.max_slot);
+    }
+    try testing.expectEqual(null, queue.pop());
+    try testing.expect(!failing.has_induced_failure);
 }

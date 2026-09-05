@@ -447,7 +447,8 @@ writes without stopping consensus.
 - **Uncompacted valid tail**: recovery derives the same configured W-slot
   answer floor used during live delivery (or the later explicit `start_slot`)
   and restores only own statements at or above it. It separately closes
-  Engine admission through the journal high-water mark. In gap-free steady
+  Engine admission through the journal high-water mark. With default journal
+  retention, in gap-free steady
   state with no already-journaled future externalizations, successful
   compaction leaves at most a W-slot journal suffix and its span can reach
   `W + 63` before the next frontier boundary. Future externalizations can
@@ -458,6 +459,14 @@ writes without stopping consensus.
   deleted prefix; an emitting validator's cached own-statement coverage at or
   below the ordered-delivery frontier can refill toward the new W only as it
   emits later statements and can include abandoned slots or holes.
+- **Asynchronous application publication**: opting into Experimental
+  `retain_until_durable` preserves local replay after the application's trusted
+  durable watermark. Acknowledgements are monotonic application assertions,
+  admitted through one bounded coalesced control slot and applied only after
+  successful delivery. A false assertion can permit deletion of required
+  replay; a stalled publisher retains a longer journal. Applications must
+  bound unpublished work and prove checkpoint/replay continuity. Peer/cache,
+  Engine restoration, and gap bounds remain unchanged.
 - Cost: every own emission pays a disk sync (`fsync`, plus `F_FULLFSYNC` on
   macOS for the key file). On slow disks this throttles ballot rounds
   (design §16); acceptable at seconds-scale slots.

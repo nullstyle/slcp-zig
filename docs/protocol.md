@@ -828,6 +828,11 @@ non-allocating control lane: repeated watermarks coalesce to the maximum and
 run before the ordinary backlog, so a queued qset response cannot revive
 pending state below a newly published purge floor.
 
+The opt-in Experimental application-durability seam has one additional
+coalesced control slot outside those budgets. It carries only a monotonic
+local durable watermark, is validated and applied by the engine thread, and
+does not enter consensus processing or change peer/cache retention.
+
 **Application-message transport** (`node.zig` `publishAppMessage`,
 `waitAppMessage`, `appMessageStats`; `app_gossip.zig`): this Experimental
 native-host seam is deliberately outside consensus. `publishAppMessage`
@@ -1067,11 +1072,11 @@ cannot persist must go silent. `externalized` → append + fsync
 to 16 and accepts 1..62. The upper bound reserves one Engine slot for current
 consensus and one for far-ahead catch-up. Once the delivered frontier `F >= W`,
 the node advances its answer floor to at least `F − (W − 1)` (`F − W + 1`).
-Each time `F` enters a new 64-slot bucket since the last compaction (so a
+By default, each time `F` enters a new 64-slot bucket since the last compaction (so a
 multi-slot catch-up drain that steps over a multiple of 64 still counts), it
 compacts both logs to `slot >= answer_floor` (atomic temp-file + fsync +
 rename-over).
-In gap-free steady state with no already-journaled future externalizations, a
+With default journal retention, in gap-free steady state with no already-journaled future externalizations, a
 successful compaction leaves at most a W-slot journal suffix; before the next
 64-slot frontier boundary its span can reach `W + 63`. Already-journaled future
 externalizations extend the upper end. Compaction failure is nonfatal and is
@@ -1082,6 +1087,17 @@ end. A restart replays the whole retained **journal** tail to the application
 restoration. At most W answer slots are therefore restored, leaving two of the
 Engine's 64 live slots: one for current work and one for the far-ahead slot
 that can initiate catch-up. That is why W is capped at 62.
+
+Experimental `RecoveryOptions.retain_until_durable` adds an application-owned
+local journal constraint: the compaction floor cannot pass `durable + 1`.
+Its initial watermark comes from the trusted recovered application checkpoint;
+`acknowledgeDurable` admits updates and `durableApplicationSlot` observes their
+engine-thread application. An acknowledgement can release a deferred cadence
+target but does not move that target on every new delivery. This option may
+retain more local log data while publication lags. It does not alter the W-slot
+answer cache, Engine restoration bound, network answering, or gap policy. See
+[application durability](application-durability.md) for the trust and ownership
+contract.
 
 A native node independently keeps the admission/purge floor at least as new
 as the durable journal's successor, and publishes the later of that floor and
@@ -1119,7 +1135,7 @@ cached set can include locally abandoned slots or holes and is not evidence
 that a quorum can supply a range.
 
 The memory and anti-entropy work attributable to retained own statements is
-O(W) (up to a nomination and ballot envelope per slot). In gap-free steady
+O(W) (up to a nomination and ballot envelope per slot). With default journal retention, in gap-free steady
 state without already-journaled future externalizations, successful compaction
 leaves at most a W-slot suffix and its span can grow to `W + 63` before the
 next frontier boundary. Future externalizations can extend the upper end,

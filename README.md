@@ -313,6 +313,11 @@ quorum can supply a range. For predictable recovery availability, configure
 the validators expected to answer one another consistently and monitor their
 actual cached own-statement coverage—not just the configured number.
 
+An asynchronous application can separately protect local crash replay with
+Experimental `RecoveryOptions.retain_until_durable`, then acknowledge only
+durable publications through `Node.acknowledgeDurable`. This does not enlarge
+peer answering or Engine retention. See [application durability](docs/application-durability.md).
+
 A larger `W` retains O(W) recent consensus state, increases connection and
 periodic anti-entropy replay toward O(W) envelopes, and leaves a wider slot
 span in the consensus logs. The upper bound of 62 reserves two of the Engine's

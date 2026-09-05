@@ -255,6 +255,12 @@ expect in the Stable list and that are deliberately **not**:
   and restore the preceding nomination value before replay, listener bind, or
   worker startup. The shape may evolve while `Node.create` and the Stable
   typed-application behavior remain fixed.
+- `RecoveryOptions.retain_until_durable`, `Node.acknowledgeDurable`,
+  `Node.durableApplicationSlot`, and `DurabilityError`: opt-in local journal
+  protection for asynchronous application publication. Admission is distinct
+  from the engine-applied watermark; truthful durable acknowledgements belong
+  to the application. The Stable answering-window policy is unchanged. See
+  [application durability](application-durability.md) and ADR 0007.
 - `slcp.lint_report`: the CLI's rendering of lint findings. The lint
   **codes** are frozen by `schema/host.capnp` and `vectors/lint.json`, not
   by these Zig names.
