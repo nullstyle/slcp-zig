@@ -1435,14 +1435,25 @@ test "owned restart from a durable snapshot (2-of-2 loopback): Context carries t
     try a2.propose(.{ .x = 40 });
     try b2.propose(.{ .x = 41 });
     const r4 = try pumpSnap(a2, b2, 4, 90_000);
-    // r4.b's observation moves into `b4` below, so only r4.a is released
-    // here — copying an owned Obs out and releasing both paths is exactly
-    // the double free the ownership rules warn about.
-    defer if (r4.a) |it| a2.release(it);
-    const a4 = r4.a orelse return error.NodeNeverAppliedSlot4;
-    try testing.expectEqual(@as(u64, 4), a4.slot);
-    try testing.expectEqual(@as(u64, 4), a4.obs.slot);
-    try testing.expectEqual(@as(usize, 4), a4.obs.entries.len);
+    // The pump returns when EITHER node reaches the target, and under load
+    // the other node's applied observation can lag by a drain cycle even
+    // though its engine externalized the same slot (2-of-2: it voted). Wait
+    // bounded for a2's own slot 4 — the same asymmetry the b-side wait
+    // below has always handled. Releases follow that side's ownership rule:
+    // release-on-replace inside the loop, one final release at the end.
+    var a4 = r4.a;
+    var waited_a: u64 = 0;
+    while ((a4 == null or a4.?.slot < 4) and waited_a < 30_000) : (waited_a += 50) {
+        if (try a2.waitApplied(.{ .timeout_ms = 50 })) |item| {
+            if (a4) |old| a2.release(old);
+            a4 = item;
+        }
+    }
+    const got_a = a4 orelse return error.NodeNeverAppliedSlot4;
+    defer a2.release(got_a);
+    try testing.expectEqual(@as(u64, 4), got_a.slot);
+    try testing.expectEqual(@as(u64, 4), got_a.obs.slot);
+    try testing.expectEqual(@as(usize, 4), got_a.obs.entries.len);
 
     // b2 restarted from genesis context, so create replayed its whole tail
     // (1..3) into its queue and slot 4 is its first live item; if the pump
@@ -1458,7 +1469,7 @@ test "owned restart from a durable snapshot (2-of-2 loopback): Context carries t
     const got = b4 orelse return error.PeerNeverAppliedSlot4;
     defer b2.release(got);
     try testing.expect(got.slot >= 4);
-    try testing.expectEqualSlices(u64, a4.obs.entries, got.obs.entries);
+    try testing.expectEqualSlices(u64, got_a.obs.entries, got.obs.entries);
     try testing.expect(a2.haltError() == null);
     try testing.expect(b2.haltError() == null);
 }

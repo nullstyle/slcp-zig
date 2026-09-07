@@ -112,6 +112,24 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Fixed
 
+- Per-peer inbound budget strikes are now forgiven after a full second with
+  no inbound charge at all. Idle anti-entropy traffic — the answering-window
+  re-flood plus `get_slot_state` answers, up to ~384 KiB inside one second at
+  the 4 KiB default value size — used to ladder honest peers to the
+  32-strike disconnect and redial forever, because strikes accumulated for
+  the connection's lifetime; burst-then-silence cannot average over the soft
+  cap, so it is not budget abuse. A peer that keeps charging at least once
+  per window is still never forgiven and disconnects at `max_budget_strikes`.
+- A dialer whose peer completes the TCP connect but never sends its Hello is
+  now redialled on the growing 1→60 s backoff ladder instead of every
+  handshake deadline plus the base interval (~11 s in production), which
+  filled the frozen peer's accept backlog forever. The attempt counter resets
+  only when a connection actually completes its Hello exchange.
+- The owned-restart convergence test now waits bounded for the restarted
+  node's own slot-4 observation when the pump returns on the peer first.
+  Under suite load the applied observation can lag the peer's by a drain
+  cycle even though the 2-of-2 engine externalized the same slot; the wait
+  mirrors the peer-side wait that has always been there.
 - Driver validation verdicts are cached per nomination/ballot phase as well
   as value and slot. A phase-sensitive application can no longer inherit the
   verdict of whichever protocol phase happened to see the bytes first; the
