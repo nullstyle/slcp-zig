@@ -37,7 +37,11 @@
 //!   * One dialer thread per configured peer (`dialerLoop`) owns exactly one
 //!     outbound connection at a time and reconnects with exponential backoff
 //!     (1s→60s) plus deterministic per-peer jitter (Wyhash over the attempt
-//!     counter — no wall clock, no RNG). The connect itself is NOT std's
+//!     counter — no wall clock, no RNG). Both a failed connect AND a
+//!     connection that never completes its Hello exchange count as failed
+//!     attempts, so a frozen peer (TCP accepts, no Hello) is retried on the
+//!     growing ladder rather than every deadline + base interval. The
+//!     connect itself is NOT std's
 //!     blocking `IpAddress.connect`: `connectInterruptible` runs a
 //!     non-blocking connect(2) under a `poll` loop that re-checks `stopping`
 //!     every `dial_poll_slice_ms`, so a peer that black-holes SYNs (down,
@@ -159,10 +163,12 @@ const handshake_timeout_s: std.Io.Timeout = .{ .duration = .{
 /// few hundred milliseconds instead of stalling the suite for ten seconds.
 var handshake_deadline: std.Io.Timeout = handshake_timeout_s;
 
-/// Per-peer budget breaches before we disconnect the peer, counted over the
-/// connection's lifetime (`Conn.strikes` is never reset; a clean window does
-/// not forgive earlier breaches). Kept well clear of anything healthy
-/// loopback traffic produces.
+/// Per-peer budget breaches before we disconnect the peer. Breaches ladder
+/// only while the peer keeps charging at least once per window — a full
+/// second with no inbound charge forgives accumulated strikes
+/// (`rollWindow`) — so the disconnect lands on an unbroken over-budget
+/// cadence, never on honest burst-then-silence traffic (the anti-entropy
+/// re-flood). Kept well clear of anything healthy loopback traffic produces.
 const max_budget_strikes: u32 = 32;
 /// Upper bound on the backoff-window exponent (1s<<6 = 64s, capped to 60s).
 const max_backoff_shift: u6 = 6;
@@ -249,6 +255,11 @@ const Conn = struct {
     win_bytes: usize = 0,
     win_reqs: usize = 0,
     strikes: u32 = 0,
+    /// Mono time of the last charge to either budget. A full window with no
+    /// charge at all forgives accumulated strikes (`rollWindow`): bursts
+    /// separated by a silent second cannot average over the soft cap, so
+    /// they are not budget abuse.
+    last_charge_ns: i96 = 0,
 
     // Per-peer link evidence (Experimental diagnostics): reader-thread
     // writes, `Overlay.peerLinks` reads — atomics, no lock needed. Ages are
@@ -783,12 +794,17 @@ pub const Overlay = struct {
                 if (attempt < 30) attempt += 1;
                 continue;
             };
-            attempt = 0; // TCP connect succeeded — reset backoff growth.
             failures = 0;
-            self.runConnection(conn);
+            const established = self.runConnection(conn);
             if (self.stopping.load(.acquire)) break;
-            // Reconnect after a base (attempt 0 ≈ 1s) delay + jitter.
-            self.waitInterruptible(backoffNs(peer_index, 0));
+            // A TCP connect that never completes its Hello exchange is a
+            // failed dial as far as backoff is concerned: a frozen peer
+            // (kernel accepts, process never answers) must not be redialled
+            // at the base interval — deadline + 1 s — forever. Only a peer
+            // that actually served a connection resets the ladder.
+            if (established) attempt = 0;
+            self.waitInterruptible(backoffNs(peer_index, attempt));
+            if (!established and attempt < 30) attempt += 1;
         }
     }
 
@@ -1000,12 +1016,17 @@ pub const Overlay = struct {
     // -----------------------------------------------------------------------
 
     fn connThread(self: *Overlay, conn: *Conn, slot: *InboundSlot) void {
-        self.runConnection(conn);
+        _ = self.runConnection(conn);
         // Last action: publish that this thread is joinable (see reaper).
         slot.done.store(true, .release);
     }
 
-    fn runConnection(self: *Overlay, conn: *Conn) void {
+    /// Run one connection to its end. Returns whether the Hello exchange
+    /// completed and the peer was published — the dialer treats a conn that
+    /// never got past the handshake as a failed attempt for backoff, so a
+    /// peer that accepts TCP but never sends its Hello cannot be redialled
+    /// at the base interval forever.
+    fn runConnection(self: *Overlay, conn: *Conn) bool {
         const gpa = self.gpa;
 
         // Register in the peer table, or bail immediately if we are stopping
@@ -1016,13 +1037,13 @@ pub const Overlay = struct {
             self.conns_mu.unlock(self.io);
             conn.deinit();
             gpa.destroy(conn);
-            return;
+            return false;
         }
         self.conns.append(gpa, conn) catch {
             self.conns_mu.unlock(self.io);
             conn.deinit();
             gpa.destroy(conn);
-            return;
+            return false;
         };
         self.conns_mu.unlock(self.io);
 
@@ -1071,6 +1092,7 @@ pub const Overlay = struct {
         self.removeConn(conn);
         conn.deinit();
         gpa.destroy(conn);
+        return established;
     }
 
     /// Send our Hello, then read + validate the peer's Hello under
@@ -1192,13 +1214,23 @@ pub const Overlay = struct {
     fn rollWindow(self: *Overlay, conn: *Conn) void {
         const now = self.monoNs();
         if (now - conn.win_start_ns >= std.time.ns_per_s) {
+            // Forgive accumulated strikes when a full second passed with no
+            // inbound charge at all. The idle-fleet anti-entropy traffic — a
+            // re-flood burst every 3 s — is over the soft cap inside each
+            // burst but silent between bursts, so it can never average over
+            // the cap and must not ladder to a disconnect; a peer that keeps
+            // charging at least once per window is never forgiven and still
+            // climbs to `max_budget_strikes`.
+            if (now - conn.last_charge_ns >= std.time.ns_per_s) conn.strikes = 0;
             conn.win_start_ns = now;
             conn.win_bytes = 0;
             conn.win_reqs = 0;
         }
+        conn.last_charge_ns = now;
     }
 
-    /// Charge `n` inbound bytes; returns false to disconnect on repeated breach.
+    /// Charge `n` inbound bytes; returns false to disconnect on an unbroken
+    /// run of breaches (a silent second forgives — see `rollWindow`).
     fn chargeBytes(self: *Overlay, conn: *Conn, n: usize) bool {
         self.rollWindow(conn);
         conn.win_bytes += n;
@@ -1219,7 +1251,8 @@ pub const Overlay = struct {
     /// is dropped (drop-and-log); the strike that reaches
     /// `max_budget_strikes` disconnects the peer — the same ladder as
     /// `chargeBytes`, which is what protocol.md §12 / threat-model.md §3
-    /// promise ("32 breaches ⇒ disconnect").
+    /// promise ("32 unbroken-cadence breaches ⇒ disconnect; a silent second
+    /// forgives").
     fn chargeRequest(self: *Overlay, conn: *Conn) RequestVerdict {
         self.rollWindow(conn);
         conn.win_reqs += 1;
@@ -2517,13 +2550,145 @@ test "stop returns promptly while a dialer is mid-connect to a black-holed peer"
     try testing.expectEqual(@as(usize, 0), ov.peerCount());
 }
 
-// Non-vacuity (S8 finding 17, docs-vs-code): docs/protocol.md's budget row
-// and this file's `max_budget_strikes` comment used to say "consecutive"
-// breaches; strikes are in fact cumulative for the connection's lifetime.
-// Adding `conn.strikes = 0` to `rollWindow` (the "consecutive" semantics)
-// makes the first expectEqual read 0 and the disconnect never happen (red),
-// which is the signal to rewrite the doc row again.
-test "budget strikes are cumulative across clean windows: the 32nd lifetime breach disconnects" {
+// Non-vacuity (fleet-revisions evidence, 2026-09-07): a peer whose kernel
+// still accepts connections but never sends its Hello (SIGSTOPped, or
+// half-dead) used to be redialled every handshake deadline + base backoff
+// (~11 s in production, 10 s of it parked in the deadline read) because
+// `dialerLoop` reset its attempt counter on every TCP success — filling the
+// frozen peer's accept backlog forever. A Hello that never arrives must
+// count as a failed dial: the redial climbs the same 1→60 s ladder as a
+// connect failure.
+test "dialer: a peer that accepts but never Hellos is redialled on growing backoff" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // Drop the file-private runtime deadline so each frozen cycle costs
+    // ~0.2 s, not the production 10 s (tests run sequentially, as the
+    // handshake-deadline test above already relies on).
+    const saved_deadline = handshake_deadline;
+    handshake_deadline = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(200),
+        .clock = .awake,
+    } };
+    defer handshake_deadline = saved_deadline;
+
+    // The frozen peer: accepts every dial, never answers any of them. The
+    // acceptor thread only records arrival times; it never reads or writes,
+    // so every accepted conn sits silent until the test closes it.
+    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
+    var server = try net.IpAddress.listen(&bind_addr, io, .{ .mode = .stream, .reuse_address = true });
+
+    const Acceptor = struct {
+        io: std.Io,
+        server: *net.Server,
+        mu: std.Io.Mutex = .init,
+        n: usize = 0,
+        times: [4]i96 = @splat(0),
+        streams: [4]net.Stream = undefined,
+
+        fn run(self: *@This()) void {
+            while (true) {
+                const stream = self.server.accept(self.io) catch return;
+                self.mu.lockUncancelable(self.io);
+                if (self.n == self.times.len) {
+                    self.mu.unlock(self.io);
+                    stream.close(self.io);
+                    return;
+                }
+                self.times[self.n] = std.Io.Clock.now(.awake, self.io).nanoseconds;
+                self.streams[self.n] = stream;
+                self.n += 1;
+                const full = self.n == self.times.len;
+                self.mu.unlock(self.io);
+                if (full) return;
+            }
+        }
+
+        fn count(self: *@This()) usize {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            return self.n;
+        }
+    };
+    var acc: Acceptor = .{ .io = io, .server = &server };
+    const acc_thread = try std.Thread.spawn(.{}, Acceptor.run, .{&acc});
+    // A `try` failing between the spawn and the explicit join below must not
+    // strand the acceptor on a socket owned by this frame.
+    errdefer {
+        server.deinit(io);
+        acc_thread.join();
+    }
+
+    const spec = try std.fmt.allocPrint(gpa, "127.0.0.1:{d}", .{portOf(server.socket.address)});
+    defer gpa.free(spec);
+    var rec: Recorder = .{ .io = io, .gpa = gpa };
+    defer rec.deinit();
+    var ov = try Overlay.init(gpa, io, testConfig(0, &.{spec}, test_prefix, 0xEE), rec.callbacks());
+    defer ov.deinit();
+    try ov.start();
+    defer ov.stop();
+
+    // Three dials arrive: the first immediately, the second after deadline +
+    // backoff(attempt 0), the third after deadline + backoff(attempt 1).
+    // Bounded wait, so a dialer that stops redialling fails the asserts
+    // below instead of hanging the suite.
+    const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
+    while (acc.count() < 3) {
+        if (std.Io.Clock.now(.awake, io).nanoseconds - t0 > 8 * std.time.ns_per_s) {
+            server.deinit(io);
+            acc_thread.join();
+            return error.RedialsDidNotArrive;
+        }
+        sleepMs(io, 25);
+    }
+    ov.stop();
+    server.deinit(io); // wake the acceptor out of accept; it has its records
+    acc_thread.join();
+
+    var times: [3]i96 = @splat(0);
+    var streams: [3]net.Stream = undefined;
+    {
+        acc.mu.lockUncancelable(io);
+        defer acc.mu.unlock(io);
+        @memcpy(&times, acc.times[0..3]);
+        @memcpy(&streams, acc.streams[0..3]);
+    }
+    for (streams) |s| s.close(io);
+
+    // Inter-dial gaps follow deadline + backoffNs(peer 0, attempt) — the
+    // ladder, not the constant base interval the TCP-success reset produced.
+    const deadline_ns: i96 = 200 * std.time.ns_per_ms;
+    const slack_ns: i96 = 600 * std.time.ns_per_ms;
+    var k: usize = 0;
+    while (k < 2) : (k += 1) {
+        const gap = times[k + 1] - times[k];
+        const want = deadline_ns + @as(i96, @intCast(backoffNs(0, @intCast(k))));
+        std.debug.print("\n[frozen-peer] redial {d}: gap {d} ms, ladder wants {d} ms\n", .{
+            k + 1,
+            @divTrunc(gap, std.time.ns_per_ms),
+            @divTrunc(want, std.time.ns_per_ms),
+        });
+        try testing.expect(gap > want - slack_ns and gap < want + slack_ns);
+    }
+
+    // The frozen peer was never published: no peer, no on_peer_up.
+    try testing.expectEqual(@as(usize, 0), ov.peerCount());
+    try testing.expectEqual(@as(usize, 0), rec.peerUpCount());
+}
+
+// Non-vacuity (fleet-revisions evidence, 2026-09-07): the idle-fleet
+// anti-entropy traffic — every 3 s a peer re-floods its answering window
+// (16 slots × nom+ballot envelopes) and answers get_slot_state with up to 64
+// more, each carrying a value up to the 4 KiB default — delivers ~384 KiB in
+// well under a second, past the 256 KiB/s soft cap, followed by two silent
+// seconds. With lifetime-cumulative strikes that honest pattern struck out a
+// healthy peer every ~32 bursts and redialled, forever (the retained lab
+// logged hundreds of these warnings while idle). The budget now forgives
+// accumulated strikes whenever a full second passes with no inbound charge
+// at all: burst-then-silence can never average over the cap, so it is not
+// budget abuse, while a peer that keeps charging at least once per second is
+// never forgiven and still ladders to the disconnect.
+test "budget strikes: a silent second forgives, only an unbroken charge cadence disconnects" {
     const io = testing.io;
     const gpa = testing.allocator;
 
@@ -2547,29 +2712,47 @@ test "budget strikes are cumulative across clean windows: the 32nd lifetime brea
         gpa.destroy(conn);
     }
 
-    // One breach, then ten clean windows (each aged past 1 s and charged a
-    // single byte; win_bytes == 1 proves the window really rolled).
+    // The idle-fleet traffic pattern first — the reproduction. Sized from
+    // the protocol's own maxima: 96 envelopes × 4 KiB per 3-second burst,
+    // delivered in read-sized chunks (the reader's buffer IS the cap, so a
+    // burst crosses it on the second chunk), each burst preceded by three
+    // seconds of inbound silence. Two full cycles of the strike-out ladder's
+    // worth of bursts must all stay connected.
+    const burst_bytes: usize = (2 * 16 + 64) * 4 * 1024;
+    var bursts: usize = 0;
+    while (bursts < 2 * max_budget_strikes) : (bursts += 1) {
+        conn.win_start_ns = ov.monoNs() - 3 * std.time.ns_per_s;
+        conn.last_charge_ns = ov.monoNs() - 3 * std.time.ns_per_s;
+        var charged: usize = 0;
+        while (charged < burst_bytes) {
+            const chunk = @min(burst_bytes - charged, inbound_rate_soft_cap_bytes_per_s);
+            try testing.expect(ov.chargeBytes(conn, chunk));
+            charged += chunk;
+        }
+        std.debug.print("\n[idle-fleet-burst] burst {d}: strikes {d}\n", .{ bursts + 1, conn.strikes });
+    }
+    try testing.expect(conn.strikes < max_budget_strikes);
+
+    // One breach, then a two-second silence: the next charge forgives it.
+    conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+    conn.last_charge_ns = ov.monoNs() - 2 * std.time.ns_per_s;
     try testing.expect(ov.chargeBytes(conn, inbound_rate_soft_cap_bytes_per_s + 1));
     try testing.expectEqual(@as(u32, 1), conn.strikes);
-    var i: usize = 0;
-    while (i < 10) : (i += 1) {
-        conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
-        try testing.expect(ov.chargeBytes(conn, 1));
-        try testing.expectEqual(@as(usize, 1), conn.win_bytes);
-    }
-    try testing.expectEqual(@as(u32, 1), conn.strikes);
+    conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+    conn.last_charge_ns = ov.monoNs() - 2 * std.time.ns_per_s;
+    try testing.expect(ov.chargeBytes(conn, 1));
+    try testing.expectEqual(@as(u32, 0), conn.strikes);
 
-    // Breaches separated by clean windows are never consecutive, yet the
-    // 32nd lifetime breach disconnects.
-    var breaches: u32 = 1;
+    // An unbroken cadence: every charge over cap, windows aged past the roll
+    // but the previous charge always recent (sub-second gap). The 32nd
+    // consecutive breach disconnects.
+    var breaches: u32 = 0;
     var disconnected = false;
     while (breaches < 2 * max_budget_strikes) {
         conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
-        try testing.expect(ov.chargeBytes(conn, 1));
-        conn.win_start_ns = ov.monoNs() - 2 * std.time.ns_per_s;
-        const ok = ov.chargeBytes(conn, inbound_rate_soft_cap_bytes_per_s + 1);
+        conn.last_charge_ns = ov.monoNs() - 100 * std.time.ns_per_ms;
         breaches += 1;
-        if (!ok) {
+        if (!ov.chargeBytes(conn, inbound_rate_soft_cap_bytes_per_s + 1)) {
             disconnected = true;
             break;
         }

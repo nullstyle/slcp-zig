@@ -73,12 +73,12 @@ Per-peer budgets, copied from `src/node/overlay.zig` and `src/node/wire.zig`
 |---|---|
 | inbound bytes | `inbound_rate_soft_cap_bytes_per_s = 256 * 1024` per peer (soft cap; a breach is a strike) |
 | unanswered requests | `max_outstanding_requests = 64` |
-| strikes before disconnect | `max_budget_strikes = 32` |
+| strikes before disconnect | `max_budget_strikes = 32`; a full second with no inbound charge forgives accumulated strikes, so the disconnect lands on an unbroken over-budget cadence (burst-then-silence traffic — e.g. the anti-entropy re-flood — cannot average over the cap) |
 | concurrent inbound connections (all peers together) | `max_inbound_conns = 128`; over-cap accepts are closed before any allocation |
 | our aggregate write queue toward a peer that stops reading | `max_write_queue_items = 1024` / `max_write_queue_bytes = 16 MiB`; ordinary overflow ⇒ disconnect |
 | application subset of that write queue | `max_app_write_queue_items = 256` / `max_app_write_queue_bytes = 1 MiB`; app pressure drops only that frame |
 | aggregate capacity unavailable to application frames | `reserved_write_queue_items = 256` / `reserved_write_queue_bytes = 4 MiB` for ordinary/consensus traffic |
-| a connection that never sends `Hello` | `handshake_timeout_s` = 10 s absolute deadline on the read operation |
+| a connection that never sends `Hello` | `handshake_timeout_s` = 10 s absolute deadline on the read operation; for a dialer, the failed handshake counts toward the reconnect backoff ladder (1 s→60 s) |
 | frame size | `max_frame_bytes = 1 MiB`; larger ⇒ framing error ⇒ disconnect |
 | one decoded application message | `max_app_message_bytes = 64 KiB`; larger ⇒ codec rejection |
 
