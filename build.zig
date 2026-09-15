@@ -33,6 +33,23 @@ fn testFilters(b: *std.Build, filter: ?[]const u8) []const []const u8 {
     return owned;
 }
 
+fn canonicalReferenceOptions(
+    b: *std.Build,
+    python: []const u8,
+    driver: ?std.Build.LazyPath,
+    required: bool,
+) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption(bool, "required", required);
+    options.addOption([]const u8, "python", python);
+    if (driver) |path| {
+        options.addOptionPath("driver", path);
+    } else {
+        options.addOption(?[]const u8, "driver", null);
+    }
+    return options;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -134,6 +151,10 @@ pub fn build(b: *std.Build) void {
     const core_tests_step = b.step("core-tests", "Run the sans-io engine unit tests (slcp-core)");
     core_tests_step.dependOn(&run_core_tests.step);
 
+    // Reference tooling is opt-in for ordinary tests. Package consumers use
+    // checked-in bindings and need neither Python nor a compiler installation.
+    const capnp_python = b.option([]const u8, "capnp-wasm-python", "Python executable for the capnp-wasm reference driver") orelse "python3";
+    const capnp_driver = b.option(std.Build.LazyPath, "capnp-wasm-driver", "capnp-wasm driver path; also enables reference checks in ordinary tests");
     const vector_tests = b.addTest(.{
         .name = "slcp-vector-tests",
         .root_module = b.createModule(.{
@@ -145,6 +166,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    vector_tests.root_module.addOptions("canonical_reference_options", canonicalReferenceOptions(b, capnp_python, capnp_driver, false));
     const run_vector_tests = b.addRunArtifact(vector_tests);
     // Reads vectors/*.json and vectors/traces/*.bin relative to the build
     // root, so cwd is pinned. And since those files are not declared build
@@ -154,6 +176,37 @@ pub fn build(b: *std.Build) void {
     // does not re-run.
     run_vector_tests.setCwd(b.path("."));
     run_vector_tests.has_side_effects = true;
+    if (capnp_driver) |path| run_vector_tests.addFileInput(path);
+
+    // This gate cannot pass by skipping a missing compiler or fixture. All
+    // source inputs are lazy: configuring a published package does not read
+    // developer-only tools/ or vectors/ files. The selected package and
+    // Wasmtime executable are checked by the driver on every execution.
+    const reference_driver = capnp_driver orelse b.path("tools/capnp_tool.py");
+    const canonical_reference_tests = b.addTest(.{
+        .name = "slcp-canonical-reference-tests",
+        .filters = &.{"canonical-reference:"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vectors_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+        }),
+    });
+    canonical_reference_tests.root_module.addOptions("canonical_reference_options", canonicalReferenceOptions(b, capnp_python, reference_driver, true));
+    const run_canonical_reference = b.addRunArtifact(canonical_reference_tests);
+    run_canonical_reference.setCwd(b.path("."));
+    run_canonical_reference.has_side_effects = true;
+    run_canonical_reference.addFileInput(reference_driver);
+    for ([_][]const u8{
+        "tools/capnp-toolchain.json",
+        "tools/capnp-generation.json",
+        "schema/slcp.capnp",
+        "vectors/crypto.json",
+        "vectors/qset.json",
+    }) |path| run_canonical_reference.addFileInput(b.path(path));
+    const canonical_reference_step = b.step("canonical-reference", "Require capnp-wasm canonicalization agreement for 2 statement and 4 quorum-set fixtures");
+    canonical_reference_step.dependOn(&run_canonical_reference.step);
 
     // Vendored framing conformance replay (design §9.1): capnp-zig's published
     // fixtures for the segment framer, checked in under vectors/framing/ and

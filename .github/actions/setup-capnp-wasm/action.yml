@@ -1,0 +1,21 @@
+name: Install the verified WASM schema toolchain
+description: Verify the locked compiler archive and mise-pinned Wasmtime.
+runs:
+  using: composite
+  steps:
+    - name: Verify/install the compiler package
+      shell: bash
+      run: python3 tools/capnp_tool.py bootstrap
+    - name: Reject accidental native compiler use in this job
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/no-native-capnp"
+        for tool in capnp capnpc capnpc-zig; do
+          cat > "$RUNNER_TEMP/no-native-capnp/$tool" <<'SH'
+        #!/bin/sh
+        echo "Native Cap'n Proto tools are disabled in the WASM tooling gate" >&2
+        exit 1
+        SH
+          chmod +x "$RUNNER_TEMP/no-native-capnp/$tool"
+        done
+        echo "$RUNNER_TEMP/no-native-capnp" >> "$GITHUB_PATH"

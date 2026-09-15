@@ -2,12 +2,13 @@
 //! `just vectors` (tools/gen_vectors.zig) and checked in; this runner parses
 //! the JSON and RE-DERIVES every result through slcp-core, byte-comparing.
 //! Tests skip (error.SkipZigTest) when vectors/ is absent (pre-first-
-//! generation bootstrap). The differential test additionally shells out to
-//! the reference `capnp convert binary:canonical` CLI and skips when the CLI
-//! is not installed.
+//! generation bootstrap). Reference canonicalization uses the explicitly
+//! configured capnp-wasm driver; ordinary tests skip when it is unconfigured.
+//! `zig build canonical-reference` requires tooling and all six reference cases.
 
 const std = @import("std");
 const slcp = @import("slcp-core");
+const reference_options = @import("canonical_reference_options");
 
 const capnpc = slcp.capnpc;
 const canonical = slcp.canonical;
@@ -606,28 +607,28 @@ test "trace vectors: scenario statuses cover insane, stale, ignored" {
 }
 
 // ---------------------------------------------------------------------------
-// Differential: our canonical bytes vs `capnp convert binary:canonical`
-// (reference CLI; skips when capnp is not installed)
+// Differential: our canonical bytes vs capnp-wasm's binary:canonical conversion
 // ---------------------------------------------------------------------------
 
-/// Run `capnp convert binary:canonical schema/slcp.capnp <type_name>` with
-/// `framed_input` on stdin; returns the CLI's canonical (flat, table-less)
-/// output bytes. Ported from capnp-zig tests/serialization/canonical_test.zig.
-fn capnpConvertCanonical(
+/// The driver runs the independent reference converter in Wasmtime, with
+/// framed input on stdin and canonical (flat, table-less) bytes on stdout.
+/// It verifies bootstrapped tooling and fails without an implicit download.
+fn wasmConvertCanonical(
     gpa: std.mem.Allocator,
+    driver_path: []const u8,
     input: []const u8,
     type_name: []const u8,
 ) ![]u8 {
     const io = std.testing.io;
-    var child = std.process.spawn(io, .{
-        .argv = &.{ "capnp", "convert", "binary:canonical", "schema/slcp.capnp", type_name },
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ reference_options.python, driver_path, "canonical", type_name },
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+        // Forward diagnostics directly; filling a stderr pipe must not
+        // deadlock while the parent reads the binary stdout stream.
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
 
     try child.stdin.?.writeStreamingAll(io, input);
     child.stdin.?.close(io);
@@ -637,62 +638,73 @@ fn capnpConvertCanonical(
     var stdout_rdr = child.stdout.?.reader(io, &stdout_buf);
     const stdout_bytes = try stdout_rdr.interface.allocRemaining(gpa, .unlimited);
 
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_rdr = child.stderr.?.reader(io, &stderr_buf);
-    const stderr_bytes = try stderr_rdr.interface.allocRemaining(gpa, .unlimited);
-
     const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print("capnp convert failed: {s}\n", .{stderr_bytes});
-                return error.CapnpConvertFailed;
-            }
-        },
-        else => {
-            std.debug.print("capnp convert failed: unexpected termination\n", .{});
-            return error.CapnpConvertFailed;
-        },
+    if (!term.success()) {
+        std.debug.print("capnp-wasm canonical conversion failed for {s}: {f}\n", .{ type_name, term });
+        return error.CapnpWasmConvertFailed;
     }
     return stdout_bytes;
 }
 
-test "differential: statement canonical bytes match capnp convert binary:canonical" {
+fn loadReferenceVector(gpa: std.mem.Allocator, comptime name: []const u8) !json.Value {
+    return (try loadVector(gpa, name)) orelse {
+        if (reference_options.required) {
+            std.debug.print("canonical-reference requires vectors/{s}\n", .{name});
+            return error.MissingCanonicalReferenceVector;
+        }
+        std.debug.print("canonical-reference skipped: vectors/{s} is unavailable\n", .{name});
+        return error.SkipZigTest;
+    };
+}
+
+test "canonical-reference: statement and quorum-set bytes match capnp-wasm" {
+    const configured_driver: ?[]const u8 = reference_options.driver;
+    const driver_path = configured_driver orelse {
+        if (reference_options.required) return error.MissingCanonicalReferenceDriver;
+        std.debug.print("canonical-reference skipped: configure -Dcapnp-wasm-driver=tools/capnp_tool.py or run zig build canonical-reference\n", .{});
+        return error.SkipZigTest;
+    };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
-    const root = (try loadVector(gpa, "crypto.json")) orelse return error.SkipZigTest;
+    const crypto_root = try loadReferenceVector(gpa, "crypto.json");
+    const qset_root = try loadReferenceVector(gpa, "qset.json");
 
-    const statements = field(root, "statements").array.items;
+    // Guard coverage before running either fixture group: empty, truncated,
+    // or missing fixtures cannot turn a required comparison into a pass.
+    const statements = field(crypto_root, "statements").array.items;
+    const cases = field(qset_root, "cases").array.items;
+    try std.testing.expectEqual(@as(usize, 2), statements.len);
+    try std.testing.expectEqual(@as(usize, 4), cases.len);
+    var statement_count: usize = 0;
+    var qset_count: usize = 0;
+
     for (statements) |c| {
         const flat = try hexAlloc(gpa, field(c, "statementBytes").string);
         const framed = try canonical.frameFlat(gpa, flat);
 
-        // Reference CLI canonicalization of the same framed message must
+        // Reference WASM canonicalization of the same framed message must
         // reproduce our flat bytes exactly (they are already canonical).
-        const cli = try capnpConvertCanonical(gpa, framed, "Statement");
-        try std.testing.expectEqualSlices(u8, flat, cli);
+        const reference = try wasmConvertCanonical(gpa, driver_path, framed, "Statement");
+        try std.testing.expectEqualSlices(u8, flat, reference);
 
         // ... and our own canonicalizer agrees with itself round-tripped.
         const ours = try canonical.canonicalFlatFromFramed(gpa, framed);
         try std.testing.expectEqualSlices(u8, flat, ours);
+        statement_count += 1;
     }
-}
-
-test "differential: qset canonical bytes match capnp convert binary:canonical" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const gpa = arena_state.allocator();
-    const root = (try loadVector(gpa, "qset.json")) orelse return error.SkipZigTest;
 
     // Use every normalization case's INPUT message (non-normalized wire
     // shapes included): the differential is about canonicalization, and the
-    // reference CLI must agree on each of them.
-    const cases = field(root, "cases").array.items;
+    // reference converter must agree on each of them.
     for (cases) |c| {
         const framed = try qsFramedFromValue(gpa, field(c, "input"));
         const ours = try canonical.canonicalFlatFromFramed(gpa, framed);
-        const cli = try capnpConvertCanonical(gpa, framed, "QuorumSet");
-        try std.testing.expectEqualSlices(u8, ours, cli);
+        const reference = try wasmConvertCanonical(gpa, driver_path, framed, "QuorumSet");
+        try std.testing.expectEqualSlices(u8, ours, reference);
+        qset_count += 1;
     }
+    try std.testing.expectEqual(@as(usize, 2), statement_count);
+    try std.testing.expectEqual(@as(usize, 4), qset_count);
+    std.debug.print("canonical-reference: {d} statements and {d} quorum sets verified through capnp-wasm\n", .{ statement_count, qset_count });
 }

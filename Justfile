@@ -1,11 +1,17 @@
-# CAPNPC_ZIG = path to the plugin binary (CI builds it from the fetched
-# capnp-zig package and points here). Unset, the default `zig` makes `capnp`
-# search $PATH for `capnpc-zig` — that is capnp's `-o<lang>` rule: a bare
-# word means "the plugin capnpc-<lang> on PATH", a path with a slash is the
-# exact executable. (`-ocapnpc-zig` would look for `capnpc-capnpc-zig`.)
-# Regenerate src/gen/*.zig from schema/*.capnp using the capnpc-zig plugin.
-gen:
-    capnp compile -o${CAPNPC_ZIG:-zig}:src/gen --src-prefix=schema schema/slcp.capnp schema/overlay.capnp schema/host.capnp
+# Verify/install the locked compiler archive; mise supplies pinned Wasmtime.
+bootstrap-toolchain:
+    python3 tools/capnp_tool.py bootstrap
+
+# Regenerate with the WASM compiler and the runtime-matched WASI generator.
+gen: bootstrap-toolchain
+    python3 tools/capnp_tool.py gen
+
+toolchain-test:
+    python3 -m unittest discover -s tools -p 'test_capnp_tool.py'
+
+# Required independent reference check: two statements and four quorum sets.
+canonical-reference: bootstrap-toolchain
+    zig build canonical-reference --summary all
 
 # Run all tests (unit + conformance vectors).
 test:
@@ -15,9 +21,9 @@ test:
 vectors:
     zig build vectors
 
-# CI drift check: regenerate and fail if checked-in gen/ differs.
-gen-check: gen
-    git diff --exit-code src/gen
+# Compare staged generation without overwriting any working-tree files.
+gen-check: bootstrap-toolchain
+    python3 tools/capnp_tool.py check
 
 # The §14-M5 gate: 4 nodes over real loopback TCP, 200 slots, kill/restart,
 # partition/heal, one equivocator (design §13.6). Minutes-scale.
@@ -174,32 +180,14 @@ preflight:
     just fmt-check
     just ci-lint
     just gen-check-pinned
+    just canonical-reference
     just pkg-hash-check
     just package-preflight
     rm -rf "$cache"
     echo "preflight: GREEN in $(( $(date +%s) - start )) s (log: preflight.log)"
 
-# gen-check with the plugin built from the capnp-zig package build.zig.zon
-# PINS (RELEASING.md "Cold preflight"; what CI's gen-check job does).
-# A capnpc-zig on PATH is never used: S6 found the checked-in src/gen had
-# been produced by a stale ~/.local/bin/capnpc-zig. Needs `capnp` (the C++
-# driver: brew/apt) and the package extracted under zig-pkg/ (any prior
-# `zig build` did that; `--fetch=all` is the fallback).
-gen-check-pinned:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    root=$(pwd)
-    hash=$(sed -n 's/.*\.hash = "\(capnpc_zig-[^"]*\)".*/\1/p' build.zig.zon | head -n 1)
-    [ -n "$hash" ] || { echo "gen-check-pinned: build.zig.zon has no capnpc_zig hash line"; exit 1; }
-    pkgdir="${ZIG_LOCAL_PKG_DIR:-$root/zig-pkg}"
-    [ -d "$pkgdir/$hash" ] || zig build --fetch=all
-    [ -d "$pkgdir/$hash" ] || { echo "gen-check-pinned: pinned package $hash not under $pkgdir"; exit 1; }
-    prefix=$(mktemp -d "${TMPDIR:-/tmp}/slcp-capnpc.XXXXXX")
-    (cd "$pkgdir/$hash" && ZIG_LOCAL_PKG_DIR="$pkgdir" zig build -p "$prefix/capnpc")
-    test -x "$prefix/capnpc/bin/capnpc-zig" || { echo "gen-check-pinned: the package build produced no capnpc-zig"; exit 1; }
-    CAPNPC_ZIG="$prefix/capnpc/bin/capnpc-zig" just gen-check
-    echo "gen-check-pinned: OK ($hash; capnp $(capnp --version))"
-    rm -rf "$prefix"
+# Compatibility recipe: every generation now uses build.zig.zon's exact pin.
+gen-check-pinned: gen-check
 
 # Advisory long fuzz (R21): the limit is ITERATIONS (K/M/G suffixes), not
 # minutes. Record the outcome in RELEASING.md's run log; it never blocks the

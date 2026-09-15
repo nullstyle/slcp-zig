@@ -64,7 +64,7 @@ just preflight               # ~15 min; keeps preflight.log (gitignored)
 byz-matrix, sim-matrix, example-smoke, registry-smoke) from a **fresh `--cache-dir`**, then
 greps each gate's evidence line out of the `--summary all` log, then runs
 `just fmt-check`, `just ci-lint`, `just gen-check-pinned`,
-`just pkg-hash-check` and `just package-preflight`. It is red when any gate
+`just canonical-reference`, `just pkg-hash-check` and `just package-preflight`. It is red when any gate
 fails, when any evidence line is missing, or when a step in the summary block
 reads ` cached`. What it greps (prefixes only, deliberately):
 
@@ -89,13 +89,13 @@ Things that look wrong and are not:
   (39100–39504) and on macOS `SO_REUSEPORT` lets a second run bind the same
   ports and contaminate the first. Do not run two preflights, or a preflight
   and an e2e, concurrently on one machine.
-- **gen-check goes through the pinned plugin.** `just gen-check-pinned`
-  builds `capnpc-zig` from the capnp-zig package `build.zig.zon` pins
-  (`zig-pkg/capnpc_zig-<version>-<hash>/`, `ZIG_LOCAL_PKG_DIR` pointed at the
-  repo's `zig-pkg/`) and runs `just gen-check` with `CAPNPC_ZIG` set to it.
-  A `capnpc-zig` on PATH is never the right one (S6 found `src/gen` had been
-  produced by a stale hand-installed build). Needs `capnp` (brew/apt); the
-  version used is printed on the OK line and recorded in the run log below.
+- **gen-check uses the locked WASM toolchain.** `just gen-check-pinned`
+  verifies the capnp-wasm archive in `tools/capnp-toolchain.json`, builds the
+  generator from `build.zig.zon` as WASI with the pinned Zig, and compares staged
+  output without rewriting `src/gen`. Run `just canonical-reference` for the
+  required two statement/four quorum-set reference comparisons. Native `capnp`
+  and a PATH-installed Zig plugin are unnecessary. Bootstrap reports the
+  compiler version and archive identity; record both in the release run log.
 - A stale `zig-out/bin/slcp_core.wasm` makes the soft wasm-diff inside `test`
   red after any frame-layout change; `just vectors-sweep` is the cure.
 

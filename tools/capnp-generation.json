@@ -1,0 +1,12 @@
+{
+  "schemas_root": "schema",
+  "entrypoints": ["slcp.capnp", "overlay.capnp", "host.capnp"],
+  "outputs": {
+    "slcp.zig": "src/gen/slcp.zig",
+    "overlay.zig": "src/gen/overlay.zig",
+    "host.zig": "src/gen/host.zig"
+  },
+  "format": false,
+  "owned_output_directory": "src/gen",
+  "dependency": "capnpc_zig"
+}
