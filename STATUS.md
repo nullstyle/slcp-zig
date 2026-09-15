@@ -52,6 +52,12 @@ readable descriptors. The native adaptivity journal uses the same capability.
 Tests cover ordinary snapshot replacement, history-directory creation and
 archive publication/reopen on Linux.
 
+The full Linux run also exposed a frozen-peer test fixture that closed its
+listener before joining a thread blocked in `accept`. Cleanup now requests
+shutdown and supplies a loopback wakeup before joining and closing the
+listener. The isolated test timed out before the change and passes on Linux
+and macOS afterward; production overlay behavior is unchanged.
+
 The focused core/application suite passes 204 tests. The full macOS graph
 passes 118/118 steps with 499 tests passed and two expected skips; separately
 run core/application tests cover cached portions of that graph. Strict API
@@ -59,6 +65,15 @@ checks retain all 292 Stable declarations and verify 1,909 Experimental
 declarations. Documentation smoke passes 443 checks and 18 tests. The
 [implementation plan](docs/plans/quorum-adaptivity.md) records the selected
 scope; broker and automatic placement policy remain downstream work.
+
+The full Linux graph also passes 118/118 steps, including 222 native node tests
+and 106 Registry tests; two platform/configuration checks are skipped. The
+three-node Linux Registry smoke completes eight transactions through restart,
+long-outage recovery and peerless authenticated replay. Protocol verification
+passes all 15,000 simulation cells and 1,000 seeds for each of two Byzantine
+actors. WASM differential replay passes four traces and 300 fuzz iterations;
+generation, required canonical-reference checks and extracted-package
+preflight also pass.
 
 Both projects also use the pinned WASM schema compiler and runtime-matched
 generators described in the [toolchain migration record](docs/plans/capnp-wasm-toolchain.md).

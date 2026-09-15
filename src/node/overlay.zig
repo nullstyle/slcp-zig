@@ -2577,10 +2577,12 @@ test "dialer: a peer that accepts but never Hellos is redialled on growing backo
     // so every accepted conn sits silent until the test closes it.
     const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
     var server = try net.IpAddress.listen(&bind_addr, io, .{ .mode = .stream, .reuse_address = true });
+    defer server.deinit(io);
 
     const Acceptor = struct {
         io: std.Io,
         server: *net.Server,
+        stopping: std.atomic.Value(bool) = .init(false),
         mu: std.Io.Mutex = .init,
         n: usize = 0,
         times: [4]i96 = @splat(0),
@@ -2589,6 +2591,10 @@ test "dialer: a peer that accepts but never Hellos is redialled on growing backo
         fn run(self: *@This()) void {
             while (true) {
                 const stream = self.server.accept(self.io) catch return;
+                if (self.stopping.load(.acquire)) {
+                    stream.close(self.io);
+                    return;
+                }
                 self.mu.lockUncancelable(self.io);
                 if (self.n == self.times.len) {
                     self.mu.unlock(self.io);
@@ -2609,15 +2615,23 @@ test "dialer: a peer that accepts but never Hellos is redialled on growing backo
             defer self.mu.unlock(self.io);
             return self.n;
         }
+
+        fn stop(self: *@This(), thread: std.Thread) void {
+            // Like Overlay.wakeAcceptThread, wake accept before joining;
+            // closing the listener in another thread does not wake Linux.
+            self.stopping.store(true, .release);
+            self.io.vtable.netShutdown(self.io.userdata, self.server.socket.handle, .both) catch {};
+            var addr = net.IpAddress.parse("127.0.0.1", portOf(self.server.socket.address)) catch unreachable;
+            if (net.IpAddress.connect(&addr, self.io, .{ .mode = .stream })) |wake| {
+                wake.close(self.io);
+            } else |_| {}
+            thread.join();
+            for (self.streams[0..self.n]) |stream| stream.close(self.io);
+        }
     };
     var acc: Acceptor = .{ .io = io, .server = &server };
     const acc_thread = try std.Thread.spawn(.{}, Acceptor.run, .{&acc});
-    // A `try` failing between the spawn and the explicit join below must not
-    // strand the acceptor on a socket owned by this frame.
-    errdefer {
-        server.deinit(io);
-        acc_thread.join();
-    }
+    defer acc.stop(acc_thread);
 
     const spec = try std.fmt.allocPrint(gpa, "127.0.0.1:{d}", .{portOf(server.socket.address)});
     defer gpa.free(spec);
@@ -2635,25 +2649,18 @@ test "dialer: a peer that accepts but never Hellos is redialled on growing backo
     const t0 = std.Io.Clock.now(.awake, io).nanoseconds;
     while (acc.count() < 3) {
         if (std.Io.Clock.now(.awake, io).nanoseconds - t0 > 8 * std.time.ns_per_s) {
-            server.deinit(io);
-            acc_thread.join();
             return error.RedialsDidNotArrive;
         }
         sleepMs(io, 25);
     }
     ov.stop();
-    server.deinit(io); // wake the acceptor out of accept; it has its records
-    acc_thread.join();
 
     var times: [3]i96 = @splat(0);
-    var streams: [3]net.Stream = undefined;
     {
         acc.mu.lockUncancelable(io);
         defer acc.mu.unlock(io);
         @memcpy(&times, acc.times[0..3]);
-        @memcpy(&streams, acc.streams[0..3]);
     }
-    for (streams) |s| s.close(io);
 
     // Inter-dial gaps follow deadline + backoffNs(peer 0, attempt) — the
     // ladder, not the constant base interval the TCP-success reset produced.
