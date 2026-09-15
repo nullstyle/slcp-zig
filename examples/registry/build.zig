@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{.{ .name = "slcp", .module = slcp_dep.module("slcp") }},
     }) });
     b.installArtifact(exe);
@@ -20,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{.{ .name = "slcp", .module = slcp_dep.module("slcp") }},
     }) });
     b.step("test", "Run the registry's tests").dependOn(&b.addRunArtifact(tests).step);

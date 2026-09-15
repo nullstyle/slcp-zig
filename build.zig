@@ -830,6 +830,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/registry/src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true, // Registry durability helpers call libc fsync/fcntl.
             .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
         }),
     });
@@ -846,6 +847,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/registry/src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "slcp", .module = slcp_mod }},
         }),
     });
