@@ -302,6 +302,13 @@ fn syncDirectory(dir: std.Io.Dir) !void {
     }
 }
 
+fn openSnapshotDataDir(io: std.Io, path: []const u8) !std.Io.Dir {
+    // fsync needs a readable directory; Zig otherwise uses O_PATH on Linux.
+    return std.Io.Dir.cwd().createDirPathOpen(io, path, .{
+        .open_options = .{ .iterate = true },
+    });
+}
+
 /// Create/open the final data-directory component through an already-existing
 /// parent and make that directory entry durable. History mode needs this
 /// fence before it can publish a vote whose trusted signing state lives under
@@ -318,10 +325,10 @@ fn openDurableDataDir(
         return error.BadPathName;
     const parent_path = std.fs.path.dirname(path) orelse ".";
     const cwd = std.Io.Dir.cwd();
-    const parent = try cwd.openDir(io, parent_path, .{ .follow_symlinks = false });
+    const parent = try cwd.openDir(io, parent_path, .{ .follow_symlinks = false, .iterate = true });
     defer parent.close(io);
     const dir = try parent.createDirPathOpen(io, base, .{
-        .open_options = .{ .follow_symlinks = false },
+        .open_options = .{ .follow_symlinks = false, .iterate = true },
     });
     errdefer dir.close(io);
     try sync_parent(parent);
@@ -924,7 +931,7 @@ fn runNode(init: std.process.Init, args: []const []const u8) !u8 {
             return 1;
         }
     else
-        std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |err| {
+        openSnapshotDataDir(io, data_dir) catch |err| {
             std.debug.print("registry node: cannot create --data-dir {s}: {t}\n", .{ data_dir, err });
             return 1;
         };
@@ -2112,7 +2119,7 @@ test "registry main: snapshot replacement does not follow a planted temp or fina
     const gpa = testing.allocator;
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var outside = try tmp.dir.createFile(io, "outside", .{});
@@ -2146,6 +2153,29 @@ const DataDirSyncProbe = struct {
     }
 };
 
+test "registry main: history-free data-dir supports durable snapshot replacement" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    var data_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try std.fmt.bufPrint(&data_buf, "{s}/missing-parent/node", .{root});
+    const dir = try openSnapshotDataDir(io, data_path);
+    defer dir.close(io);
+
+    var state = try testGenesis("registry durable snapshot directory", gpa);
+    defer state.deinit(gpa);
+    for (0..2) |_| {
+        try advanceEmpty(&state, gpa);
+        try writeSnapshotFile(io, dir, gpa, &state);
+        var restored = (try readSnapshotFile(io, dir, gpa)).?;
+        defer restored.deinit(gpa);
+        try testing.expectEqualSlices(u8, &state.head.hash, &restored.head.hash);
+    }
+}
+
 test "registry main: history data-dir creation is fenced in its existing parent" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const io = testing.io;
@@ -2167,6 +2197,11 @@ test "registry main: history data-dir creation is fenced in its existing parent"
     defer dir.close(io);
     try testing.expectEqual(@as(usize, 2), DataDirSyncProbe.calls);
     try testing.expectEqual(std.Io.File.Kind.directory, (try tmp.dir.statFile(io, "parent/node", .{ .follow_symlinks = false })).kind);
+
+    // The returned child handle also participates in later snapshot barriers.
+    var state = try testGenesis("registry history data directory", testing.allocator);
+    defer state.deinit(testing.allocator);
+    try writeSnapshotFile(io, dir, testing.allocator, &state);
 
     var nested_buf: [std.fs.max_path_bytes]u8 = undefined;
     const nested = try std.fmt.bufPrint(&nested_buf, "{s}/missing/parent/node", .{root});
@@ -2361,7 +2396,7 @@ test "registry main: startup frees durable capacity for a journal-only successor
 test "registry main: a checkpoint can resume the journal after the snapshot write crash window" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const data_dir = root_buf[0..try tmp.dir.realPath(io, &root_buf)];

@@ -209,7 +209,9 @@ pub const Archive = struct {
         errdefer gpa.free(validators);
 
         const no_follow: std.Io.Dir.CreateDirPathOpenOptions = .{
-            .open_options = .{ .follow_symlinks = false },
+            // These retained directories are both iterated and fsync'd. On
+            // Linux, iterate=true also avoids unusable O_PATH-only handles.
+            .open_options = .{ .follow_symlinks = false, .iterate = true },
         };
         const network_hex = registry.hex32(cfg.network_id);
 
@@ -1860,7 +1862,7 @@ fn openRoot(io: std.Io, path: []const u8, options: std.Io.Dir.CreateDirPathOpenO
         return error.BadPathName;
     const parent_path = std.fs.path.dirname(path) orelse ".";
     const cwd = std.Io.Dir.cwd();
-    const parent = try cwd.openDir(io, parent_path, .{ .follow_symlinks = false });
+    const parent = try cwd.openDir(io, parent_path, .{ .follow_symlinks = false, .iterate = true });
     defer parent.close(io);
     const root = try parent.createDirPathOpen(io, base, options);
     errdefer root.close(io);
