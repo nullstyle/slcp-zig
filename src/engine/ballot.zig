@@ -316,7 +316,7 @@ const BallotLookup = struct {
                 return self.s.ballot.singletons.get(node);
             }
             if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) {
-                return &self.ctx.cfg.quorum_set;
+                return self.ctx.localQuorum(self.s);
             }
             return self.ctx.qsets.get(env.statement.qsetHash());
         }
@@ -350,7 +350,7 @@ fn fedAccept(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, voted_pred: anytype, accep
     const accepted = try collectNodes(ctx, s, accepted_pred);
     defer ctx.gpa.free(accepted);
     const bl = BallotLookup{ .ctx = ctx, .s = s };
-    return slot_mod.federatedAccept(ctx.gpa, &ctx.cfg.quorum_set, voted, accepted, bl.lookup());
+    return slot_mod.federatedAccept(ctx.gpa, ctx.localQuorum(s), voted, accepted, bl.lookup());
 }
 
 /// Slot::federatedRatify over the ballot latest_envelopes
@@ -359,7 +359,7 @@ fn fedRatify(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, voted_pred: anytype) !bool
     const voted = try collectNodes(ctx, s, voted_pred);
     defer ctx.gpa.free(voted);
     const bl = BallotLookup{ .ctx = ctx, .s = s };
-    return slot_mod.federatedRatify(ctx.gpa, &ctx.cfg.quorum_set, voted, bl.lookup());
+    return slot_mod.federatedRatify(ctx.gpa, ctx.localQuorum(s), voted, bl.lookup());
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +531,7 @@ fn buildOwnStatement(ctx: *engine_mod.Ctx, s: *slot_mod.Slot) !stored.OwnedState
             errdefer if (prepared) |*b| b.deinit(gpa);
             const prepared_prime = try cloneOptBallot(gpa, &bs.prepared_prime);
             break :blk .{ .prepare = .{
-                .qset_hash = ctx.local_qset_hash,
+                .qset_hash = ctx.localQuorumHash(s),
                 .ballot = ballot,
                 .prepared = prepared,
                 .prepared_prime = prepared_prime,
@@ -540,7 +540,7 @@ fn buildOwnStatement(ctx: *engine_mod.Ctx, s: *slot_mod.Slot) !stored.OwnedState
             } };
         },
         .confirm => .{ .confirm = .{
-            .qset_hash = ctx.local_qset_hash,
+            .qset_hash = ctx.localQuorumHash(s),
             .ballot = try bs.current.?.clone(gpa),
             .n_prepared = bs.prepared.?.counter,
             .n_commit = bs.commit.?.counter,
@@ -549,7 +549,7 @@ fn buildOwnStatement(ctx: *engine_mod.Ctx, s: *slot_mod.Slot) !stored.OwnedState
         .externalize => .{ .externalize = .{
             .commit = try bs.commit.?.clone(gpa),
             .n_h = bs.high.?.counter,
-            .commit_qset_hash = ctx.local_qset_hash,
+            .commit_qset_hash = ctx.localQuorumHash(s),
         } },
     };
     return .{ .node_id = ctx.cfg.node_id, .slot = s.index, .pledges = pledges };
@@ -1502,7 +1502,7 @@ const CounterAbove = struct {
 fn hasVBlockingAheadOf(ctx: *engine_mod.Ctx, s: *slot_mod.Slot, n: u32) !bool {
     const nodes = try collectNodes(ctx, s, CounterAbove{ .n = n });
     defer ctx.gpa.free(nodes);
-    return local_node.isVBlocking(&ctx.cfg.quorum_set, nodes);
+    return local_node.isVBlocking(ctx.localQuorum(s), nodes);
 }
 
 /// Step 9 from the paper: when a v-blocking set sits strictly ahead of the
@@ -1569,7 +1569,7 @@ fn checkHeardFromQuorum(ctx: *engine_mod.Ctx, s: *slot_mod.Slot) Error!void {
     const nodes = try collectNodes(ctx, s, HeardPred{ .local_counter = cur.counter });
     defer gpa.free(nodes);
     const bl = BallotLookup{ .ctx = ctx, .s = s };
-    const is_quorum = try local_node.isQuorum(gpa, &ctx.cfg.quorum_set, nodes, bl.lookup()); // :2366-2381
+    const is_quorum = try local_node.isQuorum(gpa, ctx.localQuorum(s), nodes, bl.lookup()); // :2366-2381
 
     if (is_quorum) {
         const old_hq = bs.heard_from_quorum; // :2383

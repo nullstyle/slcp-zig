@@ -22,6 +22,11 @@ const qset_store = @import("qset_store.zig");
 const slot_mod = @import("slot.zig");
 const stored = @import("stored.zig");
 const values = @import("values.zig");
+const adaptivity_mod = @import("adaptivity.zig");
+
+pub const AdaptivityOptions = adaptivity_mod.Options;
+pub const AdaptivityError = adaptivity_mod.Error;
+pub const QuorumChangeView = adaptivity_mod.ChangeView;
 
 pub const TimerId = enum(u8) { nomination = 0, ballot = 1 };
 
@@ -207,6 +212,19 @@ pub const Ctx = struct {
     /// native-vs-wasm divergence the M4 differential harness caught.
     stored_bytes: *usize,
 
+    pub fn localQuorum(self: *const Ctx, s: *const slot_mod.Slot) *const qset.QuorumSetOwned {
+        return if (s.local_quorum) |r| &r.quorum_set else &self.cfg.quorum_set;
+    }
+
+    pub fn localQuorumHash(self: *const Ctx, s: *const slot_mod.Slot) [32]u8 {
+        return if (s.local_quorum) |r| r.hash else self.local_qset_hash;
+    }
+
+    pub fn localExcised(self: *const Ctx, s: *const slot_mod.Slot) ?*const qset.QuorumSetOwned {
+        if (s.local_quorum) |r| return if (r.excised) |*e| e else null;
+        return self.excised;
+    }
+
     /// Apply a storeLatest byte delta to the engine-wide counter.
     pub fn addStoredBytes(self: *Ctx, delta: isize) void {
         const cur: isize = @intCast(self.stored_bytes.*);
@@ -252,6 +270,9 @@ pub const Engine = struct {
     stored_statement_bytes: usize = 0,
     /// Sticky failure: once set, pushInput always fails (§7.2 discipline).
     failed: bool = false,
+    /// Experimental: null preserves the original static configuration path.
+    adaptive: ?*adaptivity_mod.State = null,
+    inputs_started: bool = false,
 
     /// Takes ownership of config.quorum_set. `config.limits` must already
     /// satisfy limits.validate.
@@ -307,6 +328,10 @@ pub const Engine = struct {
             self.gpa.destroy(entry.value_ptr.*);
         }
         self.slots.deinit(self.gpa);
+        if (self.adaptive) |a| {
+            a.deinit(self.gpa);
+            self.gpa.destroy(a);
+        }
         self.effects.deinit();
         self.qsets.deinit();
         self.pending.deinit();
@@ -340,7 +365,124 @@ pub const Engine = struct {
     pub fn commitEffect(self: *Engine) void {
         self.effects.commit();
     }
+
+    /// Experimental. Enable a fixed trust envelope before any input. The
+    /// initial Config quorum becomes the policy covering admission_floor.
+    pub fn enableQuorumAdaptivity(self: *Engine, options: AdaptivityOptions) AdaptivityError!void {
+        if (self.failed) return error.EngineFailed;
+        if (self.adaptive != null) return error.AdaptivityAlreadyEnabled;
+        if (self.inputs_started or self.slots.count() != 0 or self.pending.count() != 0 or self.effects.len() != 0) return error.EngineNotPristine;
+        if (options.max_revisions == 0 or options.max_revisions > 4096) return error.InvalidRevisionLimit;
+        var policy = try @import("../adaptivity/policy.zig").Policy.init(self.gpa, options.policy);
+        errdefer policy.deinit();
+        const initial = try adaptivity_mod.Revision.create(self.gpa, &policy, self.cfg.node_id, options.admission_floor, &self.cfg.quorum_set);
+        errdefer initial.destroy(self.gpa);
+        const state = try self.gpa.create(adaptivity_mod.State);
+        errdefer self.gpa.destroy(state);
+        state.* = .{
+            .policy = policy,
+            .fingerprint = policy.fingerprint(),
+            .floor = options.admission_floor,
+            .max_revisions = options.max_revisions,
+        };
+        try state.revisions.append(self.gpa, initial);
+        self.adaptive = state;
+    }
+
+    /// Experimental, two-phase installation. The returned bytes are ready
+    /// for the host's durable policy journal. No input may be fed until
+    /// commit/abort; violating that barrier fatally fails this engine.
+    pub fn prepareQuorumChange(self: *Engine, first_slot: u64, next: *const qset.QuorumSetOwned) AdaptivityError!QuorumChangeView {
+        if (self.failed) return error.EngineFailed;
+        const state = self.adaptive orelse return error.AdaptivityDisabled;
+        if (self.effects.len() != 0) return error.EffectsNotDrained;
+        if (state.prepared != null) return error.ChangeAlreadyPrepared;
+        if (first_slot <= state.revisions.items[state.revisions.items.len - 1].first_slot or first_slot < state.floor) return error.BoundaryNotIncreasing;
+        if (state.highest_admitted) |highest| if (first_slot <= highest) return error.SlotAlreadyAdmitted;
+        for (self.pending.items.items) |*p| if (p.env.statement.slot >= first_slot) return error.SlotAlreadyAdmitted;
+        if (state.revisions.items.len >= state.max_revisions) return error.RevisionLimitExceeded;
+        const revision = try adaptivity_mod.Revision.create(self.gpa, &state.policy, self.cfg.node_id, first_slot, next);
+        errdefer revision.destroy(self.gpa);
+        try state.revisions.ensureUnusedCapacity(self.gpa, 1);
+        state.prepared = revision;
+        return revision.view(state.fingerprint);
+    }
+
+    /// Experimental. Call only after the prepared record is durable. A
+    /// resource failure is sticky: recovery must replay the durable record.
+    pub fn commitQuorumChange(self: *Engine) AdaptivityError!void {
+        if (self.failed) return error.EngineFailed;
+        const state = self.adaptive orelse return error.AdaptivityDisabled;
+        const revision = state.prepared orelse return error.NoPreparedChange;
+        self.installRevision(revision) catch |err| {
+            self.failed = true;
+            return err;
+        };
+        state.prepared = null;
+    }
+
+    fn installRevision(self: *Engine, revision: *adaptivity_mod.Revision) error{OutOfMemory}!void {
+        const state = self.adaptive.?;
+        try self.qsets.retain(revision.hash);
+        errdefer self.qsets.release(revision.hash);
+        try self.qsets.insert(revision.hash, try qset.clone(self.gpa, &revision.quorum_set));
+        state.revisions.appendAssumeCapacity(revision);
+        errdefer _ = state.revisions.pop();
+        try self.refreshLocalQuorumRoots();
+    }
+
+    /// Discard a stage which has not been made durable. Host persistence
+    /// truthfulness has the same obligation as persist_own_envelope.
+    pub fn abortQuorumChange(self: *Engine) void {
+        const state = self.adaptive orelse return;
+        if (state.prepared) |revision| revision.destroy(self.gpa);
+        state.prepared = null;
+    }
+
+    pub fn quorumForSlot(self: *const Engine, slot_index: u64) ?*const qset.QuorumSetOwned {
+        if (self.adaptive) |state| return if (state.forSlot(slot_index)) |r| &r.quorum_set else null;
+        return &self.cfg.quorum_set;
+    }
+
+    pub fn quorumRevisionCount(self: *const Engine) usize {
+        return if (self.adaptive) |state| state.revisions.items.len else 0;
+    }
+
+    pub fn quorumRevision(self: *const Engine, index: usize) ?QuorumChangeView {
+        const state = self.adaptive orelse return null;
+        if (index >= state.revisions.items.len) return null;
+        return state.revisions.items[index].view(state.fingerprint);
+    }
+
+    /// Rebuild local roots from every retained policy, replacing rather
+    /// than permanently accumulating retired validator identities. Local
+    /// policy pins are bounded independently from the remote cache budget.
+    pub fn refreshLocalQuorumRoots(self: *Engine) error{OutOfMemory}!void {
+        const state = self.adaptive orelse return;
+        var roots: std.ArrayList([32]u8) = .empty;
+        defer roots.deinit(self.gpa);
+        try roots.append(self.gpa, self.cfg.node_id);
+        var unique: u32 = 0;
+        for (state.revisions.items, 0..) |revision, i| {
+            try appendQuorumNodes(self.gpa, &roots, &revision.quorum_set);
+            var seen = false;
+            for (state.revisions.items[0..i]) |earlier| {
+                if (std.mem.eql(u8, &earlier.hash, &revision.hash)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) unique += 1;
+        }
+        try self.qsets.replaceGraphRoots(roots.items);
+        self.qsets.setCapacity(std.math.add(u32, @max(1, self.cfg.limits.max_cached_qsets), unique - 1) catch std.math.maxInt(u32));
+    }
 };
+
+fn appendQuorumNodes(gpa: std.mem.Allocator, out: *std.ArrayList([32]u8), qs: *const qset.QuorumSetOwned) error{OutOfMemory}!void {
+    try out.appendSlice(gpa, qs.validators);
+    for (qs.inner_sets) |*inner| try appendQuorumNodes(gpa, out, inner);
+}
 
 test "timeout schedule: linear then capped" {
     const l = limits_mod.Limits{};

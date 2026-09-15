@@ -65,6 +65,41 @@ _Avoid_: Blocking quorum
 The property that every two quorums overlap. Safety depends on the overlap
 including an intact node.
 
+**Trust floor**:
+An immutable policy identifying an anchor pool, a faulty-anchor budget and the
+minimum number of anchors in every admitted quorum slice.
+_Avoid_: Current quorum set, health score
+
+**Anchor**:
+A signing identity counted by a trust floor. Being an anchor identifies a
+trust assumption; it does not establish honesty, ownership or availability.
+_Avoid_: Operator, machine
+
+**Quorum revision**:
+A durably identified local quorum set and its first eligible slot, selected
+within the same trust floor. An admitted slot retains its original revision.
+_Avoid_: Trust-pool migration
+
+**Trust-pool migration**:
+An authorized transition from one trust floor and signing domain to a successor
+floor and domain, binding an exact application checkpoint.
+_Avoid_: Quorum revision, reconnect
+
+**Terminal decision**:
+The final old-domain consensus value identifying a trust-pool migration. Its
+signers retire from further old-domain progression.
+_Avoid_: Switch time, local shutdown
+
+**Migration certificate**:
+Distinct prior-policy anchor EXTERNALIZE statements for the exact terminal
+decision, sufficient under that prior policy to authorize successor adoption.
+_Avoid_: Successor quorum, application snapshot
+
+**Managed session**:
+A host-facing consensus lifecycle that admits one application slot at a time
+and enforces activation, application-durability and retirement barriers.
+_Avoid_: Transport session, QUIC connection
+
 **Intact node**:
 A non-Byzantine node that remains inside the well-behaved part of the
 federated trust graph.

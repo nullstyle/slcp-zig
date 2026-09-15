@@ -518,7 +518,7 @@ fn leaderRound(ctx: *const engine_mod.Ctx, s: *const slot_mod2.Slot) LeaderRound
         .prev_value = s.nom.previous_value orelse "",
         .round = s.nom.round,
         .local_node = ctx.cfg.node_id,
-        .qs = ctx.excised,
+        .qs = ctx.localExcised(s),
     };
 }
 
@@ -596,7 +596,7 @@ const NominationLookup = struct {
 
     fn get(raw: *const anyopaque, node: qset.NodeId) ?*const qset.QuorumSetOwned {
         const self: *const NominationLookup = @ptrCast(@alignCast(raw));
-        if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) return &self.ctx.cfg.quorum_set;
+        if (std.mem.eql(u8, &node, &self.ctx.cfg.node_id)) return self.ctx.localQuorum(self.s);
         const env = self.s.latest_nom.get(node) orelse return null;
         return self.ctx.qsets.get(env.statement.qsetHash());
     }
@@ -739,7 +739,7 @@ fn placeholderNomStored(gpa: std.mem.Allocator, ctx: *engine_mod.Ctx, s: *slot_m
             .node_id = ctx.cfg.node_id,
             .slot = s.index,
             .pledges = .{ .nominate = .{
-                .qset_hash = ctx.local_qset_hash,
+                .qset_hash = ctx.localQuorumHash(s),
                 .votes = votes,
                 .accepted = accepted,
             } },
@@ -785,7 +785,7 @@ fn emitNomination(ctx: *engine_mod.Ctx, s: *slot_mod2.Slot) anyerror!void {
         ctx.addStoredBytes(delta); // §5.1 budget: self-stores must account
     } else {
         var env = try emit_mod.emit(ctx, s.index, .{ .nominate = .{
-            .qset_hash = ctx.local_qset_hash,
+            .qset_hash = ctx.localQuorumHash(s),
             .votes = @ptrCast(s.nom.votes.slice()),
             .accepted = @ptrCast(s.nom.accepted.slice()),
         } });
@@ -839,7 +839,7 @@ fn processNomination(
         const nl = NominationLookup{ .ctx = ctx, .s = s };
         if (try slot_mod2.federatedAccept(
             gpa,
-            &ctx.cfg.quorum_set,
+            ctx.localQuorum(s),
             voted_nodes,
             accepted_nodes,
             nl.lookup(),
@@ -871,7 +871,7 @@ fn processNomination(
         const nl = NominationLookup{ .ctx = ctx, .s = s };
         if (try slot_mod2.federatedRatify(
             gpa,
-            &ctx.cfg.quorum_set,
+            ctx.localQuorum(s),
             accepted_nodes,
             nl.lookup(),
         )) { // cpp:478-481

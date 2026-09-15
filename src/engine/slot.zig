@@ -334,6 +334,9 @@ const values_mod = @import("values.zig");
 
 pub const Slot = struct {
     index: u64,
+    /// Borrowed from Engine's retained immutable revision timeline. The
+    /// engine retires revisions only after purging every referencing slot.
+    local_quorum: ?*const @import("adaptivity.zig").Revision = null,
     nom: nomination_mod.State = .{},
     ballot: ballot_mod.State = .{},
     /// Latest stored envelope per node, per protocol (freshness-gated).

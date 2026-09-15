@@ -22,6 +22,10 @@ pub const timers = @import("node/timers.zig");
 /// Crash-safe consensus-log persistence: own.log + externalized.log (§10).
 /// Node owns the separate bounded, best-effort qsets/ answering cache.
 pub const store = @import("node/store.zig");
+/// Experimental ordered durability for managed quorum and trust-pool changes.
+pub const adaptivity_journal = @import("node/adaptivity_journal.zig");
+/// Experimental fsync-before-commit bridge and recovery for managed Sessions.
+pub const managed_store = @import("node/managed_store.zig");
 /// Ed25519 key file: loadOrCreate (§11 keys UX).
 pub const keys = @import("node/keys.zig");
 /// The omakase Node: engine thread + effect drain + propose/waitExternalized

@@ -269,6 +269,15 @@ expect in the Stable list and that are deliberately **not**:
   the reader-taking functions (which expose generated types).
 - `slcp.core.driver.Checked` and its `validate_divergence_msg` /
   `combine_divergence_msg` (R16).
+- `slcp.core.adaptivity.*`, the Engine's quorum-adaptivity methods, and
+  `slcp.{adaptivity_journal, managed_store}`: trust-floor assessment, runtime
+  quorum revisions, certified trust-pool migration and native durability.
+  Their host and recovery contracts are described in
+  [quorum adaptivity](quorum-adaptivity.md); none changes the Stable wire or
+  application interface.
+- `slcp.core.host.*`: transport-neutral ingress metadata and holding, shared
+  with the native Node through compatibility aliases. Foreign-host ownership
+  and ordering requirements are described in [QUIC hosting](quic-hosting.md).
 - `slcp.app_node` (the module path; `max_encoded_bytes`, `codec`,
   `apply_in_place` on an instantiation): implementation detail of the typed
   layer. The typed layer's contract is the `slcp.AppNode(Counter)` /

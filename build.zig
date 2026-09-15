@@ -151,6 +151,19 @@ pub fn build(b: *std.Build) void {
     const core_tests_step = b.step("core-tests", "Run the sans-io engine unit tests (slcp-core)");
     core_tests_step.dependOn(&run_core_tests.step);
 
+    const adaptivity_tests = b.addTest(.{
+        .name = "slcp-adaptivity-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/adaptivity_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+        }),
+    });
+    const run_adaptivity_tests = b.addRunArtifact(adaptivity_tests);
+    const adaptivity_tests_step = b.step("adaptivity-tests", "Exercise managed sessions across quorum revisions and certified trust-pool migrations");
+    adaptivity_tests_step.dependOn(&run_adaptivity_tests.step);
+
     // Reference tooling is opt-in for ordinary tests. Package consumers use
     // checked-in bindings and need neither Python nor a compiler installation.
     const capnp_python = b.option([]const u8, "capnp-wasm-python", "Python executable for the capnp-wasm reference driver") orelse "python3";
@@ -427,6 +440,7 @@ pub fn build(b: *std.Build) void {
     const wasm_diff_tests = b.addTest(.{ .name = "slcp-wasm-diff", .root_module = wasm_diff_mod });
 
     const test_step = b.step("test", "Run unit + vector + framing conformance + e2e + ABI conformance + sim matrix + fuzz smoke + wasm differential (skipped without the wasm artifact)");
+    test_step.dependOn(&run_adaptivity_tests.step);
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_framing_vector_tests.step);
@@ -523,6 +537,22 @@ pub fn build(b: *std.Build) void {
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step("wasm", "Build slcp_core.wasm (wasm32-freestanding, ReleaseSmall)");
     wasm_step.dependOn(&install_wasm.step);
+
+    // Exercise the foreign-host interface on the core-only WASM graph.
+    // Merely exporting core.host leaves its functions unanalyzed; this
+    // consumer forces metadata, holding, release and observation operations.
+    const host_ingress_wasm = b.addObject(.{
+        .name = "slcp-host-ingress-wasm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/host_ingress_wasm.zig"),
+            .target = wasm_target,
+            .optimize = wasm_optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core_wasm }},
+        }),
+    });
+    const host_ingress_wasm_step = b.step("host-ingress-wasm", "Compile a foreign host using ingress support on wasm32-freestanding");
+    host_ingress_wasm_step.dependOn(&host_ingress_wasm.step);
+    test_step.dependOn(host_ingress_wasm_step);
 
     // The M4 gate: `zig build wasm && zig build wasm-diff` — this run step
     // depends on the wasm install, so it always has a real artifact to drive.

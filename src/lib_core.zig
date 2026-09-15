@@ -31,11 +31,21 @@ pub const pending = @import("engine/pending.zig");
 pub const qset_store = @import("engine/qset_store.zig");
 pub const emit = @import("engine/emit.zig");
 pub const engine = @import("engine/engine.zig");
+pub const adaptivity = struct {
+    pub const policy = @import("adaptivity/policy.zig");
+    pub const migration = @import("adaptivity/migration.zig");
+    pub const session = @import("adaptivity/session.zig");
+};
 pub const host_codec = @import("engine/host_codec.zig");
+/// Experimental transport-neutral support for native and foreign hosts.
+pub const host = @import("host/ingress.zig");
 
 test {
     std.testing.refAllDecls(@This());
     // pipeline.zig is reached only through the @import inside
     // Engine.pushInput's body, which never collects its tests.
     _ = @import("engine/pipeline.zig");
+    _ = @import("adaptivity/policy.zig");
+    _ = @import("adaptivity/migration.zig");
+    _ = @import("adaptivity/session.zig");
 }

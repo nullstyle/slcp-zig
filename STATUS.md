@@ -1,6 +1,6 @@
 # Project Status
 
-**Snapshot date:** 2026-09-04
+**Snapshot date:** 2026-09-14
 
 This file distinguishes released code, the prior v0.2.0 candidate, and current
 feature work. It is a snapshot, not a guarantee of fitness: this remains an
@@ -27,7 +27,44 @@ The v0.1.0 evidence and limitations are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). The committed E1 scope is summarized in
 [`docs/examples-roadmap.md`](docs/examples-roadmap.md).
 
-## Current feature work: durable application watermark
+## Current feature work: quorum adaptivity and portable durability
+
+Experimental quorum adaptivity now includes trust-floor assessment, local
+quorum revisions frozen per admitted slot, managed sequential sessions and
+certified migration to a successor trust pool. An ordered native journal and
+`managed_store` bridge enforce persistence before activation, signing and
+retirement. Native and foreign hosts share the ingress hold buffer through
+`slcp-core.host`; the static Node keeps compatibility aliases. See
+[quorum adaptivity](docs/quorum-adaptivity.md),
+[ADR 0008](docs/adr/0008-quorum-adaptivity-and-trust-pool-migration.md) and
+[QUIC hosting](docs/quic-hosting.md).
+
+Completion review added regressions and fixes for quorum revisions recorded
+after signing began, incorrect historical quorum hashes hidden by later votes,
+terminal envelopes whose signed slot disagrees with the migration, and an
+acknowledgement that borrowed a checkpoint from the previous-value buffer.
+Ordinary and terminal recovery include allocation-failure coverage.
+
+The Linux Registry startup failure was reproduced at the real directory sync
+call: a valid `O_PATH` descriptor produced `EBADF` from `fsync`. Registry data,
+archive and parent-directory handles that require durability now request
+readable descriptors. The native adaptivity journal uses the same capability.
+Tests cover ordinary snapshot replacement, history-directory creation and
+archive publication/reopen on Linux.
+
+The focused core/application suite passes 204 tests. The full macOS graph
+passes 118/118 steps with 499 tests passed and two expected skips; separately
+run core/application tests cover cached portions of that graph. Strict API
+checks retain all 292 Stable declarations and verify 1,909 Experimental
+declarations. Documentation smoke passes 443 checks and 18 tests. The
+[implementation plan](docs/plans/quorum-adaptivity.md) records the selected
+scope; broker and automatic placement policy remain downstream work.
+
+Both projects also use the pinned WASM schema compiler and runtime-matched
+generators described in the [toolchain migration record](docs/plans/capnp-wasm-toolchain.md).
+Generated schema bytes and application runtime pins are unchanged.
+
+## Previous feature work: durable application watermark
 
 Experimental `RecoveryOptions.retain_until_durable` protects local replay for
 applications that publish state asynchronously. The trusted checkpoint's exact

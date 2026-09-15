@@ -106,11 +106,11 @@ docs-smoke:
 # S2–S7 (S8 finding 20).
 # Format the hand-written trees.
 fmt:
-    zig fmt build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
+    zig fmt build.zig src/*.zig src/cli src/node src/engine src/adaptivity src/host src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
 
 # CI twin of `fmt`: same paths, --check.
 fmt-check:
-    zig fmt --check build.zig src/*.zig src/cli src/node src/engine src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
+    zig fmt --check build.zig src/*.zig src/cli src/node src/engine src/adaptivity src/host src/wasm sim tests tools examples/*.zig examples/counter/build.zig examples/counter/src examples/registry/build.zig examples/registry/src
 
 # Lint the GitHub Actions workflows (brew install actionlint).
 ci-lint:

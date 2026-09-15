@@ -19,12 +19,14 @@ Normative details have narrower authorities:
 ## Design center
 
 SLCP is a clean-room, SCP-shaped federated Byzantine agreement system for
-small applications. The design starts from a three-node application in which
-two live validators must keep making progress and one survivor must halt. The
-project optimizes for an honest, compact application interface without hiding
-the safety, liveness, and operational constraints underneath it.
+application-defined values. Its long-term direction includes an internet-scale
+broker network built on SLCP, qmsg and QUIC, with both one-operator multi-region
+and independently operated deployments. Scale comes from many bounded consensus
+domains and explicit trust boundaries. A single global validator group is not
+the capacity model. Current tests establish behavior for bounded deployments;
+they do not establish internet-scale readiness.
 
-The v1 profile is intentionally narrow:
+The existing native Node profile is intentionally narrow:
 
 - Ed25519 signatures and SHA-256 digests;
 - Cap'n Proto messages with a project-specific wire protocol;
@@ -32,6 +34,12 @@ The v1 profile is intentionally narrow:
 - static peers and quorum configuration;
 - a TCP flood overlay with no transport authentication or confidentiality;
 - bounded recent-slot answering, not an archive or state-transfer protocol.
+
+Experimental [quorum adaptivity](docs/quorum-adaptivity.md) adds runtime
+selection within a shared trust floor and certified migration to a successor
+trust pool through a managed sequential Session. The static Node API remains
+available. Transport-neutral [host ingress](docs/quic-hosting.md) supports
+embedded event-loop hosts without importing the native TCP overlay.
 
 Stellar Core is a behavioral oracle for the consensus state-machine shapes,
 not a protocol peer. SLCP has different wire bytes, signature preimages, and

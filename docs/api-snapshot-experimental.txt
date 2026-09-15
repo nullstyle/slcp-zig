@@ -58,7 +58,7 @@ slcp.Node.failed: field atomic.Value(bool) = <default>
 slcp.Node.gap_jumps: field u64 = 0
 slcp.Node.gap_slots_skipped: field u64 = 0
 slcp.Node.gpa: field mem.Allocator
-slcp.Node.hold: field node.node.HoldBuffer = <default>
+slcp.Node.hold: field host.ingress.HoldBuffer = <default>
 slcp.Node.io: field Io
 slcp.Node.journal_tail: field ?node.node.RecoveryJournalTail = null
 slcp.Node.last_compact_frontier: field u64 = 0
@@ -193,6 +193,48 @@ slcp.Validity.valid: enumerant = 2
 slcp.ValueContext.phase: field node.app_node.ValueContext.Phase
 slcp.ValueContext.slot: field u64
 slcp.ValueContext: struct
+slcp.adaptivity_journal.Identity.node_id: field [32]u8
+slcp.adaptivity_journal.Identity.root_network_id: field [32]u8
+slcp.adaptivity_journal.Identity: struct
+slcp.adaptivity_journal.Journal.append: fn (*node.adaptivity_journal.Journal, node.adaptivity_journal.Kind, []const u8) error{AccessDenied,Canceled,ConcurrentModification,DiskQuota,InputOutput,JournalFailed,JournalFull,NoSpaceLeft,OutOfMemory,PermissionDenied,RecordTooLarge,RecoveryRequired,Streaming,SystemResources,Unexpected,WriteFailed}!void
+slcp.adaptivity_journal.Journal.create: fn (mem.Allocator, Io, []const u8, node.adaptivity_journal.Identity, node.adaptivity_journal.Limits) error{AccessDenied,AntivirusInterference,BadPathName,BrokenPipe,Busy,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,InputOutput,InvalidLimits,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.adaptivity_journal.Journal
+slcp.adaptivity_journal.Journal.deinit: fn (*node.adaptivity_journal.Journal) void
+slcp.adaptivity_journal.Journal.digest: field [32]u8
+slcp.adaptivity_journal.Journal.dir: field Io.Dir
+slcp.adaptivity_journal.Journal.end: field u64 = 76
+slcp.adaptivity_journal.Journal.failed: field bool = false
+slcp.adaptivity_journal.Journal.file: field Io.File
+slcp.adaptivity_journal.Journal.gpa: field mem.Allocator
+slcp.adaptivity_journal.Journal.identity: field node.adaptivity_journal.Identity
+slcp.adaptivity_journal.Journal.io: field Io
+slcp.adaptivity_journal.Journal.limits: field node.adaptivity_journal.Limits
+slcp.adaptivity_journal.Journal.lock: field Io.File
+slcp.adaptivity_journal.Journal.open: fn (mem.Allocator, Io, []const u8, node.adaptivity_journal.Identity, node.adaptivity_journal.Limits) error{AccessDenied,AntivirusInterference,BadPathName,BrokenPipe,Busy,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,InputOutput,InvalidLimits,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.adaptivity_journal.Journal
+slcp.adaptivity_journal.Journal.recover: fn (*node.adaptivity_journal.Journal) error{AccessDenied,AlreadyRecovered,Canceled,CorruptJournal,DiskQuota,FileBusy,FileTooBig,InputOutput,IsDir,JournalFailed,JournalFull,LockViolation,NoSpaceLeft,NonResizable,NotOpenForReading,OutOfMemory,PermissionDenied,RecordTooLarge,ShortRead,Streaming,SystemResources,Unexpected,Unseekable,WouldBlock,WrongIdentity}!node.adaptivity_journal.Recovery
+slcp.adaptivity_journal.Journal.recovered: field bool = false
+slcp.adaptivity_journal.Journal.sequence: field u64 = 0
+slcp.adaptivity_journal.Journal: struct
+slcp.adaptivity_journal.Kind.applied: enumerant = 4
+slcp.adaptivity_journal.Kind.initial: enumerant = 1
+slcp.adaptivity_journal.Kind.own_envelope: enumerant = 3
+slcp.adaptivity_journal.Kind.quorum_change: enumerant = 2
+slcp.adaptivity_journal.Kind.retirement: enumerant = 6
+slcp.adaptivity_journal.Kind.successor_install: enumerant = 5
+slcp.adaptivity_journal.Kind: enum
+slcp.adaptivity_journal.Limits.max_journal_bytes: field u64 = 67108864
+slcp.adaptivity_journal.Limits.max_record_bytes: field u32 = 16777216
+slcp.adaptivity_journal.Limits: struct
+slcp.adaptivity_journal.Record.kind: field node.adaptivity_journal.Kind
+slcp.adaptivity_journal.Record.payload: field []const u8
+slcp.adaptivity_journal.Record.sequence: field u64
+slcp.adaptivity_journal.Record: struct
+slcp.adaptivity_journal.Recovery.bytes: field []u8
+slcp.adaptivity_journal.Recovery.deinit: fn (*node.adaptivity_journal.Recovery) void
+slcp.adaptivity_journal.Recovery.gpa: field mem.Allocator
+slcp.adaptivity_journal.Recovery.records: field []node.adaptivity_journal.Record
+slcp.adaptivity_journal.Recovery.torn_tail_repaired: field bool
+slcp.adaptivity_journal.Recovery: struct
+slcp.adaptivity_journal: struct
 slcp.app_node.AppNode: fn (comptime type) type
 slcp.app_node.Codec: fn (comptime type) type
 slcp.app_node.Driver.combine_candidates: field *const fn (*anyopaque, u64, []const []const u8, mem.Allocator, *array_list.Aligned(u8,null)) error{DriverFault,OutOfMemory}!void
@@ -213,6 +255,169 @@ slcp.app_node.ValueContext.slot: field u64
 slcp.app_node.ValueContext: struct
 slcp.app_node.max_encoded_bytes: const usize = 65536
 slcp.app_node: struct
+slcp.core.adaptivity.migration.Config.checkpoint_digest: field [32]u8
+slcp.core.adaptivity.migration.Config.generation: field u64
+slcp.core.adaptivity.migration.Config.parent_network_id: field [32]u8
+slcp.core.adaptivity.migration.Config.successor_policy: field adaptivity.policy.Config
+slcp.core.adaptivity.migration.Config.terminal_slot: field u64
+slcp.core.adaptivity.migration.Config: struct
+slcp.core.adaptivity.migration.EnvelopeError: type = error{EnvelopeTooLarge,InvalidEnvelope,InvalidSignature,NonCanonicalStatement,NotExternalize,OutOfMemory}
+slcp.core.adaptivity.migration.Externalize.commit_qset_hash: field [32]u8
+slcp.core.adaptivity.migration.Externalize.node_id: field [32]u8
+slcp.core.adaptivity.migration.Externalize.slot: field u64
+slcp.core.adaptivity.migration.Externalize.value: field []const u8
+slcp.core.adaptivity.migration.Externalize: struct
+slcp.core.adaptivity.migration.Manifest.checkpoint_digest: field [32]u8
+slcp.core.adaptivity.migration.Manifest.deinit: fn (*adaptivity.migration.Manifest) void
+slcp.core.adaptivity.migration.Manifest.encode: fn (*const adaptivity.migration.Manifest, mem.Allocator) error{OutOfMemory}![]u8
+slcp.core.adaptivity.migration.Manifest.generation: field u64
+slcp.core.adaptivity.migration.Manifest.hash: fn (*const adaptivity.migration.Manifest) [32]u8
+slcp.core.adaptivity.migration.Manifest.init: fn (mem.Allocator, adaptivity.migration.Config) error{DuplicateAnchor,EmptyAnchorPool,GenerationZero,InfeasibleAvailability,InvalidFaultBudget,InvalidManifest,InvalidSliceFloor,InvalidTerminalSlot,NonCanonicalManifest,OutOfMemory,TooManyAnchors,UnsafeSliceFloor}!adaptivity.migration.Manifest
+slcp.core.adaptivity.migration.Manifest.parent_network_id: field [32]u8
+slcp.core.adaptivity.migration.Manifest.parse: fn (mem.Allocator, []const u8) error{DuplicateAnchor,EmptyAnchorPool,GenerationZero,InfeasibleAvailability,InvalidFaultBudget,InvalidManifest,InvalidSliceFloor,InvalidTerminalSlot,NonCanonicalManifest,OutOfMemory,TooManyAnchors,UnsafeSliceFloor}!adaptivity.migration.Manifest
+slcp.core.adaptivity.migration.Manifest.successorNetworkId: fn (*const adaptivity.migration.Manifest) [32]u8
+slcp.core.adaptivity.migration.Manifest.successor_policy: field adaptivity.policy.Policy
+slcp.core.adaptivity.migration.Manifest.terminal_slot: field u64
+slcp.core.adaptivity.migration.Manifest: struct
+slcp.core.adaptivity.migration.ManifestError: type = error{DuplicateAnchor,EmptyAnchorPool,GenerationZero,InfeasibleAvailability,InvalidFaultBudget,InvalidManifest,InvalidSliceFloor,InvalidTerminalSlot,NonCanonicalManifest,OutOfMemory,TooManyAnchors,UnsafeSliceFloor}
+slcp.core.adaptivity.migration.Verified.manifest_hash: field [32]u8
+slcp.core.adaptivity.migration.Verified.signers: field u16
+slcp.core.adaptivity.migration.Verified.successor_network_id: field [32]u8
+slcp.core.adaptivity.migration.Verified: struct
+slcp.core.adaptivity.migration.VerifyError: type = error{CertificateTooLarge,DuplicateAnchor,DuplicateSigner,EmptyAnchorPool,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,SignerNotAnchor,TooManyAnchors,TooManyEnvelopes,UnsafeSliceFloor,UnsortedSigners,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}
+slcp.core.adaptivity.migration.header_bytes: const usize = 103
+slcp.core.adaptivity.migration.isManifest: fn ([]const u8) bool
+slcp.core.adaptivity.migration.magic: const *const [16:0]u8
+slcp.core.adaptivity.migration.max_certificate_bytes: const usize = 2368185
+slcp.core.adaptivity.migration.max_envelope_bytes: const usize = 9287
+slcp.core.adaptivity.migration.max_manifest_bytes: const usize = 8263
+slcp.core.adaptivity.migration.verifyCertificate: fn (mem.Allocator, *const adaptivity.policy.Policy, [32]u8, u64, []const u8, []const []const u8) error{CertificateTooLarge,DuplicateAnchor,DuplicateSigner,EmptyAnchorPool,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,SignerNotAnchor,TooManyAnchors,TooManyEnvelopes,UnsafeSliceFloor,UnsortedSigners,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!adaptivity.migration.Verified
+slcp.core.adaptivity.migration.verifyExternalize: fn (mem.Allocator, [32]u8, []const u8) error{EnvelopeTooLarge,InvalidEnvelope,InvalidSignature,NonCanonicalStatement,NotExternalize,OutOfMemory}!adaptivity.migration.Externalize
+slcp.core.adaptivity.migration: struct
+slcp.core.adaptivity.policy.AssessError: type = error{DepthExceeded,DuplicateNode,EmptyQuorumSet,ThresholdOutOfRange,TooManyValidators}
+slcp.core.adaptivity.policy.Assessment.available: field bool
+slcp.core.adaptivity.policy.Assessment.minimum_blocking_anchors: field u16
+slcp.core.adaptivity.policy.Assessment.minimum_slice_anchors: field u16
+slcp.core.adaptivity.policy.Assessment.permitted: field bool
+slcp.core.adaptivity.policy.Assessment.safe: field bool
+slcp.core.adaptivity.policy.Assessment: struct
+slcp.core.adaptivity.policy.Config.anchors: field []const [32]u8
+slcp.core.adaptivity.policy.Config.max_faulty_anchors: field u16
+slcp.core.adaptivity.policy.Config.min_slice_anchors: field u16
+slcp.core.adaptivity.policy.Config.require_availability: field bool = true
+slcp.core.adaptivity.policy.Config: struct
+slcp.core.adaptivity.policy.InitError: type = error{DuplicateAnchor,EmptyAnchorPool,InfeasibleAvailability,InvalidFaultBudget,InvalidSliceFloor,OutOfMemory,TooManyAnchors,UnsafeSliceFloor}
+slcp.core.adaptivity.policy.NodeId: type = [32]u8
+slcp.core.adaptivity.policy.Policy.anchors: field []const [32]u8
+slcp.core.adaptivity.policy.Policy.assess: fn (*const adaptivity.policy.Policy, *const engine.qset.QuorumSetOwned) error{DepthExceeded,DuplicateNode,EmptyQuorumSet,ThresholdOutOfRange,TooManyValidators}!adaptivity.policy.Assessment
+slcp.core.adaptivity.policy.Policy.deinit: fn (*adaptivity.policy.Policy) void
+slcp.core.adaptivity.policy.Policy.fingerprint: fn (*const adaptivity.policy.Policy) [32]u8
+slcp.core.adaptivity.policy.Policy.gpa: field mem.Allocator
+slcp.core.adaptivity.policy.Policy.init: fn (mem.Allocator, adaptivity.policy.Config) error{DuplicateAnchor,EmptyAnchorPool,InfeasibleAvailability,InvalidFaultBudget,InvalidSliceFloor,OutOfMemory,TooManyAnchors,UnsafeSliceFloor}!adaptivity.policy.Policy
+slcp.core.adaptivity.policy.Policy.max_faulty_anchors: field u16
+slcp.core.adaptivity.policy.Policy.min_slice_anchors: field u16
+slcp.core.adaptivity.policy.Policy.require_availability: field bool
+slcp.core.adaptivity.policy.Policy: struct
+slcp.core.adaptivity.policy.max_anchors: const usize = 255
+slcp.core.adaptivity.policy: struct
+slcp.core.adaptivity.session.Activation.certificate_envelopes: field []const []const u8
+slcp.core.adaptivity.session.Activation.checkpoint: field []const u8
+slcp.core.adaptivity.session.Activation.checkpoint_digest: field [32]u8
+slcp.core.adaptivity.session.Activation.first_slot: field u64
+slcp.core.adaptivity.session.Activation.generation: field u64
+slcp.core.adaptivity.session.Activation.manifest: field ?[]const u8
+slcp.core.adaptivity.session.Activation.network_id: field [32]u8
+slcp.core.adaptivity.session.Activation.parent: field ?adaptivity.session.ParentEpoch
+slcp.core.adaptivity.session.Activation.policy: field adaptivity.policy.Config
+slcp.core.adaptivity.session.Activation.previous_value: field []const u8
+slcp.core.adaptivity.session.Activation.quorum_bytes: field []const u8
+slcp.core.adaptivity.session.Activation: struct
+slcp.core.adaptivity.session.Application.consensus_value: field []const u8
+slcp.core.adaptivity.session.Application.payload: field []const u8
+slcp.core.adaptivity.session.Application.slot: field u64
+slcp.core.adaptivity.session.Application: struct
+slcp.core.adaptivity.session.Effect.application: variant adaptivity.session.Application
+slcp.core.adaptivity.session.Effect.engine: variant *const engine.engine.Effect
+slcp.core.adaptivity.session.Effect.persist_activation: variant adaptivity.session.Activation
+slcp.core.adaptivity.session.Effect.persist_retirement: variant adaptivity.session.Retirement
+slcp.core.adaptivity.session.Effect.terminal: variant adaptivity.session.Terminal
+slcp.core.adaptivity.session.Effect: union
+slcp.core.adaptivity.session.Error: type = error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}
+slcp.core.adaptivity.session.Genesis.checkpoint: field []const u8 = <default>
+slcp.core.adaptivity.session.Genesis.host: field adaptivity.session.HostOptions
+slcp.core.adaptivity.session.Genesis.network_id: field [32]u8
+slcp.core.adaptivity.session.Genesis.policy: field adaptivity.policy.Config
+slcp.core.adaptivity.session.Genesis.previous_value: field []const u8 = <default>
+slcp.core.adaptivity.session.Genesis: struct
+slcp.core.adaptivity.session.HostOptions.authorize_migration: field ?*const fn (*anyopaque, *const adaptivity.migration.Manifest) bool = null
+slcp.core.adaptivity.session.HostOptions.driver: field driver.Driver
+slcp.core.adaptivity.session.HostOptions.limits: field engine.limits.Limits = <default>
+slcp.core.adaptivity.session.HostOptions.max_revisions: field u32 = 64
+slcp.core.adaptivity.session.HostOptions.migration_context: field ?*anyopaque = null
+slcp.core.adaptivity.session.HostOptions.node_id: field [32]u8
+slcp.core.adaptivity.session.HostOptions.quorum_set: field *const engine.qset.QuorumSetOwned
+slcp.core.adaptivity.session.HostOptions.secret_seed: field ?[32]u8
+slcp.core.adaptivity.session.HostOptions: struct
+slcp.core.adaptivity.session.ParentEpoch.generation: field u64
+slcp.core.adaptivity.session.ParentEpoch.network_id: field [32]u8
+slcp.core.adaptivity.session.ParentEpoch.policy: field *const adaptivity.policy.Policy
+slcp.core.adaptivity.session.ParentEpoch: struct
+slcp.core.adaptivity.session.QuorumRevision.first_slot: field u64
+slcp.core.adaptivity.session.QuorumRevision.quorum_bytes: field []const u8
+slcp.core.adaptivity.session.QuorumRevision: struct
+slcp.core.adaptivity.session.Recovery.checkpoint_digest: field [32]u8
+slcp.core.adaptivity.session.Recovery.max_own_history_bytes: field usize = 67108864
+slcp.core.adaptivity.session.Recovery.next_slot: field u64
+slcp.core.adaptivity.session.Recovery.own_envelopes: field []const []const u8 = <default>
+slcp.core.adaptivity.session.Recovery.previous_value: field []const u8
+slcp.core.adaptivity.session.Recovery.quorum_revisions: field []const adaptivity.session.QuorumRevision = <default>
+slcp.core.adaptivity.session.Recovery.retirement_manifest: field ?[]const u8 = null
+slcp.core.adaptivity.session.Recovery: struct
+slcp.core.adaptivity.session.Retirement.generation: field u64
+slcp.core.adaptivity.session.Retirement.manifest: field []const u8
+slcp.core.adaptivity.session.Retirement.network_id: field [32]u8
+slcp.core.adaptivity.session.Retirement.own_envelope: field ?[]const u8
+slcp.core.adaptivity.session.Retirement.slot: field u64
+slcp.core.adaptivity.session.Retirement: struct
+slcp.core.adaptivity.session.Session.abortQuorumChange: fn (*adaptivity.session.Session) void
+slcp.core.adaptivity.session.Session.acknowledgeApplied: fn (*adaptivity.session.Session, u64, []const u8) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.checkpoint: fn (*const adaptivity.session.Session) [32]u8
+slcp.core.adaptivity.session.Session.commitEffect: fn (*adaptivity.session.Session) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.commitQuorumChange: fn (*adaptivity.session.Session) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.createGenesis: fn (mem.Allocator, adaptivity.session.Genesis) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.core.adaptivity.session.Session.createSuccessor: fn (mem.Allocator, adaptivity.session.ParentEpoch, []const u8, []const []const u8, []const u8, adaptivity.session.HostOptions) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.core.adaptivity.session.Session.deinit: fn (*adaptivity.session.Session) void
+slcp.core.adaptivity.session.Session.generation: fn (*const adaptivity.session.Session) u64
+slcp.core.adaptivity.session.Session.networkId: fn (*const adaptivity.session.Session) [32]u8
+slcp.core.adaptivity.session.Session.nextSlot: fn (*const adaptivity.session.Session) u64
+slcp.core.adaptivity.session.Session.nodeId: fn (*const adaptivity.session.Session) [32]u8
+slcp.core.adaptivity.session.Session.popEffect: fn (*adaptivity.session.Session) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!?*const adaptivity.session.Effect
+slcp.core.adaptivity.session.Session.prepareQuorumChange: fn (*adaptivity.session.Session, u64, *const engine.qset.QuorumSetOwned) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!engine.adaptivity.ChangeView
+slcp.core.adaptivity.session.Session.previousValue: fn (*const adaptivity.session.Session) []const u8
+slcp.core.adaptivity.session.Session.proposeApplication: fn (*adaptivity.session.Session, []const u8) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.proposeMigration: fn (*adaptivity.session.Session, []const u8) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.receiveEnvelope: fn (*adaptivity.session.Session, []const u8) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.receiveQuorumSet: fn (*adaptivity.session.Session, []const u8) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.restore: fn (mem.Allocator, adaptivity.session.Genesis, adaptivity.session.Recovery) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.core.adaptivity.session.Session.restoreSuccessor: fn (mem.Allocator, adaptivity.session.ParentEpoch, []const u8, []const []const u8, []const u8, adaptivity.session.HostOptions, adaptivity.session.Recovery) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.core.adaptivity.session.Session.status: fn (*const adaptivity.session.Session) adaptivity.session.Status
+slcp.core.adaptivity.session.Session.timerFired: fn (*adaptivity.session.Session, u64, engine.engine.TimerId) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.core.adaptivity.session.Session.trustPolicy: fn (*const adaptivity.session.Session) *const adaptivity.policy.Policy
+slcp.core.adaptivity.session.Session: opaque
+slcp.core.adaptivity.session.Status.activation_pending: enumerant = 0
+slcp.core.adaptivity.session.Status.active: enumerant = 1
+slcp.core.adaptivity.session.Status.awaiting_application: enumerant = 2
+slcp.core.adaptivity.session.Status.failed: enumerant = 5
+slcp.core.adaptivity.session.Status.retired: enumerant = 4
+slcp.core.adaptivity.session.Status.retiring: enumerant = 3
+slcp.core.adaptivity.session.Status: enum
+slcp.core.adaptivity.session.Terminal.manifest: field []const u8
+slcp.core.adaptivity.session.Terminal.slot: field u64
+slcp.core.adaptivity.session.Terminal: struct
+slcp.core.adaptivity.session.application_magic: const *const [12:0]u8
+slcp.core.adaptivity.session.checkpointDigest: fn ([]const u8) [32]u8
+slcp.core.adaptivity.session: struct
+slcp.core.adaptivity: struct
 slcp.core.ballot.Error: type = error{AlreadyStarted,EffectBudgetExceeded,EngineFailed,InvalidValue,OutOfMemory,WrongProtocol}
 slcp.core.ballot.Phase.confirm: enumerant = 1
 slcp.core.ballot.Phase.externalize: enumerant = 2
@@ -347,6 +552,11 @@ slcp.core.emit.OwnStatement.prepare: variant engine.emit.OwnStatement__struct_*
 slcp.core.emit.OwnStatement: union
 slcp.core.emit.emit: fn (*engine.engine.Ctx, u64, engine.emit.OwnStatement) anyerror!engine.stored.StoredEnvelope
 slcp.core.emit: struct
+slcp.core.engine.AdaptivityError: type = error{AdaptivityAlreadyEnabled,AdaptivityDisabled,BoundaryNotIncreasing,ChangeAlreadyPrepared,DepthExceeded,DuplicateAnchor,DuplicateNode,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,InfeasibleAvailability,InvalidFaultBudget,InvalidQuorumSet,InvalidRevisionLimit,InvalidSliceFloor,NoPreparedChange,OutOfMemory,QuorumOutsidePolicy,RevisionLimitExceeded,SlotAlreadyAdmitted,ThresholdOutOfRange,TooManyAnchors,TooManyValidators,UnsafeSliceFloor}
+slcp.core.engine.AdaptivityOptions.admission_floor: field u64
+slcp.core.engine.AdaptivityOptions.max_revisions: field u32 = 64
+slcp.core.engine.AdaptivityOptions.policy: field adaptivity.policy.Config
+slcp.core.engine.AdaptivityOptions: struct
 slcp.core.engine.Ctx.addStoredBytes: fn (*engine.engine.Ctx, isize) void
 slcp.core.engine.Ctx.armTimer: fn (*engine.engine.Ctx, u64, engine.engine.TimerId, u32) error{EffectBudgetExceeded,EngineFailed,OutOfMemory}!void
 slcp.core.engine.Ctx.cancelTimer: fn (*engine.engine.Ctx, u64, engine.engine.TimerId) error{EffectBudgetExceeded,EngineFailed,OutOfMemory}!void
@@ -357,6 +567,9 @@ slcp.core.engine.Ctx.effects: field *engine.engine.EffectQueue
 slcp.core.engine.Ctx.excised: field ?*const engine.qset.QuorumSetOwned
 slcp.core.engine.Ctx.gpa: field mem.Allocator
 slcp.core.engine.Ctx.isWatcher: fn (*const engine.engine.Ctx) bool
+slcp.core.engine.Ctx.localExcised: fn (*const engine.engine.Ctx, *const engine.slot.Slot) ?*const engine.qset.QuorumSetOwned
+slcp.core.engine.Ctx.localQuorum: fn (*const engine.engine.Ctx, *const engine.slot.Slot) *const engine.qset.QuorumSetOwned
+slcp.core.engine.Ctx.localQuorumHash: fn (*const engine.engine.Ctx, *const engine.slot.Slot) [32]u8
 slcp.core.engine.Ctx.local_qset_hash: field [32]u8
 slcp.core.engine.Ctx.phaseEvent: fn (*engine.engine.Ctx, u64, engine.engine.PhaseKind, u64) error{EffectBudgetExceeded,EngineFailed,OutOfMemory}!void
 slcp.core.engine.Ctx.qsets: field *engine.qset_store.Store
@@ -376,18 +589,33 @@ slcp.core.engine.EffectQueue.peek: fn (*engine.engine.EffectQueue) ?*const engin
 slcp.core.engine.EffectQueue.push: fn (*engine.engine.EffectQueue, engine.engine.Effect) error{EffectBudgetExceeded,EngineFailed,OutOfMemory}!void
 slcp.core.engine.EffectQueue.total_bytes: field usize = 0
 slcp.core.engine.EffectQueue: struct
+slcp.core.engine.Engine.abortQuorumChange: fn (*engine.engine.Engine) void
+slcp.core.engine.Engine.adaptive: field ?*engine.adaptivity.State = null
 slcp.core.engine.Engine.cfg: field engine.engine.Config
+slcp.core.engine.Engine.commitQuorumChange: fn (*engine.engine.Engine) error{AdaptivityAlreadyEnabled,AdaptivityDisabled,BoundaryNotIncreasing,ChangeAlreadyPrepared,DepthExceeded,DuplicateAnchor,DuplicateNode,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,InfeasibleAvailability,InvalidFaultBudget,InvalidQuorumSet,InvalidRevisionLimit,InvalidSliceFloor,NoPreparedChange,OutOfMemory,QuorumOutsidePolicy,RevisionLimitExceeded,SlotAlreadyAdmitted,ThresholdOutOfRange,TooManyAnchors,TooManyValidators,UnsafeSliceFloor}!void
 slcp.core.engine.Engine.ctx: field engine.engine.Ctx
 slcp.core.engine.Engine.drv: field driver.Driver
 slcp.core.engine.Engine.effects: field engine.engine.EffectQueue
+slcp.core.engine.Engine.enableQuorumAdaptivity: fn (*engine.engine.Engine, engine.adaptivity.Options) error{AdaptivityAlreadyEnabled,AdaptivityDisabled,BoundaryNotIncreasing,ChangeAlreadyPrepared,DepthExceeded,DuplicateAnchor,DuplicateNode,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,InfeasibleAvailability,InvalidFaultBudget,InvalidQuorumSet,InvalidRevisionLimit,InvalidSliceFloor,NoPreparedChange,OutOfMemory,QuorumOutsidePolicy,RevisionLimitExceeded,SlotAlreadyAdmitted,ThresholdOutOfRange,TooManyAnchors,TooManyValidators,UnsafeSliceFloor}!void
 slcp.core.engine.Engine.excised: field ?engine.qset.QuorumSetOwned
 slcp.core.engine.Engine.failed: field bool = false
 slcp.core.engine.Engine.gpa: field mem.Allocator
 slcp.core.engine.Engine.init: fn (mem.Allocator, engine.engine.Config, driver.Driver) anyerror!engine.engine.Engine
+slcp.core.engine.Engine.inputs_started: field bool = false
 slcp.core.engine.Engine.pending: field engine.pending.Pending
+slcp.core.engine.Engine.prepareQuorumChange: fn (*engine.engine.Engine, u64, *const engine.qset.QuorumSetOwned) error{AdaptivityAlreadyEnabled,AdaptivityDisabled,BoundaryNotIncreasing,ChangeAlreadyPrepared,DepthExceeded,DuplicateAnchor,DuplicateNode,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,InfeasibleAvailability,InvalidFaultBudget,InvalidQuorumSet,InvalidRevisionLimit,InvalidSliceFloor,NoPreparedChange,OutOfMemory,QuorumOutsidePolicy,RevisionLimitExceeded,SlotAlreadyAdmitted,ThresholdOutOfRange,TooManyAnchors,TooManyValidators,UnsafeSliceFloor}!engine.adaptivity.ChangeView
 slcp.core.engine.Engine.qsets: field engine.qset_store.Store
+slcp.core.engine.Engine.quorumForSlot: fn (*const engine.engine.Engine, u64) ?*const engine.qset.QuorumSetOwned
+slcp.core.engine.Engine.quorumRevision: fn (*const engine.engine.Engine, usize) ?engine.adaptivity.ChangeView
+slcp.core.engine.Engine.quorumRevisionCount: fn (*const engine.engine.Engine) usize
+slcp.core.engine.Engine.refreshLocalQuorumRoots: fn (*engine.engine.Engine) error{OutOfMemory}!void
 slcp.core.engine.Engine.slots: field array_hash_map.Custom(u64,*engine.slot.Slot,array_hash_map.AutoContext(u64),false) = <default>
 slcp.core.engine.Engine.stored_statement_bytes: field usize = 0
+slcp.core.engine.QuorumChangeView.first_slot: field u64
+slcp.core.engine.QuorumChangeView.policy_fingerprint: field [32]u8
+slcp.core.engine.QuorumChangeView.qset_hash: field [32]u8
+slcp.core.engine.QuorumChangeView.quorum_bytes: field []const u8
+slcp.core.engine.QuorumChangeView: struct
 slcp.core.engine: struct
 slcp.core.gen.host.ArmTimer.Builder._builder: field serialization.message.struct_builder.define(serialization.message.MessageBuilder,serialization.message.AnyPointerBuilder,serialization.message.StructListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).TextListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).VoidListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).U8ListBuilder,serialization.message.list_builders.define(serialization.message.MessageBuilder).I8ListBuilder,serialization.message.list_readers.PrimitiveListBuilder(u16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i16,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f32,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(u64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(i64,serialization.message.MessageBuilder),serialization.message.list_readers.PrimitiveListBuilder(f64,serialization.message.MessageBuilder),serialization.message.list_builders.define(serialization.message.MessageBuilder).BoolListBuilder,serialization.message.Capability,@as(*const fn (u32) anyerror!u64, @ptrCast(&serialization.message.makeCapabilityPointer)),@as(*const fn (i32, u3, u32) anyerror!u64, @ptrCast(&serialization.message.makeListPointer)),@as(*const fn (bool, u32, u32) anyerror!u64, @ptrCast(&serialization.message.makeFarPointer))).StructBuilder
 slcp.core.gen.host.ArmTimer.Builder.init: fn (*serialization.message.MessageBuilder) error{OutOfMemory,TooManySegments}!gen.host.ArmTimer.Builder
@@ -989,6 +1217,60 @@ slcp.core.gen.slcp.Statement: struct
 slcp.core.gen.slcp.capnpSchemaManifestJson: fn () []const u8
 slcp.core.gen.slcp: struct
 slcp.core.gen: struct
+slcp.core.host.HoldBuffer.Admit.dropped_badsig: enumerant = 5
+slcp.core.host.HoldBuffer.Admit.dropped_far: enumerant = 3
+slcp.core.host.HoldBuffer.Admit.dropped_full: enumerant = 4
+slcp.core.host.HoldBuffer.Admit.fed: enumerant = 0
+slcp.core.host.HoldBuffer.Admit.held: enumerant = 1
+slcp.core.host.HoldBuffer.Admit.ready: enumerant = 2
+slcp.core.host.HoldBuffer.Admit: enum
+slcp.core.host.HoldBuffer.Entry.item: field host.ingress.InputItem
+slcp.core.host.HoldBuffer.Entry.kind: field host.ingress.HoldBuffer.Kind
+slcp.core.host.HoldBuffer.Entry.node_id: field [32]u8
+slcp.core.host.HoldBuffer.Entry: struct
+slcp.core.host.HoldBuffer.Kind.confirm: enumerant = 2
+slcp.core.host.HoldBuffer.Kind.externalize: enumerant = 3
+slcp.core.host.HoldBuffer.Kind.nominate: enumerant = 0
+slcp.core.host.HoldBuffer.Kind.prepare: enumerant = 1
+slcp.core.host.HoldBuffer.Kind: enum
+slcp.core.host.HoldBuffer.PutResult.dropped_full: enumerant = 2
+slcp.core.host.HoldBuffer.PutResult.held: enumerant = 0
+slcp.core.host.HoldBuffer.PutResult.replaced: enumerant = 1
+slcp.core.host.HoldBuffer.PutResult: enum
+slcp.core.host.HoldBuffer.admit: fn (*host.ingress.HoldBuffer, mem.Allocator, *const host.ingress.Meta, u64, bool, *const engine.qset.QuorumSetOwned, host.ingress.InputItem) host.ingress.HoldBuffer.Admit
+slcp.core.host.HoldBuffer.bytes: field usize = 0
+slcp.core.host.HoldBuffer.count: field usize = 0
+slcp.core.host.HoldBuffer.deinit: fn (*host.ingress.HoldBuffer, mem.Allocator) void
+slcp.core.host.HoldBuffer.dropped_badsig: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.dropped_behind: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.dropped_far: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.dropped_full: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.extSignersVBlocking: fn (*const host.ingress.HoldBuffer, mem.Allocator, u64, *const engine.qset.QuorumSetOwned) bool
+slcp.core.host.HoldBuffer.fed_out_of_graph: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.freeEntry: fn (mem.Allocator, *host.ingress.HoldBuffer.Entry) void
+slcp.core.host.HoldBuffer.held_now: field atomic.Value(usize) = <default>
+slcp.core.host.HoldBuffer.max_bytes: const usize = 8388608
+slcp.core.host.HoldBuffer.max_entries: const usize = 1024
+slcp.core.host.HoldBuffer.open: field hash_map.Custom(u64,void,hash_map.AutoContext(u64),80) = <default>
+slcp.core.host.HoldBuffer.put: fn (*host.ingress.HoldBuffer, mem.Allocator, u64, [32]u8, host.ingress.HoldBuffer.Kind, host.ingress.InputItem) error{OutOfMemory}!host.ingress.HoldBuffer.PutResult
+slcp.core.host.HoldBuffer.released: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.released_early: field atomic.Value(u64) = <default>
+slcp.core.host.HoldBuffer.slots: field hash_map.Custom(u64,array_list.Aligned(host.ingress.HoldBuffer.Entry,null),hash_map.AutoContext(u64),80) = <default>
+slcp.core.host.HoldBuffer.takeReleasable: fn (*host.ingress.HoldBuffer, mem.Allocator, u64) ?array_list.Aligned(host.ingress.HoldBuffer.Entry,null)
+slcp.core.host.HoldBuffer.takeSlot: fn (*host.ingress.HoldBuffer, u64) ?array_list.Aligned(host.ingress.HoldBuffer.Entry,null)
+slcp.core.host.HoldBuffer.window: const u64 = 64
+slcp.core.host.HoldBuffer: struct
+slcp.core.host.InputItem.input: field engine.engine.Input
+slcp.core.host.InputItem.source_peer: field ?usize
+slcp.core.host.InputItem: struct
+slcp.core.host.Meta.digest: field [32]u8
+slcp.core.host.Meta.kind: field host.ingress.HoldBuffer.Kind
+slcp.core.host.Meta.node_id: field [32]u8
+slcp.core.host.Meta.signature: field [64]u8
+slcp.core.host.Meta.slot: field u64
+slcp.core.host.Meta: struct
+slcp.core.host.envelopeMeta: fn (mem.Allocator, [32]u8, []const u8) error{BadNodeIdLength,BadSignatureLength,BadStatementLength,EmptyMessage,FrameTooLarge,InvalidEnumValue,InvalidFarPointer,InvalidFlatBytes,InvalidInlineCompositePointer,InvalidMessageSize,InvalidPointer,InvalidRootPointer,InvalidSegmentCount,InvalidSegmentId,ListTooLarge,MessageTooLarge,NestingLimitExceeded,OutOfBounds,OutOfMemory,PointerDepthLimit,SegmentCountLimitExceeded,TraversalLimitExceeded,TruncatedMessage,UnsetPledges}!host.ingress.Meta
+slcp.core.host: struct
 slcp.core.host_codec.CodecError: type = error{BadFieldLength,InvalidEnumValue,MalformedFrame,UnsetUnion}
 slcp.core.host_codec.decodeEffect: fn (mem.Allocator, []const u8) error{BadFieldLength,InvalidEnumValue,MalformedFrame,OutOfMemory,UnsetUnion}!engine.engine.Effect
 slcp.core.host_codec.decodeEngineConfig: fn (mem.Allocator, []const u8) error{BadFieldLength,MalformedFrame,OutOfMemory}!engine.engine.Config
@@ -1115,10 +1397,12 @@ slcp.core.qset_store.Store.reference_batch_active: field bool = false
 slcp.core.qset_store.Store.reference_batch_dirty: field bool = false
 slcp.core.qset_store.Store.release: fn (*engine.qset_store.Store, [32]u8) void
 slcp.core.qset_store.Store.removeStatementReferences: fn (*engine.qset_store.Store, []const engine.qset_store.StatementReference) error{OutOfMemory}!void
+slcp.core.qset_store.Store.replaceGraphRoots: fn (*engine.qset_store.Store, []const [32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store.replaceStatementReference: fn (*engine.qset_store.Store, [32]u8, ?[32]u8, ?[32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store.retain: fn (*engine.qset_store.Store, [32]u8) error{OutOfMemory}!void
 slcp.core.qset_store.Store.retained: field hash_map.Custom([32]u8,u32,hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.qset_store.Store.roots: field hash_map.Custom([32]u8,void,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.qset_store.Store.setCapacity: fn (*engine.qset_store.Store, u32) void
 slcp.core.qset_store.Store.statement_refs: field hash_map.Custom([32]u8,u32,hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.qset_store.Store: struct
 slcp.core.qset_store: struct
@@ -1132,6 +1416,7 @@ slcp.core.slot.Slot.init: fn (u64) engine.slot.Slot
 slcp.core.slot.Slot.latestFor: fn (*engine.slot.Slot, [32]u8, bool) ?*engine.stored.StoredEnvelope
 slcp.core.slot.Slot.latest_ballot: field hash_map.Custom([32]u8,*engine.stored.StoredEnvelope,hash_map.AutoContext([32]u8),80) = <default>
 slcp.core.slot.Slot.latest_nom: field hash_map.Custom([32]u8,*engine.stored.StoredEnvelope,hash_map.AutoContext([32]u8),80) = <default>
+slcp.core.slot.Slot.local_quorum: field ?*const engine.adaptivity.Revision = null
 slcp.core.slot.Slot.nom: field engine.nomination.State = <default>
 slcp.core.slot.Slot.own_ballot: field ?engine.stored.StoredEnvelope = null
 slcp.core.slot.Slot.own_nom: field ?engine.stored.StoredEnvelope = null
@@ -1271,6 +1556,35 @@ slcp.lint_report.write: fn (*Io.Writer, node.lint_report.Report) error{WriteFail
 slcp.lint_report.writeFinding: fn (*Io.Writer, engine.qset.LintFinding, *const engine.qset.QuorumSetOwned) error{WriteFailed}!void
 slcp.lint_report.writeSelfAbsent: fn (*Io.Writer, [32]u8) error{WriteFailed}!void
 slcp.lint_report: struct
+slcp.managed_store.Recovered.activation: field json.static.Parsed(node.managed_store.ActivationRecord)
+slcp.managed_store.Recovered.checkpoint: field []const u8
+slcp.managed_store.Recovered.deinit: fn (*node.managed_store.Recovered) void
+slcp.managed_store.Recovered.gpa: field mem.Allocator
+slcp.managed_store.Recovered.identity: field node.adaptivity_journal.Identity
+slcp.managed_store.Recovered.log: field node.adaptivity_journal.Recovery
+slcp.managed_store.Recovered.next_slot: field u64
+slcp.managed_store.Recovered.own_envelopes: field array_list.Aligned([]const u8,null) = <default>
+slcp.managed_store.Recovered.parsed_applied: field array_list.Aligned(json.static.Parsed(node.managed_store.AppliedRecord),null) = <default>
+slcp.managed_store.Recovered.parsed_changes: field array_list.Aligned(json.static.Parsed(engine.adaptivity.ChangeView),null) = <default>
+slcp.managed_store.Recovered.parsed_retirements: field array_list.Aligned(json.static.Parsed(adaptivity.session.Retirement),null) = <default>
+slcp.managed_store.Recovered.previous_value: field []const u8
+slcp.managed_store.Recovered.restoreGenesis: fn (*const node.managed_store.Recovered, adaptivity.session.Genesis) error{ActivationMismatch,ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidActivation,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.managed_store.Recovered.restoreSuccessor: fn (*const node.managed_store.Recovered, adaptivity.session.ParentEpoch, adaptivity.session.HostOptions) error{ActivationMismatch,ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidActivation,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!*adaptivity.session.Session
+slcp.managed_store.Recovered.revisions: field array_list.Aligned(adaptivity.session.QuorumRevision,null) = <default>
+slcp.managed_store.Recovered: struct
+slcp.managed_store.Store.acknowledgeApplied: fn (*node.managed_store.Store, *adaptivity.session.Session) error{ActivationPending,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,CertificateTooLarge,ChangeAlreadyPrepared,ConflictingRetirement,DepthExceeded,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,JournalFailed,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,QuorumChangePending,QuorumOutsidePolicy,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.managed_store.Store.activated: field bool = false
+slcp.managed_store.Store.changeQuorum: fn (*node.managed_store.Store, *adaptivity.session.Session, u64, *const engine.qset.QuorumSetOwned) error{AccessDenied,ActivationPending,ActivationRequired,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,Canceled,CertificateTooLarge,ChangeAlreadyPrepared,ConcurrentModification,ConflictingRetirement,DepthExceeded,DiskQuota,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InputOutput,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,JournalFailed,JournalFull,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NoSpaceLeft,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,PermissionDenied,QuorumChangePending,QuorumOutsidePolicy,RecordTooLarge,RecoveryRequired,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,Streaming,SystemResources,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,Unexpected,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WriteFailed,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.managed_store.Store.checkpointApplication: fn (*node.managed_store.Store, *adaptivity.session.Session, []const u8) error{AccessDenied,ActivationPending,ActivationRequired,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,ApplicationPending,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,Canceled,CertificateTooLarge,ChangeAlreadyPrepared,ConcurrentModification,ConflictingRetirement,DepthExceeded,DiskQuota,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InputOutput,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,JournalFailed,JournalFull,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NoSpaceLeft,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,PermissionDenied,QuorumChangePending,QuorumOutsidePolicy,RecordTooLarge,RecoveryRequired,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,Streaming,SystemResources,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,Unexpected,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WriteFailed,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!void
+slcp.managed_store.Store.create: fn (mem.Allocator, Io, []const u8, *const adaptivity.session.Session, node.adaptivity_journal.Limits) error{AccessDenied,ActivationRequired,AntivirusInterference,BadPathName,BrokenPipe,Busy,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,InputOutput,InvalidLimits,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.managed_store.Store
+slcp.managed_store.Store.deinit: fn (*node.managed_store.Store) void
+slcp.managed_store.Store.journal: field node.adaptivity_journal.Journal
+slcp.managed_store.Store.open: fn (mem.Allocator, Io, []const u8, node.adaptivity_journal.Identity, node.adaptivity_journal.Limits) error{AccessDenied,AntivirusInterference,BadPathName,BrokenPipe,Busy,Canceled,DeviceBusy,DiskQuota,FileBusy,FileLocksUnsupported,FileNotFound,FileTooBig,InputOutput,InvalidLimits,IsDir,LockViolation,NameTooLong,NetworkNotFound,NoDevice,NoSpaceLeft,NotDir,NotOpenForWriting,PathAlreadyExists,PermissionDenied,PipeBusy,ProcessFdQuotaExceeded,ReadOnlyFileSystem,SymLinkLoop,SystemFdQuotaExceeded,SystemResources,Unexpected,WouldBlock}!node.managed_store.Store
+slcp.managed_store.Store.pending_application: field ?node.managed_store.Store__struct_* = null
+slcp.managed_store.Store.persistEffect: fn (*node.managed_store.Store, *adaptivity.session.Session) error{AccessDenied,ActivationPending,ActivationRequired,AdaptivityAlreadyEnabled,AdaptivityDisabled,ApplicationNotApplied,BadNominationValues,BadTimeoutCap,BadValueBytes,BoundaryNotIncreasing,Canceled,CertificateTooLarge,ChangeAlreadyPrepared,ConcurrentModification,ConflictingRetirement,DepthExceeded,DiskQuota,DuplicateActivation,DuplicateAnchor,DuplicateNode,DuplicateSigner,EffectBudgetExceeded,EffectsNotDrained,EmptyAnchorPool,EmptyQuorumSet,EngineFailed,EngineNotPristine,EnvelopeTooLarge,GenerationZero,InfeasibleAvailability,InputOutput,InsufficientSigners,InvalidApplicationValue,InvalidEnvelope,InvalidFaultBudget,InvalidManifest,InvalidMigration,InvalidQuorumSet,InvalidRecovery,InvalidRevisionLimit,InvalidSignature,InvalidSliceFloor,InvalidTerminalSlot,JournalFailed,JournalFull,KeyIdentityMismatch,MigrationCapacityTooSmall,MigrationNotAuthorized,NoApplication,NoEffect,NoPreparedChange,NoSpaceLeft,NonCanonicalManifest,NonCanonicalStatement,NotExternalize,OutOfMemory,PermissionDenied,QuorumChangePending,QuorumOutsidePolicy,RecordTooLarge,RecoveryRequired,RecoveryTooLarge,RevisionLimitExceeded,SessionRetired,SignerNotAnchor,SignerOutsidePool,SlotAlreadyAdmitted,SlotExhausted,SlotNotCurrent,Streaming,SystemResources,ThresholdOutOfRange,TooManyAnchors,TooManyEnvelopes,TooManyValidators,Unexpected,UnsafeSliceFloor,UnsortedSigners,ValueTooLarge,WriteFailed,WrongApplicationSlot,WrongCheckpoint,WrongGeneration,WrongIdentity,WrongParentDomain,WrongTerminalSlot,WrongTerminalValue}!bool
+slcp.managed_store.Store.recover: fn (*node.managed_store.Store) anyerror!node.managed_store.Recovered
+slcp.managed_store.Store: struct
+slcp.managed_store: struct
 slcp.node.AppMessageStats.dropped_messages: field u64
 slcp.node.AppMessageStats.duplicate_messages: field u64
 slcp.node.AppMessageStats.queued_bytes: field usize
@@ -1312,48 +1626,18 @@ slcp.node.CatchupStats.released_early_statements: field u64
 slcp.node.CatchupStats: struct
 slcp.node.Diagnostic.set: fn (*node.node.Diagnostic, comptime []const u8, anytype) void
 slcp.node.DurabilityError: type = error{AheadOfDelivery,DurabilityDisabled,DurabilityRegression,NodeClosed,NodeFailed}
-slcp.node.HoldBuffer.Admit.dropped_badsig: enumerant = 5
-slcp.node.HoldBuffer.Admit.dropped_far: enumerant = 3
-slcp.node.HoldBuffer.Admit.dropped_full: enumerant = 4
-slcp.node.HoldBuffer.Admit.fed: enumerant = 0
-slcp.node.HoldBuffer.Admit.held: enumerant = 1
-slcp.node.HoldBuffer.Admit.ready: enumerant = 2
-slcp.node.HoldBuffer.Admit: enum
-slcp.node.HoldBuffer.Entry.item: field node.node.InputItem
-slcp.node.HoldBuffer.Entry.kind: field node.node.HoldBuffer.Kind
-slcp.node.HoldBuffer.Entry.node_id: field [32]u8
-slcp.node.HoldBuffer.Entry: struct
-slcp.node.HoldBuffer.Kind.confirm: enumerant = 2
-slcp.node.HoldBuffer.Kind.externalize: enumerant = 3
-slcp.node.HoldBuffer.Kind.nominate: enumerant = 0
-slcp.node.HoldBuffer.Kind.prepare: enumerant = 1
-slcp.node.HoldBuffer.Kind: enum
-slcp.node.HoldBuffer.PutResult.dropped_full: enumerant = 2
-slcp.node.HoldBuffer.PutResult.held: enumerant = 0
-slcp.node.HoldBuffer.PutResult.replaced: enumerant = 1
-slcp.node.HoldBuffer.PutResult: enum
-slcp.node.HoldBuffer.admit: fn (*node.node.HoldBuffer, mem.Allocator, *const node.node.Meta, u64, bool, *const engine.qset.QuorumSetOwned, node.node.InputItem) node.node.HoldBuffer.Admit
 slcp.node.HoldBuffer.bytes: field usize = 0
 slcp.node.HoldBuffer.count: field usize = 0
-slcp.node.HoldBuffer.deinit: fn (*node.node.HoldBuffer, mem.Allocator) void
 slcp.node.HoldBuffer.dropped_badsig: field atomic.Value(u64) = <default>
 slcp.node.HoldBuffer.dropped_behind: field atomic.Value(u64) = <default>
 slcp.node.HoldBuffer.dropped_far: field atomic.Value(u64) = <default>
 slcp.node.HoldBuffer.dropped_full: field atomic.Value(u64) = <default>
-slcp.node.HoldBuffer.extSignersVBlocking: fn (*const node.node.HoldBuffer, mem.Allocator, u64, *const engine.qset.QuorumSetOwned) bool
 slcp.node.HoldBuffer.fed_out_of_graph: field atomic.Value(u64) = <default>
-slcp.node.HoldBuffer.freeEntry: fn (mem.Allocator, *node.node.HoldBuffer.Entry) void
 slcp.node.HoldBuffer.held_now: field atomic.Value(usize) = <default>
-slcp.node.HoldBuffer.max_bytes: const usize = 8388608
-slcp.node.HoldBuffer.max_entries: const usize = 1024
 slcp.node.HoldBuffer.open: field hash_map.Custom(u64,void,hash_map.AutoContext(u64),80) = <default>
-slcp.node.HoldBuffer.put: fn (*node.node.HoldBuffer, mem.Allocator, u64, [32]u8, node.node.HoldBuffer.Kind, node.node.InputItem) error{OutOfMemory}!node.node.HoldBuffer.PutResult
 slcp.node.HoldBuffer.released: field atomic.Value(u64) = <default>
 slcp.node.HoldBuffer.released_early: field atomic.Value(u64) = <default>
-slcp.node.HoldBuffer.slots: field hash_map.Custom(u64,array_list.Aligned(node.node.HoldBuffer.Entry,null),hash_map.AutoContext(u64),80) = <default>
-slcp.node.HoldBuffer.takeReleasable: fn (*node.node.HoldBuffer, mem.Allocator, u64) ?array_list.Aligned(node.node.HoldBuffer.Entry,null)
-slcp.node.HoldBuffer.takeSlot: fn (*node.node.HoldBuffer, u64) ?array_list.Aligned(node.node.HoldBuffer.Entry,null)
-slcp.node.HoldBuffer.window: const u64 = 64
+slcp.node.HoldBuffer.slots: field hash_map.Custom(u64,array_list.Aligned(host.ingress.HoldBuffer.Entry,null),hash_map.AutoContext(u64),80) = <default>
 slcp.node.HoldBuffer: struct
 slcp.node.IngressStats.dropped_network_inputs: field usize
 slcp.node.IngressStats.queued_bytes: field usize
@@ -1363,7 +1647,7 @@ slcp.node.InputItem.input: field engine.engine.Input
 slcp.node.InputItem.source_peer: field ?usize
 slcp.node.InputItem: struct
 slcp.node.Meta.digest: field [32]u8
-slcp.node.Meta.kind: field node.node.HoldBuffer.Kind
+slcp.node.Meta.kind: field host.ingress.HoldBuffer.Kind
 slcp.node.Meta.node_id: field [32]u8
 slcp.node.Meta.signature: field [64]u8
 slcp.node.Meta.slot: field u64
@@ -1400,7 +1684,7 @@ slcp.node.Node.failed: field atomic.Value(bool) = <default>
 slcp.node.Node.gap_jumps: field u64 = 0
 slcp.node.Node.gap_slots_skipped: field u64 = 0
 slcp.node.Node.gpa: field mem.Allocator
-slcp.node.Node.hold: field node.node.HoldBuffer = <default>
+slcp.node.Node.hold: field host.ingress.HoldBuffer = <default>
 slcp.node.Node.ingressStats: fn (*node.node.Node) node.node.IngressStats
 slcp.node.Node.io: field Io
 slcp.node.Node.journal_tail: field ?node.node.RecoveryJournalTail = null
@@ -1469,7 +1753,7 @@ slcp.node.StorageStats.qset_cache_evictions: field u64
 slcp.node.StorageStats.qset_cache_read_failures: field u64
 slcp.node.StorageStats.qset_cache_write_failures: field u64
 slcp.node.StorageStats: struct
-slcp.node.envelopeMeta: fn (mem.Allocator, [32]u8, []const u8) error{BadNodeIdLength,BadSignatureLength,BadStatementLength,EmptyMessage,FrameTooLarge,InvalidEnumValue,InvalidFarPointer,InvalidFlatBytes,InvalidInlineCompositePointer,InvalidMessageSize,InvalidPointer,InvalidRootPointer,InvalidSegmentCount,InvalidSegmentId,ListTooLarge,MessageTooLarge,NestingLimitExceeded,OutOfBounds,OutOfMemory,PointerDepthLimit,SegmentCountLimitExceeded,TraversalLimitExceeded,TruncatedMessage,UnsetPledges}!node.node.Meta
+slcp.node.envelopeMeta: fn (mem.Allocator, [32]u8, []const u8) error{BadNodeIdLength,BadSignatureLength,BadStatementLength,EmptyMessage,FrameTooLarge,InvalidEnumValue,InvalidFarPointer,InvalidFlatBytes,InvalidInlineCompositePointer,InvalidMessageSize,InvalidPointer,InvalidRootPointer,InvalidSegmentCount,InvalidSegmentId,ListTooLarge,MessageTooLarge,NestingLimitExceeded,OutOfBounds,OutOfMemory,PointerDepthLimit,SegmentCountLimitExceeded,TraversalLimitExceeded,TruncatedMessage,UnsetPledges}!host.ingress.Meta
 slcp.node.msTimeout: fn (u64) Io.Timeout
 slcp.node: struct
 slcp.overlay.Callbacks.ctx: field ?*anyopaque = null

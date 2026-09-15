@@ -14,7 +14,7 @@
 //! own nom/ballot per slot), the `onPeerUp` re-flood of own latest
 //! envelopes, and the `getSlotState(0)` answer (OWN envelopes only, ballot
 //! preferred — node.zig answerGetSlotState) — and, per harness node, the
-//! REAL `slcp.node.HoldBuffer` + `slcp.node.envelopeMeta` in front of the
+//! REAL `core.host.HoldBuffer` + `core.host.envelopeMeta` in front of the
 //! engine, modelling `Node.applyInput`'s gate through the real
 //! `HoldBuffer.admit`: every statement kind for a slot beyond the delivery
 //! frontier (`next_deliver`, slot-ordered like the Node's) is held
@@ -41,8 +41,8 @@ const canonical = core.canonical;
 const driver = core.driver;
 const gen_slcp = core.gen.slcp;
 const Validity = slcp.Validity;
-const HoldBuffer = slcp.node.HoldBuffer;
-const InputItem = slcp.node.InputItem;
+const HoldBuffer = core.host.HoldBuffer;
+const InputItem = core.host.InputItem;
 
 const max_n = 7;
 const max_slot = 16;
@@ -327,7 +327,7 @@ fn Harness(comptime App: type) type {
         fn gateFrame(self: *Self, to: u8, frame: []u8) !bool {
             const gpa = self.gpa;
             const nd = &self.nodes[to];
-            const meta = slcp.node.envelopeMeta(gpa, self.network_id, frame) catch return false;
+            const meta = core.host.envelopeMeta(gpa, self.network_id, frame) catch return false;
             if (meta.slot <= nd.next_deliver) return false;
             const item: InputItem = .{ .input = .{ .envelope_received = .{ .bytes = frame } }, .source_peer = null };
             switch (nd.hold.admit(gpa, &meta, nd.next_deliver, nd.eng.qsets.inGraph(meta.node_id), &nd.eng.cfg.quorum_set, item)) {

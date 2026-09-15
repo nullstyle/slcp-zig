@@ -37,11 +37,18 @@ The library is two layers in one package:
   sibling of the typed layer for state that does not fit by-value copies
   ([ADR 0003](docs/adr/0003-owned-application-state.md)).
 
-The program every design decision is derived from is a replicated counter on
-three hobbyist machines: each proposes "the count becomes N+1", the network
-externalizes one value per slot, every machine applies it. If one of the
-three is down, the other two carry on (2-of-3); if two are down, the survivor
-halts — waiting without a quorum is *correct* FBA behaviour, not a bug.
+The smallest example is a replicated counter on three machines: each proposes
+"the count becomes N+1", the network externalizes a value, and every machine
+applies it. A 2-of-3 profile can continue with one unavailable validator under
+its zero-Byzantine assumption; one survivor must halt.
+
+The longer-term objective includes an internet-scale broker network built on
+SLCP, qmsg and QUIC, supporting one-operator multi-region and independently
+operated deployments. The capacity model is many bounded consensus domains.
+Current verification covers bounded deployments, not that eventual scale.
+Experimental [quorum adaptivity](docs/quorum-adaptivity.md) provides runtime
+quorum revisions and a managed trust-pool migration lifecycle;
+[QUIC hosting](docs/quic-hosting.md) describes the shared ingress boundary.
 
 ## Status
 
@@ -469,6 +476,10 @@ in [`docs/stability.md`](docs/stability.md).
   can do, why the listen port is an internal service in v1.
 - `docs/quorum-recipes.md` — three copy-paste quorum specs with their exact
   lint output, what each lint code means, and two anti-recipes.
+- [`docs/quorum-adaptivity.md`](docs/quorum-adaptivity.md) — trust floors,
+  runtime revisions, certified migration and durable managed-session recovery.
+- [`docs/quic-hosting.md`](docs/quic-hosting.md) — transport-neutral ingress
+  and the qmsg/QUIC host contract.
 - `docs/driver-upgrade.md` — from the default driver to the typed `AppNode`
   to the raw `Driver` vtable, and why evolving a `Command` is a network
   version event.

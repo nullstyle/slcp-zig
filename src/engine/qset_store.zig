@@ -106,6 +106,11 @@ pub const Store = struct {
         return self.by_hash.count();
     }
 
+    pub fn setCapacity(self: *Store, capacity: u32) void {
+        self.max_cached = @max(1, capacity);
+        self.trimToCapacity();
+    }
+
     pub fn get(self: *const Store, hash: [32]u8) ?*const qset.QuorumSetOwned {
         return if (self.by_hash.get(hash)) |p| p else null;
     }
@@ -311,6 +316,24 @@ pub const Store = struct {
     pub fn addGraphRoot(self: *Store, node: [32]u8) !void {
         try self.roots.put(self.gpa, node, {});
         try self.rebuildGraph();
+    }
+
+    /// Replace the local-policy root set transactionally. Live remote
+    /// references remain intact; the resulting graph is exact immediately.
+    pub fn replaceGraphRoots(self: *Store, nodes: []const [32]u8) error{OutOfMemory}!void {
+        var replacement: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        errdefer replacement.deinit(self.gpa);
+        for (nodes) |node| try replacement.put(self.gpa, node, {});
+        var previous = self.roots;
+        self.roots = replacement;
+        const rebuilt = self.buildGraph() catch |err| {
+            self.roots = previous;
+            return err;
+        };
+        previous.deinit(self.gpa);
+        self.graph.deinit(self.gpa);
+        self.graph = rebuilt;
+        self.deferred_reference_updates = 0;
     }
 
     fn buildGraph(self: *Store) !std.AutoHashMapUnmanaged([32]u8, void) {

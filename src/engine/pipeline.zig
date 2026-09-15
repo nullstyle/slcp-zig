@@ -64,6 +64,13 @@ const stored = @import("stored.zig");
 /// §5.1 pushInput: exactly one InputStatus per input, pushed LAST.
 pub fn pushInput(eng: *engine.Engine, input: engine.Input) engine.PushError!void {
     if (eng.failed) return error.EngineFailed;
+    if (eng.adaptive) |state| {
+        if (state.prepared != null) {
+            eng.failed = true;
+            return error.EngineFailed;
+        }
+    }
+    eng.inputs_started = true;
     fixupCtx(eng);
     const status = run(eng, input) catch |err| {
         eng.failed = true; // sticky (§7.2)
@@ -202,12 +209,15 @@ fn decodeEnvelope(gpa: std.mem.Allocator, bytes: []const u8, l: limits_mod.Limit
 /// max_live_slots (→ over_limit). Existing slots — including already
 /// externalized ones — always accept (they keep answering laggards).
 fn getOrCreateSlot(eng: *engine.Engine, index: u64) !?*slot_mod.Slot {
+    if (eng.adaptive) |state| if (index < state.floor) return null;
     if (eng.slots.get(index)) |p| return p;
     if (eng.slots.count() >= eng.cfg.limits.max_live_slots) return null;
     const p = try eng.gpa.create(slot_mod.Slot);
     errdefer eng.gpa.destroy(p);
     p.* = slot_mod.Slot.init(index);
+    if (eng.adaptive) |state| p.local_quorum = state.forSlot(index).?;
     try eng.slots.put(eng.gpa, index, p);
+    if (eng.adaptive) |state| state.highest_admitted = if (state.highest_admitted) |highest| @max(highest, index) else index;
     return p;
 }
 
@@ -346,6 +356,12 @@ fn handleEnvelope(eng: *engine.Engine, bytes: []const u8) engine.EngineError!eng
     };
 
     const qset_hash = owned.qsetHash();
+    if (eng.adaptive) |state| {
+        if (owned.slot < state.floor) {
+            owned.deinit(gpa);
+            return .ignored;
+        }
+    }
     const is_ext = owned.pledges == .externalize;
     if (!is_ext and eng.qsets.get(qset_hash) == null) {
         const still_relevant = eng.qsets.recheckBeforeParking(node) catch |err| {
@@ -552,6 +568,7 @@ fn handleNominate(eng: *engine.Engine, slot_index: u64, value: []const u8, prev_
     // Watcher mode: full tracking, zero emissions (§5.1) — proposing is not
     // legal, not fatal.
     if (eng.ctx.isWatcher()) return .ignored;
+    if (eng.adaptive) |state| if (slot_index < state.floor) return .ignored;
     const s = (try getOrCreateSlot(eng, slot_index)) orelse return .over_limit;
     const advanced = try protoBool(nomination_mod.nominate(&eng.ctx, s, value, prev_value), true);
     return if (advanced) .applied else .ignored;
@@ -602,6 +619,18 @@ fn handleRestore(eng: *engine.Engine, bytes: []const u8) engine.EngineError!engi
     };
     const slot_index = owned.slot;
     const is_nom = owned.isNomination();
+    if (eng.adaptive) |state| {
+        const revision = state.forSlot(slot_index) orelse {
+            owned.deinit(gpa);
+            return .ignored;
+        };
+        const advertised = owned.qsetHash();
+        if (!std.mem.eql(u8, &advertised, &revision.hash)) {
+            owned.deinit(gpa);
+            eng.failed = true;
+            return error.EngineFailed;
+        }
+    }
 
     const s = (getOrCreateSlot(eng, slot_index) catch |err| {
         owned.deinit(gpa);
@@ -722,6 +751,15 @@ fn handlePurge(eng: *engine.Engine, max_slot: u64) engine.EngineError!engine.Inp
         }
     }
     eng.pending.purgeBelow(max_slot);
+    if (eng.adaptive) |state| {
+        state.floor = @max(state.floor, max_slot);
+        while (state.revisions.items.len > 1 and state.revisions.items[1].first_slot <= state.floor) {
+            const retired = state.revisions.orderedRemove(0);
+            eng.qsets.release(retired.hash);
+            retired.destroy(gpa);
+        }
+        try eng.refreshLocalQuorumRoots();
+    }
     return .applied;
 }
 
@@ -2132,4 +2170,359 @@ test "restore_own_envelope: no leak at any allocation point (nominate + external
 
     try expectRestoreLeaksNothing(own_nom);
     try expectRestoreLeaksNothing(own_ext);
+}
+
+// Experimental adaptive local-policy lifecycle. These tests exercise the
+// same Engine methods and signed inputs available to a host.
+fn enableAdaptiveTest(eng: *engine.Engine, floor: u64, max_revisions: u32) !void {
+    const members = [_][32]u8{
+        try crypto.publicKeyFromSeed(engine_seed),
+        try crypto.publicKeyFromSeed(peer_seed),
+        try crypto.publicKeyFromSeed(peer2_seed),
+        try crypto.publicKeyFromSeed(peer3_seed),
+    };
+    try eng.enableQuorumAdaptivity(.{
+        .policy = .{ .anchors = &members, .max_faulty_anchors = 0, .min_slice_anchors = 3 },
+        .admission_floor = floor,
+        .max_revisions = max_revisions,
+    });
+}
+
+fn adaptiveNextQset(gpa: std.mem.Allocator) !qset.QuorumSetOwned {
+    return ownedQsetOf(gpa, 3, &.{
+        try crypto.publicKeyFromSeed(engine_seed),
+        try crypto.publicKeyFromSeed(peer_seed),
+        try crypto.publicKeyFromSeed(peer2_seed),
+    });
+}
+
+test "adaptivity: future policy preserves old slot quorum math and emits exact revision hashes" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3, .limits = .{ .max_cached_qsets = 0 } });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 1, 2);
+    const original = eng.quorumRevision(0).?.qset_hash;
+    try expectStatus(gpa, &eng, .{ .nominate = .{ .slot = 1, .value = "own", .prev_value = "" } }, .applied);
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    const prepared = try eng.prepareQuorumChange(2, &next);
+    const next_hash = prepared.qset_hash;
+    try testing.expect(!std.mem.eql(u8, &original, &next_hash));
+    // Prepared bytes can be durably recorded before any new-policy use.
+    var decoded = try capnpc.message.Message.init(gpa, prepared.quorum_bytes, .{});
+    defer decoded.deinit();
+    const qs_reader = try gen_slcp.QuorumSet.Reader.init(&decoded);
+    try testing.expectEqual(@as(u32, 3), try qs_reader.getThreshold());
+    try testing.expectEqual(@as(usize, 1), eng.quorumRevisionCount());
+    try eng.commitQuorumChange();
+    try expectStatus(gpa, &eng, .{ .nominate = .{ .slot = 2, .value = "own", .prev_value = "prior" } }, .applied);
+
+    // One accepted signer is blocking for new 3-of-3 but not old 3-of-4.
+    for ([_]u64{ 1, 2 }) |slot_index| {
+        const peer = try peerEnvelope(gpa, peer_seed, slot_index, .{ .nominate = .{
+            .qset_hash = original,
+            .votes = &.{"peer"},
+            .accepted = &.{"peer"},
+        } });
+        defer gpa.free(peer);
+        try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = peer } }, .applied);
+    }
+    try testing.expect(!eng.slots.get(1).?.nom.accepted.contains("peer"));
+    try testing.expect(eng.slots.get(2).?.nom.accepted.contains("peer"));
+    try testing.expectEqual(original, eng.ctx.localQuorumHash(eng.slots.get(1).?));
+    try testing.expectEqual(next_hash, eng.ctx.localQuorumHash(eng.slots.get(2).?));
+    const newer_own = eng.slots.get(2).?.own_nom orelse return error.ExpectedOwnNomination;
+    try testing.expectEqual(next_hash, newer_own.statement.qsetHash());
+    try testing.expectEqual(@as(u32, 4), @as(u32, @intCast(eng.quorumForSlot(1).?.validators.len)));
+    try testing.expectEqual(@as(u32, 3), @as(u32, @intCast(eng.quorumForSlot(2).?.validators.len)));
+}
+
+test "adaptivity: rejected changes and abort leave policy usable; admitted future slots cannot change" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3 });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 5, 2);
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    try testing.expectError(error.BoundaryNotIncreasing, eng.prepareQuorumChange(5, &next));
+    next.threshold = 1;
+    try testing.expectError(error.QuorumOutsidePolicy, eng.prepareQuorumChange(6, &next));
+    next.threshold = 3;
+    _ = try eng.prepareQuorumChange(6, &next);
+    eng.abortQuorumChange();
+    try testing.expectEqual(@as(usize, 1), eng.quorumRevisionCount());
+    try expectStatus(gpa, &eng, .{ .nominate = .{ .slot = 9, .value = "own", .prev_value = "prior" } }, .applied);
+    try testing.expectError(error.SlotAlreadyAdmitted, eng.prepareQuorumChange(8, &next));
+    try testing.expectError(error.SlotAlreadyAdmitted, eng.prepareQuorumChange(9, &next));
+    _ = try eng.prepareQuorumChange(10, &next);
+    try eng.commitQuorumChange();
+    try testing.expectError(error.RevisionLimitExceeded, eng.prepareQuorumChange(11, &next));
+    try testing.expect(!eng.failed);
+}
+
+test "adaptivity: prepared persistence barrier is enforced with sticky failure" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3 });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 1, 2);
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    _ = try eng.prepareQuorumChange(2, &next);
+    try testing.expectError(error.EngineFailed, eng.pushInput(.{ .nominate = .{ .slot = 2, .value = "v", .prev_value = "" } }));
+    eng.abortQuorumChange();
+    try testing.expectError(error.EngineFailed, eng.pushInput(.{ .purge_slots = .{ .max_slot = 2 } }));
+    try testing.expectEqual(@as(usize, 0), eng.stats().live_slots);
+}
+
+test "adaptivity: recovery installs historical schedule before own replay and rejects wrong policy" {
+    const gpa = testing.allocator;
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3 });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 1, 3);
+    const old_hash = eng.quorumRevision(0).?.qset_hash;
+    const next_hash = (try eng.prepareQuorumChange(4, &next)).qset_hash;
+    try eng.commitQuorumChange();
+    // No ordinary input is needed to reconstruct a durable timeline.
+    for ([_]u64{ 2, 5 }) |slot_index| {
+        const hash = if (slot_index < 4) old_hash else next_hash;
+        const own = try peerEnvelope(gpa, engine_seed, slot_index, .{ .nominate = .{
+            .qset_hash = hash,
+            .votes = &.{"restored"},
+            .accepted = &.{},
+        } });
+        defer gpa.free(own);
+        var effects = try pushAndDrain(gpa, &eng, .{ .restore_own_envelope = .{ .bytes = own } });
+        defer effects.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), effects.broadcasts);
+        try testing.expectEqual(@as(usize, 0), effects.persists);
+        try testing.expectEqualSlices(u8, own, effects.last_broadcast.?);
+    }
+    // Even an authentic own statement is unsafe under the wrong local qset.
+    const wrong = try peerEnvelope(gpa, engine_seed, 6, .{ .externalize = .{
+        .commit = .{ .counter = 1, .value = "v" },
+        .n_h = 1,
+        .commit_qset_hash = old_hash,
+    } });
+    defer gpa.free(wrong);
+    try testing.expectError(error.EngineFailed, eng.pushInput(.{ .restore_own_envelope = .{ .bytes = wrong } }));
+    try testing.expect(eng.failed);
+}
+
+test "adaptivity: purge fences retired slots and releases old policy roots and pins" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3, .limits = .{ .max_cached_qsets = 0 } });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 1, 2);
+    const old_hash = eng.quorumRevision(0).?.qset_hash;
+    const retired_node = try crypto.publicKeyFromSeed(peer3_seed);
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    const next_hash = (try eng.prepareQuorumChange(2, &next)).qset_hash;
+    try eng.commitQuorumChange();
+    try testing.expect(eng.qsets.inGraph(retired_node));
+    try testing.expect(eng.qsets.get(old_hash) != null);
+    try expectStatus(gpa, &eng, .{ .purge_slots = .{ .max_slot = 2 } }, .applied);
+    try testing.expect(!eng.qsets.inGraph(retired_node));
+    try testing.expectEqual(@as(usize, 1), eng.quorumRevisionCount());
+    try testing.expect(eng.qsets.get(old_hash) == null);
+    try testing.expect(eng.qsets.get(next_hash) != null);
+    try testing.expect(eng.quorumForSlot(1) == null);
+    try expectStatus(gpa, &eng, .{ .nominate = .{ .slot = 1, .value = "recreate", .prev_value = "" } }, .ignored);
+    const stale = try peerEnvelope(gpa, engine_seed, 1, .{ .nominate = .{
+        .qset_hash = old_hash,
+        .votes = &.{"old"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(stale);
+    try expectStatus(gpa, &eng, .{ .envelope_received = .{ .bytes = stale } }, .ignored);
+    try expectStatus(gpa, &eng, .{ .restore_own_envelope = .{ .bytes = stale } }, .ignored);
+    try expectStatus(gpa, &eng, .{ .purge_slots = .{ .max_slot = 1 } }, .applied);
+    try testing.expect(eng.quorumForSlot(1) == null);
+    try testing.expectEqual(@as(usize, 0), eng.stats().live_slots);
+    _ = try eng.prepareQuorumChange(3, &next);
+    try eng.commitQuorumChange();
+    try expectStatus(gpa, &eng, .{ .purge_slots = .{ .max_slot = 3 } }, .applied);
+    try testing.expectEqual(@as(usize, 1), eng.qsets.count());
+}
+
+test "adaptivity: enabling after any input is rejected and static behavior stays available" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3 });
+    defer eng.deinit();
+    try expectStatus(gpa, &eng, .{ .timer_fired = .{ .slot = 99, .timer = .ballot } }, .ignored);
+    try testing.expectError(error.EngineNotPristine, enableAdaptiveTest(&eng, 1, 2));
+    try testing.expect(eng.quorumForSlot(0) != null);
+    try testing.expectEqual(@as(usize, 0), eng.quorumRevisionCount());
+}
+
+test "adaptivity: pending future envelopes and undrained effects prevent policy replacement" {
+    const gpa = testing.allocator;
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3 });
+    defer eng.deinit();
+    try enableAdaptiveTest(&eng, 1, 3);
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    const parked = try peerEnvelope(gpa, peer_seed, 10, .{ .nominate = .{
+        .qset_hash = @splat(0xff),
+        .votes = &.{"pending"},
+        .accepted = &.{},
+    } });
+    defer gpa.free(parked);
+    try eng.pushInput(.{ .envelope_received = .{ .bytes = parked } });
+    try testing.expectError(error.EffectsNotDrained, eng.prepareQuorumChange(11, &next));
+    var effects = try drain(gpa, &eng);
+    defer effects.deinit(gpa);
+    try testing.expectEqual(engine.InputStatus.parked_awaiting_qset, effects.status);
+    try testing.expectError(error.SlotAlreadyAdmitted, eng.prepareQuorumChange(10, &next));
+    _ = try eng.prepareQuorumChange(11, &next);
+    eng.abortQuorumChange();
+    try testing.expect(!eng.failed);
+}
+
+const AdaptiveOomOperation = enum { enable, prepare, commit, purge };
+
+fn adaptiveOomAttempt(fa: *testing.FailingAllocator, operation: AdaptiveOomOperation, fail_offset: usize) !bool {
+    const gpa = fa.allocator();
+    var eng = try makeEngine(gpa, .{ .quorum_threshold = 3, .limits = .{ .max_cached_qsets = 0 } });
+    defer eng.deinit();
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    if (operation != .enable) try enableAdaptiveTest(&eng, 1, 2);
+    if (operation == .commit or operation == .purge) _ = try eng.prepareQuorumChange(2, &next);
+    if (operation == .purge) try eng.commitQuorumChange();
+    fa.fail_index = fa.alloc_index + fail_offset;
+    const result: anyerror!void = switch (operation) {
+        .enable => enableAdaptiveTest(&eng, 1, 2),
+        .prepare => blk: {
+            _ = eng.prepareQuorumChange(2, &next) catch |err| break :blk err;
+            break :blk {};
+        },
+        .commit => eng.commitQuorumChange(),
+        .purge => eng.pushInput(.{ .purge_slots = .{ .max_slot = 2 } }),
+    };
+    if (fa.has_induced_failure) {
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expectEqual(operation == .commit or operation == .purge, eng.failed);
+        if (operation == .enable) try testing.expect(eng.adaptive == null);
+        if (operation == .prepare) {
+            try testing.expectEqual(@as(usize, 1), eng.quorumRevisionCount());
+            try testing.expect(eng.adaptive.?.prepared == null);
+        }
+        return true;
+    }
+    try result;
+    return false;
+}
+
+test "adaptivity: allocation failures preserve preparation atomicity and make durable commit fail-stop without leaks" {
+    inline for (std.meta.tags(AdaptiveOomOperation)) |operation| {
+        var offset: usize = 0;
+        while (true) : (offset += 1) {
+            var fa = testing.FailingAllocator.init(testing.allocator, .{});
+            const induced = try adaptiveOomAttempt(&fa, operation, offset);
+            try testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+            if (!induced) break;
+        }
+        try testing.expect(offset > 0);
+    }
+}
+
+const AdaptiveBusMessage = struct { to: usize, bytes: []u8 };
+
+fn drainAdaptiveBus(gpa: std.mem.Allocator, engines: []engine.Engine, sender: usize, queue: *std.ArrayList(AdaptiveBusMessage), externalized: []u64, emitted: *usize) !void {
+    const eng = &engines[sender];
+    while (eng.popEffect()) |effect| {
+        switch (effect.*) {
+            .persist_own_envelope => |payload| {
+                var decoded = try decodeEnvelope(gpa, payload.bytes, eng.cfg.limits);
+                defer decoded.deinit();
+                var statement = try stored.fromReader(gpa, try decoded.statement());
+                defer statement.deinit(gpa);
+                try testing.expectEqual(eng.ctx.localQuorumHash(eng.slots.get(payload.slot).?), statement.qsetHash());
+                emitted.* += 1;
+            },
+            .broadcast_envelope => |payload| {
+                for (engines, 0..) |_, recipient| {
+                    if (recipient == sender) continue;
+                    const copy = try gpa.dupe(u8, payload.bytes);
+                    errdefer gpa.free(copy);
+                    try queue.append(gpa, .{ .to = recipient, .bytes = copy });
+                }
+            },
+            .externalized => |payload| {
+                try testing.expectEqualSlices(u8, "value", payload.bytes);
+                externalized[sender] = payload.slot;
+            },
+            .request_qset => return error.UnexpectedMissingLocalRevision,
+            else => {},
+        }
+        eng.commitEffect();
+    }
+}
+
+test "adaptivity: four engines converge across different local revision boundaries and all pledge hashes match" {
+    const gpa = testing.allocator;
+    const seeds = [_][32]u8{ engine_seed, peer_seed, peer2_seed, peer3_seed };
+    var members: [4][32]u8 = undefined;
+    for (seeds, 0..) |seed, i| members[i] = try crypto.publicKeyFromSeed(seed);
+    var engines: [4]engine.Engine = undefined;
+    var initialized: usize = 0;
+    defer for (engines[0..initialized]) |*eng| eng.deinit();
+    for (&engines, 0..) |*eng, i| {
+        const qs = try ownedQsetOf(gpa, 3, &members);
+        eng.* = engine.Engine.init(gpa, .{
+            .network_id = testNet(),
+            .node_id = members[i],
+            .secret_seed = seeds[i],
+            .quorum_set = qs,
+        }, driver_mod.Driver.default()) catch |err| {
+            var to_free = qs;
+            to_free.deinit(gpa);
+            return err;
+        };
+        initialized += 1;
+        try eng.enableQuorumAdaptivity(.{
+            .policy = .{ .anchors = &members, .max_faulty_anchors = 0, .min_slice_anchors = 3 },
+            .admission_floor = 1,
+        });
+    }
+    var next = try adaptiveNextQset(gpa);
+    defer next.deinit(gpa);
+    var queue: std.ArrayList(AdaptiveBusMessage) = .empty;
+    defer {
+        for (queue.items) |message| gpa.free(message.bytes);
+        queue.deinit(gpa);
+    }
+    var externalized: [4]u64 = @splat(0);
+    var emitted: usize = 0;
+    // Install at different *future slot* boundaries on each node. Every
+    // local policy is within the fixed family, so mixed profiles are valid.
+    for (&engines, 0..) |*eng, i| {
+        _ = try eng.prepareQuorumChange(if (i < 2) 2 else 3, &next);
+        try eng.commitQuorumChange();
+    }
+    for ([_]u64{ 1, 2, 3 }) |slot_index| {
+        const before_emitted = emitted;
+        for (&engines, 0..) |*eng, i| {
+            try eng.pushInput(.{ .nominate = .{
+                .slot = slot_index,
+                .value = "value",
+                .prev_value = if (slot_index == 1) "" else "value",
+            } });
+            try drainAdaptiveBus(gpa, &engines, i, &queue, &externalized, &emitted);
+        }
+        var steps: usize = 0;
+        while (queue.items.len > 0) {
+            try testing.expect(steps < 5000);
+            const message = queue.orderedRemove(0);
+            defer gpa.free(message.bytes);
+            try engines[message.to].pushInput(.{ .envelope_received = .{ .bytes = message.bytes } });
+            try drainAdaptiveBus(gpa, &engines, message.to, &queue, &externalized, &emitted);
+            steps += 1;
+        }
+        for (externalized) |slot| try testing.expectEqual(slot_index, slot);
+        try testing.expect(emitted > before_emitted);
+    }
 }
