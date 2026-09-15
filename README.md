@@ -389,9 +389,11 @@ the exact capnp-zig runtime dependency. `just gen-check` (also
 `just gen-check-pinned`) compares staged results without modifying the checkout.
 `just canonical-reference` requires all six independent canonicalization cases.
 These development commands use Python 3.8+, Bash, and the Wasmtime/Zig pins in
-`mise.toml`; the compiler archive is locked in `tools/capnp-toolchain.json` and
-verified by `just bootstrap-toolchain`. Native `capnp` is unnecessary. Ordinary
-package builds use checked-in bindings; ordinary tests skip the reference check
+`mise.toml`; the compiler archive is published by
+[capnpc-wasm](https://github.com/nullstyle/capnpc-wasm/releases), locked in
+`tools/capnp-toolchain.json`, and verified by `just bootstrap-toolchain`. Native
+`capnp` is unnecessary. Ordinary package builds use checked-in bindings;
+ordinary tests skip the reference check
 unless opted in with `-Dcapnp-wasm-driver=tools/capnp_tool.py`.
 
 ## Using slcp-zig as a dependency

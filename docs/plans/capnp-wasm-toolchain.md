@@ -5,6 +5,10 @@ Status: implemented and merged into both local and remote `main` branches,
 and [bucketlist `830de28`](https://github.com/nullstyle/bucketlist-zig/commit/830de283657a385fec06ebd49cc49adecdd0aa9a).
 The draft PRs are closed and the migration branches are removed.
 
+Current download host: the now-public [capnpc-wasm repository](https://github.com/nullstyle/capnpc-wasm/releases).
+The original SLCP release link below records the initial publication; the active
+pins now fetch identical archive bytes from capnpc-wasm. Versions and hashes are unchanged.
+
 ## Implementation result
 
 - Published the approved [compiler-only archive](https://github.com/nullstyle/slcp-zig/releases/tag/capnp-wasm-tools-v0.1.0-rc.2)
