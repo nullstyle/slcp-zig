@@ -2,7 +2,7 @@
     .name = .registry_example,
     .version = "0.0.0",
     .fingerprint = 0x69a724cdaee27bea, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0-dev.1786",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .slcp = .{ .path = "../.." },
     },

@@ -170,10 +170,14 @@ preflight:
     need '\[docs-smoke\] checks=[0-9]+ failures=0'
     need 'api-snapshot: OK \('
     # The summary block is everything from `Build Summary:` on; a ` cached`
-    # step there means the fresh cache dir was not honoured.
-    if sed -n '/^Build Summary:/,$p' preflight.log | grep -q ' cached'; then
+    # step there means the fresh cache dir was not honoured — EXCEPT options
+    # steps: since the capnp-zig v0.21.0 dependency graph, one build shares
+    # options modules between several consumers, and Zig 0.17 renders the
+    # in-build dedup as `+- options cached`. That is not a carried-over
+    # artifact; only compile/run/install hits disprove the fresh cache.
+    if sed -n '/^Build Summary:/,$p' preflight.log | grep ' cached' | grep -qv '+- options cached'; then
         echo "preflight: a step in the summary block was served from cache:"
-        sed -n '/^Build Summary:/,$p' preflight.log | grep ' cached'
+        sed -n '/^Build Summary:/,$p' preflight.log | grep ' cached' | grep -v '+- options cached'
         missing=1
     fi
     [ "$missing" -eq 0 ] || { echo "preflight: RED — evidence missing (see preflight.log)"; exit 1; }

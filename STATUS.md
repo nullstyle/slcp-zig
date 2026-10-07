@@ -77,7 +77,22 @@ preflight also pass.
 
 Both projects also use the pinned WASM schema compiler and runtime-matched
 generators described in the [toolchain migration record](docs/plans/capnp-wasm-toolchain.md).
-Generated schema bytes and application runtime pins are unchanged.
+The capnp-zig runtime dependency and its coordinated set move to v0.21.0
+(transitive quic v0.30.1 and boringssl 0.6.7) — the pin capnp-zig's upgrade
+guides pair with Zig 0.17.0 — and all three generated files are regenerated
+by the v0.21.0 WASI generator, which embeds reflection metadata by default.
+Wire bytes, conformance vectors and the capnp-wasm canonical-reference
+agreement are unchanged; the Experimental API snapshot refreshes from 1,909
+to 2,266 declarations while the 292-declaration Stable surface stays frozen.
+The counter and registry example floors move off the deleted dev-pin
+spelling. Fresh-cache preflight on the bumped set: 137/137 steps with 715
+tests passed and two expected skips, 15,000 simulation cells, 1,000 seeds
+per Byzantine actor, four WASM differential traces and 300 fuzz
+iterations, and the extracted-package consumer build. One build-graph
+side effect: options modules shared between consumers render as
+`+- options cached` in Zig 0.17 summaries, so the preflight recipe's
+fresh-cache check now ignores options-step dedup and flags only
+compile/run/install cache hits.
 
 The toolchain pin moved from `0.17.0-dev.1786+75044cb04` — a dev build
 ziglang.org has deleted, which made every CI install of it a lottery — to

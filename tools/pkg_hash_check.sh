@@ -1,7 +1,8 @@
 #!/bin/sh
 # The pinning check for `tools/pkg_hash.sh` (`just pkg-hash-check`).
 #
-# On Zig 0.17.0-dev.1786 a BARE `zig fetch <archive>` (no --save*) of an
+# On Zig 0.17.0 (also at 0.17.0-dev.1786, where this was found) a BARE
+# `zig fetch <archive>` (no --save*) of an
 # archive with a single root directory — a `git archive --prefix=…` tarball, a
 # GitHub `/archive/…tar.gz` — prints the correct hash but rewrites the global
 # cache tarball `$ZIG_GLOBAL_CACHE_DIR/p/<hash>.tar.gz` double-nested

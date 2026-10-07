@@ -80,6 +80,21 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Changed
 
+- The capnp-zig dependency moves v0.16.0 → v0.21.0, with its transitive
+  quic v0.30.1 and boringssl 0.6.7 — the coordinated set capnp-zig's
+  upgrade guides pin for Zig 0.17.0. All three generated files are
+  regenerated with the v0.21.0 WASI generator (the codegen skew guard
+  requires the plugin and the runtime to move together): output embeds
+  reflection metadata by default, Text getters validate, and builder
+  error sets are named. No Stable API line changed after v0.19.1 and no
+  slcp call site needed adaptation; wire bytes and conformance vectors
+  are unchanged. The counter and registry example floors also move off
+  the deleted dev-pin spelling. The Experimental API snapshot refreshes
+  (1,909 → 2,266 declarations; the Stable surface is frozen and
+  unchanged), and the preflight recipe's fresh-cache check now ignores
+  `options`-step dedup — the v0.21.0 dependency graph shares options
+  modules between consumers, which Zig 0.17 renders as
+  `+- options cached` inside a single fresh-cache build.
 - The toolchain moves to tagged Zig `0.17.0` (the `mise.toml` pin and the
   `build.zig.zon` floor). The previous pin, `0.17.0-dev.1786+75044cb04`,
   has been deleted from ziglang.org and the community mirrors are following,
