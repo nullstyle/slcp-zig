@@ -1452,7 +1452,7 @@ test "version scanner: refs/tags/v0.0.9.tar.gz vs 0.1.0 is flagged; real manifes
     const mise = try std.Io.Dir.cwd().readFileAlloc(io, "mise.toml", gpa, read_limit);
     defer gpa.free(mise);
     const zig_pin = parseMiseZig(mise) orelse return error.NoZigPin;
-    try testing.expect(std.mem.startsWith(u8, zig_pin, "0.17.0-dev."));
+    try testing.expect(std.mem.startsWith(u8, zig_pin, "0.17."));
     const zhits = try scanZigPins(gpa, "mise use -g zig@0.17.0-dev.1786+75044cb04\nfloor 0.17.0-dev.1786.\n");
     defer gpa.free(zhits);
     try testing.expectEqual(@as(usize, 2), zhits.len);

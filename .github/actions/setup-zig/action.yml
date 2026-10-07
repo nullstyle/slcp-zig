@@ -14,11 +14,11 @@ description: >
   Node runtime to deprecate, and nothing here caches .zig-cache across runs, so
   that failure class is structurally gone.
 
-  NOTE: `jdx/mise-action` must pin its `version:`. mise only resolves explicit
-  Zig dev-build tarball URLs (`mise ls-remote zig` lists tagged releases only)
-  in recent versions, and mise-action's cache otherwise serves whatever mise a
-  runner happened to cache earlier — which silently differed per platform and
-  failed on Linux/Windows while passing on macOS.
+  NOTE: `jdx/mise-action` must pin its `version:` — its cache otherwise
+  serves whatever mise a runner happened to cache earlier, which silently
+  differed per platform and failed on Linux/Windows while passing on macOS.
+  (The Zig pin is a tagged release; the old dev-build pins additionally
+  needed a recent mise to resolve their tarball URLs.)
 
 runs:
   using: composite

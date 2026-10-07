@@ -86,11 +86,11 @@ TCP port 7311 — a private network or a WireGuard mesh is strongly recommended
 every box.
 
 1. **Install the pinned Zig with [mise](https://mise.jdx.dev).** slcp-zig
-   tracks one exact nightly; anything else may not compile.
+   tracks one exact tagged release; anything else may not compile.
 
    ```sh
    curl https://mise.run | sh
-   mise use -g zig@0.17.0-dev.1786+75044cb04
+   mise use -g zig@0.17.0
    ```
 
 2. **Create the package** and replace the generated `build.zig` with this one

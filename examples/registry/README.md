@@ -276,7 +276,7 @@ mesh — see *Security*). On every box:
 
    ```sh
    curl https://mise.run | sh
-   mise use -g zig@0.17.0-dev.1786+75044cb04
+   mise use -g zig@0.17.0
    ```
 
 2. **Get the example.** Clone the repository and build in place (the example

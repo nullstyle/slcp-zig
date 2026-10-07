@@ -516,7 +516,7 @@ const Conn = struct {
                 .socket_handle = self.stream.socket.handle,
                 .data = &bufs,
             } }, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(idle_timeout_ms), .clock = .awake } }) catch return;
-            const n = res.net_read catch return;
+            const n = (res.net_read catch return).data_len;
             if (n == 0) return;
             len += n;
         }
@@ -541,7 +541,11 @@ pub fn request(io: std.Io, spec: []const u8, line: []const u8, out: []u8) ![]con
     var len: usize = 0;
     while (len < out.len) {
         var bufs: [1][]u8 = .{out[len..]};
-        const n = try stream.read(io, &bufs);
+        const result = try io.operate(.{ .net_read = .{
+            .socket_handle = stream.socket.handle,
+            .data = &bufs,
+        } });
+        const n = (try result.net_read).data_len;
         if (n == 0) break;
         len += n;
         if (std.mem.indexOfScalar(u8, out[0..len], '\n')) |nl| return std.mem.trimEnd(u8, out[0..nl], "\r");

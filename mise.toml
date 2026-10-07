@@ -7,6 +7,7 @@ wasmtime = "48.0.1"
 # build.zig.zon holds only a FLOOR (minimum_zig_version), never a second pin.
 # If you manage Zig with zvm, its PATH entry wins over mise's shims — run
 # `mise exec -- zig ...` to match CI, or drop zvm from PATH.
-# M5 bump: the node layer targets this std.Io surface (Mutex/Condition under
-# std.Io, net.Server/Stream, File.Atomic); older -dev builds differ.
-zig = "0.17.0-dev.1786+75044cb04"
+# Pin TAGGED releases: ziglang.org deletes dev builds within weeks, and the
+# old dev.1786 pin is already gone, which turned every CI Zig install into
+# a lottery. Bumping Zig is this one line (plus the floor when it moves).
+zig = "0.17.0"

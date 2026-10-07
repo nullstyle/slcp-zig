@@ -80,6 +80,16 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Changed
 
+- The toolchain moves to tagged Zig `0.17.0` (the `mise.toml` pin and the
+  `build.zig.zon` floor). The previous pin, `0.17.0-dev.1786+75044cb04`,
+  has been deleted from ziglang.org and the community mirrors are following,
+  so every CI install of it had become a lottery; tagged releases stay.
+  Zig 0.17.0's `net.Stream.read` returns an `Io.net.Stream.ReadResult`
+  struct — and its own std implementation does not compile — so the
+  overlay's connection reads, two raw-socket test helpers, and the registry
+  example's RPC reads now submit `net_read` operations directly and read
+  `data_len`. Every read keeps its `usize` contract; no caller changes.
+  The READMEs and the docs gate move with the pin.
 - Outbound application traffic now has a 256-item / 1 MiB per-peer subset of
   the unchanged 1,024-item / 16 MiB aggregate writer queue. A 256-item /
   4 MiB reserve remains unavailable to app frames, and app pressure drops

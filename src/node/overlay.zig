@@ -274,10 +274,16 @@ const Conn = struct {
     slot_state_envelopes_answered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Blocking read into `read_buf`; 0 on EOF. The established-connection
-    /// path — no deadline, straight through the Io vtable.
+    /// path — no deadline, straight through the Io vtable. Submits the
+    /// `net_read` operation directly: Zig 0.17.0's own `net.Stream.read`
+    /// does not compile (it tuple-destructures the `ReadResult` struct).
     fn read(self: *Conn) !usize {
         var bufs: [1][]u8 = .{self.read_buf};
-        return self.stream.read(self.io, &bufs);
+        const result = try self.io.operate(.{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = &bufs,
+        } });
+        return (try result.net_read).data_len;
     }
 
     /// Blocking read into `read_buf` under a DEADLINE, returning
@@ -295,7 +301,7 @@ const Conn = struct {
             .socket_handle = self.stream.socket.handle,
             .data = &bufs,
         } }, timeout);
-        return result.net_read;
+        return (try result.net_read).data_len;
     }
 
     /// Copy `bytes` onto the write queue (async) or, before the writer thread
@@ -1652,7 +1658,18 @@ fn readBounded(io: std.Io, handle: net.Socket.Handle, buf: []u8, ms: i64) !usize
         .raw = std.Io.Duration.fromMilliseconds(ms),
         .clock = .awake,
     } });
-    return result.net_read;
+    return (try result.net_read).data_len;
+}
+
+/// Blocking read from a raw test socket; 0 on EOF. Submits the `net_read`
+/// operation directly (Zig 0.17.0's `net.Stream.read` does not compile).
+fn readTestRaw(io: std.Io, stream: net.Stream, buf: []u8) !usize {
+    var bufs: [1][]u8 = .{buf};
+    const result = try io.operate(.{ .net_read = .{
+        .socket_handle = stream.socket.handle,
+        .data = &bufs,
+    } });
+    return (try result.net_read).data_len;
 }
 
 /// Read one complete overlay frame from a raw loopback peer under a bounded
@@ -2068,8 +2085,7 @@ test "inbound conn cap: over-cap accepts are closed, under-cap conns still work"
     // c3 must see EOF without ever receiving B's Hello (an accepted conn
     // would have been sent one immediately).
     var rb: [64]u8 = undefined;
-    var rbufs: [1][]u8 = .{&rb};
-    const n = c3.read(io, &rbufs) catch 0;
+    const n = readTestRaw(io, c3, &rb) catch 0;
     try testing.expectEqual(@as(usize, 0), n);
 
     // c1 and c2 were kept: complete their Hello exchanges and become peers.
@@ -2179,8 +2195,7 @@ test "write queue caps: overflow fails the enqueue and shuts the conn down" {
         try testing.expectError(error.WriteClosed, conn.enqueue("x"));
         // …and shut the socket down: the peer side sees EOF.
         var rb: [8]u8 = undefined;
-        var rbufs: [1][]u8 = .{&rb};
-        const n = srv_side.read(io, &rbufs) catch 0;
+        const n = readTestRaw(io, srv_side, &rb) catch 0;
         try testing.expectEqual(@as(usize, 0), n);
     }
 

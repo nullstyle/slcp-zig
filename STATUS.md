@@ -79,6 +79,21 @@ Both projects also use the pinned WASM schema compiler and runtime-matched
 generators described in the [toolchain migration record](docs/plans/capnp-wasm-toolchain.md).
 Generated schema bytes and application runtime pins are unchanged.
 
+The toolchain pin moved from `0.17.0-dev.1786+75044cb04` — a dev build
+ziglang.org has deleted, which made every CI install of it a lottery — to
+tagged Zig `0.17.0`, in `mise.toml` and the `build.zig.zon` floor. 0.17.0's
+`net.Stream.read` returns an `Io.net.Stream.ReadResult` struct and its own
+std implementation does not compile, so the overlay's connection reads, two
+raw-socket test helpers and the registry example's RPC reads submit
+`net_read` operations directly and read `data_len`; every read keeps its
+`usize` contract and no caller changed. The full fresh-cache graph
+re-validates on 0.17.0: 134/134 steps with 715 tests passed and two
+expected skips, 15,000 simulation cells, 1,000 seeds for each of two
+Byzantine actors, four WASM differential traces and 300 fuzz iterations,
+440 documentation checks, and the frozen 292-declaration Stable API
+snapshot. Extracted-package preflight re-runs on the commit (it archives
+HEAD by design and cannot validate a dirty tree).
+
 ## Previous feature work: durable application watermark
 
 Experimental `RecoveryOptions.retain_until_durable` protects local replay for

@@ -1,7 +1,7 @@
 .{
     .name = .slcp,
     .version = "0.2.0",
-    .minimum_zig_version = "0.17.0-dev.1786",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .capnpc_zig = .{
             .url = "https://github.com/nullstyle/capnp-zig/archive/refs/tags/v0.16.0.tar.gz",
