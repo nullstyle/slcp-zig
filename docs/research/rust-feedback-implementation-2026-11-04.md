@@ -31,10 +31,13 @@ including kill/restart, partition/heal and renewed progress. Stable API declarat
 schema/generated/vector files retained their prior contents. The x86-64 Linux
 native CLI cross-compiles; this does not establish Linux runtime results.
 
-Artifact-tool tests passed 16/16, including corruption/inventory/source
+Artifact-tool tests passed 18/18, including corruption/inventory/source
 substitution, skipped/vacuous gates, broken packaged WASM, unknown profiles and
 required gates, untracked-source contamination and actual shallow-source
-rejection. Packaging builds its executables from a fresh clone of the bundled
+rejection and an actual Zig 0.17 build using the qualification cache controls.
+The first cold artifact attempt caught an unsupported global-cache CLI flag;
+that attempt's failure receipt remains intact. The corrected qualifier uses
+`ZIG_GLOBAL_CACHE_DIR` and a supported local-cache argument. Packaging builds its executables from a fresh clone of the bundled
 commit. CI fetches full history for that job and retains the archive and
 qualification evidence.
 

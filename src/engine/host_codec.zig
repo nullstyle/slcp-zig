@@ -22,8 +22,9 @@
 //!
 //! Field mapping notes (§7.1):
 //!   - Limits: 0 on the wire = engine default. ENCODE writes the actual
-//!     configured values (never 0 — defaults are nonzero); DECODE maps each
-//!     0 field to the limits.zig default.
+//!     configured values, including an explicit direct-API zero; DECODE maps
+//!     each 0 field to the limits.zig default. Such a zero does not round-trip
+//!     through v1: the separate SLCPRUN1 conformance controls preserve it.
 //!   - secretSeed: empty/absent Data = watcher (secret_seed = null).
 //!   - strictCanonical: capnp default true (host.capnp is unsigned, so a
 //!     non-zero default is allowed).

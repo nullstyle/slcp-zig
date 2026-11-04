@@ -285,6 +285,19 @@ def gate_evidence(name, output):
     return bool(re.search(rb"\b[1-9][0-9]*/[1-9][0-9]* tests passed\b", output))
 
 
+def qualification_environment(cache):
+    return dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(cache / "global"),
+                ZIG_LOCAL_CACHE_DIR=str(cache / "local"),
+                ZIG_LOCAL_PKG_DIR=str(cache / "packages"),
+                CAPNP_WASM_CACHE=str(cache / "capnp"), GIT_TERMINAL_PROMPT="0")
+
+
+def qualification_build_command(zig, steps, cache):
+    # Zig 0.17's build frontend accepts --cache-dir. Its global cache is
+    # selected through ZIG_GLOBAL_CACHE_DIR, not --global-cache-dir.
+    return [zig, "build", *steps, "--cache-dir", cache / "local", "--summary", "all"]
+
+
 def qualify(archive, expected_sha256, destination):
     manifest = restore(archive, expected_sha256, destination)
     reference = destination / "reference"
@@ -303,10 +316,7 @@ def qualify(archive, expected_sha256, destination):
     if target != manifest["builtWith"]["nativeTarget"]:
         raise ValueError("packaged native runner target mismatch; build an artifact for this target")
     cache = destination / "qualification-cache"
-    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(cache / "global"),
-               ZIG_LOCAL_CACHE_DIR=str(cache / "local"),
-               ZIG_LOCAL_PKG_DIR=str(cache / "packages"),
-               CAPNP_WASM_CACHE=str(cache / "capnp"), GIT_TERMINAL_PROMPT="0")
+    env = qualification_environment(cache)
     receipts = []
     receipt = {"format": "SLCP-CONFORMANCE-RECEIPT-1", "source": manifest["source"],
                "artifactSha256": expected_sha256, "versions": versions,
@@ -315,8 +325,7 @@ def qualify(archive, expected_sha256, destination):
     logs = destination / "logs"
     logs.mkdir()
     commands = [("bootstrap", [sys.executable, "tools/capnp_tool.py", "bootstrap"])]
-    commands += [(name, [zig, "build", *steps, "--cache-dir", cache / "local",
-                         "--global-cache-dir", cache / "global", "--summary", "all"])
+    commands += [(name, qualification_build_command(zig, steps, cache))
                  for name, steps in GATES]
     commands.append(("packaged-runner", [destination / "bin/slcp-conformance-runner",
                                          "vectors/runner/SLCPRUN1.json"]))

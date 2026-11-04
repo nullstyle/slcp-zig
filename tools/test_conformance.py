@@ -310,6 +310,38 @@ class ConformanceTests(unittest.TestCase):
         self.assertFalse(receipt["passed"])
         self.assertTrue(receipt["gates"][0]["skipped"])
 
+    def test_qualification_commands_use_supported_cli_and_fresh_cache_environment(self):
+        cache = self.root / "qualification-cache"
+        with mock.patch.dict(os.environ, {"ZIG_GLOBAL_CACHE_DIR": "/unrelated/warm-global",
+                                          "ZIG_LOCAL_CACHE_DIR": "/unrelated/warm-local",
+                                          "ZIG_LOCAL_PKG_DIR": "/unrelated/warm-packages",
+                                          "CAPNP_WASM_CACHE": "/unrelated/warm-capnp"}):
+            environment = tool.qualification_environment(cache)
+        for variable, suffix in (("ZIG_GLOBAL_CACHE_DIR", "global"), ("ZIG_LOCAL_CACHE_DIR", "local"),
+                                 ("ZIG_LOCAL_PKG_DIR", "packages"), ("CAPNP_WASM_CACHE", "capnp")):
+            self.assertEqual(environment[variable], str(cache / suffix))
+            self.assertFalse((cache / suffix).exists())
+        for _, steps in tool.GATES:
+            command = tool.qualification_build_command("zig", steps, cache)
+            self.assertNotIn("--global-cache-dir", command)
+            self.assertEqual(command[command.index("--cache-dir") + 1], cache / "local")
+            self.assertEqual(command[-2:], ["--summary", "all"])
+
+    def test_real_pinned_zig_accepts_qualification_cache_arguments(self):
+        zig = os.environ.get("ZIG", "zig")
+        self.assertEqual(tool.invoke([zig, "version"]).decode().strip(), "0.17.0")
+        reference = self.root / "minimal-build"
+        reference.mkdir()
+        (reference / "build.zig").write_text(
+            'const std = @import("std");\n'
+            'pub fn build(b: *std.Build) void { _ = b.step("probe", "cache argument probe"); }\n')
+        cache = self.root / "fresh-zig-cache"
+        output = tool.invoke(tool.qualification_build_command(zig, ["probe"], cache),
+                             cwd=reference, env=tool.qualification_environment(cache), timeout=120)
+        self.assertIn(b"Build Summary:", output)
+        self.assertTrue((cache / "global").is_dir())
+        self.assertTrue((cache / "local").is_dir())
+
     def test_successful_noop_or_empty_runner_is_not_completed_work(self):
         for name in ("bootstrap", "vectors", "runner", "wasm", "canonical", "packaged-runner", "packaged-cross-target"):
             with self.subTest(name=name):
