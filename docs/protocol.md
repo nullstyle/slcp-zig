@@ -1068,6 +1068,14 @@ the paired `broadcast_envelope`. A failed append latches the node **inert**
 cannot persist must go silent. `externalized` → append + fsync
 `externalized.log` → deliver to the app.
 
+Native acknowledgements use the
+[native durability profile](native-durability.md): macOS additionally requires
+successful `F_FULLFSYNC`, with no fallback on rejection. File creation and
+replacement synchronize directory entries and a subsequent macOS media flush.
+An uncertain write, sync or compaction barrier stops the writer; reopen and
+recover before continuing. This failure-policy clarification changes no v1
+persistence bytes and does not establish physical power-loss qualification.
+
 **GC / answering window**: `Node.Options.answering_window_slots = W` defaults
 to 16 and accepts 1..62. The upper bound reserves one Engine slot for current
 consensus and one for far-ahead catch-up. Once the delivered frontier `F >= W`,

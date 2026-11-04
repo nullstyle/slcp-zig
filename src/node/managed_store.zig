@@ -10,6 +10,8 @@ const session = core.adaptivity.session;
 const migration = core.adaptivity.migration;
 const policy = core.adaptivity.policy;
 const journal_mod = @import("adaptivity_journal.zig");
+const durability = @import("durability.zig");
+const builtin = @import("builtin");
 
 const ParentRecord = struct { network_id: [32]u8, generation: u64, policy: policy.Config };
 const ActivationRecord = struct {
@@ -375,6 +377,79 @@ fn drain(store: *Store, managed: *session.Session) !void {
     if (store.pending_application != null) {
         try store.acknowledgeApplied(managed);
         while (try managed.popEffect() != null) try managed.commitEffect();
+    }
+}
+
+test "durability: managed persistence failure leaves activation gate uncommitted" {
+    for ([_]durability.Testing.Operation{ .file_sync, .media_flush }) |operation| {
+        if (operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [256]u8 = undefined;
+        const path = try testPath(&tmp, &buffer);
+        const seed: [32]u8 = @splat(0x69);
+        var qs = try testQuorum(seed);
+        defer qs.deinit(testing.allocator);
+        const genesis = testGenesis(&qs, seed);
+        const identity: journal_mod.Identity = .{ .node_id = qs.validators[0], .root_network_id = genesis.network_id };
+        {
+            const managed = try session.Session.createGenesis(testing.allocator, genesis);
+            defer managed.deinit();
+            var store = try Store.create(testing.allocator, testing.io, path, managed, .{});
+            defer store.deinit();
+            durability.Testing.fault = .{ .operation = operation, .handle = store.journal.file.handle };
+            defer durability.Testing.fault = null;
+            const expected = if (operation == .media_flush) error.FullSyncFailed else error.FileSyncFailed;
+            try testing.expectError(expected, store.persistEffect(managed));
+            try testing.expectEqual(.activation_pending, managed.status());
+            try testing.expect((try managed.popEffect()).?.* == .persist_activation);
+            durability.Testing.fault = null;
+            try testing.expectError(error.JournalFailed, store.persistEffect(managed));
+        }
+        var reopened = try Store.open(testing.allocator, testing.io, path, identity, .{});
+        defer reopened.deinit();
+        var recovered = try reopened.recover();
+        defer recovered.deinit();
+        const managed = try recovered.restoreGenesis(genesis);
+        defer managed.deinit();
+        try drain(&reopened, managed);
+        try managed.proposeApplication("progress after recovered activation");
+        try drain(&reopened, managed);
+        try testing.expectEqual(@as(u64, 2), managed.nextSlot());
+    }
+}
+
+test "durability: managed checkpoint failure refuses application acknowledgement" {
+    for ([_]durability.Testing.Operation{ .file_sync, .media_flush }) |operation| {
+        if (operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [256]u8 = undefined;
+        const path = try testPath(&tmp, &buffer);
+        const seed: [32]u8 = @splat(0x6a);
+        var qs = try testQuorum(seed);
+        defer qs.deinit(testing.allocator);
+        const genesis = testGenesis(&qs, seed);
+        const managed = try session.Session.createGenesis(testing.allocator, genesis);
+        defer managed.deinit();
+        var store = try Store.create(testing.allocator, testing.io, path, managed, .{});
+        defer store.deinit();
+        try drain(&store, managed);
+        try managed.proposeApplication("decided value");
+        while (try managed.popEffect()) |effect| {
+            if (effect.* == .application) break;
+            if (!try store.persistEffect(managed)) try managed.commitEffect();
+        }
+        try testing.expect((try managed.popEffect()).?.* == .application);
+        durability.Testing.fault = .{ .operation = operation, .handle = store.journal.file.handle };
+        defer durability.Testing.fault = null;
+        const expected = if (operation == .media_flush) error.FullSyncFailed else error.FileSyncFailed;
+        try testing.expectError(expected, store.checkpointApplication(managed, "complete state"));
+        durability.Testing.fault = null;
+        try testing.expectError(error.JournalFailed, store.acknowledgeApplied(managed));
+        try testing.expect((try managed.popEffect()).?.* == .application);
+        try testing.expectEqual(@as(u64, 1), managed.nextSlot());
+        try testing.expectError(error.EffectsNotDrained, managed.proposeApplication("must remain blocked"));
     }
 }
 

@@ -7,12 +7,14 @@
 //! Creation is atomic AND durable: the seed is written to an unnamed/temp
 //! file (0600 from birth), fsync'd (plus F_FULLFSYNC on macOS, where fsync
 //! alone does not flush the drive cache), and only then linked into place
-//! under the final name. A crash, ENOSPC, or power loss mid-ceremony leaves
+//! under the final name. The containing directory is synchronized and a final
+//! macOS media flush succeeds before an identity is returned. A failed barrier
+//! may leave a complete named seed; loading retries those barriers rather than
+//! minting over it. A crash, ENOSPC, or power loss mid-ceremony leaves
 //! either no key file at all (next boot mints a fresh identity — fine, the
 //! old one never existed durably) or the complete 32-byte file. It can never
-//! leave a partial file that bricks startup, and it can never expose a name
-//! whose seed bytes are not yet on disk (which could otherwise mint a NEW
-//! identity on the next boot — identity-level equivocation).
+//! leave a partial file that bricks startup. These are syscall-level durability
+//! barriers; physical power-loss qualification is separate.
 //!
 //! Watcher nodes call `ephemeral(io)` instead: a random nodeId that never
 //! signs (the engine needs one for its maps; §11).
@@ -40,6 +42,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("slcp-core");
+const durability = @import("durability.zig");
 
 pub const Error = error{ BadKeyFile, EntropyUnavailable, KeyFileExists } || std.mem.Allocator.Error;
 
@@ -91,6 +94,7 @@ pub fn loadOrCreate(io: std.Io, path: []const u8) LoadOrCreateError!KeyPair {
         const n = try file.readPositionalAll(io, &buf, 0);
         if (n != 32) return error.BadKeyFile;
         seed = buf[0..32].*;
+        try confirmDurability(io, cwd, path, file);
     } else |err| switch (err) {
         // First run: mint fresh OS entropy and commit it atomically + durably
         // with owner-only perms set at creation, so the seed never exists on
@@ -119,6 +123,7 @@ pub fn load(io: std.Io, path: []const u8) LoadError!KeyPair {
     const n = try file.readPositionalAll(io, &buf, 0);
     if (n != 32) return error.BadKeyFile;
     const seed = buf[0..32].*;
+    try confirmDurability(io, cwd, path, file);
     return .{ .seed = seed, .public_key = try core.crypto.publicKeyFromSeed(seed) };
 }
 
@@ -181,16 +186,25 @@ fn mint(io: std.Io, cwd: std.Io.Dir, path: []const u8, seed: *[32]u8) MintError!
     // loss after link-but-before-flush would otherwise leave a named
     // key file whose content evaporates, so the next boot silently
     // mints a different identity.
-    try af.file.sync(io);
-    if (comptime builtin.os.tag == .macos) {
-        // fsync(2) on macOS does not flush the drive's own cache;
-        // F_FULLFSYNC asks for a true flush to media. Filesystems
-        // that lack it (e.g. SMB) fail the fcntl — the plain fsync
-        // above is then the best available, so this is deliberately
-        // non-fatal (the same fallback SQLite uses).
-        _ = std.c.fcntl(af.file.handle, std.posix.F.FULLFSYNC);
-    }
+    durability.syncFile(io, af.file) catch return error.InputOutput;
     try af.link(io);
+    // link consumes the temporary handle. Reopen the complete published key
+    // for the final media barrier after synchronizing its containing entry.
+    const published = cwd.openFile(io, path, .{}) catch return error.InputOutput;
+    defer published.close(io);
+    try confirmDurability(io, cwd, path, published);
+}
+
+/// Retrying a failed publication must reuse the complete seed already named
+/// on disk. Confirm the same barriers on load before returning an identity;
+/// never acknowledge the failed creation merely because its name survived.
+/// Map failures into the existing frozen key error vocabulary.
+fn confirmDurability(io: std.Io, cwd: std.Io.Dir, path: []const u8, file: std.Io.File) error{InputOutput}!void {
+    durability.syncFile(io, file) catch return error.InputOutput;
+    const parent = cwd.openDir(io, std.fs.path.dirname(path) orelse ".", .{ .iterate = true }) catch return error.InputOutput;
+    defer parent.close(io);
+    durability.syncDirectory(io, parent) catch return error.InputOutput;
+    durability.flushMedia(file) catch return error.InputOutput;
 }
 
 /// A random, non-signing identity for watcher mode.
@@ -205,6 +219,76 @@ pub fn ephemeral(io: std.Io) !KeyPair {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "durability: key barriers refuse identity and preserve uncertain publication" {
+    const fault = durability.Testing;
+    const io = testing.io;
+    inline for (.{ .file_sync, .media_flush, .directory_sync }) |operation| {
+        if (operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try tmpPath(io, &tmp, &path_buf, "failed.seed");
+        fault.injected = 0;
+        fault.fault = .{ .operation = operation };
+        defer fault.fault = null;
+        try testing.expectError(error.InputOutput, createNew(io, path));
+        try testing.expectEqual(@as(usize, 1), fault.injected);
+        fault.fault = null;
+        if (operation == .directory_sync) {
+            // Publication happened but was not acknowledged. Loading retries
+            // its barriers and preserves exactly that seed, without reminting.
+            const original = try tmp.dir.readFileAlloc(io, "failed.seed", testing.allocator, .limited(33));
+            defer testing.allocator.free(original);
+            const recovered = try loadOrCreate(io, path);
+            try testing.expectEqualSlices(u8, original, &recovered.seed);
+        } else {
+            try testing.expectError(error.FileNotFound, load(io, path));
+        }
+    }
+}
+
+test "durability: key publication requires the media flush after directory sync" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const fault = durability.Testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "published.seed");
+    fault.injected = 0;
+    // Pre-link file flush, reopened-file flush, then post-directory flush.
+    fault.fault = .{ .operation = .media_flush, .after = 2 };
+    defer fault.fault = null;
+    try testing.expectError(error.InputOutput, createNew(io, path));
+    try testing.expectEqual(@as(usize, 1), fault.injected);
+    const original = try tmp.dir.readFileAlloc(io, "published.seed", testing.allocator, .limited(33));
+    defer testing.allocator.free(original);
+    fault.fault = null;
+    const recovered = try load(io, path);
+    try testing.expectEqualSlices(u8, original, &recovered.seed);
+}
+
+test "durability: loading a key retries every required barrier before returning" {
+    const fault = durability.Testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpPath(io, &tmp, &path_buf, "existing.seed");
+    const created = try createNew(io, path);
+    inline for (.{ .file_sync, .media_flush, .directory_sync }) |operation| {
+        if (operation == .media_flush and builtin.os.tag != .macos) continue;
+        fault.injected = 0;
+        fault.fault = .{ .operation = operation };
+        defer fault.fault = null;
+        try testing.expectError(error.InputOutput, load(io, path));
+        try testing.expectEqual(@as(usize, 1), fault.injected);
+        fault.fault = null;
+        const recovered = try load(io, path);
+        try testing.expectEqualSlices(u8, &created.seed, &recovered.seed);
+    }
+}
 
 /// The absolute path of `name` inside `tmp`, written into `buf`. Keeps the file
 /// tests off the tmpDir internal layout: `loadOrCreate` resolves paths against

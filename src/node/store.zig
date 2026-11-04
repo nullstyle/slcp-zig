@@ -72,6 +72,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("slcp-core");
+const durability = @import("durability.zig");
 
 const Crc32 = std.hash.Crc32;
 
@@ -141,6 +142,8 @@ pub const Store = struct {
     ext_file: std.Io.File,
     /// Owned copy of the data-dir path (diagnostics only).
     data_dir: []u8,
+    /// An uncertain write/barrier requires closing and recovering a new Store.
+    failed: bool = false,
 
     /// Open (creating if needed) the data dir and both logs. Takes the
     /// data_dir's exclusive lock first: `Busy` if another live Store holds it.
@@ -148,7 +151,7 @@ pub const Store = struct {
     /// so the node can tell "permission denied" from "read-only" from
     /// "disk full" (review finding).
     pub fn open(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) !Store {
-        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{});
+        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{ .open_options = .{ .iterate = true } });
         errdefer dir.close(io);
 
         // One live process per data_dir (design §10; threat-model §7): the
@@ -174,6 +177,14 @@ pub const Store = struct {
         errdefer own_file.close(io);
         const ext_file = try dir.createFile(io, ext_log_name, .{ .truncate = false, .read = true });
         errdefer ext_file.close(io);
+
+        // Establish both contents and namespace before any signing append.
+        // Repeat on reopen so an unacknowledged prior creation is confirmed.
+        try fullSync(io, own_file);
+        try fullSync(io, ext_file);
+        durability.syncDirectory(io, dir) catch return Error.IoFailed;
+        durability.syncParentDirectories(io, data_dir) catch return Error.IoFailed;
+        durability.flushMedia(ext_file) catch return Error.IoFailed;
 
         const dd = try gpa.dupe(u8, data_dir);
 
@@ -213,6 +224,7 @@ pub const Store = struct {
     /// before returning. fsync completing before return is the write-ahead
     /// durability guarantee the Node relies on (§10: persist precedes broadcast).
     fn appendRecord(self: *Store, file: std.Io.File, slot: u64, payload: []const u8) Error!void {
+        if (self.failed) return Error.IoFailed;
         const total = rec_header_len + payload.len + rec_crc_len;
         const rec = try self.gpa.alloc(u8, total);
         defer self.gpa.free(rec);
@@ -225,6 +237,7 @@ pub const Store = struct {
 
         // Positional append: write at the current end, so a kept-open handle
         // never depends on a global seek position.
+        errdefer self.failed = true;
         const end = file.length(self.io) catch return Error.IoFailed;
         var buf: [4096]u8 = undefined;
         var w = file.writer(self.io, &buf);
@@ -239,6 +252,7 @@ pub const Store = struct {
     /// truncated back to its valid prefix through the open handle, so
     /// subsequent appends land on a clean record boundary.
     pub fn recover(self: *Store, gpa: std.mem.Allocator) !Recovery {
+        if (self.failed) return Error.IoFailed;
         var torn_tail_repaired = false;
 
         const own_data = self.dir.readFileAlloc(self.io, own_log_name, gpa, .unlimited) catch |err| switch (err) {
@@ -253,7 +267,10 @@ pub const Store = struct {
             gpa.free(own_scan.records);
         }
         if (own_scan.tail != .clean) {
-            try truncateTo(self.io, self.own_file, own_scan.valid_len);
+            truncateTo(self.io, self.own_file, own_scan.valid_len) catch |err| {
+                self.failed = true;
+                return err;
+            };
             if (own_scan.tail == .torn) torn_tail_repaired = true;
         }
 
@@ -283,7 +300,10 @@ pub const Store = struct {
             gop.value_ptr.* = copy;
         }
         if (ext_iter.tail != .clean) {
-            try truncateTo(self.io, self.ext_file, ext_iter.pos);
+            truncateTo(self.io, self.ext_file, ext_iter.pos) catch |err| {
+                self.failed = true;
+                return err;
+            };
             if (ext_iter.tail == .torn) torn_tail_repaired = true;
         }
 
@@ -379,8 +399,15 @@ pub const Store = struct {
     /// keeps the recent journal — its high-water mark is preserved because the
     /// max-slot record always survives.) Called occasionally by the Node.
     pub fn compact(self: *Store, keep_from_slot: u64) Error!void {
-        try self.compactLog(&self.own_file, own_log_name, own_tmp_name, keep_from_slot);
-        try self.compactLog(&self.ext_file, ext_log_name, ext_tmp_name, keep_from_slot);
+        if (self.failed) return Error.IoFailed;
+        self.compactLog(&self.own_file, own_log_name, own_tmp_name, keep_from_slot) catch |err| {
+            if (err == Error.IoFailed) self.failed = true;
+            return err;
+        };
+        self.compactLog(&self.ext_file, ext_log_name, ext_tmp_name, keep_from_slot) catch |err| {
+            if (err == Error.IoFailed) self.failed = true;
+            return err;
+        };
     }
 
     /// Rewrite one log, dropping records with slot < keep_from_slot. Surviving
@@ -435,23 +462,17 @@ pub const Store = struct {
         file.close(io);
         file.* = tmp;
 
-        // Durability barrier for the rename itself (on darwin F_FULLFSYNC
-        // flushes the journal and the drive cache; a lost-but-atomic rename on
-        // other targets still leaves the old complete log, which is safe).
-        try fullSync(io, tmp);
+        // Persist the namespace change before the final media flush. A file
+        // sync alone does not establish that the replacement name is durable.
+        durability.syncDirectory(io, self.dir) catch return Error.IoFailed;
+        durability.flushMedia(tmp) catch return Error.IoFailed;
     }
 };
 
-/// fsync `file`, upgraded to a real media flush on macOS. Plain fsync there
-/// only reaches the drive cache; F_FULLFSYNC asks the drive to flush to
-/// stable media — required for the §10 persist-precedes-broadcast guarantee.
-/// If the filesystem rejects F_FULLFSYNC (e.g. SMB), the completed fsync is
-/// the strongest barrier available, so — like SQLite — fall back to it.
+/// A successful acknowledgement requires file sync and, on macOS, a checked
+/// media-flush request. Unsupported FULLFSYNC is an error, never a downgrade.
 fn fullSync(io: std.Io, file: std.Io.File) Error!void {
-    file.sync(io) catch return Error.IoFailed;
-    if (comptime builtin.os.tag == .macos) {
-        _ = std.c.fcntl(file.handle, std.c.F.FULLFSYNC);
-    }
+    durability.syncFile(io, file) catch return Error.IoFailed;
 }
 
 /// Cut `file` back to `new_len` bytes (a log's valid prefix) and sync, so the
@@ -459,6 +480,102 @@ fn fullSync(io: std.Io, file: std.Io.File) Error!void {
 fn truncateTo(io: std.Io, file: std.Io.File, new_len: usize) Error!void {
     file.setLength(io, new_len) catch return Error.IoFailed;
     try fullSync(io, file);
+}
+
+test "durability: store refuses uncertain append until reopen" {
+    for ([_]durability.Testing.Operation{ .file_sync, .media_flush }) |operation| {
+        if (operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+        {
+            var store = try Store.open(testing.allocator, testing.io, path);
+            defer store.deinit();
+            durability.Testing.fault = .{ .operation = operation, .handle = store.ext_file.handle };
+            defer durability.Testing.fault = null;
+            try testing.expectError(error.IoFailed, store.appendExternalized(1, "uncertain decision"));
+            durability.Testing.fault = null;
+            try testing.expectError(error.IoFailed, store.appendExternalized(2, "must not continue"));
+            try testing.expectError(error.IoFailed, store.recover(testing.allocator));
+            try testing.expectError(error.IoFailed, store.compact(1));
+        }
+        var reopened = try Store.open(testing.allocator, testing.io, path);
+        defer reopened.deinit();
+        var recovered = try reopened.recover(testing.allocator);
+        defer Store.deinitRecovery(testing.allocator, &recovered);
+        try testing.expectEqual(@as(usize, 1), recovered.ext_tail.len);
+        try testing.expectEqualStrings("uncertain decision", recovered.ext_tail[0].value);
+        try reopened.appendExternalized(2, "safe continuation after recovery");
+    }
+}
+
+test "durability: store creation refuses file and namespace barrier failures" {
+    const faults = [_]durability.Testing.Fault{
+        .{ .operation = .file_sync },
+        .{ .operation = .media_flush },
+        .{ .operation = .directory_sync },
+        .{ .operation = .directory_sync, .after = 1 },
+        .{ .operation = .directory_sync, .after = 2 },
+        .{ .operation = .media_flush, .after = 2 },
+    };
+    for (faults) |fault| {
+        if (fault.operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const base = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/new-parent/new-child", .{base});
+        defer testing.allocator.free(path);
+        durability.Testing.fault = fault;
+        defer durability.Testing.fault = null;
+        if (Store.open(testing.allocator, testing.io, path)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.CreationAcknowledgedWithoutDurabilityBarrier;
+        } else |err| try testing.expectEqual(error.IoFailed, err);
+        durability.Testing.fault = null;
+        var reopened = try Store.open(testing.allocator, testing.io, path);
+        defer reopened.deinit();
+        var recovered = try reopened.recover(testing.allocator);
+        defer Store.deinitRecovery(testing.allocator, &recovered);
+        try testing.expectEqual(@as(usize, 0), recovered.ext_tail.len);
+        try reopened.appendExternalized(1, "first acknowledged decision");
+    }
+}
+
+test "durability: compaction barrier failure stops the writer and reopens a complete generation" {
+    for ([_]durability.Testing.Fault{
+        .{ .operation = .file_sync },
+        .{ .operation = .media_flush },
+        .{ .operation = .directory_sync },
+        .{ .operation = .directory_sync, .after = 1 },
+        .{ .operation = .media_flush, .after = 3 },
+    }) |fault| {
+        if (fault.operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+        {
+            var store = try Store.open(testing.allocator, testing.io, path);
+            defer store.deinit();
+            try store.appendExternalized(1, "older");
+            try store.appendExternalized(2, "retained");
+            durability.Testing.fault = fault;
+            defer durability.Testing.fault = null;
+            try testing.expectError(error.IoFailed, store.compact(2));
+            durability.Testing.fault = null;
+            try testing.expectError(error.IoFailed, store.appendExternalized(3, "must not continue"));
+        }
+        var reopened = try Store.open(testing.allocator, testing.io, path);
+        defer reopened.deinit();
+        var recovered = try reopened.recover(testing.allocator);
+        defer Store.deinitRecovery(testing.allocator, &recovered);
+        try testing.expectEqual(@as(?u64, 2), recovered.externalized_hwm);
+        try testing.expectEqualStrings("retained", recovered.ext_tail[recovered.ext_tail.len - 1].value);
+        try reopened.appendExternalized(3, "safe continuation after generation recovery");
+    }
 }
 
 /// Front-to-back reader over a log's framed records. `pos` only advances past

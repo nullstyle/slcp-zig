@@ -467,8 +467,10 @@ writes without stopping consensus.
   replay; a stalled publisher retains a longer journal. Applications must
   bound unpublished work and prove checkpoint/replay continuity. Peer/cache,
   Engine restoration, and gap bounds remain unchanged.
-- Cost: every own emission pays a disk sync (`fsync`, plus `F_FULLFSYNC` on
-  macOS for the key file). On slow disks this throttles ballot rounds
+- Cost: every own emission pays a disk sync (`fsync`, plus checked
+  `F_FULLFSYNC` on macOS). A rejected media flush stops the writer; there is
+  no weaker fallback. Creation/replacement also synchronize directory entries
+  under the [native durability profile](native-durability.md). On slow disks this throttles ballot rounds
   (design §16); acceptable at seconds-scale slots.
 
 ## 7. Keys

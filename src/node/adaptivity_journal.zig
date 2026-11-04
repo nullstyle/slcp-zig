@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const durability = @import("durability.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
 const magic = "SLCPAJ1\x00";
 const header_len = 76;
@@ -110,7 +111,8 @@ pub const Journal = struct {
             try file.writeStreamingAll(io, &header);
             try syncFile(io, file);
             // Persist the filename as well as its contents before signing.
-            try syncFile(io, .{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
+            try durability.syncDirectory(io, dir);
+            try durability.flushMedia(file);
         }
         var digest: [32]u8 = undefined;
         Hash.hash(&header, &digest, .{});
@@ -180,8 +182,13 @@ pub const Journal = struct {
         errdefer self.gpa.free(owned_records);
         if (torn) {
             try self.file.setLength(self.io, offset);
-            try syncFile(self.io, self.file);
         }
+        // A prior failed barrier may have left a complete cached append or
+        // an unconfirmed filename. Confirm both before recovery can release
+        // original signed bytes or acknowledge application state.
+        try syncFile(self.io, self.file);
+        try durability.syncDirectory(self.io, self.dir);
+        try durability.flushMedia(self.file);
         self.end = offset;
         self.sequence = sequence;
         self.recovered = true;
@@ -225,12 +232,7 @@ pub const Journal = struct {
 };
 
 fn syncFile(io: std.Io, file: std.Io.File) !void {
-    try file.sync(io);
-    if (comptime builtin.os.tag == .macos) {
-        // Match the native store's best-effort media-flush upgrade. Filesystems
-        // without FULLFSYNC support retain the successful fsync barrier above.
-        _ = std.c.fcntl(file.handle, std.c.F.FULLFSYNC);
-    }
+    return durability.syncFile(io, file);
 }
 
 const testing = std.testing;
@@ -238,6 +240,96 @@ const test_identity: Identity = .{ .node_id = @splat(3), .root_network_id = @spl
 
 fn testPath(tmp: *testing.TmpDir, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+}
+
+test "durability: journal media-flush failure refuses append acknowledgement until reopen" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [256]u8 = undefined;
+    const path = try testPath(&tmp, &buffer);
+    {
+        var journal = try Journal.create(testing.allocator, testing.io, path, test_identity, .{});
+        defer journal.deinit();
+        durability.Testing.fault = .{ .operation = .media_flush, .handle = journal.file.handle };
+        defer durability.Testing.fault = null;
+        try testing.expectError(error.FullSyncFailed, journal.append(.initial, "uncertain activation"));
+        durability.Testing.fault = null;
+        try testing.expectError(error.JournalFailed, journal.append(.own_envelope, "must not continue"));
+    }
+    var reopened = try Journal.open(testing.allocator, testing.io, path, test_identity, .{});
+    defer reopened.deinit();
+    try testing.expectError(error.RecoveryRequired, reopened.append(.initial, "must recover first"));
+    var recovered = try reopened.recover();
+    defer recovered.deinit();
+    try testing.expectEqual(@as(usize, 1), recovered.records.len);
+    try testing.expectEqualStrings("uncertain activation", recovered.records[0].payload);
+    try reopened.append(.own_envelope, "safe continuation after recovery");
+}
+
+test "durability: journal creation refuses a failed directory barrier" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [256]u8 = undefined;
+    const path = try testPath(&tmp, &buffer);
+    durability.Testing.fault = .{ .operation = .directory_sync };
+    defer durability.Testing.fault = null;
+    if (Journal.create(testing.allocator, testing.io, path, test_identity, .{})) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.CreationAcknowledgedWithoutDirectoryBarrier;
+    } else |err| try testing.expectEqual(error.DirectorySyncFailed, err);
+    durability.Testing.fault = null;
+    try testing.expectError(error.PathAlreadyExists, Journal.create(testing.allocator, testing.io, path, test_identity, .{}));
+    var reopened = try Journal.open(testing.allocator, testing.io, path, test_identity, .{});
+    defer reopened.deinit();
+    var recovered = try reopened.recover();
+    defer recovered.deinit();
+    try testing.expectEqual(@as(usize, 0), recovered.records.len);
+}
+
+test "durability: journal recovery confirms file and namespace barriers before exposing records" {
+    for ([_]durability.Testing.Fault{
+        .{ .operation = .file_sync },
+        .{ .operation = .media_flush },
+        .{ .operation = .directory_sync },
+        .{ .operation = .media_flush, .after = 1 },
+    }) |fault| {
+        if (fault.operation == .media_flush and builtin.os.tag != .macos) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [256]u8 = undefined;
+        const path = try testPath(&tmp, &buffer);
+        {
+            var journal = try Journal.create(testing.allocator, testing.io, path, test_identity, .{});
+            defer journal.deinit();
+            try journal.append(.initial, "activation");
+        }
+        {
+            var journal = try Journal.open(testing.allocator, testing.io, path, test_identity, .{});
+            defer journal.deinit();
+            durability.Testing.fault = fault;
+            defer durability.Testing.fault = null;
+            const expected = switch (fault.operation) {
+                .file_sync => error.FileSyncFailed,
+                .media_flush => error.FullSyncFailed,
+                .directory_sync => error.DirectorySyncFailed,
+            };
+            if (journal.recover()) |value| {
+                var unexpected = value;
+                unexpected.deinit();
+                return error.RecoveryExposedUnconfirmedHistory;
+            } else |err| try testing.expectEqual(expected, err);
+            durability.Testing.fault = null;
+            try testing.expectError(error.JournalFailed, journal.recover());
+        }
+        var reopened = try Journal.open(testing.allocator, testing.io, path, test_identity, .{});
+        defer reopened.deinit();
+        var recovered = try reopened.recover();
+        defer recovered.deinit();
+        try testing.expectEqual(@as(usize, 1), recovered.records.len);
+        try reopened.append(.own_envelope, "safe continuation");
+    }
 }
 
 test "adaptivity journal preserves ordered history and requires explicit recovery" {

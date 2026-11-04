@@ -137,6 +137,13 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Fixed
 
+- Native persistence acknowledgements now require successful macOS
+  `F_FULLFSYNC`, including the media barrier after directory publication.
+  Journal and Store failures stop the writer until reopen/recovery; Node
+  suppresses dependent broadcasts and delivery and halts on uncertain
+  compaction. Key publication/loading uses the same checked barriers without
+  changing its public error signatures. Failure-injection tests exercise file
+  sync, media flush, directory sync and recovery through real caller paths.
 - Per-peer inbound budget strikes are now forgiven after a full second with
   no inbound charge at all. Idle anti-entropy traffic — the answering-window
   re-flood plus `get_slot_state` answers, up to ~384 KiB inside one second at

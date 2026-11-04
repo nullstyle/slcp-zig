@@ -27,6 +27,7 @@ const overlay_mod = @import("overlay.zig");
 const app_gossip = @import("app_gossip.zig");
 const timers_mod = @import("timers.zig");
 const store_mod = @import("store.zig");
+const durability = @import("durability.zig");
 const qset_disk_cache = @import("qset_disk_cache.zig");
 const keys_mod = @import("keys.zig");
 const lint_report = @import("lint_report.zig");
@@ -45,6 +46,19 @@ test {
 }
 
 const log = std.log.scoped(.slcp_node);
+
+fn logPersistenceFailure(comptime format: []const u8, args: anytype) void {
+    // The standard test runner counts error logs as failures. Expected
+    // syscall faults still exercise the real caller's halt path and assert
+    // the exact injected failure; production error diagnostics are unchanged.
+    if (comptime @import("builtin").is_test) {
+        if (durability.Testing.fault != null) {
+            log.warn(format, args);
+            return;
+        }
+    }
+    log.err(format, args);
+}
 
 const default_answering_window_slots: u8 = 16;
 const max_answering_window_slots: u8 = 62;
@@ -2392,7 +2406,7 @@ pub const Node = struct {
     /// after the next crash.
     fn markFailed(self: *Node, err: anyerror) void {
         if (!self.failed.swap(true, .seq_cst)) {
-            log.err("node failed: {s} — going inert (§10 write-ahead discipline)", .{@errorName(err)});
+            logPersistenceFailure("node failed: {s} — going inert (§10 write-ahead discipline)", .{@errorName(err)});
             self.ext_mu.lockUncancelable(self.io);
             self.ext_closed = true;
             self.ext_cond.broadcast(self.io);
@@ -2415,7 +2429,7 @@ pub const Node = struct {
                 // On failure the node goes inert — applyInput then suppresses
                 // the rest of this input's effects, including that broadcast.
                 self.store.appendOwn(sb.slot, sb.bytes) catch |e| {
-                    log.err("own.log append failed: {s}", .{@errorName(e)});
+                    logPersistenceFailure("own.log append failed: {s}", .{@errorName(e)});
                     self.markFailed(e);
                 };
             },
@@ -2453,7 +2467,7 @@ pub const Node = struct {
         // Write-ahead journal first; a failed append is FATAL (the app must
         // never consume a value the crash-bound computation cannot see, §10).
         self.store.appendExternalized(slot, value) catch |e| {
-            log.err("externalized.log append failed: {s}", .{@errorName(e)});
+            logPersistenceFailure("externalized.log append failed: {s}", .{@errorName(e)});
             self.markFailed(e);
             return;
         };
@@ -2587,7 +2601,12 @@ pub const Node = struct {
             self.last_compact_frontier = frontier;
             self.last_compact_keep_from = keep_from;
         } else |err| {
-            log.warn("log compaction failed (will retry later): {s}", .{@errorName(err)});
+            if (self.store.failed) {
+                logPersistenceFailure("log compaction durability failed: {s}", .{@errorName(err)});
+                self.markFailed(err);
+            } else {
+                log.warn("log compaction refused before uncertain I/O (will retry later): {s}", .{@errorName(err)});
+            }
         }
     }
 
@@ -5297,6 +5316,106 @@ const GateFixture = struct {
         n.engine_thread = null;
     }
 };
+
+const DurabilityFailureProbe = struct {
+    failure: ?anyerror = null,
+    delivered: usize = 0,
+
+    fn onExternalized(ctx: *anyopaque, _: u64, _: []const u8) anyerror!void {
+        const self: *DurabilityFailureProbe = @ptrCast(@alignCast(ctx));
+        self.delivered += 1;
+    }
+
+    fn onFailed(ctx: *anyopaque, err: anyerror) void {
+        const self: *DurabilityFailureProbe = @ptrCast(@alignCast(ctx));
+        self.failure = err;
+    }
+
+    fn hook(self: *DurabilityFailureProbe) DeliveryHook {
+        return .{ .ctx = self, .on_externalized = onExternalized, .on_failed = onFailed };
+    }
+
+    fn nomination(gpa: std.mem.Allocator, slot: u64) !InputItem {
+        const value = try gpa.dupe(u8, "decided");
+        errdefer gpa.free(value);
+        const previous = try gpa.dupe(u8, "");
+        return .{ .input = .{ .nominate = .{ .slot = slot, .value = value, .prev_value = previous } }, .source_peer = null };
+    }
+};
+
+test "durability: native append failures suppress dependent broadcast and application delivery" {
+    for ([_]durability.Testing.Operation{ .file_sync, .media_flush }) |operation| {
+        if (operation == .media_flush and @import("builtin").os.tag != .macos) continue;
+        for ([_]bool{ true, false }) |own| {
+            var f = try GateFixture.init(testing.allocator, testing.io);
+            defer f.deinit();
+            const seed: [32]u8 = @splat(0x4b);
+            const me = try crypto.publicKeyFromSeed(seed);
+            var probe: DurabilityFailureProbe = .{};
+            const n = try Node.create(testing.allocator, testing.io, .{
+                .network = GateFixture.passphrase,
+                .secret_seed = seed,
+                .quorum = Quorum.of(1, &.{me}),
+                .listen_port = 0,
+                .data_dir = f.dataDir(),
+                .diagnostic = &f.diag,
+                .delivery = probe.hook(),
+            });
+            defer n.deinit();
+            GateFixture.ownEngineThread(n);
+            const before = durability.Testing.injected;
+            durability.Testing.fault = .{ .operation = operation, .handle = if (own) n.store.own_file.handle else n.store.ext_file.handle };
+            defer durability.Testing.fault = null;
+            n.applyInput(try DurabilityFailureProbe.nomination(testing.allocator, 1));
+            try testing.expectEqual(before + 1, durability.Testing.injected);
+            try testing.expect(n.stats().failed);
+            try testing.expectEqual(error.IoFailed, probe.failure.?);
+            try testing.expectEqual(@as(usize, 0), probe.delivered);
+            try testing.expectEqual(@as(u64, 1), n.next_deliver);
+            if (own) try testing.expectEqual(@as(usize, 0), n.own_latest.count());
+            durability.Testing.fault = null;
+            n.applyInput(try DurabilityFailureProbe.nomination(testing.allocator, 2));
+            try testing.expect(n.eng.slots.get(2) == null);
+            try testing.expect(n.own_latest.get(2) == null);
+            try testing.expectEqual(@as(usize, 0), probe.delivered);
+        }
+    }
+}
+
+test "durability: native compaction namespace failure halts before accepting later input" {
+    var f = try GateFixture.init(testing.allocator, testing.io);
+    defer f.deinit();
+    const seed: [32]u8 = @splat(0x4c);
+    const me = try crypto.publicKeyFromSeed(seed);
+    var probe: DurabilityFailureProbe = .{};
+    const n = try Node.create(testing.allocator, testing.io, .{
+        .network = GateFixture.passphrase,
+        .watcher = true,
+        .quorum = Quorum.of(1, &.{me}),
+        .listen_port = 0,
+        .data_dir = f.dataDir(),
+        .diagnostic = &f.diag,
+        .delivery = probe.hook(),
+        .start_slot = 64,
+    });
+    defer n.deinit();
+    GateFixture.ownEngineThread(n);
+    const before = durability.Testing.injected;
+    durability.Testing.fault = .{ .operation = .directory_sync, .handle = n.store.dir.handle };
+    defer durability.Testing.fault = null;
+    n.applyInput(try f.item(n, seed, 64, .{ .externalize = "decided" }));
+    try testing.expectEqual(before + 1, durability.Testing.injected);
+    try testing.expect(n.stats().failed);
+    try testing.expectEqual(error.IoFailed, probe.failure.?);
+    // The decision append succeeded before this later namespace failure;
+    // delivery of that durable value is valid, further processing is forbidden.
+    try testing.expectEqual(@as(usize, 1), probe.delivered);
+    durability.Testing.fault = null;
+    n.applyInput(try f.item(n, seed, 65, .{ .externalize = "later" }));
+    try testing.expect(n.eng.slots.get(65) == null);
+    try testing.expect(n.own_latest.get(65) == null);
+    try testing.expectEqual(@as(usize, 1), probe.delivered);
+}
 
 const GateProbe = struct {
     fn heldOne(n: *Node) bool {

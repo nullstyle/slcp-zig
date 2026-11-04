@@ -146,8 +146,12 @@ session can release effects.
 
 `slcp.adaptivity_journal` supplies an exclusive-writer native journal bound to a
 node and root domain. Records are ordered, bounded and hash chained, with a
-separate checksum for length metadata. Append completes after file sync and a
-macOS media-flush upgrade. A new journal also syncs its directory entry.
+separate checksum for length metadata. Append completes after successful file
+sync and, on macOS, successful `F_FULLFSYNC`; a rejected media flush is an
+error, with no weaker fallback. A new journal also syncs its directory entry
+and checks a final macOS media flush after that directory barrier. See the
+[native durability profile](native-durability.md) for supported assumptions,
+publication barriers and failure-injection coverage.
 Reopen requires existing state and successful recovery before another append.
 An incomplete final write is repaired; complete corruption, reordering, wrong
 identity or a missing file fails closed. An uncertain append stops that journal
