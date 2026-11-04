@@ -11,8 +11,8 @@
 //!
 //!     zig build wasm && zig build wasm-diff
 //!
-//! `zig build wasm-diff` builds `slcp_core.wasm` itself, so it never silently
-//! skips. `zig build test` runs the SAME tests through a second run step that
+//! `zig build wasm-diff` builds `slcp_core.wasm` itself and requires every
+//! artifact, fixture and runtime. `zig build test` runs the same source in a soft binary that
 //! does NOT depend on the wasm artifact: on a clean tree (no `zig build wasm`
 //! yet) every test here reports `error.SkipZigTest` and the plain test suite
 //! still passes. The same skip covers a missing `node` and missing
@@ -74,6 +74,7 @@
 const std = @import("std");
 const slcp = @import("slcp-core");
 const adversary = @import("adversary");
+const differential_options = @import("wasm_differential_options");
 
 const engine = slcp.engine;
 const driver = slcp.driver;
@@ -127,12 +128,17 @@ const Host = struct {
     rdr: std.Io.File.Reader,
     next_id: u64 = 1,
 
-    /// Returns `error.SkipZigTest` when the wasm artifact, the runner script,
-    /// or `node` is absent, so a clean-tree `zig build test` stays green.
+    /// Ordinary tests may skip unavailable resources; the required gate fails.
     fn start(gpa: std.mem.Allocator) !*Host {
         const io = testing.io;
-        std.Io.Dir.cwd().access(io, wasm_path, .{ .read = true }) catch return error.SkipZigTest;
-        std.Io.Dir.cwd().access(io, host_script, .{ .read = true }) catch return error.SkipZigTest;
+        std.Io.Dir.cwd().access(io, wasm_path, .{ .read = true }) catch |err| {
+            if (differential_options.required) return err;
+            return error.SkipZigTest;
+        };
+        std.Io.Dir.cwd().access(io, host_script, .{ .read = true }) catch |err| {
+            if (differential_options.required) return err;
+            return error.SkipZigTest;
+        };
 
         const child = std.process.spawn(io, .{
             .argv = &.{ "node", host_script, wasm_path },
@@ -140,7 +146,10 @@ const Host = struct {
             .stdout = .pipe,
             .stderr = .inherit, // runner stack traces land in the test log
         }) catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest, // no node on PATH
+            error.FileNotFound => {
+                if (differential_options.required) return err;
+                return error.SkipZigTest;
+            },
             else => return err,
         };
 
@@ -451,7 +460,10 @@ fn parseTrace(gpa: std.mem.Allocator, bytes: []const u8) ![]TraceRecord {
 fn readTrace(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
     const path = try std.fmt.allocPrint(gpa, "vectors/traces/{s}.bin", .{name});
     defer gpa.free(path);
-    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .unlimited) catch null;
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .unlimited) catch |err| {
+        if (differential_options.required) return err;
+        return null;
+    };
 }
 
 /// A recorded observable (kind-3) frame and its replay, compared in a pass of
@@ -471,7 +483,10 @@ test "wasm differential: trace vectors replay byte-identically (native vs wasm v
     var observable: std.ArrayList(ObservablePair) = .empty;
 
     for (trace_names) |name| {
-        const bytes = (try readTrace(arena, name)) orelse return error.SkipZigTest;
+        const bytes = (try readTrace(arena, name)) orelse {
+            if (differential_options.required) return error.MissingRequiredTrace;
+            return error.SkipZigTest;
+        };
         const recs = try parseTrace(arena, bytes);
         try testing.expect(recs.len >= 2);
         try testing.expectEqual(@as(u8, 0), recs[0].kind); // config first

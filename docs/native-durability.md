@@ -26,8 +26,8 @@ directory handle.
 The convenience native Store also synchronizes the containing directory chain
 for its automatically created data directory. Managed Journal callers retain
 their existing obligation to supply a durably provisioned directory. Key-file
-parents must already exist; creation and loading confirm the key contents and
-its containing entry before returning an identity. A key left named by an
+parents must already exist and be durably provisioned; creation and loading
+confirm the key contents and its containing entry before returning an identity. A key left named by an
 unacknowledged publication is loaded and synchronized, never overwritten with a
 fresh identity.
 

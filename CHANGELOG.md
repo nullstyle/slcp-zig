@@ -15,6 +15,15 @@ pre-1.0 and uses [semver](https://semver.org/) as `RELEASING.md` classifies it
 
 ### Added
 
+- Additive shared compatibility fixtures for twelve hostile Ed25519 provider
+  cases, five full envelopes, unsigned wrapper construction, legacy qsets,
+  bounded eager decoding and receive precedence, checked independently in Rust.
+- Versioned `SLCPRUN1` native conformance controls for exact zero/default
+  limits, fatal push results, partial-effect disposition and sticky failure;
+  actual native/WASM checks report unrepresentable ABI v1 configurations.
+- A separately hashed conformance artifact with exact source bundle, profile,
+  schemas, fixtures, executables and tool identities; isolated qualification
+  refuses missing, skipped or vacuous required gates.
 - Stable `Node.Options.answering_window_slots`, mirrored by `AppNode`, makes
   bounded native live-peer catch-up configurable from 1 through 62 slots
   (default 16). One validated policy now governs restart restoration,

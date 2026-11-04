@@ -1,0 +1,312 @@
+{
+  "version": 1,
+  "provenance": {
+    "referenceCommit": "346d3ec67f5917f579e4d7505b3b1abb3194d898",
+    "zigVersion": "0.17.0",
+    "capnpZigVersion": "0.21.0",
+    "reviewIssue": "https://github.com/nullstyle/slcp-zig/issues/4",
+    "scope": "Finite regression corpus preserving v1; diagnostic names are implementation-specific."
+  },
+  "cases": [
+    {
+      "id": "empty-flat",
+      "encoding": "flat",
+      "bytes": "",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "InvalidFlatBytes",
+      "note": ""
+    },
+    {
+      "id": "non-word-aligned-flat",
+      "encoding": "flat",
+      "bytes": "00",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "InvalidFlatBytes",
+      "note": "SLCP flat entry point requires at least one complete word."
+    },
+    {
+      "id": "empty-struct-root",
+      "encoding": "flat",
+      "bytes": "fcffffff00000000",
+      "options": {
+        "traversalLimitWords": 1,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "null-root",
+      "encoding": "flat",
+      "bytes": "0000000000000000",
+      "options": {
+        "traversalLimitWords": 0,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "unknown-null-pointers",
+      "encoding": "flat",
+      "bytes": "000000000200030000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "malformed-unknown-pointer",
+      "encoding": "flat",
+      "bytes": "00000000020003000000000000000000000000000000000000000000000000000000000000000000fcffff7f00000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "OutOfBounds",
+      "note": "Eager validation must traverse the unknown third pointer field."
+    },
+    {
+      "id": "self-cycle-depth-bound",
+      "encoding": "flat",
+      "bytes": "0000000000000100fcffffff00000100",
+      "options": {
+        "traversalLimitWords": 1024,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "NestingLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "depth-three-accept",
+      "encoding": "flat",
+      "bytes": "00000000000001000000000000000100fcffffff00000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 3
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "depth-two-reject",
+      "encoding": "flat",
+      "bytes": "00000000000001000000000000000100fcffffff00000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 2
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "NestingLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "alias-work-four-accept",
+      "encoding": "flat",
+      "bytes": "000000000000020005000000420000000100000042000000abababababababab",
+      "options": {
+        "traversalLimitWords": 4,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Two pointer slots plus one data word charged on each alias visit."
+    },
+    {
+      "id": "alias-work-three-reject",
+      "encoding": "flat",
+      "bytes": "000000000000020005000000420000000100000042000000abababababababab",
+      "options": {
+        "traversalLimitWords": 3,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "TraversalLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "void-list-logical-work-reject",
+      "encoding": "flat",
+      "bytes": "0100000000350c00",
+      "options": {
+        "traversalLimitWords": 100,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "TraversalLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "void-list-logical-work-accept",
+      "encoding": "flat",
+      "bytes": "0100000000350c00",
+      "options": {
+        "traversalLimitWords": 100000,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "zero-width-inline-elements-accept",
+      "encoding": "flat",
+      "bytes": "01000000070000000c00000000000000",
+      "options": {
+        "traversalLimitWords": 3,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": ""
+    },
+    {
+      "id": "zero-width-inline-work-reject",
+      "encoding": "flat",
+      "bytes": "01000000070000000c00000000000000",
+      "options": {
+        "traversalLimitWords": 2,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "TraversalLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "present-empty-data",
+      "encoding": "flat",
+      "bytes": "0100000002000000",
+      "options": {
+        "traversalLimitWords": 0,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Non-null empty Data pointer is valid and consumes no payload word."
+    },
+    {
+      "id": "far-segment-id-invalid",
+      "encoding": "framed",
+      "bytes": "00000000010000000200000007000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "InvalidSegmentId",
+      "note": ""
+    },
+    {
+      "id": "far-chain-0-graph-accept",
+      "encoding": "framed",
+      "bytes": "000000000900000000000000010002000100000000000000050000000e000000000000000000000001000000020100000101010101010101010101010101010101010101010101010101010101010101",
+      "options": {
+        "traversalLimitWords": 131072,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Graph validation depth and typed-reader far-hop caps are distinct."
+    },
+    {
+      "id": "far-chain-1-graph-accept",
+      "encoding": "framed",
+      "bytes": "01000000010000000900000000000000020000000100000000000000010002000100000000000000050000000e000000000000000000000001000000020100000101010101010101010101010101010101010101010101010101010101010101",
+      "options": {
+        "traversalLimitWords": 131072,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Graph validation depth and typed-reader far-hop caps are distinct."
+    },
+    {
+      "id": "far-chain-2-graph-accept",
+      "encoding": "framed",
+      "bytes": "020000000100000001000000090000000200000001000000020000000200000000000000010002000100000000000000050000000e000000000000000000000001000000020100000101010101010101010101010101010101010101010101010101010101010101",
+      "options": {
+        "traversalLimitWords": 131072,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Graph validation depth and typed-reader far-hop caps are distinct."
+    },
+    {
+      "id": "far-chain-3-graph-accept",
+      "encoding": "framed",
+      "bytes": "03000000010000000100000001000000090000000000000002000000010000000200000002000000020000000300000000000000010002000100000000000000050000000e000000000000000000000001000000020100000101010101010101010101010101010101010101010101010101010101010101",
+      "options": {
+        "traversalLimitWords": 131072,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": true,
+      "zigDiagnostic": null,
+      "note": "Graph validation depth and typed-reader far-hop caps are distinct."
+    },
+    {
+      "id": "far-chain-depth-reject",
+      "encoding": "framed",
+      "bytes": "020000000100000001000000090000000200000001000000020000000200000000000000010002000100000000000000050000000e000000000000000000000001000000020100000101010101010101010101010101010101010101010101010101010101010101",
+      "options": {
+        "traversalLimitWords": 131072,
+        "nestingLimit": 2
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "NestingLimitExceeded",
+      "note": ""
+    },
+    {
+      "id": "zero-width-default-element-cap",
+      "encoding": "flat",
+      "bytes": "01000000070000000400000200000000",
+      "options": {
+        "traversalLimitWords": 9437184,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "TraversalLimitExceeded",
+      "note": "Physical payload is two words; element-count cap is independent of traversal words."
+    },
+    {
+      "id": "default-segment-count-cap",
+      "encoding": "framed",
+      "bytes": "0002000001000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "SegmentCountLimitExceeded",
+      "note": "513 declared segments exceed the default 512 cap before graph traversal."
+    },
+    {
+      "id": "truncated-over-cap-word-declaration",
+      "encoding": "framed",
+      "bytes": "01000000010000000000800000000000",
+      "options": {
+        "traversalLimitWords": 32,
+        "nestingLimit": 32
+      },
+      "expectedAccepted": false,
+      "zigDiagnostic": "TruncatedMessage",
+      "note": "Oversized declared total plus truncated body; truncated framing is the pinned first diagnostic. This does not isolate the default total-word cap."
+    }
+  ]
+}

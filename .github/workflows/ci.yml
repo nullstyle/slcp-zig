@@ -72,6 +72,9 @@ jobs:
       - name: Build slcp_core.wasm
         run: zig build wasm --summary all
 
+      - name: Native and WASM runner configuration, budgets and fatal outcomes
+        run: zig build runner-targets --summary all
+
       # The M4 gate: depends on the wasm artifact, so it can never pass by
       # skipping (unlike the soft twin inside `test`).
       - name: Differential native-vs-wasm replay
@@ -191,7 +194,49 @@ jobs:
       - uses: ./.github/actions/setup-capnp-wasm
       - name: Check tool integrity and read-only publication contracts
         run: just toolchain-test
+      - name: Check conformance artifact integrity and exact-source qualification
+        run: just conformance-tool-test
       - name: Compare generation with the pinned WASI plugin
         run: just gen-check-pinned
       - name: Require all independent canonical-reference cases
         run: just canonical-reference
+
+  conformance-artifact:
+    name: Isolated conformance artifact (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.7.17
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/setup-capnp-wasm
+      - name: Package exact committed source and qualify with fresh caches
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          root = Path(os.environ["RUNNER_TEMP"]) / "slcp-conformance"
+          root.mkdir()
+          archive = root / "slcp-conformance.tgz"
+          output = subprocess.check_output([sys.executable, "tools/conformance.py", "pack", "--output", str(archive)])
+          (root / "pack.json").write_bytes(output)
+          metadata = json.loads(output)
+          subprocess.run([sys.executable, "tools/conformance.py", "qualify", str(archive), "--sha256", metadata["sha256"], "--destination", str(root / "qualified")], check=True)
+          PY
+      - name: Retain artifact and qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: slcp-conformance-linux
+          path: |
+            ${{ runner.temp }}/slcp-conformance/slcp-conformance.tgz
+            ${{ runner.temp }}/slcp-conformance/pack.json
+            ${{ runner.temp }}/slcp-conformance/qualified/qualification.json
+            ${{ runner.temp }}/slcp-conformance/qualified/logs/

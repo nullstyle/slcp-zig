@@ -1,0 +1,28 @@
+{
+  "format": "SLCP-CONFORMANCE-PROFILE-1",
+  "id": "SLCP-v1-static-strict-default-driver+SLCPRUN1",
+  "wire": {"protocolVersion": 1, "strictCanonical": true},
+  "engine": {"traceFormat": "SLCPTRC1", "normativeEffects": "exact bytes and queue order", "observableEffects": "separate comparison", "driver": "default"},
+  "runners": {
+    "native": {"format": "SLCPRUN1", "explicitZeroLimits": true, "fatalResults": "separate outcome, partial effects and sticky state"},
+    "wasm": {"abiVersion": 1, "lineProtocolVersion": 1, "explicitZeroLimits": false, "zeroLimitMeaning": "engine default", "initialMemoryBytes": 4194304, "maximumMemoryBytes": 67108864}
+  },
+  "excludedClaims": ["managed carrier interoperability", "application/history interoperability", "data-directory interchange", "physical power-loss durability", "independent consensus safety proof"],
+  "requiredFiles": [
+    "schema/slcp.capnp", "schema/host.capnp", "schema/overlay.capnp",
+    "vectors/crypto.json", "vectors/qset.json", "vectors/lint.json", "vectors/sanity.json", "vectors/leader.json",
+    "vectors/compatibility/ed25519-provider.json", "vectors/compatibility/envelope-signatures.json",
+    "vectors/compatibility/wrappers.json", "vectors/compatibility/qsets.json",
+    "vectors/compatibility/decoder.json", "vectors/compatibility/receive.json",
+    "vectors/framing/PROVENANCE.md", "vectors/framing/framing_fixtures.json",
+    "vectors/traces/FORMAT.md", "vectors/traces/single-node-1of1.bin", "vectors/traces/insane-and-stale.bin", "vectors/traces/qset-park-resume.bin", "vectors/traces/timer-bump.bin",
+    "vectors/runner/SLCPRUN1.json"
+  ],
+  "expectations": {
+    "jsonVectors": "Expected fields are stored with each case; all vectors/ files are included and hashed.",
+    "traces": {"count": 4, "normativeEffects": 32, "comparison": "kind 2 exact; kind 3 separately observable"},
+    "runner": "vectors/runner/SLCPRUN1.json contains explicit expected push/effect/failure outcomes"
+  },
+  "requiredGates": ["vector-conformance", "runner-conformance", "wasm-diff", "canonical-reference", "packaged-runner", "packaged-cross-target"],
+  "terms": "No license is granted yet; retain the source README notice. Packaging does not grant redistribution permissions."
+}

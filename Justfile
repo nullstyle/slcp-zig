@@ -9,6 +9,14 @@ gen: bootstrap-toolchain
 toolchain-test:
     python3 -m unittest discover -s tools -p 'test_capnp_tool.py'
 
+# Conformance artifact integrity, exact-source restoration and required gates.
+conformance-tool-test:
+    python3 -m unittest discover -s tools -p 'test_conformance.py'
+
+# Explicit-zero scope plus actual native/WASM budget and fatal-outcome parity.
+runner-targets:
+    zig build runner-targets --summary all
+
 # Required independent reference check: two statements and four quorum sets.
 canonical-reference: bootstrap-toolchain
     zig build canonical-reference --summary all

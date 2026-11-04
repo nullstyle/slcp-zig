@@ -33,8 +33,10 @@
 //         "flagsLo":5,"flagsHi":0}
 //   {"id":2,"cmd":"version"}
 //     -> {"id":2,"ok":true,"version":"slcp-core 0.17.0-dev..."}
-//   {"id":3,"cmd":"new","config":"<EngineConfig frame hex>"}
+//   {"id":3,"cmd":"new","config":"<EngineConfig frame hex>","driver":"default"}
 //     -> {"id":3,"ok":true,"handle":1} | {"ok":false,"errCode":5,...}
+//     Optional driver "combine_fault" is a deterministic conformance profile;
+//     it belongs to this runner, and does not alter WASM ABI v1 or defaults.
 //   {"id":4,"cmd":"push","handle":1,"input":"<Input frame hex>"}
 //     -> {"id":4,"ok":true,"pushed":1}
 //        {"id":4,"ok":true,"pushed":0,"errCode":3,"errMsg":"..."}
@@ -228,6 +230,8 @@ function driverFault(what, e) {
 }
 
 const stats = { validate: 0, combine: 0, extract: 0 };
+const handleDrivers = new Map();
+let activeDriver = "default";
 
 const slcp_driver = {
   // 0 invalid | 1 maybeValid | 2 valid | 3+ fault
@@ -240,6 +244,7 @@ const slcp_driver = {
   // engine copies and frees.
   combine_candidates(_slotLo, _slotHi, listPtr, listLen, outPtrPtr, outLenPtr) {
     stats.combine += 1;
+    if (activeDriver === "combine_fault") return 1;
     try {
       const values = readValueList(listPtr, listLen);
       if (values.length === 0) return 1; // native defaultCombine: error.DriverFault
@@ -312,18 +317,30 @@ function handle(req) {
     }
 
     case "new": {
+      const driver = req.driver ?? "default";
+      if (driver !== "default" && driver !== "combine_fault") {
+        return { ok: false, err: "unsupported conformance driver" };
+      }
       const cfg = fromHex(req.config);
       const p = copyIn(cfg);
       const h = wasm.slcp_engine_new(p, cfg.length);
       wasm.slcp_free(p, cfg.length);
       if (h === 0) return { ok: false, err: "slcp_engine_new returned 0", ...takeError() };
+      handleDrivers.set(h, driver);
       return { ok: true, handle: h };
     }
 
     case "push": {
       const bytes = fromHex(req.input);
       const p = copyIn(bytes);
-      const rc = wasm.slcp_engine_push_input(req.handle, p, bytes.length);
+      let rc;
+      const previousDriver = activeDriver;
+      activeDriver = handleDrivers.get(req.handle) ?? "default";
+      try {
+        rc = wasm.slcp_engine_push_input(req.handle, p, bytes.length);
+      } finally {
+        activeDriver = previousDriver;
+      }
       wasm.slcp_free(p, bytes.length);
       if (rc === 0) return { ok: true, pushed: 0, ...takeError() };
       return { ok: true, pushed: 1 };
@@ -354,6 +371,7 @@ function handle(req) {
 
     case "free":
       wasm.slcp_engine_free(req.handle);
+      handleDrivers.delete(req.handle);
       return { ok: true };
 
     case "qsetHash": {

@@ -378,6 +378,8 @@ mise exec -- zig build test
 | `zig build registry-smoke` | Builds `examples/registry` once as a consumer package and runs three skewed-clock registry nodes in a loopback line through its CLI — bounded transaction flooding/source death, deterministic close-time agreement, ordinary restart, then exact peerless anchor-to-tip replay after one validator misses at least 201 slots and both certifying peers stop. The recovered validator must expose the same non-anchor slot/hash/time after replaying 17–63 immutable ledgers, then cast a necessary vote in the first later transaction-bearing ledger. It also proves the hard network epoch. Not part of `test` (which runs `registry-tests`, the example's own tests). |
 | `zig build cli` | Build and install `zig-out/bin/slcp`. |
 | `zig build wasm` / `zig build wasm-diff` | Build `slcp_core.wasm` and replay the trace vectors natively and in wasm, comparing effects byte for byte. |
+| `zig build signature-vectors wire-compatibility` | Require additive hostile-signature, full-envelope, wrapper, legacy-qset, bounded-decoder and receive-precedence fixtures. Also part of `test`. |
+| `zig build runner-conformance runner-targets` | Check versioned native explicit-zero/fatal outcomes and actual native/WASM parity for representable configurations. [Runner contract](docs/runner-conformance.md). |
 | `zig build sim-matrix` / `zig build byz-matrix` | The full 1000-seed simulation and Byzantine matrices (long). |
 | `zig build vectors` | Regenerate `vectors/` (a protocol event — never casually). |
 | `zig build check-api` / `zig build api-snapshot` | Compare / regenerate the API snapshots in `docs/`. |
@@ -388,6 +390,10 @@ are the same steps with the flags CI uses. `mise exec -- just gen` regenerates
 the exact capnp-zig runtime dependency. `just gen-check` (also
 `just gen-check-pinned`) compares staged results without modifying the checkout.
 `just canonical-reference` requires all six independent canonicalization cases.
+The [separate conformance artifact](conformance/README.md) includes an exact
+source bundle, schemas, fixtures, native/WASM executables and hashed tool pins.
+Its isolated qualification refuses missing or skipped required gates. The
+ordinary dependency package's export paths remain unchanged.
 These development commands use Python 3.8+, Bash, and the Wasmtime/Zig pins in
 `mise.toml`; the compiler archive is published by
 [capnpc-wasm](https://github.com/nullstyle/capnpc-wasm/releases), locked in

@@ -438,10 +438,93 @@ pub fn build(b: *std.Build) void {
         },
     });
     const wasm_diff_tests = b.addTest(.{ .name = "slcp-wasm-diff", .root_module = wasm_diff_mod });
+    const soft_wasm_options = b.addOptions();
+    soft_wasm_options.addOption(bool, "required", false);
+    wasm_diff_mod.addOptions("wasm_differential_options", soft_wasm_options);
+    const required_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("tests/wasm/differential_test.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{
+            .{ .name = "slcp-core", .module = slcp_core_sim },
+            .{ .name = "adversary", .module = adversary_mod },
+        },
+    });
+    const required_wasm_options = b.addOptions();
+    required_wasm_options.addOption(bool, "required", true);
+    required_wasm_mod.addOptions("wasm_differential_options", required_wasm_options);
+    const required_wasm_tests = b.addTest(.{ .name = "slcp-wasm-diff-required", .root_module = required_wasm_mod });
+
+    const signature_vectors = b.addTest(.{
+        .name = "slcp-signature-vectors",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/signature_vectors_test.zig"),
+            .target = target,
+            .optimize = sim_optimize,
+            .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+        }),
+    });
+    const run_signature_vectors = b.addRunArtifact(signature_vectors);
+    run_signature_vectors.setCwd(b.path("."));
+    run_signature_vectors.has_side_effects = true;
+    const signature_step = b.step("signature-vectors", "Require provider and full-envelope signature acceptance fixtures");
+    signature_step.dependOn(&run_signature_vectors.step);
+
+    const wire_vectors = b.addTest(.{
+        .name = "slcp-wire-compatibility",
+        .filters = &.{"wire-compatibility:"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wire_compatibility_test.zig"),
+            .target = target,
+            .optimize = sim_optimize,
+            .imports = &.{
+                .{ .name = "slcp-core", .module = slcp_core_native },
+                .{ .name = "slcp", .module = slcp_mod },
+            },
+        }),
+    });
+    const run_wire_vectors = b.addRunArtifact(wire_vectors);
+    run_wire_vectors.setCwd(b.path("."));
+    run_wire_vectors.has_side_effects = true;
+    const wire_step = b.step("wire-compatibility", "Require wrapper, legacy qset, decoder and receive-precedence fixtures");
+    wire_step.dependOn(&run_wire_vectors.step);
+    const vector_conformance = b.step("vector-conformance", "Replay original vectors and additive compatibility fixtures");
+    vector_conformance.dependOn(&run_vector_tests.step);
+    vector_conformance.dependOn(&run_framing_vector_tests.step);
+    vector_conformance.dependOn(signature_step);
+    vector_conformance.dependOn(wire_step);
+
+    const runner_module = b.createModule(.{
+        .root_source_file = b.path("tools/conformance_runner.zig"),
+        .target = target,
+        .optimize = sim_optimize,
+        .imports = &.{.{ .name = "slcp-core", .module = slcp_core }},
+    });
+    const runner_exe = b.addExecutable(.{ .name = "slcp-conformance-runner", .root_module = runner_module });
+    const install_runner = b.addInstallArtifact(runner_exe, .{});
+    const runner_build = b.step("conformance-runner", "Build the versioned native conformance fixture runner");
+    runner_build.dependOn(&install_runner.step);
+    const runner_tests = b.addTest(.{ .name = "slcp-conformance-runner-tests", .root_module = runner_module });
+    const run_runner_tests = b.addRunArtifact(runner_tests);
+    run_runner_tests.setCwd(b.path("."));
+    run_runner_tests.has_side_effects = true;
+    const run_runner_fixture = b.addRunArtifact(runner_exe);
+    run_runner_fixture.addFileArg(b.path("vectors/runner/SLCPRUN1.json"));
+    run_runner_fixture.setCwd(b.path("."));
+    run_runner_fixture.has_side_effects = true;
+    // Keep the full JSONL receipt as a build artifact, rather than flooding
+    // ordinary test output with exact envelope/effect hex.
+    _ = run_runner_fixture.captureStdOut(.{});
+    const runner_step = b.step("runner-conformance", "Require explicit-zero, fatal/partial-effect and sticky-failure runner fixtures");
+    runner_step.dependOn(&run_runner_tests.step);
+    runner_step.dependOn(&run_runner_fixture.step);
 
     const test_step = b.step("test", "Run unit + vector + framing conformance + e2e + ABI conformance + sim matrix + fuzz smoke + wasm differential (skipped without the wasm artifact)");
     test_step.dependOn(&run_adaptivity_tests.step);
     test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(signature_step);
+    test_step.dependOn(wire_step);
+    test_step.dependOn(runner_step);
     test_step.dependOn(&run_vector_tests.step);
     test_step.dependOn(&run_framing_vector_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
@@ -451,10 +534,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sim_tests.step);
     test_step.dependOn(fuzz_smoke_step);
 
-    // Two run steps over the SAME differential binary, differing only in
-    // whether the wasm artifact is a build dependency:
-    //   `zig build wasm-diff` — depends on the wasm build, so the M4 gate can
-    //     never silently pass by skipping.
+    // Separate soft/required binaries retain the convenience test skip while
+    // the required gate fails on missing runtime, scripts, artifact or traces:
+    //   `zig build wasm-diff` — builds WASM and refuses missing prerequisites.
     //   `zig build test`      — no dependency, so a clean tree (or a machine
     //     without node) reports error.SkipZigTest and stays green.
     // Both are side-effectful: a gate reading files the build graph does not
@@ -538,6 +620,17 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build slcp_core.wasm (wasm32-freestanding, ReleaseSmall)");
     wasm_step.dependOn(&install_wasm.step);
 
+    const runner_targets = b.addSystemCommand(&.{ "python3", "tools/test_runner_conformance.py", "--runner" });
+    runner_targets.addArtifactArg(runner_exe);
+    runner_targets.addArg("--wasm");
+    runner_targets.addArtifactArg(wasm_exe);
+    runner_targets.addArg("--fixture");
+    runner_targets.addFileArg(b.path("vectors/runner/SLCPRUN1.json"));
+    runner_targets.setCwd(b.path("."));
+    runner_targets.has_side_effects = true;
+    const runner_targets_step = b.step("runner-targets", "Require native/WASM logical-budget, fatal partial-effect and sticky-failure parity");
+    runner_targets_step.dependOn(&runner_targets.step);
+
     // Exercise the foreign-host interface on the core-only WASM graph.
     // Merely exporting core.host leaves its functions unanalyzed; this
     // consumer forces metadata, holding, release and observation operations.
@@ -556,7 +649,7 @@ pub fn build(b: *std.Build) void {
 
     // The M4 gate: `zig build wasm && zig build wasm-diff` — this run step
     // depends on the wasm install, so it always has a real artifact to drive.
-    const run_wasm_diff_gate = b.addRunArtifact(wasm_diff_tests);
+    const run_wasm_diff_gate = b.addRunArtifact(required_wasm_tests);
     run_wasm_diff_gate.setCwd(b.path("."));
     run_wasm_diff_gate.has_side_effects = true;
     run_wasm_diff_gate.step.dependOn(&install_wasm.step);

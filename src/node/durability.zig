@@ -35,7 +35,9 @@ pub fn syncFile(io: std.Io, file: std.Io.File) !void {
 
 /// Flush a preceding file or directory sync out of the device cache on
 /// macOS. Directory-entry publication must invoke this AFTER directory sync.
-pub fn flushMedia(file: std.Io.File) !void {
+/// Keep the error contract identical on Linux, where the call is a no-op:
+/// inferred public Journal/managed Store signatures must remain portable.
+pub fn flushMedia(file: std.Io.File) error{FullSyncFailed}!void {
     if (comptime builtin.os.tag == .macos) {
         if (mediaFlush(file) < 0) return error.FullSyncFailed;
     }

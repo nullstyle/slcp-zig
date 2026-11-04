@@ -193,6 +193,11 @@ flags).
   digest** — never over the raw preimage (`crypto.zig` `sign`). Verification
   is over the **received** `statementBytes`; verifiers never re-canonicalize
   on the hot path.
+  The existing cofactored equation and scalar/point rejection rules are
+  specified in [signature acceptance](signature-acceptance.md), with separate
+  hostile-provider and complete-envelope fixtures. This records current v1
+  acceptance; replacing it with a stricter provider mode requires an explicit
+  compatibility/version decision.
 - A wrong-network envelope implicitly fails verification: its digest differs.
 
 **Normative receive order for `envelope_received`** (copied from the
@@ -723,6 +728,17 @@ actual values (0 = engine default). Scenarios: `single-node-1of1.bin`,
 (`max_effects = 4096`, `max_bytes = 16 MiB`), OOM, or non-protocol error
 marks the engine failed (sticky); `pushInput` then always returns
 `error.EngineFailed`.
+
+The additive [wire compatibility corpus](wire-compatibility.md) specifies
+unsigned wrapper construction, accepted legacy qset spellings, bounded eager
+graph validation and multi-fault precedence at the pinned dependency. Original
+signed bytes and frozen traces remain unchanged.
+
+[SLCPRUN1](runner-conformance.md) separately versions explicit-zero native
+configuration and fatal/partial/sticky outcomes. It does not reinterpret zero
+in `host.capnp` or change WASM ABI v1. The [conformance artifact](../conformance/README.md)
+binds the exact source, schemas, profile, fixtures, runners and tool identities;
+wire/engine parity does not establish storage interchange or application trust.
 
 ## 12. Overlay
 
